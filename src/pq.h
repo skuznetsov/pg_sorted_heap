@@ -26,11 +26,24 @@
 /* Maximum iterations for k-means training */
 #define PQ_MAX_ITER		50
 
-/* SQL-callable functions */
+/* IVF: max centroids (must fit in int2) */
+#define IVF_MAX_NLIST	32767
+
+/* PQ SQL-callable functions */
 extern Datum svec_pq_train(PG_FUNCTION_ARGS);
 extern Datum svec_pq_encode(PG_FUNCTION_ARGS);
 extern Datum svec_pq_distance(PG_FUNCTION_ARGS);
 extern Datum svec_pq_distance_table(PG_FUNCTION_ARGS);
 extern Datum svec_pq_adc_lookup(PG_FUNCTION_ARGS);
+extern Datum svec_pq_adc(PG_FUNCTION_ARGS);
+
+/* IVF SQL-callable functions */
+extern Datum svec_ivf_train(PG_FUNCTION_ARGS);
+extern Datum svec_ivf_assign(PG_FUNCTION_ARGS);
+extern Datum svec_ivf_probe(PG_FUNCTION_ARGS);
+
+/* K-means (used by both PQ and IVF training) */
+extern void kmeans_train(float *data, int npts, int dsub, int k,
+						 int n_iter, float *centroids_out);
 
 #endif							/* PQ_H */

@@ -455,7 +455,7 @@ COMMENT ON FUNCTION @extschema@.svec_pq_train(text, int4, int4, int4)
 IS 'Train Product Quantization codebook. M subvectors, 256 centroids each. Returns codebook ID.';
 
 -- Encode a vector to M-byte PQ code using trained codebook.
-CREATE FUNCTION @extschema@.svec_pq_encode(@extschema@.svec, cb_id int4)
+CREATE FUNCTION @extschema@.svec_pq_encode(@extschema@.svec, cb_id int4 DEFAULT 1)
 RETURNS bytea
 AS '$libdir/pg_sorted_heap', 'svec_pq_encode'
 LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
@@ -473,8 +473,8 @@ LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
 COMMENT ON FUNCTION @extschema@.svec_pq_distance(@extschema@.svec, bytea, int4)
 IS 'ADC distance: estimate squared L2 between query vector and PQ code. Fast (no TOAST reads).';
 
--- Split ADC for batch queries: precompute table once, lookup per row
-CREATE FUNCTION @extschema@.svec_pq_distance_table(@extschema@.svec, cb_id int4)
+-- Split ADC for batch queries: precompute table once, lookup per row (power-user API)
+CREATE FUNCTION @extschema@.svec_pq_distance_table(@extschema@.svec, cb_id int4 DEFAULT 1)
 RETURNS bytea
 AS '$libdir/pg_sorted_heap', 'svec_pq_distance_table'
 LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
@@ -489,3 +489,70 @@ LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
 
 COMMENT ON FUNCTION @extschema@.svec_pq_adc_lookup(bytea, bytea)
 IS 'ADC lookup: sum precomputed distances using PQ code. O(M) per call — sub-microsecond.';
+
+-- Combined ADC: auto-caches distance table per scan, then O(M) lookup per row.
+-- Eliminates the CTE pattern needed with distance_table + adc_lookup.
+CREATE FUNCTION @extschema@.svec_pq_adc(@extschema@.svec, code bytea, cb_id int4 DEFAULT 1)
+RETURNS float8
+AS '$libdir/pg_sorted_heap', 'svec_pq_adc'
+LANGUAGE C STRICT STABLE PARALLEL SAFE;
+
+COMMENT ON FUNCTION @extschema@.svec_pq_adc(@extschema@.svec, bytea, int4)
+IS 'ADC distance with auto-cached distance table. Use in ORDER BY — no CTE needed.';
+
+-- ================================================================
+-- IVF (Inverted File Index) functions for IVF-PQ approximate nearest neighbor search.
+-- sorted_heap physical clustering by PK prefix acts as the inverted file.
+-- ================================================================
+
+-- Train IVF centroids via k-means on full vectors.
+-- Returns codebook ID.
+CREATE FUNCTION @extschema@.svec_ivf_train(
+    source_query text,
+    nlist int4,
+    n_iter int4 DEFAULT 10,
+    max_samples int4 DEFAULT 10000
+)
+RETURNS int4
+AS '$libdir/pg_sorted_heap', 'svec_ivf_train'
+LANGUAGE C STRICT;
+
+COMMENT ON FUNCTION @extschema@.svec_ivf_train(text, int4, int4, int4)
+IS 'Train IVF centroids via k-means. nlist partitions. Returns codebook ID.';
+
+-- Assign vector to nearest IVF centroid. For use in GENERATED columns.
+CREATE FUNCTION @extschema@.svec_ivf_assign(@extschema@.svec, cb_id int4 DEFAULT 1)
+RETURNS int2
+AS '$libdir/pg_sorted_heap', 'svec_ivf_assign'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+COMMENT ON FUNCTION @extschema@.svec_ivf_assign(@extschema@.svec, int4)
+IS 'Assign vector to nearest IVF centroid. Returns centroid_id (int2). IMMUTABLE for GENERATED columns.';
+
+-- Find nprobe nearest IVF centroids for a query vector.
+CREATE FUNCTION @extschema@.svec_ivf_probe(@extschema@.svec, nprobe int4, cb_id int4 DEFAULT 1)
+RETURNS int2[]
+AS '$libdir/pg_sorted_heap', 'svec_ivf_probe'
+LANGUAGE C STRICT STABLE PARALLEL SAFE;
+
+COMMENT ON FUNCTION @extschema@.svec_ivf_probe(@extschema@.svec, int4, int4)
+IS 'Find nprobe nearest IVF centroids for query. Returns int2[] of centroid_ids for WHERE partition_id = ANY(...).';
+
+-- ================================================================
+-- Convenience: combined IVF + PQ training in one call.
+-- ================================================================
+CREATE FUNCTION @extschema@.svec_ann_train(
+    source_query text,
+    nlist int4,
+    m int4,
+    n_iter int4 DEFAULT 10,
+    max_samples int4 DEFAULT 10000
+)
+RETURNS TABLE(ivf_cb_id int4, pq_cb_id int4)
+AS $$
+    SELECT @extschema@.svec_ivf_train(source_query, nlist, n_iter, max_samples) AS ivf_cb_id,
+           @extschema@.svec_pq_train(source_query, m, n_iter, max_samples) AS pq_cb_id;
+$$ LANGUAGE SQL;
+
+COMMENT ON FUNCTION @extschema@.svec_ann_train(text, int4, int4, int4, int4)
+IS 'Train both IVF centroids and PQ codebook in one call. Returns (ivf_cb_id, pq_cb_id).';
