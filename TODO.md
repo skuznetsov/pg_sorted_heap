@@ -480,9 +480,119 @@ No `pg_sorted_heap--0.1.0--0.2.0.sql` upgrade script exists. Currently requires
 `DROP EXTENSION` + `CREATE EXTENSION` for version changes (data preserved in
 tables, zone map rebuilt on next compact).
 
+## Vector Search Track
+
+Extending sorted_heap for approximate nearest neighbor (ANN) search.
+The key idea: use sorted_heap's zone-map pruning on hash columns
+(generated from vector embeddings) for coarse filtering, then PQ codes
+for fast distance estimation without TOAST reads.
+
+### Source Files (Vector)
+
+| File | Lines | Purpose |
+|------|------:|---------|
+| `svec.h` | 35 | Svec struct (pgvector-compatible layout), macros |
+| `svec.c` | 280 | svec type I/O, typmod, cosine distance operator `<=>` |
+| `sorted_vector_hash.c` | 590 | SimHash, VQ, RVQ, RPVQ, CVQ hash functions |
+| `pq.h` | 36 | PQ constants (PQ_MAX_M, PQ_KSUB=256), function declarations |
+| `pq.c` | 860 | PQ training (k-means), encode, split ADC (distance_table + adc_lookup) |
+
+### Vector Hash Functions (SimHash, VQ, RVQ, RPVQ, CVQ)
+
+Five hash functions for mapping high-dimensional vectors to int2 bucket IDs,
+used as generated columns for zone-map-based scan pruning:
+
+- `sorted_vector_hash(svec, seed)` — SimHash (random hyperplanes, Hamming-like)
+- `sorted_vector_vq(svec, n_centroids, seed)` — Vector Quantization (random centroids)
+- `sorted_vector_rvq(svec, n_centroids, seed)` — Residual VQ (two-stage)
+- `sorted_vector_rpvq(svec, n_centroids, seed)` — Random Projection + VQ
+- `sorted_vector_cvq(svec, ref, n_centroids, seed)` — Composite VQ (diff from reference)
+- `sorted_vector_cvq_probe(svec, ref, n_centroids, n_probes, seed)` — Multi-probe CVQ
+
+### svec Type (Own Vector Type)
+
+Custom PostgreSQL vector type replacing pgvector dependency:
+- Binary-compatible with pgvector's `vector` struct layout
+- Same `[x,y,z]` text I/O format
+- Cosine distance operator `<=>`
+- `STORAGE = external` for TOAST
+- Typmod support: `svec(768)` for dimension checking
+
+### Product Quantization (PQ)
+
+Compact vector encoding for fast ANN search without TOAST reads.
+
+**Training:**
+- `svec_pq_train(source_query, M, n_iter, max_samples)` → codebook ID
+- k-means clustering on M subvector groups (Ksub=256 centroids each)
+- Codebook stored in `_pq_codebook_meta` + `_pq_codebooks` tables
+- Backend-local codebook cache for cross-query reuse
+
+**Encoding:**
+- `svec_pq_encode(svec, cb_id)` → M-byte bytea PQ code
+- For dim=2880, M=180: each vector compressed to 180 bytes (64× reduction)
+
+**Distance computation (split ADC):**
+- `svec_pq_distance_table(query, cb_id)` → M×256 float distance table (once per query)
+- `svec_pq_adc_lookup(dist_table, code)` → float8 estimated L2² distance (O(M) per candidate)
+- Split design avoids recomputing distance table per row (573× speedup over naive per-row)
+
+**Memory context fix:**
+SPI's `procCxt` is deleted by `SPI_finish()`. Any `palloc` between `SPI_connect()`
+and `SPI_finish()` becomes a dangling pointer. Fixed by allocating long-lived data
+(sample_data, indices) in the caller's `func_ctx` via explicit `MemoryContextSwitchTo`.
+
+### ANN Benchmark Results
+
+103K vectors, svec(2880) / halfvec(2880), 1Gi k8s pod, PostgreSQL 18.
+
+**PQ vs pgvector HNSW (20 queries, recall@10):**
+
+| Method | Recall@10 | Avg latency | Index size |
+|---|---|---|---|
+| Exact brute-force | 10.0/10 | 996 ms | — |
+| pgvector HNSW ef=40 | 9.7/10 | 17 ms | 806 MB |
+| pgvector HNSW ef=100 | 9.7/10 | 14 ms | 806 MB |
+| pgvector HNSW ef=200 | 9.7/10 | 20 ms | 806 MB |
+| PQ two-phase pool=200 | 10.0/10 | 60 ms | 27 MB |
+
+**PQ recall by reranking pool size (10 queries):**
+
+| Pool size | Recall@10 |
+|---|---|
+| 50 | 93% |
+| 100 | 99% |
+| 200 | 100% |
+| 500 | 100% |
+
+**PQ two-phase timing breakdown (single query):**
+
+| Phase | Time | Description |
+|---|---|---|
+| Distance table | 15.6 ms | Precompute M×256 distances (once per query) |
+| ADC scan | 25.5 ms | Scan 103K PQ codes, sort top-200 |
+| Exact rerank | 22.8 ms | Detoast + cosine for 200 candidates |
+| Total | 63.9 ms | 16× faster than brute-force |
+
+**Key tradeoffs:**
+- HNSW: 3-4× faster latency, but 30× larger index (stores full vectors)
+- PQ: higher recall (100% vs 97%), 30× smaller index, scales better to large datasets
+- At 1M vectors: HNSW ~8 GB vs PQ ~260 MB
+
+### Multi-Hash Filter PoC (Counterproductive)
+
+Tested two-table architecture with multi-hash filter (h1×h2×h3×h4) for
+tighter candidate selection. Result: **filter hurts recall without improving
+latency** — the problem is TOAST read latency, not candidate count.
+PQ approach directly addresses this by eliminating TOAST reads for filtering.
+
 ## Possible Future Work
 
 - Index-only scan equivalent using zone map
 - Online compact/merge support for UUID/text PKs (requires log format redesign)
 - Extension upgrade SQL scripts for version transitions
 - pg_upgrade testing with two major PG versions
+- IVF-PQ: use SimHash or VQ partitioning + PQ codes for sub-linear scan on large datasets
+- Scalar quantization (SQ8/SQ4) as lighter alternative to PQ for lower dimensions
+- SIMD-accelerated ADC lookup (NEON/AVX2 for distance table precomputation)
+- pgvectorscale DiskANN comparison (requires Rust/PGRX build)

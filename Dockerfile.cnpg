@@ -1,0 +1,39 @@
+# Multi-stage build: compile pg_sorted_heap extension for CNPG PG18 image
+# Stage 1: Build
+FROM ghcr.io/cloudnative-pg/postgresql:18.1-202511240807-standard-trixie AS builder
+
+USER root
+
+# Install build dependencies (Debian trixie)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        postgresql-server-dev-18 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy extension source
+COPY Makefile pg_sorted_heap.control /build/
+COPY src/ /build/src/
+COPY sql/ /build/sql/
+
+WORKDIR /build
+
+# Clean macOS .o files, then build for linux/arm64
+RUN make clean PG_CONFIG=/usr/bin/pg_config && \
+    make PG_CONFIG=/usr/bin/pg_config && \
+    make install PG_CONFIG=/usr/bin/pg_config
+
+# Stage 2: Final image (same CNPG base, add only built artifacts)
+FROM ghcr.io/cloudnative-pg/postgresql:18.1-202511240807-standard-trixie
+
+USER root
+
+# Copy compiled extension from builder
+COPY --from=builder /usr/lib/postgresql/18/lib/pg_sorted_heap.so \
+     /usr/lib/postgresql/18/lib/pg_sorted_heap.so
+COPY --from=builder /usr/share/postgresql/18/extension/pg_sorted_heap.control \
+     /usr/share/postgresql/18/extension/pg_sorted_heap.control
+COPY --from=builder /usr/share/postgresql/18/extension/pg_sorted_heap--0.9.7.sql \
+     /usr/share/postgresql/18/extension/pg_sorted_heap--0.9.7.sql
+
+USER 26

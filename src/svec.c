@@ -1,0 +1,285 @@
+/*
+ * svec.c
+ *
+ * Sorted Vector (svec): a lightweight float32 vector type for pg_sorted_heap.
+ * Text I/O: [x1,x2,...,xn]  (identical to pgvector format)
+ * Binary I/O: int16 dim + dim × float32
+ * Cosine distance operator: <=>
+ */
+#include "postgres.h"
+
+#include "fmgr.h"
+#include "lib/stringinfo.h"
+#include "libpq/pqformat.h"
+#include "utils/array.h"
+#include "utils/builtins.h"
+#include "utils/float.h"
+
+#include <math.h>
+
+#include "svec.h"
+
+/* ----------------------------------------------------------------
+ *  Text input: '[1.0,2.0,3.0]' → Svec
+ * ---------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(svec_in);
+Datum
+svec_in(PG_FUNCTION_ARGS)
+{
+	char	   *str = PG_GETARG_CSTRING(0);
+	int32		typmod = PG_GETARG_INT32(2);
+	float	   *values;
+	int			dim = 0;
+	int			capacity = 16;
+	char	   *p;
+	Svec	   *result;
+
+	values = palloc(sizeof(float) * capacity);
+
+	/* Skip leading whitespace */
+	p = str;
+	while (*p == ' ' || *p == '\t')
+		p++;
+
+	if (*p != '[')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("svec must start with \"[\"")));
+	p++;
+
+	/* Parse comma-separated floats */
+	while (*p != '\0' && *p != ']')
+	{
+		char	   *end;
+		float		val;
+
+		/* Skip whitespace */
+		while (*p == ' ' || *p == '\t')
+			p++;
+
+		if (*p == ']')
+			break;
+
+		val = strtof(p, &end);
+		if (end == p)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("invalid input syntax for type svec: \"%s\"", str)));
+		p = end;
+
+		if (dim >= capacity)
+		{
+			capacity *= 2;
+			values = repalloc(values, sizeof(float) * capacity);
+		}
+		values[dim++] = val;
+
+		/* Skip whitespace + comma */
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (*p == ',')
+			p++;
+	}
+
+	if (*p != ']')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("svec must end with \"]\"")));
+	p++;
+
+	/* Trailing garbage check */
+	while (*p == ' ' || *p == '\t')
+		p++;
+	if (*p != '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("unexpected characters after \"]\" in svec input")));
+
+	if (dim < 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("svec must have at least 1 dimension")));
+
+	if (dim > SVEC_MAX_DIM)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("svec cannot have more than %d dimensions", SVEC_MAX_DIM)));
+
+	/* Check typmod */
+	if (typmod != -1 && typmod != dim)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("expected %d dimensions, not %d", typmod, dim)));
+
+	result = (Svec *) palloc0(SVEC_SIZE(dim));
+	SET_VARSIZE(result, SVEC_SIZE(dim));
+	result->dim = dim;
+	result->unused = 0;
+	memcpy(result->x, values, sizeof(float) * dim);
+
+	pfree(values);
+
+	PG_RETURN_SVEC_P(result);
+}
+
+/* ----------------------------------------------------------------
+ *  Text output: Svec → '[1,2,3]'
+ * ---------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(svec_out);
+Datum
+svec_out(PG_FUNCTION_ARGS)
+{
+	Svec	   *vec = PG_GETARG_SVEC_P(0);
+	int			dim = vec->dim;
+	StringInfoData buf;
+	int			i;
+
+	initStringInfo(&buf);
+	appendStringInfoChar(&buf, '[');
+
+	for (i = 0; i < dim; i++)
+	{
+		if (i > 0)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfo(&buf, "%g", (double) vec->x[i]);
+	}
+
+	appendStringInfoChar(&buf, ']');
+
+	PG_RETURN_CSTRING(buf.data);
+}
+
+/* ----------------------------------------------------------------
+ *  Typmod input: svec(768) → typmod = 768
+ * ---------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(svec_typmod_in);
+Datum
+svec_typmod_in(PG_FUNCTION_ARGS)
+{
+	ArrayType  *ta = PG_GETARG_ARRAYTYPE_P(0);
+	int			n;
+	int32	   *dims;
+
+	dims = ArrayGetIntegerTypmods(ta, &n);
+
+	if (n != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("svec type modifier must have exactly one dimension")));
+
+	if (dims[0] < 1 || dims[0] > SVEC_MAX_DIM)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("svec dimensions must be between 1 and %d", SVEC_MAX_DIM)));
+
+	PG_RETURN_INT32(dims[0]);
+}
+
+/* ----------------------------------------------------------------
+ *  Binary receive
+ * ---------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(svec_recv);
+Datum
+svec_recv(PG_FUNCTION_ARGS)
+{
+	StringInfo	buf = (StringInfo) PG_GETARG_POINTER(0);
+	int32		typmod = PG_GETARG_INT32(2);
+	int16		dim;
+	int16		unused;
+	Svec	   *result;
+	int			i;
+
+	dim = pq_getmsgint(buf, sizeof(int16));
+	unused = pq_getmsgint(buf, sizeof(int16));
+
+	(void) unused;	/* suppress warning */
+
+	if (dim < 1 || dim > SVEC_MAX_DIM)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("svec dimensions out of range: %d", dim)));
+
+	if (typmod != -1 && typmod != dim)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("expected %d dimensions, not %d", typmod, dim)));
+
+	result = (Svec *) palloc0(SVEC_SIZE(dim));
+	SET_VARSIZE(result, SVEC_SIZE(dim));
+	result->dim = dim;
+	result->unused = 0;
+
+	for (i = 0; i < dim; i++)
+		result->x[i] = pq_getmsgfloat4(buf);
+
+	PG_RETURN_SVEC_P(result);
+}
+
+/* ----------------------------------------------------------------
+ *  Binary send
+ * ---------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(svec_send);
+Datum
+svec_send(PG_FUNCTION_ARGS)
+{
+	Svec	   *vec = PG_GETARG_SVEC_P(0);
+	StringInfoData buf;
+	int			i;
+
+	pq_begintypsend(&buf);
+	pq_sendint16(&buf, vec->dim);
+	pq_sendint16(&buf, vec->unused);
+
+	for (i = 0; i < vec->dim; i++)
+		pq_sendfloat4(&buf, vec->x[i]);
+
+	PG_RETURN_BYTEA_P(pq_endtypsend(&buf));
+}
+
+/* ----------------------------------------------------------------
+ *  Cosine distance: 1 - dot(a,b) / (|a| * |b|)
+ * ---------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(svec_cosine_distance);
+Datum
+svec_cosine_distance(PG_FUNCTION_ARGS)
+{
+	Svec	   *a = PG_GETARG_SVEC_P(0);
+	Svec	   *b = PG_GETARG_SVEC_P(1);
+	int			dim;
+	double		dot = 0.0;
+	double		norm_a = 0.0;
+	double		norm_b = 0.0;
+	double		similarity;
+	int			i;
+
+	if (a->dim != b->dim)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("svec dimensions must match: %d vs %d", a->dim, b->dim)));
+
+	dim = a->dim;
+
+	for (i = 0; i < dim; i++)
+	{
+		double		ai = (double) a->x[i];
+		double		bi = (double) b->x[i];
+
+		dot += ai * bi;
+		norm_a += ai * ai;
+		norm_b += bi * bi;
+	}
+
+	/* Handle zero vectors */
+	if (norm_a == 0.0 || norm_b == 0.0)
+		PG_RETURN_FLOAT8(get_float8_nan());
+
+	similarity = dot / (sqrt(norm_a) * sqrt(norm_b));
+
+	/* Clamp to [-1, 1] for numerical safety */
+	if (similarity > 1.0)
+		similarity = 1.0;
+	else if (similarity < -1.0)
+		similarity = -1.0;
+
+	PG_RETURN_FLOAT8(1.0 - similarity);
+}

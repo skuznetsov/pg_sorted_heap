@@ -1,6 +1,6 @@
 EXTENSION = pg_sorted_heap
 MODULE_big = pg_sorted_heap
-OBJS = src/pg_sorted_heap.o src/sorted_heap.o src/sorted_heap_scan.o src/sorted_heap_online.o
+OBJS = src/pg_sorted_heap.o src/sorted_heap.o src/sorted_heap_scan.o src/sorted_heap_online.o src/sorted_vector_hash.o src/svec.o src/pq.o
 PG_CPPFLAGS = -I$(srcdir)/src
 DATA = sql/pg_sorted_heap--0.9.7.sql
 DOCS =

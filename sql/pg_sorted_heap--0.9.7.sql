@@ -283,3 +283,209 @@ AS '$libdir/pg_sorted_heap', 'sorted_heap_merge_online'
 LANGUAGE C;
 
 COMMENT ON EXTENSION pg_sorted_heap IS 'Physically clustered storage via directed placement in table AM.';
+
+-- ================================================================
+-- svec: sorted vector type (float32, variable-length)
+-- ================================================================
+
+CREATE FUNCTION @extschema@.svec_in(cstring, oid, int4)
+RETURNS @extschema@.svec
+AS '$libdir/pg_sorted_heap', 'svec_in'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.svec_out(@extschema@.svec)
+RETURNS cstring
+AS '$libdir/pg_sorted_heap', 'svec_out'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.svec_typmod_in(cstring[])
+RETURNS int4
+AS '$libdir/pg_sorted_heap', 'svec_typmod_in'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.svec_recv(internal, oid, int4)
+RETURNS @extschema@.svec
+AS '$libdir/pg_sorted_heap', 'svec_recv'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.svec_send(@extschema@.svec)
+RETURNS bytea
+AS '$libdir/pg_sorted_heap', 'svec_send'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE TYPE @extschema@.svec (
+	INPUT = @extschema@.svec_in,
+	OUTPUT = @extschema@.svec_out,
+	TYPMOD_IN = @extschema@.svec_typmod_in,
+	RECEIVE = @extschema@.svec_recv,
+	SEND = @extschema@.svec_send,
+	STORAGE = external,
+	INTERNALLENGTH = VARIABLE,
+	ALIGNMENT = int4
+);
+
+COMMENT ON TYPE @extschema@.svec IS 'Sorted vector: float32 array for ANN hashing and cosine distance.';
+
+-- Cosine distance operator: <=>
+CREATE FUNCTION @extschema@.svec_cosine_distance(@extschema@.svec, @extschema@.svec)
+RETURNS float8
+AS '$libdir/pg_sorted_heap', 'svec_cosine_distance'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE OPERATOR @extschema@.<=> (
+	LEFTARG = @extschema@.svec,
+	RIGHTARG = @extschema@.svec,
+	FUNCTION = @extschema@.svec_cosine_distance,
+	COMMUTATOR = OPERATOR(@extschema@.<=>)
+);
+
+COMMENT ON FUNCTION @extschema@.svec_cosine_distance(@extschema@.svec, @extschema@.svec)
+IS 'Cosine distance: 1 - cos(a, b). Range [0, 2].';
+
+-- ----------------------------------------------------------------
+-- SimHash: 12-bit locality-sensitive hash for svec columns
+-- ----------------------------------------------------------------
+
+CREATE FUNCTION @extschema@.sorted_vector_hash(@extschema@.svec, int4 DEFAULT 42)
+RETURNS int2
+AS '$libdir/pg_sorted_heap', 'sorted_vector_hash'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.sorted_vector_hash(float4[], int4 DEFAULT 42)
+RETURNS int2
+AS '$libdir/pg_sorted_heap', 'sorted_vector_hash_arr'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+COMMENT ON FUNCTION @extschema@.sorted_vector_hash(@extschema@.svec, int4)
+IS '12-bit SimHash (LSH for cosine similarity). Deterministic from seed.';
+
+CREATE FUNCTION @extschema@.sorted_vector_vq(@extschema@.svec, n_centroids int4, seed int4 DEFAULT 42)
+RETURNS int2
+AS '$libdir/pg_sorted_heap', 'sorted_vector_vq'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.sorted_vector_vq(float4[], n_centroids int4, seed int4 DEFAULT 42)
+RETURNS int2
+AS '$libdir/pg_sorted_heap', 'sorted_vector_vq_arr'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+COMMENT ON FUNCTION @extschema@.sorted_vector_vq(@extschema@.svec, int4, int4)
+IS 'Random Codebook VQ hash: assign to nearest of n_centroids random unit vectors. Deterministic from seed.';
+
+-- ----------------------------------------------------------------
+-- Residual VQ (RVQ): two-level hash for uniform bucket distribution
+-- ----------------------------------------------------------------
+
+CREATE FUNCTION @extschema@.sorted_vector_rvq(@extschema@.svec, n_coarse int4, n_fine int4, seed int4 DEFAULT 42)
+RETURNS int2
+AS '$libdir/pg_sorted_heap', 'sorted_vector_rvq'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.sorted_vector_rvq(float4[], n_coarse int4, n_fine int4, seed int4 DEFAULT 42)
+RETURNS int2
+AS '$libdir/pg_sorted_heap', 'sorted_vector_rvq_arr'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+COMMENT ON FUNCTION @extschema@.sorted_vector_rvq(@extschema@.svec, int4, int4, int4)
+IS 'Residual VQ hash: two-level (coarse → residual → fine). hash = coarse×n_fine + fine. Uniform buckets in high-D.';
+
+-- ----------------------------------------------------------------
+-- Random Projection VQ (RPVQ): project to low-D, then VQ
+-- Best for high-D vectors (>256D) where plain VQ degenerates
+-- ----------------------------------------------------------------
+
+CREATE FUNCTION @extschema@.sorted_vector_rpvq(@extschema@.svec, n_proj int4, n_centroids int4, seed int4 DEFAULT 42)
+RETURNS int2
+AS '$libdir/pg_sorted_heap', 'sorted_vector_rpvq'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.sorted_vector_rpvq(float4[], n_proj int4, n_centroids int4, seed int4 DEFAULT 42)
+RETURNS int2
+AS '$libdir/pg_sorted_heap', 'sorted_vector_rpvq_arr'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+COMMENT ON FUNCTION @extschema@.sorted_vector_rpvq(@extschema@.svec, int4, int4, int4)
+IS 'Random Projection VQ: project to n_proj dims then VQ. Best for high-D where plain VQ degenerates.';
+
+-- ----------------------------------------------------------------
+-- Centered VQ (CVQ): subtract reference vector (dataset mean), then VQ
+-- Solves high-D degeneration where random centroids are orthogonal to data
+-- ----------------------------------------------------------------
+
+CREATE FUNCTION @extschema@.sorted_vector_cvq(@extschema@.svec, ref @extschema@.svec, n_centroids int4, seed int4 DEFAULT 42)
+RETURNS int2
+AS '$libdir/pg_sorted_heap', 'sorted_vector_cvq'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+CREATE FUNCTION @extschema@.sorted_vector_cvq(float4[], ref float4[], n_centroids int4, seed int4 DEFAULT 42)
+RETURNS int2
+AS '$libdir/pg_sorted_heap', 'sorted_vector_cvq_arr'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+COMMENT ON FUNCTION @extschema@.sorted_vector_cvq(@extschema@.svec, @extschema@.svec, int4, int4)
+IS 'Centered VQ: subtract reference (mean) vector then VQ. Best for tightly clustered high-D data.';
+
+CREATE FUNCTION @extschema@.sorted_vector_cvq_probe(@extschema@.svec, ref @extschema@.svec, n_centroids int4, n_probes int4, seed int4 DEFAULT 42)
+RETURNS int2[]
+AS '$libdir/pg_sorted_heap', 'sorted_vector_cvq_probe'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+COMMENT ON FUNCTION @extschema@.sorted_vector_cvq_probe(@extschema@.svec, @extschema@.svec, int4, int4, int4)
+IS 'Multi-probe CVQ: returns top-K nearest CVQ bucket IDs as int2[]. Use with ANY() for multi-bucket scan.';
+
+-- ================================================================
+-- Product Quantization (PQ) functions
+-- ================================================================
+
+-- Train PQ codebook from a query returning svec vectors.
+-- M = number of subvectors, n_iter = k-means iterations,
+-- max_samples = max training samples (randomly sampled).
+-- Returns codebook ID.
+CREATE FUNCTION @extschema@.svec_pq_train(
+    source_query text,
+    m int4,
+    n_iter int4 DEFAULT 10,
+    max_samples int4 DEFAULT 10000
+)
+RETURNS int4
+AS '$libdir/pg_sorted_heap', 'svec_pq_train'
+LANGUAGE C STRICT;
+
+COMMENT ON FUNCTION @extschema@.svec_pq_train(text, int4, int4, int4)
+IS 'Train Product Quantization codebook. M subvectors, 256 centroids each. Returns codebook ID.';
+
+-- Encode a vector to M-byte PQ code using trained codebook.
+CREATE FUNCTION @extschema@.svec_pq_encode(@extschema@.svec, cb_id int4)
+RETURNS bytea
+AS '$libdir/pg_sorted_heap', 'svec_pq_encode'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+COMMENT ON FUNCTION @extschema@.svec_pq_encode(@extschema@.svec, int4)
+IS 'Encode vector to PQ code (M bytes) using trained codebook.';
+
+-- Asymmetric Distance Computation: estimate squared L2 distance
+-- between a query vector and a PQ-encoded vector.
+CREATE FUNCTION @extschema@.svec_pq_distance(@extschema@.svec, code bytea, cb_id int4)
+RETURNS float8
+AS '$libdir/pg_sorted_heap', 'svec_pq_distance'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+COMMENT ON FUNCTION @extschema@.svec_pq_distance(@extschema@.svec, bytea, int4)
+IS 'ADC distance: estimate squared L2 between query vector and PQ code. Fast (no TOAST reads).';
+
+-- Split ADC for batch queries: precompute table once, lookup per row
+CREATE FUNCTION @extschema@.svec_pq_distance_table(@extschema@.svec, cb_id int4)
+RETURNS bytea
+AS '$libdir/pg_sorted_heap', 'svec_pq_distance_table'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+COMMENT ON FUNCTION @extschema@.svec_pq_distance_table(@extschema@.svec, int4)
+IS 'Precompute ADC distance table (M×256 floats) for a query vector. Call once per query.';
+
+CREATE FUNCTION @extschema@.svec_pq_adc_lookup(dist_table bytea, code bytea)
+RETURNS float8
+AS '$libdir/pg_sorted_heap', 'svec_pq_adc_lookup'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+COMMENT ON FUNCTION @extschema@.svec_pq_adc_lookup(bytea, bytea)
+IS 'ADC lookup: sum precomputed distances using PQ code. O(M) per call — sub-microsecond.';
