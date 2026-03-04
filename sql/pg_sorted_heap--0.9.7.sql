@@ -556,3 +556,128 @@ $$ LANGUAGE SQL;
 
 COMMENT ON FUNCTION @extschema@.svec_ann_train(text, int4, int4, int4, int4)
 IS 'Train both IVF centroids and PQ codebook in one call. Returns (ivf_cb_id, pq_cb_id).';
+
+-- ================================================================
+-- ANN search: IVF probe → PQ scan → optional exact rerank
+--
+-- Usage (PQ-only, fastest):
+--   SELECT * FROM svec_ann_search('my_table', query_vec, 10, 10);
+--
+-- With exact reranking (higher recall):
+--   SELECT * FROM svec_ann_search('my_table', query_vec, 10, 10, rerank_topk := 30);
+--
+-- Table must have columns: id text, partition_id int2, pq_code bytea, embedding (castable to svec)
+-- ================================================================
+CREATE FUNCTION @extschema@.svec_ann_search(
+    tbl       regclass,
+    query     @extschema@.svec,
+    nprobe    int4 DEFAULT 10,
+    lim       int4 DEFAULT 10,
+    rerank_topk int4 DEFAULT 0,
+    cb_id     int4 DEFAULT 1
+)
+RETURNS TABLE(id text, distance float8)
+AS $$
+DECLARE
+    _sql text;
+BEGIN
+    IF rerank_topk > 0 THEN
+        -- Two-stage: PQ coarse → exact cosine rerank
+        _sql := format(
+            'SELECT c.id, c.embedding::text::@extschema@.svec <=> $1 AS distance
+             FROM (
+                 SELECT i.id, i.embedding
+                 FROM %s i
+                 WHERE i.partition_id = ANY(@extschema@.svec_ivf_probe($1, $2, $5))
+                 ORDER BY @extschema@.svec_pq_adc($1, i.pq_code, $5)
+                 LIMIT $4
+             ) c
+             ORDER BY c.embedding::text::@extschema@.svec <=> $1
+             LIMIT $3',
+            tbl);
+        RETURN QUERY EXECUTE _sql USING query, nprobe, lim, rerank_topk, cb_id;
+    ELSE
+        -- PQ-only (fastest)
+        _sql := format(
+            'SELECT i.id, @extschema@.svec_pq_adc($1, i.pq_code, $4)::float8 AS distance
+             FROM %s i
+             WHERE i.partition_id = ANY(@extschema@.svec_ivf_probe($1, $2, $4))
+             ORDER BY @extschema@.svec_pq_adc($1, i.pq_code, $4)
+             LIMIT $3',
+            tbl);
+        RETURN QUERY EXECUTE _sql USING query, nprobe, lim, cb_id;
+    END IF;
+END;
+$$ LANGUAGE plpgsql STABLE PARALLEL SAFE;
+
+COMMENT ON FUNCTION @extschema@.svec_ann_search(regclass, @extschema@.svec, int4, int4, int4, int4)
+IS 'IVF-PQ approximate nearest neighbor search. Set rerank_topk > 0 for exact cosine reranking.';
+
+-- ================================================================
+-- C-level ANN scan: IVF probe + PQ ADC + rerank in single C call.
+-- Eliminates per-row SQL function call overhead for maximum speed.
+-- ================================================================
+CREATE FUNCTION @extschema@.svec_ann_scan(
+    tbl       regclass,
+    query     @extschema@.svec,
+    nprobe    int4 DEFAULT 10,
+    lim       int4 DEFAULT 10,
+    rerank_topk int4 DEFAULT 0,
+    cb_id     int4 DEFAULT 1
+)
+RETURNS TABLE(id text, distance float8)
+AS '$libdir/pg_sorted_heap', 'svec_ann_scan'
+LANGUAGE C STRICT STABLE PARALLEL SAFE;
+
+COMMENT ON FUNCTION @extschema@.svec_ann_scan(regclass, @extschema@.svec, int4, int4, int4, int4)
+IS 'C-level IVF-PQ scan. Fastest path: IVF probe + PQ ADC + optional reranking in single C call.';
+
+-- ================================================================
+-- Residual PQ: train/encode/ADC on residuals (vec - IVF centroid).
+-- Standard FAISS approach — removes inter-centroid variance so PQ
+-- focuses on fine intra-cluster distinctions, improving recall.
+-- ================================================================
+
+-- Train residual PQ codebook: k-means on (vec - nearest centroid).
+CREATE FUNCTION @extschema@.svec_pq_train_residual(
+    source_query text,
+    m int4,
+    ivf_cb_id int4 DEFAULT 1,
+    n_iter int4 DEFAULT 10,
+    max_samples int4 DEFAULT 10000
+)
+RETURNS int4
+AS '$libdir/pg_sorted_heap', 'svec_pq_train_residual'
+LANGUAGE C STRICT;
+
+COMMENT ON FUNCTION @extschema@.svec_pq_train_residual(text, int4, int4, int4, int4)
+IS 'Train PQ codebook on IVF residuals (vec - centroid). Returns codebook ID. Use with svec_pq_encode_residual.';
+
+-- Encode vector residual (vec - centroid[partition_id]) to PQ code.
+CREATE FUNCTION @extschema@.svec_pq_encode_residual(
+    @extschema@.svec,
+    partition_id int2,
+    pq_cb_id int4,
+    ivf_cb_id int4 DEFAULT 1
+)
+RETURNS bytea
+AS '$libdir/pg_sorted_heap', 'svec_pq_encode_residual'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+COMMENT ON FUNCTION @extschema@.svec_pq_encode_residual(@extschema@.svec, int2, int4, int4)
+IS 'PQ-encode residual (vec - IVF centroid). For GENERATED columns in IVF-PQ tables.';
+
+-- Per-centroid ADC distance table for residual PQ.
+-- Must be called once per (query, centroid_id) pair.
+CREATE FUNCTION @extschema@.svec_pq_distance_table_residual(
+    @extschema@.svec,
+    centroid_id int2,
+    pq_cb_id int4,
+    ivf_cb_id int4 DEFAULT 1
+)
+RETURNS bytea
+AS '$libdir/pg_sorted_heap', 'svec_pq_distance_table_residual'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+COMMENT ON FUNCTION @extschema@.svec_pq_distance_table_residual(@extschema@.svec, int2, int4, int4)
+IS 'Precompute ADC distance table for residual PQ. One table per probed centroid. Use with svec_pq_adc_lookup.';

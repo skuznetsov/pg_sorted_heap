@@ -37,10 +37,18 @@ extern Datum svec_pq_distance_table(PG_FUNCTION_ARGS);
 extern Datum svec_pq_adc_lookup(PG_FUNCTION_ARGS);
 extern Datum svec_pq_adc(PG_FUNCTION_ARGS);
 
+/* Residual PQ SQL-callable functions */
+extern Datum svec_pq_train_residual(PG_FUNCTION_ARGS);
+extern Datum svec_pq_encode_residual(PG_FUNCTION_ARGS);
+extern Datum svec_pq_distance_table_residual(PG_FUNCTION_ARGS);
+
 /* IVF SQL-callable functions */
 extern Datum svec_ivf_train(PG_FUNCTION_ARGS);
 extern Datum svec_ivf_assign(PG_FUNCTION_ARGS);
 extern Datum svec_ivf_probe(PG_FUNCTION_ARGS);
+
+/* C-level ANN scan (IVF probe + PQ ADC + rerank in single C call) */
+extern Datum svec_ann_scan(PG_FUNCTION_ARGS);
 
 /* K-means (used by both PQ and IVF training) */
 extern void kmeans_train(float *data, int npts, int dsub, int k,

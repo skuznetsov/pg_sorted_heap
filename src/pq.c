@@ -26,13 +26,37 @@
 #include "executor/spi.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 
+#include <float.h>
 #include <math.h>
 #include <string.h>
 
 #include "svec.h"
 #include "pq.h"
+
+/* ----------------------------------------------------------------
+ *  L2-normalize a float vector in-place (for cosine ↔ L2 equivalence)
+ * ---------------------------------------------------------------- */
+static void
+normalize_vector(float *v, int dim)
+{
+	double	norm = 0.0;
+	float	inv;
+	int		i;
+
+	for (i = 0; i < dim; i++)
+		norm += (double) v[i] * v[i];
+
+	norm = sqrt(norm);
+	if (norm < 1e-30)
+		return;					/* zero vector, leave as-is */
+
+	inv = (float) (1.0 / norm);
+	for (i = 0; i < dim; i++)
+		v[i] *= inv;
+}
 
 /* ----------------------------------------------------------------
  *  Backend-local codebook cache
@@ -399,34 +423,6 @@ kmeans_train(float *data, int npts, int dsub, int k, int n_iter,
 	pfree(sums);
 }
 
-/* ----------------------------------------------------------------
- *  Fisher-Yates shuffle for sample selection
- * ---------------------------------------------------------------- */
-static void
-shuffle_indices(int *arr, int n, uint64 seed)
-{
-	int		i;
-	uint64	state = seed;
-
-	for (i = n - 1; i > 0; i--)
-	{
-		/* Simple splitmix64-based random */
-		uint64	z = (state += 0x9e3779b97f4a7c15ULL);
-		int		j;
-
-		z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-		z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-		z ^= (z >> 31);
-		j = (int) (z % ((uint64) i + 1));
-
-		/* Swap */
-		{
-			int tmp = arr[i];
-			arr[i] = arr[j];
-			arr[j] = tmp;
-		}
-	}
-}
 
 /* ----------------------------------------------------------------
  *  svec_pq_train: train PQ codebook from data
@@ -448,14 +444,13 @@ svec_pq_train(PG_FUNCTION_ARGS)
 	int			max_samples = PG_GETARG_INT32(3);
 
 	char	   *query_str;
+	StringInfoData wrapped_query;
 	int			ret;
-	int			total_rows;
 	int			n_samples;
 	int			dim, dsub;
 	float	   *sample_data;	/* n_samples × dim */
 	float	   *sub_data;		/* n_samples × dsub for one subvector */
 	float	   *centroids;		/* 256 × dsub for one subvector */
-	int		   *indices;
 	int			cb_id;
 	int			m, i, j;
 	char		sql[256];
@@ -481,9 +476,21 @@ svec_pq_train(PG_FUNCTION_ARGS)
 	query_str = text_to_cstring(source_query);
 	func_ctx = CurrentMemoryContext;
 
-	/* Execute source query to get training data */
+	/*
+	 * Wrap the user query with ORDER BY random() LIMIT max_samples.
+	 * PostgreSQL uses a bounded heap sort for LIMIT, so only max_samples
+	 * rows are held in memory at any time — O(K) instead of O(N).
+	 * This eliminates the previous OOM on large tables.
+	 */
+	initStringInfo(&wrapped_query);
+	appendStringInfo(&wrapped_query,
+					 "SELECT * FROM (%s) _src ORDER BY random() LIMIT %d",
+					 query_str, max_samples);
+
+	/* Execute wrapped query — returns at most max_samples rows */
 	SPI_connect();
-	ret = SPI_execute(query_str, true, 0);
+	ret = SPI_execute(wrapped_query.data, true, 0);
+	pfree(wrapped_query.data);
 
 	if (ret != SPI_OK_SELECT || SPI_processed == 0)
 	{
@@ -493,7 +500,7 @@ svec_pq_train(PG_FUNCTION_ARGS)
 				 errmsg("source query returned no rows")));
 	}
 
-	total_rows = (int) SPI_processed;
+	n_samples = (int) SPI_processed;
 
 	/* Read first vector to get dimension */
 	{
@@ -529,31 +536,23 @@ svec_pq_train(PG_FUNCTION_ARGS)
 
 	dsub = dim / M;
 
-	n_samples = (total_rows < max_samples) ? total_rows : max_samples;
-
 	ereport(NOTICE,
 			(errmsg("PQ training: dim=%d, M=%d, dsub=%d, Ksub=%d, "
-					"n_iter=%d, data=%d rows, samples=%d",
-					dim, M, dsub, PQ_KSUB, n_iter, total_rows, n_samples)));
+					"n_iter=%d, samples=%d",
+					dim, M, dsub, PQ_KSUB, n_iter, n_samples)));
 
 	/*
-	 * Allocate indices and sample_data in func_ctx, NOT in SPI's procCxt.
+	 * Allocate sample_data in func_ctx, NOT in SPI's procCxt.
 	 * SPI_finish() deletes procCxt, so anything allocated there becomes
-	 * a dangling pointer — the root cause of the previous
-	 * "could not find block containing chunk" crash.
+	 * a dangling pointer.
 	 */
 	old_ctx = MemoryContextSwitchTo(func_ctx);
-	indices = palloc(sizeof(int) * total_rows);
 	sample_data = palloc(sizeof(float) * n_samples * dim);
 	MemoryContextSwitchTo(old_ctx);
 
-	for (i = 0; i < total_rows; i++)
-		indices[i] = i;
-	shuffle_indices(indices, total_rows, 42);
-
 	/*
-	 * Copy sampled vectors into contiguous float array.
-	 * Detoast each vector and pfree immediately to keep memory bounded.
+	 * Copy all returned vectors into contiguous float array.
+	 * Rows are already randomly sampled by ORDER BY random() LIMIT.
 	 */
 	for (i = 0; i < n_samples; i++)
 	{
@@ -561,7 +560,7 @@ svec_pq_train(PG_FUNCTION_ARGS)
 		Datum	d;
 		Svec   *vec;
 
-		d = SPI_getbinval(SPI_tuptable->vals[indices[i]],
+		d = SPI_getbinval(SPI_tuptable->vals[i],
 						  SPI_tuptable->tupdesc, 1, &isnull);
 
 		if (isnull)
@@ -569,8 +568,7 @@ svec_pq_train(PG_FUNCTION_ARGS)
 			SPI_finish();
 			ereport(ERROR,
 					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-					 errmsg("NULL vector in training data at row %d",
-							indices[i])));
+					 errmsg("NULL vector in training data at row %d", i)));
 		}
 
 		vec = (Svec *) PG_DETOAST_DATUM(d);
@@ -582,10 +580,13 @@ svec_pq_train(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_DATA_EXCEPTION),
 					 errmsg("inconsistent vector dim at row %d: "
 							"expected %d, got %d",
-							indices[i], dim, vec->dim)));
+							i, dim, vec->dim)));
 		}
 
 		memcpy(sample_data + i * dim, vec->x, sizeof(float) * dim);
+
+		/* L2-normalize so PQ learns cosine-equivalent space */
+		normalize_vector(sample_data + i * dim, dim);
 
 		/* Free detoasted copy to prevent memory growth */
 		if (DatumGetPointer(d) != (Pointer) vec)
@@ -593,7 +594,6 @@ svec_pq_train(PG_FUNCTION_ARGS)
 	}
 
 	SPI_finish();
-	pfree(indices);
 
 	ereport(NOTICE,
 			(errmsg("PQ training: sampled %d vectors (%d MB), starting k-means...",
@@ -765,6 +765,520 @@ svec_pq_train(PG_FUNCTION_ARGS)
 }
 
 /* ----------------------------------------------------------------
+ *  svec_pq_train_residual: train PQ codebook on IVF residuals
+ *
+ *  svec_pq_train_residual(source_query text, M int, ivf_cb_id int,
+ *                         n_iter int DEFAULT 10, max_samples int DEFAULT 10000) → int
+ *
+ *  Same as svec_pq_train but:
+ *  1. Loads IVF centroids for ivf_cb_id
+ *  2. For each sample: residual = vector - nearest_centroid (NO normalization)
+ *  3. Trains k-means on residuals
+ *  Stores residual flag in _pq_codebook_meta.
+ * ---------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(svec_pq_train_residual);
+Datum
+svec_pq_train_residual(PG_FUNCTION_ARGS)
+{
+	text	   *source_query = PG_GETARG_TEXT_PP(0);
+	int			M = PG_GETARG_INT32(1);
+	int			ivf_cb_id = PG_GETARG_INT32(2);
+	int			n_iter = PG_GETARG_INT32(3);
+	int			max_samples = PG_GETARG_INT32(4);
+
+	char	   *query_str;
+	StringInfoData wrapped_query;
+	int			ret;
+	int			n_samples;
+	int			dim, dsub, nlist;
+	float	   *sample_data;
+	float	   *sub_data;
+	float	   *centroids;
+	int			cb_id;
+	int			m, i, j;
+	char		sql[512];
+	MemoryContext func_ctx;
+	MemoryContext tmp_ctx;
+	MemoryContext old_ctx;
+
+	if (M < 1 || M > PQ_MAX_M)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("M must be between 1 and %d", PQ_MAX_M)));
+
+	if (n_iter < 1 || n_iter > PQ_MAX_ITER)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("n_iter must be between 1 and %d", PQ_MAX_ITER)));
+
+	if (max_samples < 256)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("max_samples must be at least 256")));
+
+	/* Load IVF centroids first */
+	ivf_load_centroids(ivf_cb_id);
+	nlist = cached_ivf.nlist;
+
+	query_str = text_to_cstring(source_query);
+	func_ctx = CurrentMemoryContext;
+
+	/* Sample vectors */
+	initStringInfo(&wrapped_query);
+	appendStringInfo(&wrapped_query,
+					 "SELECT * FROM (%s) _src ORDER BY random() LIMIT %d",
+					 query_str, max_samples);
+
+	SPI_connect();
+	ret = SPI_execute(wrapped_query.data, true, 0);
+	pfree(wrapped_query.data);
+
+	if (ret != SPI_OK_SELECT || SPI_processed == 0)
+	{
+		SPI_finish();
+		ereport(ERROR,
+				(errcode(ERRCODE_NO_DATA_FOUND),
+				 errmsg("source query returned no rows")));
+	}
+
+	n_samples = (int) SPI_processed;
+
+	/* Read first vector to get dimension */
+	{
+		bool	isnull;
+		Datum	d;
+		Svec   *first;
+
+		d = SPI_getbinval(SPI_tuptable->vals[0],
+						  SPI_tuptable->tupdesc, 1, &isnull);
+		if (isnull)
+		{
+			SPI_finish();
+			ereport(ERROR, (errmsg("NULL vector in training data")));
+		}
+
+		first = (Svec *) PG_DETOAST_DATUM(d);
+		dim = first->dim;
+		if (DatumGetPointer(d) != (Pointer) first)
+			pfree(first);
+	}
+
+	if (dim != cached_ivf.dim)
+	{
+		SPI_finish();
+		ereport(ERROR,
+				(errmsg("vector dim %d doesn't match IVF dim %d",
+						dim, cached_ivf.dim)));
+	}
+
+	if (dim % M != 0)
+	{
+		SPI_finish();
+		ereport(ERROR,
+				(errmsg("vector dimension %d is not divisible by M=%d",
+						dim, M)));
+	}
+
+	dsub = dim / M;
+
+	ereport(NOTICE,
+			(errmsg("Residual PQ training: dim=%d, M=%d, dsub=%d, "
+					"ivf_cb=%d (nlist=%d), n_iter=%d, samples=%d",
+					dim, M, dsub, ivf_cb_id, nlist, n_iter, n_samples)));
+
+	/* Allocate in func_ctx */
+	old_ctx = MemoryContextSwitchTo(func_ctx);
+	sample_data = palloc(sizeof(float) * n_samples * dim);
+	MemoryContextSwitchTo(old_ctx);
+
+	/* Copy vectors and convert to residuals */
+	for (i = 0; i < n_samples; i++)
+	{
+		bool	isnull;
+		Datum	d;
+		Svec   *vec;
+		float  *dest;
+		float	best_dist;
+		int		best_c;
+
+		d = SPI_getbinval(SPI_tuptable->vals[i],
+						  SPI_tuptable->tupdesc, 1, &isnull);
+		if (isnull)
+		{
+			SPI_finish();
+			ereport(ERROR,
+					(errmsg("NULL vector in training data at row %d", i)));
+		}
+
+		vec = (Svec *) PG_DETOAST_DATUM(d);
+		if (vec->dim != dim)
+		{
+			SPI_finish();
+			ereport(ERROR,
+					(errmsg("inconsistent dim at row %d: expected %d, got %d",
+							i, dim, vec->dim)));
+		}
+
+		dest = sample_data + i * dim;
+		memcpy(dest, vec->x, sizeof(float) * dim);
+
+		/* Find nearest IVF centroid */
+		best_dist = 1e30f;
+		best_c = 0;
+		for (j = 0; j < nlist; j++)
+		{
+			float  *cent = cached_ivf.centroids + j * dim;
+			float	dist = 0.0f;
+			int		k;
+
+			for (k = 0; k < dim; k++)
+			{
+				float diff = dest[k] - cent[k];
+
+				dist += diff * diff;
+			}
+			if (dist < best_dist)
+			{
+				best_dist = dist;
+				best_c = j;
+			}
+		}
+
+		/* Subtract centroid → residual */
+		{
+			float  *cent = cached_ivf.centroids + best_c * dim;
+
+			for (j = 0; j < dim; j++)
+				dest[j] -= cent[j];
+		}
+
+		if (DatumGetPointer(d) != (Pointer) vec)
+			pfree(vec);
+	}
+
+	SPI_finish();
+
+	ereport(NOTICE,
+			(errmsg("Residual PQ: computed %d residuals, starting k-means...",
+					n_samples)));
+
+	/* Train k-means on residuals (same as svec_pq_train from here) */
+	sub_data = palloc(sizeof(float) * n_samples * dsub);
+	centroids = palloc(sizeof(float) * PQ_KSUB * dsub);
+
+	tmp_ctx = AllocSetContextCreate(func_ctx,
+									"RPQ training temp",
+									ALLOCSET_DEFAULT_SIZES);
+
+	/* Create tables and get codebook ID */
+	SPI_connect();
+
+	ret = SPI_execute(
+		"CREATE TABLE IF NOT EXISTS _pq_codebook_meta ("
+		"  cb_id int PRIMARY KEY,"
+		"  m int NOT NULL,"
+		"  dsub int NOT NULL,"
+		"  total_dim int NOT NULL"
+		")", false, 0);
+
+	/* Add residual columns if missing */
+	SPI_execute("ALTER TABLE _pq_codebook_meta "
+				"ADD COLUMN IF NOT EXISTS residual boolean DEFAULT false",
+				false, 0);
+	SPI_execute("ALTER TABLE _pq_codebook_meta "
+				"ADD COLUMN IF NOT EXISTS ivf_cb_id int",
+				false, 0);
+
+	ret = SPI_execute(
+		"CREATE TABLE IF NOT EXISTS _pq_codebooks ("
+		"  cb_id int NOT NULL,"
+		"  sub_id int NOT NULL,"
+		"  cent_id int NOT NULL,"
+		"  centroid svec NOT NULL,"
+		"  PRIMARY KEY (cb_id, sub_id, cent_id)"
+		")", false, 0);
+
+	/* Get next cb_id */
+	ret = SPI_execute(
+		"SELECT COALESCE(MAX(cb_id), 0) + 1 FROM _pq_codebook_meta",
+		true, 1);
+
+	if (ret != SPI_OK_SELECT || SPI_processed != 1)
+	{
+		SPI_finish();
+		ereport(ERROR, (errmsg("failed to get next cb_id")));
+	}
+
+	cb_id = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+										SPI_tuptable->tupdesc, 1,
+										&(bool){false}));
+
+	/* Insert meta row with residual flag */
+	snprintf(sql, sizeof(sql),
+			 "INSERT INTO _pq_codebook_meta "
+			 "(cb_id, m, dsub, total_dim, residual, ivf_cb_id) "
+			 "VALUES (%d, %d, %d, %d, true, %d)",
+			 cb_id, M, dsub, dim, ivf_cb_id);
+	ret = SPI_execute(sql, false, 0);
+
+	if (ret != SPI_OK_INSERT)
+	{
+		SPI_finish();
+		ereport(ERROR, (errmsg("failed to insert codebook meta")));
+	}
+
+	SPI_finish();
+
+	/* Train each subvector group and store centroids (identical to raw PQ) */
+	for (m = 0; m < M; m++)
+	{
+		int			offset = m * dsub;
+		StringInfoData insert_buf;
+
+		for (i = 0; i < n_samples; i++)
+			memcpy(sub_data + i * dsub,
+				   sample_data + i * dim + offset,
+				   sizeof(float) * dsub);
+
+		kmeans_train(sub_data, n_samples, dsub, PQ_KSUB, n_iter,
+					 centroids);
+
+		if ((m + 1) % 10 == 0 || m == 0 || m == M - 1)
+			ereport(NOTICE,
+					(errmsg("Residual PQ: subvector %d/%d k-means done",
+							m + 1, M)));
+
+		old_ctx = MemoryContextSwitchTo(tmp_ctx);
+		initStringInfo(&insert_buf);
+		appendStringInfo(&insert_buf,
+						 "INSERT INTO _pq_codebooks "
+						 "(cb_id, sub_id, cent_id, centroid) VALUES ");
+
+		for (j = 0; j < PQ_KSUB; j++)
+		{
+			float  *cent = centroids + j * dsub;
+			int		k;
+
+			if (j > 0)
+				appendStringInfoChar(&insert_buf, ',');
+
+			appendStringInfo(&insert_buf, "(%d,%d,%d,'[", cb_id, m, j);
+			for (k = 0; k < dsub; k++)
+			{
+				if (k > 0)
+					appendStringInfoChar(&insert_buf, ',');
+				appendStringInfo(&insert_buf, "%.9g", (double) cent[k]);
+			}
+			appendStringInfo(&insert_buf, "]'::svec)");
+		}
+
+		MemoryContextSwitchTo(old_ctx);
+
+		SPI_connect();
+
+		if ((m + 1) % 10 == 0 || m == 0 || m == M - 1)
+			ereport(NOTICE,
+					(errmsg("Residual PQ: subvector %d/%d inserting "
+							"(%d bytes SQL)", m + 1, M,
+							(int) strlen(insert_buf.data))));
+
+		ret = SPI_execute(insert_buf.data, false, 0);
+		SPI_finish();
+
+		MemoryContextReset(tmp_ctx);
+
+		if (ret != SPI_OK_INSERT)
+			ereport(ERROR,
+					(errmsg("failed to insert centroids for sub=%d", m)));
+	}
+
+	pfree(sub_data);
+	pfree(centroids);
+	pfree(sample_data);
+	MemoryContextDelete(tmp_ctx);
+
+	cached_pq.cb_id = -1;
+
+	ereport(NOTICE,
+			(errmsg("Residual PQ training complete: cb_id=%d, M=%d, dsub=%d, "
+					"ivf_cb=%d, stored %d centroids",
+					cb_id, M, dsub, ivf_cb_id, M * PQ_KSUB)));
+
+	PG_RETURN_INT32(cb_id);
+}
+
+/* ----------------------------------------------------------------
+ *  svec_pq_encode_residual: encode vector residual to PQ code
+ *
+ *  svec_pq_encode_residual(vec svec, partition_id int2, pq_cb_id int,
+ *                          ivf_cb_id int) → bytea
+ *
+ *  Computes residual = vec - centroid[partition_id], then PQ-encodes.
+ *  No normalization (residual PQ operates in the original space).
+ * ---------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(svec_pq_encode_residual);
+Datum
+svec_pq_encode_residual(PG_FUNCTION_ARGS)
+{
+	Svec	   *vec = PG_GETARG_SVEC_P(0);
+	int			partition_id = PG_GETARG_INT16(1);
+	int			pq_cb_id = PG_GETARG_INT32(2);
+	int			ivf_cb_id = PG_GETARG_INT32(3);
+	int			M, dsub, dim;
+	bytea	   *result;
+	uint8	   *codes;
+	int			m, j, c;
+	float	   *residual;
+	float	   *cent;
+
+	pq_load_codebook(pq_cb_id);
+	ivf_load_centroids(ivf_cb_id);
+
+	M = cached_pq.M;
+	dsub = cached_pq.dsub;
+	dim = cached_pq.total_dim;
+
+	if (vec->dim != dim)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("vector dimension %d doesn't match codebook "
+						"(expected %d)", vec->dim, dim)));
+
+	if (partition_id < 0 || partition_id >= cached_ivf.nlist)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("partition_id %d out of range [0, %d)",
+						partition_id, cached_ivf.nlist)));
+
+	/* Compute residual = vec - centroid[partition_id] */
+	residual = palloc(sizeof(float) * dim);
+	cent = cached_ivf.centroids + partition_id * dim;
+	for (j = 0; j < dim; j++)
+		residual[j] = vec->x[j] - cent[j];
+
+	/* PQ-encode the residual */
+	result = (bytea *) palloc(VARHDRSZ + M);
+	SET_VARSIZE(result, VARHDRSZ + M);
+	codes = (uint8 *) VARDATA(result);
+
+	for (m = 0; m < M; m++)
+	{
+		float  *sub = residual + m * dsub;
+		float  *cb_base = cached_pq.centroids + m * PQ_KSUB * dsub;
+		float	best_dist = 1e30f;
+		int		best_c = 0;
+
+		for (c = 0; c < PQ_KSUB; c++)
+		{
+			float  *cen = cb_base + c * dsub;
+			float	dist = 0.0f;
+
+			for (j = 0; j < dsub; j++)
+			{
+				float diff = sub[j] - cen[j];
+
+				dist += diff * diff;
+			}
+
+			if (dist < best_dist)
+			{
+				best_dist = dist;
+				best_c = c;
+			}
+		}
+
+		codes[m] = (uint8) best_c;
+	}
+
+	pfree(residual);
+	PG_RETURN_BYTEA_P(result);
+}
+
+/* ----------------------------------------------------------------
+ *  svec_pq_distance_table_residual: distance table for one centroid
+ *
+ *  svec_pq_distance_table_residual(query svec, centroid_id int2,
+ *                                  pq_cb_id int, ivf_cb_id int) → bytea
+ *
+ *  Computes query_residual = query - centroid[centroid_id], then builds
+ *  a distance table (M × 256 float array stored as bytea) from the
+ *  query residual to all PQ centroids.
+ *
+ *  Used with svec_pq_adc_lookup for the ADC scan:
+ *    ORDER BY svec_pq_adc_lookup(dt.t, m.pq_code)
+ * ---------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(svec_pq_distance_table_residual);
+Datum
+svec_pq_distance_table_residual(PG_FUNCTION_ARGS)
+{
+	Svec	   *query = PG_GETARG_SVEC_P(0);
+	int			centroid_id = PG_GETARG_INT16(1);
+	int			pq_cb_id = PG_GETARG_INT32(2);
+	int			ivf_cb_id = PG_GETARG_INT32(3);
+	int			M, dsub, dim;
+	int			m, c, j;
+	int			table_bytes;
+	bytea	   *result;
+	float	   *table;
+	float	   *q_residual;
+	float	   *cent;
+
+	pq_load_codebook(pq_cb_id);
+	ivf_load_centroids(ivf_cb_id);
+
+	M = cached_pq.M;
+	dsub = cached_pq.dsub;
+	dim = cached_pq.total_dim;
+
+	if (query->dim != dim)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("query dimension %d doesn't match codebook "
+						"(expected %d)", query->dim, dim)));
+
+	if (centroid_id < 0 || centroid_id >= cached_ivf.nlist)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("centroid_id %d out of range [0, %d)",
+						centroid_id, cached_ivf.nlist)));
+
+	/* Compute query residual = query - centroid[centroid_id] */
+	q_residual = palloc(sizeof(float) * dim);
+	cent = cached_ivf.centroids + centroid_id * dim;
+	for (j = 0; j < dim; j++)
+		q_residual[j] = query->x[j] - cent[j];
+
+	/* Build distance table: M × 256 floats */
+	table_bytes = sizeof(float) * M * PQ_KSUB;
+	result = (bytea *) palloc(VARHDRSZ + table_bytes);
+	SET_VARSIZE(result, VARHDRSZ + table_bytes);
+	table = (float *) VARDATA(result);
+
+	for (m = 0; m < M; m++)
+	{
+		float  *qsub = q_residual + m * dsub;
+		float  *cb_base = cached_pq.centroids + m * PQ_KSUB * dsub;
+
+		for (c = 0; c < PQ_KSUB; c++)
+		{
+			float  *cen = cb_base + c * dsub;
+			float	d = 0.0f;
+
+			for (j = 0; j < dsub; j++)
+			{
+				float diff = qsub[j] - cen[j];
+
+				d += diff * diff;
+			}
+			table[m * PQ_KSUB + c] = d;
+		}
+	}
+
+	pfree(q_residual);
+	PG_RETURN_BYTEA_P(result);
+}
+
+/* ----------------------------------------------------------------
  *  svec_pq_encode: encode vector to PQ code
  *
  *  svec_pq_encode(vec svec, cb_id int) → bytea
@@ -778,21 +1292,28 @@ svec_pq_encode(PG_FUNCTION_ARGS)
 {
 	Svec	   *vec = PG_GETARG_SVEC_P(0);
 	int			cb_id = PG_GETARG_INT32(1);
-	int			M, dsub;
+	int			M, dsub, dim;
 	bytea	   *result;
 	uint8	   *codes;
 	int			m, j, c;
+	float	   *norm_vec;
 
 	pq_load_codebook(cb_id);
 
 	M = cached_pq.M;
 	dsub = cached_pq.dsub;
+	dim = cached_pq.total_dim;
 
-	if (vec->dim != cached_pq.total_dim)
+	if (vec->dim != dim)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_EXCEPTION),
 				 errmsg("vector dimension %d doesn't match codebook "
-						"(expected %d)", vec->dim, cached_pq.total_dim)));
+						"(expected %d)", vec->dim, dim)));
+
+	/* L2-normalize a copy for cosine-equivalent encoding */
+	norm_vec = palloc(sizeof(float) * dim);
+	memcpy(norm_vec, vec->x, sizeof(float) * dim);
+	normalize_vector(norm_vec, dim);
 
 	result = (bytea *) palloc(VARHDRSZ + M);
 	SET_VARSIZE(result, VARHDRSZ + M);
@@ -800,7 +1321,7 @@ svec_pq_encode(PG_FUNCTION_ARGS)
 
 	for (m = 0; m < M; m++)
 	{
-		float  *sub = vec->x + m * dsub;
+		float  *sub = norm_vec + m * dsub;
 		float  *cb_base = cached_pq.centroids + m * PQ_KSUB * dsub;
 		float	best_dist = 1e30f;
 		int		best_c = 0;
@@ -826,6 +1347,7 @@ svec_pq_encode(PG_FUNCTION_ARGS)
 		codes[m] = (uint8) best_c;
 	}
 
+	pfree(norm_vec);
 	PG_RETURN_BYTEA_P(result);
 }
 
@@ -878,24 +1400,34 @@ svec_pq_distance(PG_FUNCTION_ARGS)
 	/* Precompute distance table: dist_table[m * 256 + c] */
 	dist_table = palloc(sizeof(float) * M * PQ_KSUB);
 
-	for (m = 0; m < M; m++)
+	/* L2-normalize query for cosine-equivalent ADC */
 	{
-		float  *qsub = query->x + m * dsub;
-		float  *cb_base = cached_pq.centroids + m * PQ_KSUB * dsub;
+		float  *norm_q = palloc(sizeof(float) * query->dim);
 
-		for (c = 0; c < PQ_KSUB; c++)
+		memcpy(norm_q, query->x, sizeof(float) * query->dim);
+		normalize_vector(norm_q, query->dim);
+
+		for (m = 0; m < M; m++)
 		{
-			float  *cent = cb_base + c * dsub;
-			float	dist = 0.0f;
+			float  *qsub = norm_q + m * dsub;
+			float  *cb_base = cached_pq.centroids + m * PQ_KSUB * dsub;
 
-			for (j = 0; j < dsub; j++)
+			for (c = 0; c < PQ_KSUB; c++)
 			{
-				float diff = qsub[j] - cent[j];
-				dist += diff * diff;
-			}
+				float  *cent = cb_base + c * dsub;
+				float	dist = 0.0f;
 
-			dist_table[m * PQ_KSUB + c] = dist;
+				for (j = 0; j < dsub; j++)
+				{
+					float diff = qsub[j] - cent[j];
+					dist += diff * diff;
+				}
+
+				dist_table[m * PQ_KSUB + c] = dist;
+			}
 		}
+
+		pfree(norm_q);
 	}
 
 	/* Sum distances using PQ codes */
@@ -947,24 +1479,34 @@ svec_pq_distance_table(PG_FUNCTION_ARGS)
 	SET_VARSIZE(result, VARHDRSZ + sizeof(float) * M * PQ_KSUB);
 	dt = (float *) VARDATA(result);
 
-	for (m = 0; m < M; m++)
+	/* L2-normalize query for cosine-equivalent ADC */
 	{
-		float  *qsub = query->x + m * dsub;
-		float  *cb_base = cached_pq.centroids + m * PQ_KSUB * dsub;
+		float  *norm_q = palloc(sizeof(float) * query->dim);
 
-		for (c = 0; c < PQ_KSUB; c++)
+		memcpy(norm_q, query->x, sizeof(float) * query->dim);
+		normalize_vector(norm_q, query->dim);
+
+		for (m = 0; m < M; m++)
 		{
-			float  *cent = cb_base + c * dsub;
-			float	dist = 0.0f;
+			float  *qsub = norm_q + m * dsub;
+			float  *cb_base = cached_pq.centroids + m * PQ_KSUB * dsub;
 
-			for (j = 0; j < dsub; j++)
+			for (c = 0; c < PQ_KSUB; c++)
 			{
-				float diff = qsub[j] - cent[j];
-				dist += diff * diff;
-			}
+				float  *cent = cb_base + c * dsub;
+				float	dist = 0.0f;
 
-			dt[m * PQ_KSUB + c] = dist;
+				for (j = 0; j < dsub; j++)
+				{
+					float diff = qsub[j] - cent[j];
+					dist += diff * diff;
+				}
+
+				dt[m * PQ_KSUB + c] = dist;
+			}
 		}
+
+		pfree(norm_q);
 	}
 
 	PG_RETURN_BYTEA_P(result);
@@ -1038,13 +1580,12 @@ svec_ivf_train(PG_FUNCTION_ARGS)
 	int			max_samples = PG_GETARG_INT32(3);
 
 	char	   *query_str;
+	StringInfoData wrapped_query;
 	int			ret;
-	int			total_rows;
 	int			n_samples;
 	int			dim;
 	float	   *sample_data;	/* n_samples * dim */
 	float	   *centroids;		/* nlist * dim */
-	int		   *indices;
 	int			cb_id;
 	int			i;
 	char		sql[256];
@@ -1070,9 +1611,20 @@ svec_ivf_train(PG_FUNCTION_ARGS)
 	query_str = text_to_cstring(source_query);
 	func_ctx = CurrentMemoryContext;
 
-	/* Execute source query to get training data */
+	/*
+	 * Wrap the user query with ORDER BY random() LIMIT max_samples.
+	 * PostgreSQL uses a bounded heap sort for LIMIT, so only max_samples
+	 * rows are held in memory at any time — O(K) instead of O(N).
+	 */
+	initStringInfo(&wrapped_query);
+	appendStringInfo(&wrapped_query,
+					 "SELECT * FROM (%s) _src ORDER BY random() LIMIT %d",
+					 query_str, max_samples);
+
+	/* Execute wrapped query — returns at most max_samples rows */
 	SPI_connect();
-	ret = SPI_execute(query_str, true, 0);
+	ret = SPI_execute(wrapped_query.data, true, 0);
+	pfree(wrapped_query.data);
 
 	if (ret != SPI_OK_SELECT || SPI_processed == 0)
 	{
@@ -1082,7 +1634,7 @@ svec_ivf_train(PG_FUNCTION_ARGS)
 				 errmsg("source query returned no rows")));
 	}
 
-	total_rows = (int) SPI_processed;
+	n_samples = (int) SPI_processed;
 
 	/* Read first vector to get dimension */
 	{
@@ -1107,31 +1659,26 @@ svec_ivf_train(PG_FUNCTION_ARGS)
 			pfree(first);
 	}
 
-	n_samples = (total_rows < max_samples) ? total_rows : max_samples;
-
 	ereport(NOTICE,
-			(errmsg("IVF training: dim=%d, nlist=%d, n_iter=%d, "
-					"data=%d rows, samples=%d",
-					dim, nlist, n_iter, total_rows, n_samples)));
+			(errmsg("IVF training: dim=%d, nlist=%d, n_iter=%d, samples=%d",
+					dim, nlist, n_iter, n_samples)));
 
 	/* Allocate in func_ctx to survive SPI_finish */
 	old_ctx = MemoryContextSwitchTo(func_ctx);
-	indices = palloc(sizeof(int) * total_rows);
 	sample_data = palloc(sizeof(float) * n_samples * dim);
 	MemoryContextSwitchTo(old_ctx);
 
-	for (i = 0; i < total_rows; i++)
-		indices[i] = i;
-	shuffle_indices(indices, total_rows, 42);
-
-	/* Copy sampled vectors into contiguous float array */
+	/*
+	 * Copy all returned vectors into contiguous float array.
+	 * Rows are already randomly sampled by ORDER BY random() LIMIT.
+	 */
 	for (i = 0; i < n_samples; i++)
 	{
 		bool	isnull;
 		Datum	d;
 		Svec   *vec;
 
-		d = SPI_getbinval(SPI_tuptable->vals[indices[i]],
+		d = SPI_getbinval(SPI_tuptable->vals[i],
 						  SPI_tuptable->tupdesc, 1, &isnull);
 
 		if (isnull)
@@ -1139,8 +1686,7 @@ svec_ivf_train(PG_FUNCTION_ARGS)
 			SPI_finish();
 			ereport(ERROR,
 					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-					 errmsg("NULL vector in training data at row %d",
-							indices[i])));
+					 errmsg("NULL vector in training data at row %d", i)));
 		}
 
 		vec = (Svec *) PG_DETOAST_DATUM(d);
@@ -1152,7 +1698,7 @@ svec_ivf_train(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_DATA_EXCEPTION),
 					 errmsg("inconsistent vector dim at row %d: "
 							"expected %d, got %d",
-							indices[i], dim, vec->dim)));
+							i, dim, vec->dim)));
 		}
 
 		memcpy(sample_data + i * dim, vec->x, sizeof(float) * dim);
@@ -1162,7 +1708,6 @@ svec_ivf_train(PG_FUNCTION_ARGS)
 	}
 
 	SPI_finish();
-	pfree(indices);
 
 	ereport(NOTICE,
 			(errmsg("IVF training: sampled %d vectors (%d MB), "
@@ -1530,19 +2075,26 @@ svec_pq_adc(PG_FUNCTION_ARGS)
 	if (need_recompute)
 	{
 		MemoryContext old_ctx;
-		int			dsub, c, j;
+		int			dsub, c, j, dim;
+		float	   *norm_q;
 
 		pq_load_codebook(cb_id);
 
 		M = cached_pq.M;
 		dsub = cached_pq.dsub;
+		dim = cached_pq.total_dim;
 
-		if (query->dim != cached_pq.total_dim)
+		if (query->dim != dim)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_EXCEPTION),
 					 errmsg("query dimension %d doesn't match codebook "
 							"(expected %d)",
-							query->dim, cached_pq.total_dim)));
+							query->dim, dim)));
+
+		/* L2-normalize query for cosine-equivalent ADC */
+		norm_q = palloc(sizeof(float) * dim);
+		memcpy(norm_q, query->x, sizeof(float) * dim);
+		normalize_vector(norm_q, dim);
 
 		/* Allocate or reallocate state in fn_mcxt */
 		old_ctx = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
@@ -1563,10 +2115,10 @@ svec_pq_adc(PG_FUNCTION_ARGS)
 		state->dim = query->dim;
 		memcpy(state->query_sig, query->x, sizeof(float) * sig_len);
 
-		/* Compute distance table */
+		/* Compute distance table using normalized query */
 		for (m = 0; m < M; m++)
 		{
-			float  *qsub = query->x + m * dsub;
+			float  *qsub = norm_q + m * dsub;
 			float  *cb_base = cached_pq.centroids + m * PQ_KSUB * dsub;
 
 			for (c = 0; c < PQ_KSUB; c++)
@@ -1584,6 +2136,7 @@ svec_pq_adc(PG_FUNCTION_ARGS)
 			}
 		}
 
+		pfree(norm_q);
 		fcinfo->flinfo->fn_extra = state;
 	}
 
@@ -1603,4 +2156,408 @@ svec_pq_adc(PG_FUNCTION_ARGS)
 		total_dist += (double) state->dist_table[m * PQ_KSUB + codes[m]];
 
 	PG_RETURN_FLOAT8(total_dist);
+}
+
+/* ================================================================
+ *  svec_ann_scan: C-level IVF-PQ scan (maximum throughput)
+ *
+ *  svec_ann_scan(tbl regclass, query svec,
+ *                nprobe int4 DEFAULT 10, lim int4 DEFAULT 10,
+ *                rerank_topk int4 DEFAULT 0, cb_id int4 DEFAULT 1)
+ *  RETURNS TABLE(id text, distance float8)
+ *
+ *  Performs full IVF-PQ search in a single C function:
+ *    1. IVF probe: find nearest nprobe centroids (no SQL overhead)
+ *    2. SPI fetch: get candidate rows from probed partitions
+ *    3. ADC scan: tight C loop over PQ codes (no per-row fmgr)
+ *    4. Top-K selection via max-heap
+ *    5. Optional exact cosine reranking of top candidates
+ *
+ *  Eliminates per-row function call overhead (~1μs/row) that
+ *  dominates the SQL-level svec_pq_adc approach.
+ * ================================================================ */
+
+/* --- Max-heap for top-K selection --- */
+
+typedef struct
+{
+	int		idx;
+	float	dist;
+} TopKEntry;
+
+static void
+topk_siftdown(TopKEntry *heap, int n, int i)
+{
+	for (;;)
+	{
+		int		largest = i;
+		int		left = 2 * i + 1;
+		int		right = 2 * i + 2;
+		TopKEntry tmp;
+
+		if (left < n && heap[left].dist > heap[largest].dist)
+			largest = left;
+		if (right < n && heap[right].dist > heap[largest].dist)
+			largest = right;
+		if (largest == i)
+			break;
+
+		tmp = heap[i];
+		heap[i] = heap[largest];
+		heap[largest] = tmp;
+		i = largest;
+	}
+}
+
+static void
+topk_siftup(TopKEntry *heap, int i)
+{
+	while (i > 0)
+	{
+		int		parent = (i - 1) / 2;
+		TopKEntry tmp;
+
+		if (heap[i].dist <= heap[parent].dist)
+			break;
+
+		tmp = heap[i];
+		heap[i] = heap[parent];
+		heap[parent] = tmp;
+		i = parent;
+	}
+}
+
+static void
+topk_insert(TopKEntry *heap, int *heap_size, int max_k,
+			int idx, float dist)
+{
+	if (*heap_size < max_k)
+	{
+		heap[*heap_size].idx = idx;
+		heap[*heap_size].dist = dist;
+		(*heap_size)++;
+		topk_siftup(heap, *heap_size - 1);
+	}
+	else if (dist < heap[0].dist)
+	{
+		heap[0].idx = idx;
+		heap[0].dist = dist;
+		topk_siftdown(heap, *heap_size, 0);
+	}
+}
+
+/* --- Result sorting --- */
+
+typedef struct
+{
+	char   *id;
+	float8	distance;
+} AnnResult;
+
+static int
+cmp_ann_result(const void *a, const void *b)
+{
+	float8	da = ((const AnnResult *) a)->distance;
+	float8	db = ((const AnnResult *) b)->distance;
+
+	if (da < db) return -1;
+	if (da > db) return 1;
+	return 0;
+}
+
+/* --- Main scan function --- */
+
+PG_FUNCTION_INFO_V1(svec_ann_scan);
+Datum
+svec_ann_scan(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Oid			tbl_oid = PG_GETARG_OID(0);
+	Svec	   *query = PG_GETARG_SVEC_P(1);
+	int			nprobe = PG_GETARG_INT32(2);
+	int			lim = PG_GETARG_INT32(3);
+	int			rerank_topk = PG_GETARG_INT32(4);
+	int			cb_id = PG_GETARG_INT32(5);
+	int			dim, M, dsub, nlist;
+	int			effective_topk, n_cand, ret;
+	int			i, j, m, c, p;
+	float	   *norm_q;
+	float	   *dist_table;
+	float	   *centroid_dists;
+	int		   *probe_ids;
+	TopKEntry  *heap;
+	int			heap_size;
+	AnnResult  *results;
+	SPITupleTable *tuptable;
+	TupleDesc	tupdesc;
+	MemoryContext caller_ctx;
+
+	/* Setup materialized SRF (tuplestore) */
+	InitMaterializedSRF(fcinfo, 0);
+
+	/* Load codebooks (cached in TopMemoryContext) */
+	pq_load_codebook(cb_id);
+	ivf_load_centroids(cb_id);
+
+	M = cached_pq.M;
+	dsub = cached_pq.dsub;
+	dim = cached_pq.total_dim;
+	nlist = cached_ivf.nlist;
+
+	if (query->dim != dim)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("query dimension %d doesn't match codebook "
+						"(expected %d)", query->dim, dim)));
+	if (nprobe > nlist)
+		nprobe = nlist;
+	if (nprobe < 1)
+		nprobe = 1;
+
+	effective_topk = rerank_topk > 0 ? rerank_topk : lim;
+
+	/* ---- Step 1: Normalize query & compute PQ distance table ---- */
+	norm_q = palloc(sizeof(float) * dim);
+	memcpy(norm_q, query->x, sizeof(float) * dim);
+	normalize_vector(norm_q, dim);
+
+	dist_table = palloc(sizeof(float) * M * PQ_KSUB);
+	for (m = 0; m < M; m++)
+	{
+		float  *qsub = norm_q + m * dsub;
+		float  *cb_base = cached_pq.centroids + m * PQ_KSUB * dsub;
+
+		for (c = 0; c < PQ_KSUB; c++)
+		{
+			float  *cent = cb_base + c * dsub;
+			float	d = 0.0f;
+
+			for (j = 0; j < dsub; j++)
+			{
+				float diff = qsub[j] - cent[j];
+
+				d += diff * diff;
+			}
+			dist_table[m * PQ_KSUB + c] = d;
+		}
+	}
+	pfree(norm_q);
+
+	/* ---- Step 2: IVF probe (raw query, not normalized) ---- */
+	centroid_dists = palloc(sizeof(float) * nlist);
+	for (i = 0; i < nlist; i++)
+	{
+		float  *cent = cached_ivf.centroids + i * dim;
+		float	d = 0.0f;
+
+		for (j = 0; j < dim; j++)
+		{
+			float diff = query->x[j] - cent[j];
+
+			d += diff * diff;
+		}
+		centroid_dists[i] = d;
+	}
+
+	probe_ids = palloc(sizeof(int) * nprobe);
+	for (p = 0; p < nprobe; p++)
+	{
+		float	best_d = FLT_MAX;
+		int		best_i = 0;
+
+		for (i = 0; i < nlist; i++)
+		{
+			if (centroid_dists[i] < best_d)
+			{
+				best_d = centroid_dists[i];
+				best_i = i;
+			}
+		}
+		probe_ids[p] = best_i;
+		centroid_dists[best_i] = FLT_MAX;	/* mark used */
+	}
+	pfree(centroid_dists);
+
+	/* ---- Step 3: SPI fetch candidate rows ---- */
+	caller_ctx = CurrentMemoryContext;
+	{
+		char	   *relname = get_rel_name(tbl_oid);
+		Oid			nspid = get_rel_namespace(tbl_oid);
+		char	   *nspname = get_namespace_name(nspid);
+		const char *qname = quote_qualified_identifier(nspname, relname);
+		StringInfoData sql;
+
+		initStringInfo(&sql);
+		appendStringInfo(&sql,
+						 "SELECT id::text, pq_code "
+						 "FROM %s WHERE partition_id IN (", qname);
+
+		for (p = 0; p < nprobe; p++)
+			appendStringInfo(&sql, "%s%d", p > 0 ? "," : "",
+							 probe_ids[p]);
+		appendStringInfoChar(&sql, ')');
+
+		SPI_connect();
+		ret = SPI_execute(sql.data, true, 0);
+		pfree(sql.data);
+
+		if (ret != SPI_OK_SELECT)
+		{
+			SPI_finish();
+			ereport(ERROR,
+					(errmsg("svec_ann_scan: SPI query failed")));
+		}
+
+		n_cand = (int) SPI_processed;
+		tuptable = SPI_tuptable;
+		tupdesc = tuptable->tupdesc;
+	}
+
+	/* ---- Step 4: ADC scan in tight C loop ---- */
+	{
+		MemoryContext old = MemoryContextSwitchTo(caller_ctx);
+
+		heap = palloc(sizeof(TopKEntry) * effective_topk);
+		MemoryContextSwitchTo(old);
+	}
+	heap_size = 0;
+
+	for (i = 0; i < n_cand; i++)
+	{
+		bool	isnull;
+		Datum	code_d;
+		bytea  *code;
+		uint8  *codes;
+		int		code_len;
+		float	dist;
+
+		code_d = SPI_getbinval(tuptable->vals[i], tupdesc, 2, &isnull);
+		if (isnull)
+			continue;
+
+		code = DatumGetByteaPP(code_d);
+		codes = (uint8 *) VARDATA_ANY(code);
+		code_len = VARSIZE_ANY_EXHDR(code);
+		if (code_len != M)
+			continue;
+
+		dist = 0.0f;
+		for (m = 0; m < M; m++)
+			dist += dist_table[m * PQ_KSUB + codes[m]];
+
+		topk_insert(heap, &heap_size, effective_topk, i, dist);
+	}
+
+	/* ---- Step 5: Extract results into caller context ---- */
+	MemoryContextSwitchTo(caller_ctx);
+	results = palloc(sizeof(AnnResult) * heap_size);
+	for (j = 0; j < heap_size; j++)
+	{
+		int		idx = heap[j].idx;
+		bool	isnull;
+		Datum	id_d;
+
+		id_d = SPI_getbinval(tuptable->vals[idx], tupdesc, 1, &isnull);
+		results[j].id = isnull ? pstrdup("") : TextDatumGetCString(id_d);
+		results[j].distance = (float8) heap[j].dist;
+	}
+
+	/* ---- Step 6: Optional exact cosine reranking via second SPI query ---- */
+	if (rerank_topk > 0 && heap_size > 0)
+	{
+		char	   *relname = get_rel_name(tbl_oid);
+		Oid			nspid = get_rel_namespace(tbl_oid);
+		Oid			fn_nspid = get_func_namespace(fcinfo->flinfo->fn_oid);
+		char	   *nspname = get_namespace_name(nspid);
+		char	   *fn_nspname = get_namespace_name(fn_nspid);
+		const char *qname = quote_qualified_identifier(nspname, relname);
+		const char *qsvec = quote_qualified_identifier(fn_nspname, "svec");
+		char	   *query_text;
+		StringInfoData rerank_sql;
+
+		query_text = DatumGetCString(
+			DirectFunctionCall1(svec_out, PointerGetDatum(query)));
+
+		initStringInfo(&rerank_sql);
+		appendStringInfo(&rerank_sql,
+						 "SELECT id::text, "
+						 "(embedding <=> '%s'::%s(%d)) AS exact_dist "
+						 "FROM %s WHERE id IN (",
+						 query_text, qsvec, dim, qname);
+		pfree(query_text);
+		pfree(fn_nspname);
+
+		for (j = 0; j < heap_size; j++)
+		{
+			char *esc = quote_literal_cstr(results[j].id);
+
+			if (j > 0) appendStringInfoChar(&rerank_sql, ',');
+			appendStringInfoString(&rerank_sql, esc);
+			pfree(esc);
+		}
+		appendStringInfoChar(&rerank_sql, ')');
+
+		ret = SPI_execute(rerank_sql.data, true, 0);
+		pfree(rerank_sql.data);
+
+		if (ret == SPI_OK_SELECT)
+		{
+			SPITupleTable *rt = SPI_tuptable;
+			TupleDesc	rd = rt->tupdesc;
+			int			nrows = (int) SPI_processed;
+
+			for (i = 0; i < nrows; i++)
+			{
+				bool	isnull;
+				Datum	id_d, dist_d;
+				char   *rid;
+
+				id_d = SPI_getbinval(rt->vals[i], rd, 1, &isnull);
+				if (isnull) continue;
+				rid = TextDatumGetCString(id_d);
+
+				dist_d = SPI_getbinval(rt->vals[i], rd, 2, &isnull);
+				if (isnull) continue;
+
+				/* Find matching result and update distance */
+				for (j = 0; j < heap_size; j++)
+				{
+					if (strcmp(results[j].id, rid) == 0)
+					{
+						results[j].distance = DatumGetFloat8(dist_d);
+						break;
+					}
+				}
+			}
+		}
+
+		qsort(results, heap_size, sizeof(AnnResult), cmp_ann_result);
+		if (heap_size > lim)
+			heap_size = lim;
+	}
+	else
+	{
+		qsort(results, heap_size, sizeof(AnnResult), cmp_ann_result);
+	}
+
+	SPI_finish();
+
+	/* ---- Step 7: Write to tuplestore ---- */
+	for (j = 0; j < heap_size; j++)
+	{
+		Datum	values[2];
+		bool	nulls[2] = {false, false};
+
+		values[0] = CStringGetTextDatum(results[j].id);
+		values[1] = Float8GetDatum(results[j].distance);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+							values, nulls);
+	}
+
+	pfree(results);
+	pfree(heap);
+	pfree(dist_table);
+	pfree(probe_ids);
+
+	return (Datum) 0;
 }
