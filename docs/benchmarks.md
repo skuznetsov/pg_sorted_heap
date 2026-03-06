@@ -129,15 +129,16 @@ Same corpus, pure svec (float32), nlist=64, M=720 residual PQ.
 | nprobe=5, rerank=96 | 93% | 93% |
 | nprobe=10, rerank=200 | 99% | 99% |
 
-### float32 vs halfvec precision impact
+### float32 vs float16 precision impact
 
 Tested the same 10K Gutenberg vectors in two configurations:
 - **float32 (svec):** native 32-bit storage, independently trained codebooks
-- **halfvec-degraded:** float32 → float16 → float32 roundtrip, independently trained
+- **float16-degraded (hsvec):** svec → hsvec → svec roundtrip, independently trained
 
-Result: **no measurable recall difference**. Halfvec precision loss (~1e-7) is
+Result: **no measurable recall difference**. Float16 precision loss (~1e-7) is
 1000× smaller than typical distance gaps between consecutive neighbors (~1e-4).
 The recall bottleneck is PQ quantization and IVF routing, not input precision.
+This confirms hsvec is a safe storage choice for ANN workloads.
 
 ### Comparison with pgvector HNSW
 
@@ -145,13 +146,13 @@ Same dataset (103K × 2880-dim), same k8s pod.
 
 | Method | R@1 | Avg latency | Index size | Max dim |
 |---|---|---|---|---|
-| Exact brute-force (svec `<=>`) | 100% | 996 ms | — | 16,000 |
+| Exact brute-force (svec `<=>`) | 100% | 996 ms | — | 16,000 / 32,000 |
 | pgvector HNSW ef=100 | 97% | 14 ms | 806 MB | 2,000 |
-| IVF-PQ nprobe=10, rerank=200 | 97–99% | 22 ms | 27 MB | 16,000 |
+| IVF-PQ nprobe=10, rerank=200 | 97–99% | 22 ms | 27 MB | 16,000 / 32,000 |
 
 pgvector's HNSW/IVFFlat indexes are limited to 2,000 dimensions. For
-dim=2880, pgvector must use `halfvec` (float16) or binary quantization.
-svec+IVF-PQ works natively at full float32 precision up to 16,000 dimensions.
+dim=2880, pgvector must truncate or quantize. svec+IVF-PQ works natively at
+full float32 precision up to 16,000 dims; hsvec extends to 32,000 dims.
 
 ### Self-query vs cross-query
 

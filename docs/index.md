@@ -32,9 +32,10 @@ btree-competitive query performance without a separate index structure.
 - **Prepared statement support** -- Runtime parameter resolution enables scan
   pruning for parameterized queries (`$1`, `$2`), not just literal constants.
 
-- **Vector search** -- Built-in `svec` vector type (float32, up to 16,000 dim)
-  with cosine distance and IVF-PQ approximate nearest neighbor search. 30x
-  smaller index than HNSW, no pgvector dependency, no 2,000-dim index limit.
+- **Vector search** -- Built-in `svec` (float32, up to 16K dim) and `hsvec`
+  (float16, up to 32K dim) vector types with cosine distance and IVF-PQ
+  approximate nearest neighbor search. 30x smaller index than HNSW, no
+  pgvector dependency, no 2,000-dim index limit.
   See [Vector Search](vector-search).
 
 - **PG 17 and PG 18** -- Builds and runs on both versions with zero warnings.

@@ -6,41 +6,57 @@ nav_order: 3
 
 # Vector Search
 
-pg_sorted_heap includes a built-in vector type (`svec`) and IVF-PQ approximate
+pg_sorted_heap includes two built-in vector types and IVF-PQ approximate
 nearest neighbor search. The key insight: sorted_heap's physical clustering by
 primary key prefix **is** the inverted file index — no separate index structure
 needed, no pgvector dependency, no 800 MB HNSW graph.
 
 ---
 
-## svec type
+## Vector types
 
-`svec` is a dense vector stored as an array of `float4` (32-bit) values,
-up to 16,000 dimensions. Cosine distance is computed in `float8` (64-bit)
-for accumulation precision.
+| Type | Precision | Bytes/dim | Max dimensions | Use case |
+|------|-----------|-----------|----------------|----------|
+| `svec` | float32 | 4 | 16,000 | Full precision, training codebooks |
+| `hsvec` | float16 | 2 | 32,000 | Storage-optimized, large embeddings |
+
+Both types support the `<=>` cosine distance operator (returns 1 − cosine
+similarity, range [0, 2]). Distance is accumulated in `float8` (64-bit) for
+precision.
+
+`hsvec` casts to `svec` implicitly — all PQ/IVF functions accept both types
+without code changes. `svec` casts to `hsvec` via explicit or assignment cast
+(lossy, float32 → float16).
 
 **Advantage over pgvector:** pgvector's HNSW and IVFFlat indexes are limited to
-2,000 dimensions. For larger embeddings (e.g., 2880-dim), pgvector requires
-`halfvec` (float16) to halve the dimension count. svec stores full float32
-and IVF-PQ has no index dimension limit.
+2,000 dimensions. For larger embeddings (e.g., 2880-dim), pgvector must
+truncate or quantize. svec+IVF-PQ works at full precision up to 16K dims;
+hsvec extends that to 32K dims at half the storage.
 
 ```sql
--- Column declaration with dimension check
+-- svec: float32, up to 16,000 dimensions
 CREATE TABLE items (
     id        text PRIMARY KEY,
     embedding pg_sorted_heap.svec(768)
 );
 
--- Insert with bracket notation
+-- hsvec: float16, up to 32,000 dimensions
+CREATE TABLE items_compact (
+    id        text PRIMARY KEY,
+    embedding pg_sorted_heap.hsvec(768)
+);
+
+-- Insert with bracket notation (same for both types)
 INSERT INTO items VALUES ('doc1', '[0.1, 0.2, 0.3, ...]');
 
--- Cosine distance operator
+-- Cosine distance operator works on both types
 SELECT a.id, a.embedding <=> b.embedding AS distance
 FROM items a, items b
 WHERE a.id = 'doc1' AND b.id = 'doc2';
-```
 
-The `<=>` operator returns cosine distance (1 − cosine similarity), range [0, 2].
+-- hsvec casts to svec implicitly for PQ/IVF functions
+SELECT svec_cosine_distance('[1,0,0]'::hsvec, '[0,1,0]'::hsvec);
+```
 
 ---
 
@@ -213,14 +229,14 @@ Same corpus, pure svec (float32), nlist=64, M=720 residual PQ:
 | nprobe=5, rerank=96 | 93% | 93% |
 | nprobe=10, rerank=200 | **99%** | **99%** |
 
-### float32 vs halfvec precision
+### float32 vs float16 precision
 
 Tested the same 10K Gutenberg vectors stored as float32 (svec) vs
-halfvec-degraded (float32 → float16 → float32 roundtrip). Both trained
-independently with identical parameters. **No measurable recall difference** —
-halfvec precision loss (~1e-7) is 1000× smaller than typical distance gaps
-between neighbors (~1e-4). Precision is not the recall bottleneck; PQ
-quantization and IVF routing are.
+float16-degraded (svec → hsvec → svec roundtrip). Both trained independently
+with identical parameters. **No measurable recall difference** — float16
+precision loss (~1e-7) is 1000× smaller than typical distance gaps between
+neighbors (~1e-4). Precision is not the recall bottleneck; PQ quantization
+and IVF routing are. This confirms hsvec is a safe storage choice for ANN.
 
 ### Comparison with pgvector HNSW
 
@@ -228,13 +244,14 @@ Same dataset (103K × 2880-dim), same k8s pod.
 
 | Method | R@1 | Avg latency | Index size | Max dim |
 |---|---|---|---|---|
-| Exact brute-force (svec `<=>`) | 100% | 996 ms | — | 16,000 |
+| Exact brute-force (svec `<=>`) | 100% | 996 ms | — | 16,000 / 32,000 |
 | pgvector HNSW ef=100 | 97% | 14 ms | 806 MB | 2,000 |
-| IVF-PQ nprobe=10, rerank=200 | 97–99% | 22 ms | 27 MB | 16,000 |
+| IVF-PQ nprobe=10, rerank=200 | 97–99% | 22 ms | 27 MB | 16,000 / 32,000 |
 
 IVF-PQ is 30x smaller on storage at comparable recall. HNSW is faster for
 single queries but requires storing full vectors in the index. For dimensions
-above 2,000, pgvector cannot build HNSW/IVFFlat on float32 vectors at all.
+above 2,000, pgvector cannot build HNSW/IVFFlat indexes at all. svec handles
+up to 16K dims; hsvec extends to 32K dims at half the storage cost.
 
 ### Self-query vs cross-query
 
