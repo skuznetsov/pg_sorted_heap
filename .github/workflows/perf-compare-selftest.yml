@@ -227,6 +227,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install ripgrep
+        run: sudo apt-get install -y ripgrep
+
       - name: Ensure scripts are executable
         run: chmod +x scripts/*.sh
 

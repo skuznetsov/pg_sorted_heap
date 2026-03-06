@@ -10,6 +10,9 @@ PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
+# Ensure bash for recipes that use pipefail (dash on Ubuntu doesn't support it)
+SHELL = /bin/bash
+
 PERF_RUNTIME_SELFTEST_PORT ?= 65473
 PERF_RUNTIME_SELFTEST_ROWS ?= 128
 PERF_RUNTIME_SELFTEST_ITERS ?= 50

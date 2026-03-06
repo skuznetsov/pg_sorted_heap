@@ -54,5 +54,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Install ripgrep
+        run: sudo apt-get install -y ripgrep
       - name: policy-safety-selftest
         run: make -s --no-print-directory policy-safety-selftest UNNEST_AB_SELFTEST_TMP_ROOT=/tmp UNNEST_GATE_SELFTEST_TMP_ROOT=/tmp

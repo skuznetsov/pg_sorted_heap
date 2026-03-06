@@ -150,14 +150,20 @@ SELECT * FROM events WHERE id BETWEEN 500 AND 600;
 ### Run tests
 
 ```bash
-make installcheck              # regression tests (17 suites)
+make installcheck              # regression tests (18 suites)
 make test-crash-recovery       # crash recovery (4 scenarios)
 make test-concurrent           # concurrent DML + online ops
 make test-toast                # TOAST integrity + concurrent guard
 make test-alter-table          # ALTER TABLE DDL (36 checks)
 make test-dump-restore         # pg_dump/restore lifecycle (10 checks)
 make test-pg-upgrade           # pg_upgrade 17->18 (13 checks)
+make policy-safety-selftest    # policy + doc contract checks
+make pg-core-regression-smoke  # PG core regression smoke test
+make selftest-lightweight      # lightweight selftest suite
 ```
+
+Command selection quick map: see [OPERATIONS.md](OPERATIONS.md) for the full
+list of available make targets and their descriptions.
 
 ## Vector search
 
