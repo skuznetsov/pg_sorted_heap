@@ -2282,11 +2282,15 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 	int			lim = PG_GETARG_INT32(3);
 	int			rerank_topk = PG_GETARG_INT32(4);
 	int			cb_id = PG_GETARG_INT32(5);
+	int			ivf_id = PG_GETARG_INT32(6);
+	char	   *pq_col = text_to_cstring(PG_GETARG_TEXT_PP(7));
+	bool		is_residual = (ivf_id > 0);
 	int			dim, M, dsub, nlist;
 	int			effective_topk, n_cand, ret;
 	int			i, j, m, c, p;
-	float	   *norm_q;
-	float	   *dist_table;
+	float	   *dist_table = NULL;
+	float	   *per_centroid_dt = NULL;
+	int		   *centroid_to_probe = NULL;
 	float	   *centroid_dists;
 	int		   *probe_ids;
 	TopKEntry  *heap;
@@ -2301,7 +2305,9 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 
 	/* Load codebooks (cached in TopMemoryContext) */
 	pq_load_codebook(cb_id);
-	ivf_load_centroids(cb_id);
+	if (ivf_id <= 0)
+		ivf_id = cb_id;
+	ivf_load_centroids(ivf_id);
 
 	M = cached_pq.M;
 	dsub = cached_pq.dsub;
@@ -2320,32 +2326,37 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 
 	effective_topk = rerank_topk > 0 ? rerank_topk : lim;
 
-	/* ---- Step 1: Normalize query & compute PQ distance table ---- */
-	norm_q = palloc(sizeof(float) * dim);
-	memcpy(norm_q, query->x, sizeof(float) * dim);
-	normalize_vector(norm_q, dim);
-
-	dist_table = palloc(sizeof(float) * M * PQ_KSUB);
-	for (m = 0; m < M; m++)
+	/* ---- Step 1: Compute PQ distance table (raw PQ only) ---- */
+	if (!is_residual)
 	{
-		float  *qsub = norm_q + m * dsub;
-		float  *cb_base = cached_pq.centroids + m * PQ_KSUB * dsub;
+		float  *norm_q = palloc(sizeof(float) * dim);
 
-		for (c = 0; c < PQ_KSUB; c++)
+		memcpy(norm_q, query->x, sizeof(float) * dim);
+		normalize_vector(norm_q, dim);
+
+		dist_table = palloc(sizeof(float) * M * PQ_KSUB);
+		for (m = 0; m < M; m++)
 		{
-			float  *cent = cb_base + c * dsub;
-			float	d = 0.0f;
+			float  *qsub = norm_q + m * dsub;
+			float  *cb_base = cached_pq.centroids + m * PQ_KSUB * dsub;
 
-			for (j = 0; j < dsub; j++)
+			for (c = 0; c < PQ_KSUB; c++)
 			{
-				float diff = qsub[j] - cent[j];
+				float  *cent = cb_base + c * dsub;
+				float	d = 0.0f;
 
-				d += diff * diff;
+				for (j = 0; j < dsub; j++)
+				{
+					float diff = qsub[j] - cent[j];
+
+					d += diff * diff;
+				}
+				dist_table[m * PQ_KSUB + c] = d;
 			}
-			dist_table[m * PQ_KSUB + c] = d;
 		}
+		pfree(norm_q);
 	}
-	pfree(norm_q);
+	/* Residual PQ distance tables computed after IVF probe (Step 2b) */
 
 	/* ---- Step 2: IVF probe (raw query, not normalized) ---- */
 	centroid_dists = palloc(sizeof(float) * nlist);
@@ -2382,6 +2393,49 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 	}
 	pfree(centroid_dists);
 
+	/* ---- Step 2b: Per-centroid distance tables (residual PQ) ---- */
+	if (is_residual)
+	{
+		per_centroid_dt = palloc(sizeof(float) * nprobe * M * PQ_KSUB);
+		centroid_to_probe = palloc(sizeof(int) * nlist);
+		memset(centroid_to_probe, 0xFF, sizeof(int) * nlist);	/* -1 */
+
+		for (p = 0; p < nprobe; p++)
+		{
+			float  *cent = cached_ivf.centroids + probe_ids[p] * dim;
+			float  *dt = per_centroid_dt + (size_t) p * M * PQ_KSUB;
+			float  *q_residual = palloc(sizeof(float) * dim);
+
+			/* query_residual = query - centroid */
+			for (j = 0; j < dim; j++)
+				q_residual[j] = query->x[j] - cent[j];
+
+			/* Build distance table from query residual to PQ centroids */
+			for (m = 0; m < M; m++)
+			{
+				float  *qsub = q_residual + m * dsub;
+				float  *cb_base = cached_pq.centroids + m * PQ_KSUB * dsub;
+
+				for (c = 0; c < PQ_KSUB; c++)
+				{
+					float  *pqc = cb_base + c * dsub;
+					float	d = 0.0f;
+
+					for (j = 0; j < dsub; j++)
+					{
+						float diff = qsub[j] - pqc[j];
+
+						d += diff * diff;
+					}
+					dt[m * PQ_KSUB + c] = d;
+				}
+			}
+
+			pfree(q_residual);
+			centroid_to_probe[probe_ids[p]] = p;
+		}
+	}
+
 	/* ---- Resolve table and extension names (used by Steps 3 & 6) ---- */
 	caller_ctx = CurrentMemoryContext;
 	{
@@ -2397,8 +2451,9 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 		/* ---- Step 3: SPI fetch candidate rows ---- */
 		initStringInfo(&sql);
 		appendStringInfo(&sql,
-						 "SELECT id::text, pq_code "
-						 "FROM %s WHERE partition_id IN (", qname);
+						 "SELECT id::text, %s, partition_id "
+						 "FROM %s WHERE partition_id IN (",
+						 quote_identifier(pq_col), qname);
 
 		for (p = 0; p < nprobe; p++)
 			appendStringInfo(&sql, "%s%d", p > 0 ? "," : "",
@@ -2437,6 +2492,7 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 			uint8  *codes;
 			int		code_len;
 			float	dist;
+			float  *dt;
 
 			code_d = SPI_getbinval(tuptable->vals[i], tupdesc, 2, &isnull);
 			if (isnull)
@@ -2448,9 +2504,29 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 			if (code_len != M)
 				continue;
 
+			/* Select appropriate distance table */
+			if (is_residual)
+			{
+				int		part_id;
+				int		probe_idx;
+
+				part_id = DatumGetInt16(SPI_getbinval(tuptable->vals[i],
+													 tupdesc, 3, &isnull));
+				if (isnull)
+					continue;
+				probe_idx = centroid_to_probe[part_id];
+				if (probe_idx < 0)
+					continue;
+				dt = per_centroid_dt + (size_t) probe_idx * M * PQ_KSUB;
+			}
+			else
+			{
+				dt = dist_table;
+			}
+
 			dist = 0.0f;
 			for (m = 0; m < M; m++)
-				dist += dist_table[m * PQ_KSUB + codes[m]];
+				dist += dt[m * PQ_KSUB + codes[m]];
 
 			topk_insert(heap, &heap_size, effective_topk, i, dist);
 		}
@@ -2556,7 +2632,12 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 
 	pfree(results);
 	pfree(heap);
-	pfree(dist_table);
+	if (dist_table)
+		pfree(dist_table);
+	if (per_centroid_dt)
+		pfree(per_centroid_dt);
+	if (centroid_to_probe)
+		pfree(centroid_to_probe);
 	pfree(probe_ids);
 
 	return (Datum) 0;

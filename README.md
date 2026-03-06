@@ -164,16 +164,16 @@ no pgvector dependency, no 800 MB HNSW graph.
 | | pg_sorted_heap IVF-PQ | pgvector HNSW |
 |---|---|---|
 | Index size (103K × 2880-dim) | **27 MB** (PQ codes) | 806 MB (full vectors) |
-| Recall@10 | 79–88% (tunable) | 97% |
-| Latency (warm, single query) | **5 ms** PQ-only | 14 ms |
-| Latency (avg over 20 queries) | 13–21 ms PQ-only | 14 ms |
+| Recall@10 | 79–90% (tunable) | 97% |
+| Latency (warm, single query) | **5 ms** raw PQ / 24 ms with rerank | 14 ms |
 | Separate index needed? | No — PK prefix is the IVF | Yes — HNSW graph |
 | External dependency | None | pgvector extension |
 | Scales to 1M vectors | ~260 MB | ~8 GB |
 
-PQ is competitive on latency (5 ms warm) and 30x smaller on storage.
-Recall is tunable via `nprobe` and `rerank_topk`. At scale, the storage
-difference dominates: 8 GB HNSW index vs 260 MB PQ codes at 1M vectors.
+PQ is competitive on latency (5 ms warm, 2 ms at nprobe=1) and 30x smaller
+on storage. Recall is tunable via `nprobe`, `rerank_topk`, and residual PQ
+mode. At scale, the storage difference dominates: 8 GB HNSW index vs 260 MB
+PQ codes at 1M vectors.
 
 ### svec type
 
@@ -234,6 +234,11 @@ SELECT * FROM pg_sorted_heap.svec_ann_search(
 -- 5c. C-level scan (maximum throughput, same API)
 SELECT * FROM pg_sorted_heap.svec_ann_scan(
     'vectors', query_vec, nprobe := 10, lim := 10, rerank_topk := 200);
+
+-- 5d. Residual PQ (higher recall, set ivf_cb_id to IVF codebook)
+SELECT * FROM pg_sorted_heap.svec_ann_scan(
+    'vectors', query_vec, nprobe := 10, lim := 10,
+    rerank_topk := 50, cb_id := 2, ivf_cb_id := 1);
 ```
 
 ### How IVF-PQ works
@@ -258,25 +263,33 @@ partitions at the I/O level.
 
 ### Performance (103K vectors, 2880-dim, 1 Gi k8s pod)
 
-`svec_ann_scan` (C-level IVF-PQ), M=720, 256 IVF partitions,
-20 queries averaged:
+`svec_ann_scan` (C-level IVF-PQ), M=720, 256 IVF partitions.
 
-| nprobe | rerank | Avg latency | Recall@10 |
-|---|---|---|---|
-| 5 | — | 13 ms | 76% |
-| 10 | — | 21 ms | 79% |
-| 20 | — | 35 ms | 83% |
-| 10 | top-200 | 93 ms | 89% |
+**Single warm query** (buffers cached):
 
-Single warm query (buffers cached): **5.2 ms** (nprobe=10, PQ-only).
+| Mode | nprobe | rerank | Latency | Recall@10 |
+|---|---|---|---|---|
+| Raw PQ | 1 | — | 2.2 ms | 53% |
+| Raw PQ | 10 | — | 5 ms | 79% |
+| Residual PQ | 1 | — | 2.5 ms | 53% |
+| Residual PQ | 10 | — | 10 ms | 81% |
+| Residual PQ | 10 | top-50 | 24 ms | 89% |
+| Residual PQ | 20 | top-200 | 35 ms | 90% |
+
+**20-query average** (nprobe=10, PQ-only): raw PQ 20 ms, residual PQ 25 ms.
+
+Residual PQ trains on residuals `(vec − IVF centroid)` for better quantization
+but requires per-centroid distance tables, roughly doubling PQ-only latency.
+Both modes converge to ~90% recall with reranking.
 
 For comparison:
 
-| Method | Recall@10 | Avg latency | Index size |
+| Method | Recall@10 | Latency (warm) | Index size |
 |---|---|---|---|
 | Exact brute-force | 100% | 996 ms | — |
 | pgvector HNSW ef=100 | 97% | 14 ms | 806 MB |
-| IVF-PQ nprobe=10 | 79% | 21 ms | 27 MB |
+| IVF-PQ nprobe=10 (raw) | 79% | 5 ms | 27 MB |
+| IVF-PQ nprobe=10 (residual, rerank-50) | 89% | 24 ms | 27 MB |
 
 ## SQL API
 

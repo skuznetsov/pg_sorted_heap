@@ -623,14 +623,16 @@ CREATE FUNCTION @extschema@.svec_ann_scan(
     nprobe    int4 DEFAULT 10,
     lim       int4 DEFAULT 10,
     rerank_topk int4 DEFAULT 0,
-    cb_id     int4 DEFAULT 1
+    cb_id     int4 DEFAULT 1,
+    ivf_cb_id int4 DEFAULT 0,
+    pq_column text DEFAULT 'pq_code'
 )
 RETURNS TABLE(id text, distance float8)
 AS '$libdir/pg_sorted_heap', 'svec_ann_scan'
 LANGUAGE C STRICT STABLE PARALLEL SAFE;
 
-COMMENT ON FUNCTION @extschema@.svec_ann_scan(regclass, @extschema@.svec, int4, int4, int4, int4)
-IS 'C-level IVF-PQ scan. Fastest path: IVF probe + PQ ADC + optional reranking in single C call.';
+COMMENT ON FUNCTION @extschema@.svec_ann_scan(regclass, @extschema@.svec, int4, int4, int4, int4, int4, text)
+IS 'C-level IVF-PQ scan. Set ivf_cb_id > 0 for residual PQ mode. pq_column selects the PQ code column name.';
 
 -- ================================================================
 -- Residual PQ: train/encode/ADC on residuals (vec - IVF centroid).
