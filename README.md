@@ -164,15 +164,21 @@ no pgvector dependency, no 800 MB HNSW graph.
 | | pg_sorted_heap IVF-PQ | pgvector HNSW |
 |---|---|---|
 | Index size (103K × 2880-dim) | **27 MB** (PQ codes) | 806 MB (full vectors) |
-| R@1 (cross-query) | 79–97% (tunable) | 97% |
+| R@1 (cross-query) | 79–99% (tunable) | 97% |
 | Latency (avg, 103K) | **8 ms** PQ-only / 22 ms rerank | 14 ms |
+| Max indexed dimensions | **16,000** | 2,000 |
 | Separate index needed? | No — PK prefix is the IVF | Yes — HNSW graph |
 | External dependency | None | pgvector extension |
 | Scales to 1M vectors | ~260 MB | ~8 GB |
 
 IVF-PQ trades recall for 30x smaller storage. At nprobe=10 with reranking,
-R@1 reaches 97% at 22 ms. For self-query workloads (searching your own
+R@1 reaches 97–99% at 22 ms. For self-query workloads (searching your own
 corpus), R@1 is 100% at nprobe=3 / 8 ms. See [FAQ](#faq) for tuning.
+
+**High-dimensional advantage:** pgvector's HNSW and IVFFlat indexes are limited
+to 2,000 dimensions. For larger embeddings (e.g., 2880-dim), pgvector requires
+`halfvec` (float16) to halve the dimension count — losing precision. svec stores
+full float32 and IVF-PQ has no dimension limit (up to 16,000).
 
 ### svec type
 
@@ -260,7 +266,9 @@ Physical clustering by `(partition_id, id)` means IVF probe translates directly
 to a contiguous block range scan — sorted_heap's zone map skips all other
 partitions at the I/O level.
 
-### Performance (103K vectors, 2880-dim, 1 Gi k8s pod)
+### Performance
+
+#### 103K vectors, 2880-dim (Gutenberg corpus, 1 Gi k8s pod)
 
 Residual IVF-PQ via `svec_ann_scan`, M=720, 256 IVF partitions.
 100 cross-queries (query ≠ result, self-match excluded):
@@ -276,13 +284,28 @@ Residual IVF-PQ via `svec_ann_scan`, M=720, 256 IVF partitions.
 **Self-query** (searching your own corpus): R@1 = **100%** at nprobe=3 / 8 ms.
 This is the common RAG use case — you embedded the documents, now you search them.
 
-For comparison:
+#### 10K vectors, 2880-dim (float32 precision test)
+
+Same corpus, pure svec (float32), nlist=64, M=720 residual PQ:
+
+| Config | R@1 | Recall@10 |
+|---|---|---|
+| nprobe=1, PQ-only | 56% | 56% |
+| nprobe=3, PQ-only | 72% | 82% |
+| nprobe=5, rerank=96 | 93% | 93% |
+| nprobe=10, rerank=200 | **99%** | **99%** |
+
+Tested float32 vs halfvec-degraded (float32 → float16 → float32 roundtrip) on
+the same 10K vectors: **no measurable recall difference** — halfvec precision loss
+(~1e-7) is 1000× smaller than typical distance gaps between neighbors (~1e-4).
+
+#### Comparison with pgvector HNSW
 
 | Method | R@1 | Avg latency | Index size |
 |---|---|---|---|
 | Exact brute-force | 100% | 996 ms | — |
 | pgvector HNSW ef=100 | 97% | 14 ms | 806 MB |
-| IVF-PQ nprobe=10, rerank=200 | 97% | 22 ms | 27 MB |
+| IVF-PQ nprobe=10, rerank=200 | 97–99% | 22 ms | 27 MB |
 
 ## SQL API
 
@@ -431,8 +454,8 @@ vector you're searching for is in the dataset (the typical RAG case) — here R@
 |---|---|---|---|---|
 | Lowest latency | 1 | 0 | 5.5 ms | 54% |
 | Self-query RAG | 3 | 0 | 8 ms | 100% (self) |
-| Balanced cross-query | 5 | 96 | 12 ms | 89% |
-| Highest quality | 10 | 200 | 22 ms | 97% |
+| Balanced cross-query | 5 | 96 | 12 ms | 89–93% |
+| Highest quality | 10 | 200 | 22 ms | 97–99% |
 
 Start with nprobe=3 for self-query workloads. For cross-query (query not in
 corpus), increase nprobe and add reranking until recall meets your threshold.
@@ -443,6 +466,11 @@ No. pg_sorted_heap includes `svec` (float32 vector type), the `<=>`
 cosine distance operator, and full IVF-PQ infrastructure. The PQ index is
 30x smaller than HNSW. pgvector is only needed if you want HNSW or IVFFlat
 index types.
+
+svec stores full float32 precision and supports up to 16,000 dimensions.
+pgvector's HNSW/IVFFlat indexes are limited to 2,000 dimensions — for
+embeddings like 2880-dim, pgvector must use `halfvec` (float16) or binary
+quantization to index them, while svec+IVF-PQ works natively at full precision.
 
 ### How do I reproduce these benchmarks?
 

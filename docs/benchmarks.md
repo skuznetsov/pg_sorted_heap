@@ -99,10 +99,13 @@ heap-without-index -- roughly 30% less than heap + btree at scale.
 
 ## Vector search (IVF-PQ)
 
-103K vectors, 2880-dim, residual PQ (M=720, dsub=4), 256 IVF partitions.
-1 Gi k8s pod, PostgreSQL 18. `svec_ann_scan` (C-level).
+All vector benchmarks use `svec_ann_scan` (C-level) with residual PQ.
+1 Gi k8s pod, PostgreSQL 18.
 
-### Cross-query recall (100 queries, self-match excluded)
+### 103K vectors, 2880-dim (Gutenberg corpus)
+
+Residual PQ (M=720, dsub=4), 256 IVF partitions.
+100 cross-queries (self-match excluded):
 
 | Config | R@1 | Recall@10 | Avg latency |
 |---|---|---|---|
@@ -114,15 +117,41 @@ heap-without-index -- roughly 30% less than heap + btree at scale.
 
 Self-query (vector in dataset): R@1 = 100% at nprobe=3 / 8 ms.
 
+### 10K vectors, 2880-dim (float32 precision test)
+
+Same corpus, pure svec (float32), nlist=64, M=720 residual PQ.
+100 cross-queries:
+
+| Config | R@1 | Recall@10 |
+|---|---|---|
+| nprobe=1, PQ-only | 56% | 56% |
+| nprobe=3, PQ-only | 72% | 82% |
+| nprobe=5, rerank=96 | 93% | 93% |
+| nprobe=10, rerank=200 | 99% | 99% |
+
+### float32 vs halfvec precision impact
+
+Tested the same 10K Gutenberg vectors in two configurations:
+- **float32 (svec):** native 32-bit storage, independently trained codebooks
+- **halfvec-degraded:** float32 → float16 → float32 roundtrip, independently trained
+
+Result: **no measurable recall difference**. Halfvec precision loss (~1e-7) is
+1000× smaller than typical distance gaps between consecutive neighbors (~1e-4).
+The recall bottleneck is PQ quantization and IVF routing, not input precision.
+
 ### Comparison with pgvector HNSW
 
 Same dataset (103K × 2880-dim), same k8s pod.
 
-| Method | R@1 | Avg latency | Index size |
-|---|---|---|---|
-| Exact brute-force (svec `<=>`) | 100% | 996 ms | — |
-| pgvector HNSW ef=100 | 97% | 14 ms | 806 MB |
-| IVF-PQ nprobe=10, rerank=200 | 97% | 22 ms | 27 MB |
+| Method | R@1 | Avg latency | Index size | Max dim |
+|---|---|---|---|---|
+| Exact brute-force (svec `<=>`) | 100% | 996 ms | — | 16,000 |
+| pgvector HNSW ef=100 | 97% | 14 ms | 806 MB | 2,000 |
+| IVF-PQ nprobe=10, rerank=200 | 97–99% | 22 ms | 27 MB | 16,000 |
+
+pgvector's HNSW/IVFFlat indexes are limited to 2,000 dimensions. For
+dim=2880, pgvector must use `halfvec` (float16) or binary quantization.
+svec+IVF-PQ works natively at full float32 precision up to 16,000 dimensions.
 
 ### Self-query vs cross-query
 

@@ -15,8 +15,14 @@ needed, no pgvector dependency, no 800 MB HNSW graph.
 
 ## svec type
 
-`svec` is a dense vector stored as an array of `float4` (32-bit) values.
-Cosine distance is computed in `float8` (64-bit) for accumulation precision.
+`svec` is a dense vector stored as an array of `float4` (32-bit) values,
+up to 16,000 dimensions. Cosine distance is computed in `float8` (64-bit)
+for accumulation precision.
+
+**Advantage over pgvector:** pgvector's HNSW and IVFFlat indexes are limited to
+2,000 dimensions. For larger embeddings (e.g., 2880-dim), pgvector requires
+`halfvec` (float16) to halve the dimension count. svec stores full float32
+and IVF-PQ has no index dimension limit.
 
 ```sql
 -- Column declaration with dimension check
@@ -156,11 +162,12 @@ SELECT * FROM pg_sorted_heap.svec_ann_scan(
 |---|---|---|---|---|---|
 | Lowest latency | 1 | 0 | 5.5 ms | 54% | 48% |
 | Self-query RAG | 3 | 0 | 8 ms | 100%* | 71% |
-| Balanced | 5 | 96 | 12 ms | 89% | 86% |
-| High quality | 10 | 200 | 22 ms | 97% | 94% |
+| Balanced | 5 | 96 | 12 ms | 89–93% | 86–93% |
+| High quality | 10 | 200 | 22 ms | 97–99% | 94–99% |
 
 \* Self-query R@1 = 100% because the query vector is in the dataset.
-Cross-query R@1 at nprobe=3 is 79%.
+Cross-query R@1 at nprobe=3 is 79%. The recall ranges reflect different
+dataset sizes (10K–103K vectors).
 
 **Guidelines:**
 - Start with **nprobe=3, no rerank** for RAG workloads (searching your own corpus)
@@ -182,7 +189,9 @@ Rule of thumb: `nlist ≈ sqrt(N)` where N is dataset size. `M = dim/4` gives
 
 ## Benchmarks
 
-103K vectors, 2880-dim, residual PQ (M=720, dsub=4), 256 IVF partitions.
+### 103K vectors, 2880-dim (Gutenberg corpus)
+
+Residual PQ (M=720, dsub=4), 256 IVF partitions.
 1 Gi k8s pod, PostgreSQL 18. 100 cross-queries (self-match excluded):
 
 | Config | R@1 | Recall@10 | Avg latency |
@@ -193,16 +202,39 @@ Rule of thumb: `nlist ≈ sqrt(N)` where N is dataset size. `M = dim/4` gives
 | nprobe=5, rerank=96 | 89% | 86% | 12 ms |
 | nprobe=10, rerank=200 | 97% | 94% | 22 ms |
 
+### 10K vectors, 2880-dim (float32 precision test)
+
+Same corpus, pure svec (float32), nlist=64, M=720 residual PQ:
+
+| Config | R@1 | Recall@10 |
+|---|---|---|
+| nprobe=1, PQ-only | 56% | 56% |
+| nprobe=3, PQ-only | 72% | 82% |
+| nprobe=5, rerank=96 | 93% | 93% |
+| nprobe=10, rerank=200 | **99%** | **99%** |
+
+### float32 vs halfvec precision
+
+Tested the same 10K Gutenberg vectors stored as float32 (svec) vs
+halfvec-degraded (float32 → float16 → float32 roundtrip). Both trained
+independently with identical parameters. **No measurable recall difference** —
+halfvec precision loss (~1e-7) is 1000× smaller than typical distance gaps
+between neighbors (~1e-4). Precision is not the recall bottleneck; PQ
+quantization and IVF routing are.
+
 ### Comparison with pgvector HNSW
 
-| Method | R@1 | Avg latency | Index size |
-|---|---|---|---|
-| Exact brute-force | 100% | 996 ms | — |
-| pgvector HNSW ef=100 | 97% | 14 ms | 806 MB |
-| IVF-PQ nprobe=10, rerank=200 | 97% | 22 ms | 27 MB |
+Same dataset (103K × 2880-dim), same k8s pod.
+
+| Method | R@1 | Avg latency | Index size | Max dim |
+|---|---|---|---|---|
+| Exact brute-force (svec `<=>`) | 100% | 996 ms | — | 16,000 |
+| pgvector HNSW ef=100 | 97% | 14 ms | 806 MB | 2,000 |
+| IVF-PQ nprobe=10, rerank=200 | 97–99% | 22 ms | 27 MB | 16,000 |
 
 IVF-PQ is 30x smaller on storage at comparable recall. HNSW is faster for
-single queries but requires storing full vectors in the index.
+single queries but requires storing full vectors in the index. For dimensions
+above 2,000, pgvector cannot build HNSW/IVFFlat on float32 vectors at all.
 
 ### Self-query vs cross-query
 
