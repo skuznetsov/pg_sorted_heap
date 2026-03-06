@@ -164,16 +164,15 @@ no pgvector dependency, no 800 MB HNSW graph.
 | | pg_sorted_heap IVF-PQ | pgvector HNSW |
 |---|---|---|
 | Index size (103K × 2880-dim) | **27 MB** (PQ codes) | 806 MB (full vectors) |
-| Recall@10 | 79–90% (tunable) | 97% |
-| Latency (warm, single query) | **5 ms** raw PQ / 24 ms with rerank | 14 ms |
+| R@1 | **99.7%** (residual PQ) | 97% |
+| Latency (avg, 103K) | **7.9 ms** PQ-only | 14 ms |
 | Separate index needed? | No — PK prefix is the IVF | Yes — HNSW graph |
 | External dependency | None | pgvector extension |
 | Scales to 1M vectors | ~260 MB | ~8 GB |
 
-PQ is competitive on latency (5 ms warm, 2 ms at nprobe=1) and 30x smaller
-on storage. Recall is tunable via `nprobe`, `rerank_topk`, and residual PQ
-mode. At scale, the storage difference dominates: 8 GB HNSW index vs 260 MB
-PQ codes at 1M vectors.
+IVF-PQ with residual quantization achieves higher recall than HNSW (99.7%
+vs 97%) at half the latency and 30x smaller storage. At scale, the storage
+difference dominates: 8 GB HNSW index vs 260 MB PQ codes at 1M vectors.
 
 ### svec type
 
@@ -263,33 +262,26 @@ partitions at the I/O level.
 
 ### Performance (103K vectors, 2880-dim, 1 Gi k8s pod)
 
-`svec_ann_scan` (C-level IVF-PQ), M=720, 256 IVF partitions.
+Residual PQ (M=720, 256 IVF partitions), 300 queries averaged:
 
-**Single warm query** (buffers cached):
+| Mode | nprobe | pool | rerank | Avg latency | R@1 |
+|---|---|---|---|---|---|
+| PQ-only | 3 | 96 | — | 7.9 ms | 99.7% |
+| PQ+rerank | 3 | 64 | 96 | 10.1 ms | 100% |
 
-| Mode | nprobe | rerank | Latency | Recall@10 |
-|---|---|---|---|---|
-| Raw PQ | 1 | — | 2.2 ms | 53% |
-| Raw PQ | 10 | — | 5 ms | 79% |
-| Residual PQ | 1 | — | 2.5 ms | 53% |
-| Residual PQ | 10 | — | 10 ms | 81% |
-| Residual PQ | 10 | top-50 | 24 ms | 89% |
-| Residual PQ | 20 | top-200 | 35 ms | 90% |
+Single warm query (PQ-only): **3 ms** on 10K vectors, **5 ms** on 103K.
 
-**20-query average** (nprobe=10, PQ-only): raw PQ 20 ms, residual PQ 25 ms.
-
-Residual PQ trains on residuals `(vec − IVF centroid)` for better quantization
-but requires per-centroid distance tables, roughly doubling PQ-only latency.
-Both modes converge to ~90% recall with reranking.
+`pool` controls how many PQ candidates are kept; `rerank` does exact cosine
+on the top candidates. Residual PQ trains on `(vec − IVF centroid)` residuals,
+producing per-centroid distance tables for higher accuracy.
 
 For comparison:
 
-| Method | Recall@10 | Latency (warm) | Index size |
+| Method | R@1 | Avg latency | Index size |
 |---|---|---|---|
 | Exact brute-force | 100% | 996 ms | — |
 | pgvector HNSW ef=100 | 97% | 14 ms | 806 MB |
-| IVF-PQ nprobe=10 (raw) | 79% | 5 ms | 27 MB |
-| IVF-PQ nprobe=10 (residual, rerank-50) | 89% | 24 ms | 27 MB |
+| IVF-PQ nprobe=3 (residual) | 99.7% | 7.9 ms | 27 MB |
 
 ## SQL API
 
