@@ -439,10 +439,10 @@ corpus), increase nprobe and add reranking until recall meets your threshold.
 
 ### Do I need pgvector?
 
-No. pg_sorted_heap includes `svec` (sparse/dense vector type), the `<=>`
+No. pg_sorted_heap includes `svec` (float32 vector type), the `<=>`
 cosine distance operator, and full IVF-PQ infrastructure. The PQ index is
-30x smaller than HNSW. You do need pgvector if you want HNSW, IVFFlat, or
-half-precision vector types (`halfvec`).
+30x smaller than HNSW. pgvector is only needed if you want HNSW or IVFFlat
+index types.
 
 ### How do I reproduce these benchmarks?
 

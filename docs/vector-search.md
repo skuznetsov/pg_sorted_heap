@@ -15,7 +15,8 @@ needed, no pgvector dependency, no 800 MB HNSW graph.
 
 ## svec type
 
-`svec` is a dense floating-point vector stored as an array of `float4` values.
+`svec` is a dense vector stored as an array of `float4` (32-bit) values.
+Cosine distance is computed in `float8` (64-bit) for accumulation precision.
 
 ```sql
 -- Column declaration with dimension check
