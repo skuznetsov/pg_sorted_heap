@@ -32,6 +32,10 @@ btree-competitive query performance without a separate index structure.
 - **Prepared statement support** -- Runtime parameter resolution enables scan
   pruning for parameterized queries (`$1`, `$2`), not just literal constants.
 
+- **Vector search** -- Built-in `svec` vector type with cosine distance and
+  IVF-PQ approximate nearest neighbor search. 30x smaller index than HNSW,
+  no pgvector dependency. See [Vector Search](vector-search).
+
 - **PG 17 and PG 18** -- Builds and runs on both versions with zero warnings.
   pg_upgrade from 17 to 18 tested and verified.
 

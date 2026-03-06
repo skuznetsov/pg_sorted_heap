@@ -164,15 +164,15 @@ no pgvector dependency, no 800 MB HNSW graph.
 | | pg_sorted_heap IVF-PQ | pgvector HNSW |
 |---|---|---|
 | Index size (103K × 2880-dim) | **27 MB** (PQ codes) | 806 MB (full vectors) |
-| R@1 | **99.7%** (residual PQ) | 97% |
-| Latency (avg, 103K) | **7.9 ms** PQ-only | 14 ms |
+| R@1 (cross-query) | 79–97% (tunable) | 97% |
+| Latency (avg, 103K) | **8 ms** PQ-only / 22 ms rerank | 14 ms |
 | Separate index needed? | No — PK prefix is the IVF | Yes — HNSW graph |
 | External dependency | None | pgvector extension |
 | Scales to 1M vectors | ~260 MB | ~8 GB |
 
-IVF-PQ with residual quantization achieves higher recall than HNSW (99.7%
-vs 97%) at half the latency and 30x smaller storage. At scale, the storage
-difference dominates: 8 GB HNSW index vs 260 MB PQ codes at 1M vectors.
+IVF-PQ trades recall for 30x smaller storage. At nprobe=10 with reranking,
+R@1 reaches 97% at 22 ms. For self-query workloads (searching your own
+corpus), R@1 is 100% at nprobe=3 / 8 ms. See [FAQ](#faq) for tuning.
 
 ### svec type
 
@@ -262,18 +262,19 @@ partitions at the I/O level.
 
 ### Performance (103K vectors, 2880-dim, 1 Gi k8s pod)
 
-Residual PQ (M=720, 256 IVF partitions), 300 queries averaged:
+Residual IVF-PQ via `svec_ann_scan`, M=720, 256 IVF partitions.
+100 cross-queries (query ≠ result, self-match excluded):
 
-| Mode | nprobe | pool | rerank | Avg latency | R@1 |
-|---|---|---|---|---|---|
-| PQ-only | 3 | 96 | — | 7.9 ms | 99.7% |
-| PQ+rerank | 3 | 64 | 96 | 10.1 ms | 100% |
+| Config | R@1 | Recall@10 | Avg latency |
+|---|---|---|---|
+| nprobe=1, PQ-only | 54% | 48% | 5.5 ms |
+| nprobe=3, PQ-only | 79% | 71% | 8 ms |
+| nprobe=3, rerank=96 | 82% | 74% | 10 ms |
+| nprobe=5, rerank=96 | 89% | 86% | 12 ms |
+| nprobe=10, rerank=200 | 97% | 94% | 22 ms |
 
-Single warm query (PQ-only): **3 ms** on 10K vectors, **5 ms** on 103K.
-
-`pool` controls how many PQ candidates are kept; `rerank` does exact cosine
-on the top candidates. Residual PQ trains on `(vec − IVF centroid)` residuals,
-producing per-centroid distance tables for higher accuracy.
+**Self-query** (searching your own corpus): R@1 = **100%** at nprobe=3 / 8 ms.
+This is the common RAG use case — you embedded the documents, now you search them.
 
 For comparison:
 
@@ -281,7 +282,7 @@ For comparison:
 |---|---|---|---|
 | Exact brute-force | 100% | 996 ms | — |
 | pgvector HNSW ef=100 | 97% | 14 ms | 806 MB |
-| IVF-PQ nprobe=3 (residual) | 99.7% | 7.9 ms | 27 MB |
+| IVF-PQ nprobe=10, rerank=200 | 97% | 22 ms | 27 MB |
 
 ## SQL API
 
@@ -410,6 +411,101 @@ CREATE INDEX ON t USING btree (key_col);
   restore to re-enable scan pruning.
 - pg_upgrade 17 to 18: tested and verified (13 checks). Data files including
   zone map are copied as-is.
+
+## FAQ
+
+### What do R@1, Hit@10, and Recall@10 mean?
+
+- **R@1** — Is the ground-truth closest vector also the ANN's #1 result?
+- **Hit@10** — Is the ground-truth closest vector anywhere in the ANN's top 10?
+- **Recall@10** — What fraction of the ground-truth top 10 appear in the ANN's top 10?
+
+All benchmarks above use **cross-query** evaluation: the query vector is excluded
+from results, so self-match doesn't inflate the numbers. **Self-query** means the
+vector you're searching for is in the dataset (the typical RAG case) — here R@1 is
+100% because the query is trivially its own closest neighbor.
+
+### How do I choose nprobe and rerank_topk?
+
+| Use case | nprobe | rerank | Latency | R@1 |
+|---|---|---|---|---|
+| Lowest latency | 1 | 0 | 5.5 ms | 54% |
+| Self-query RAG | 3 | 0 | 8 ms | 100% (self) |
+| Balanced cross-query | 5 | 96 | 12 ms | 89% |
+| Highest quality | 10 | 200 | 22 ms | 97% |
+
+Start with nprobe=3 for self-query workloads. For cross-query (query not in
+corpus), increase nprobe and add reranking until recall meets your threshold.
+
+### Do I need pgvector?
+
+No. pg_sorted_heap includes `svec` (sparse/dense vector type), the `<=>`
+cosine distance operator, and full IVF-PQ infrastructure. The PQ index is
+30x smaller than HNSW. You do need pgvector if you want HNSW, IVFFlat, or
+half-precision vector types (`halfvec`).
+
+### How do I reproduce these benchmarks?
+
+```sql
+-- 1. Create table with IVF partition + PQ code
+CREATE TABLE bench (
+    id           text,
+    partition_id int2 GENERATED ALWAYS AS (
+                     pg_sorted_heap.svec_ivf_assign(embedding, 1)) STORED,
+    embedding    pg_sorted_heap.svec(768),
+    pq_code      bytea GENERATED ALWAYS AS (
+                     pg_sorted_heap.svec_pq_encode_residual(
+                         embedding,
+                         pg_sorted_heap.svec_ivf_assign(embedding, 1),
+                         2, 1)) STORED,
+    PRIMARY KEY (partition_id, id)
+) USING sorted_heap;
+
+-- 2. Load vectors
+INSERT INTO bench (id, embedding)
+SELECT id, embedding FROM your_source_table;
+SELECT pg_sorted_heap.sorted_heap_compact('bench');
+
+-- 3. Train IVF + residual PQ (one-time)
+SELECT * FROM pg_sorted_heap.svec_ann_train(
+    'SELECT embedding FROM bench',
+    nlist := 64, m := 192);
+-- Compact again after training to re-cluster by new partition_id
+SELECT pg_sorted_heap.sorted_heap_compact('bench');
+
+-- 4. Measure recall (cross-query, excluding self-match)
+WITH queries AS (
+    SELECT id AS qid, embedding AS qvec
+    FROM bench ORDER BY random() LIMIT 100
+),
+ground_truth AS (
+    SELECT q.qid,
+           array_agg(t.id ORDER BY t.embedding <=> q.qvec) AS gt
+    FROM queries q
+    CROSS JOIN LATERAL (
+        SELECT id, embedding FROM bench
+        WHERE id != q.qid
+        ORDER BY embedding <=> q.qvec LIMIT 10
+    ) t GROUP BY q.qid
+),
+ann_results AS (
+    SELECT q.qid,
+           (array_agg(a.id ORDER BY a.distance))[2:11] AS ann
+    FROM queries q
+    CROSS JOIN LATERAL pg_sorted_heap.svec_ann_scan(
+        'bench', q.qvec, nprobe := 3, lim := 11,
+        cb_id := 2, ivf_cb_id := 1) a
+    GROUP BY q.qid
+)
+SELECT
+    round((avg(CASE WHEN gt.gt[1] = ar.ann[1]
+               THEN 1.0 ELSE 0.0 END) * 100)::numeric, 1) AS "R@1",
+    round((avg((SELECT count(*)::numeric
+               FROM unnest(ar.ann) x
+               WHERE x = ANY(gt.gt)) / 10.0) * 100)::numeric, 1) AS "Recall@10"
+FROM ground_truth gt
+JOIN ann_results ar ON gt.qid = ar.qid;
+```
 
 ## License
 

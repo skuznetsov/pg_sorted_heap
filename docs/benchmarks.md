@@ -1,7 +1,7 @@
 ---
 layout: default
 title: Benchmarks
-nav_order: 5
+nav_order: 6
 ---
 
 # Benchmarks
@@ -97,6 +97,47 @@ heap-without-index -- roughly 30% less than heap + btree at scale.
 
 ---
 
+## Vector search (IVF-PQ)
+
+103K vectors, 2880-dim, residual PQ (M=720, dsub=4), 256 IVF partitions.
+1 Gi k8s pod, PostgreSQL 18. `svec_ann_scan` (C-level).
+
+### Cross-query recall (100 queries, self-match excluded)
+
+| Config | R@1 | Recall@10 | Avg latency |
+|---|---|---|---|
+| nprobe=1, PQ-only | 54% | 48% | 5.5 ms |
+| nprobe=3, PQ-only | 79% | 71% | 8 ms |
+| nprobe=3, rerank=96 | 82% | 74% | 10 ms |
+| nprobe=5, rerank=96 | 89% | 86% | 12 ms |
+| nprobe=10, rerank=200 | 97% | 94% | 22 ms |
+
+Self-query (vector in dataset): R@1 = 100% at nprobe=3 / 8 ms.
+
+### Comparison with pgvector HNSW
+
+Same dataset (103K × 2880-dim), same k8s pod.
+
+| Method | R@1 | Avg latency | Index size |
+|---|---|---|---|
+| Exact brute-force (svec `<=>`) | 100% | 996 ms | — |
+| pgvector HNSW ef=100 | 97% | 14 ms | 806 MB |
+| IVF-PQ nprobe=10, rerank=200 | 97% | 22 ms | 27 MB |
+
+### Self-query vs cross-query
+
+**Self-query**: query vector is in the dataset (typical RAG case — you
+embedded documents, now you search them). The vector is always found as its
+own closest neighbor, so R@1 = 100%.
+
+**Cross-query**: query vector is NOT in the dataset (e.g., user question
+embedded at search time). R@1 depends on nprobe and PQ fidelity.
+
+When comparing benchmarks, verify whether self-match is included or excluded.
+The tables above use cross-query (self-match excluded) for honest comparison.
+
+---
+
 ## Methodology notes
 
 - **EXPLAIN ANALYZE:** warm cache (pg_prewarm), average of 5 runs, actual
@@ -105,3 +146,7 @@ heap-without-index -- roughly 30% less than heap + btree at scale.
   management, query dispatch); useful for relative throughput comparison
 - **INSERT:** COPY path via `INSERT ... SELECT generate_series()`
 - **Compact time:** wall-clock time for `sorted_heap_compact()` on warm data
+- **Vector search:** 100 random queries from the dataset, self-match excluded
+  by requesting `lim := 11` and taking positions 2–11. Ground truth via exact
+  brute-force cosine (`<=>` operator). Latency measured via `clock_timestamp()`
+  per-query in PL/pgSQL loop (20 queries, warm cache)

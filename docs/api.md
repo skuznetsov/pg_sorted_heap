@@ -1,7 +1,7 @@
 ---
 layout: default
 title: SQL API
-nav_order: 4
+nav_order: 5
 ---
 
 # SQL API Reference
@@ -143,3 +143,78 @@ scan pruning without a manual compact step.
 ```sql
 SET sorted_heap.vacuum_rebuild_zonemap = off;
 ```
+
+---
+
+## Vector search
+
+See the [Vector Search guide](vector-search) for a full tutorial.
+
+### `svec_ann_train(source_query, nlist, m, n_iter, max_samples)`
+
+Trains both IVF centroids and raw PQ codebook from a SQL query returning
+`svec` vectors. Returns `(ivf_cb_id, pq_cb_id)`.
+
+```sql
+SELECT * FROM svec_ann_train(
+    'SELECT embedding FROM my_table',
+    nlist := 64, m := 192);
+```
+
+### `svec_pq_train_residual(source_query, m, ivf_cb_id, n_iter, max_samples)`
+
+Trains a residual PQ codebook on `(vector − nearest IVF centroid)` residuals.
+Higher recall than raw PQ at no additional storage cost.
+
+```sql
+SELECT svec_pq_train_residual(
+    'SELECT embedding FROM my_table',
+    m := 192, ivf_cb_id := 1);
+```
+
+### `svec_ann_scan(tbl, query, nprobe, lim, rerank_topk, cb_id, ivf_cb_id, pq_column)`
+
+C-level IVF-PQ scan — fastest path. Performs IVF probe, PQ ADC, top-K selection,
+and optional exact cosine reranking in a single C function call.
+
+```sql
+-- PQ-only (fastest)
+SELECT * FROM svec_ann_scan('my_table', query_vec,
+    nprobe := 3, lim := 10, cb_id := 2, ivf_cb_id := 1);
+
+-- With exact reranking
+SELECT * FROM svec_ann_scan('my_table', query_vec,
+    nprobe := 10, lim := 10, rerank_topk := 200,
+    cb_id := 2, ivf_cb_id := 1);
+```
+
+| Parameter | Default | Description |
+|---|---|---|
+| tbl | — | Table name (regclass) |
+| query | — | Query vector (svec) |
+| nprobe | 10 | Number of IVF partitions to probe |
+| lim | 10 | Number of results to return |
+| rerank_topk | 0 | If > 0, rerank this many PQ candidates with exact cosine |
+| cb_id | 1 | PQ codebook ID |
+| ivf_cb_id | 0 | IVF codebook ID (> 0 enables residual PQ mode) |
+| pq_column | 'pq_code' | Name of the PQ code column |
+
+### `svec_ann_search(tbl, query, nprobe, lim, rerank_topk, cb_id)`
+
+SQL-level IVF-PQ search. Same interface as `svec_ann_scan` but implemented in
+PL/pgSQL. Useful for debugging and when `svec_ann_scan` is not available.
+
+### `svec_ivf_assign(vec, cb_id)`
+
+Returns the nearest IVF centroid ID for a vector. Used in generated columns
+to assign rows to partitions.
+
+### `svec_ivf_probe(vec, nprobe, cb_id)`
+
+Returns an array of the `nprobe` nearest IVF centroid IDs. Used in WHERE
+clauses to filter candidates.
+
+### `svec_pq_encode(vec, cb_id)` / `svec_pq_encode_residual(vec, centroid_id, pq_cb_id, ivf_cb_id)`
+
+Encode a vector as an M-byte PQ code. The residual variant encodes
+`(vec − centroid)` for use with residual PQ codebooks.
