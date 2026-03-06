@@ -164,15 +164,16 @@ no pgvector dependency, no 800 MB HNSW graph.
 | | pg_sorted_heap IVF-PQ | pgvector HNSW |
 |---|---|---|
 | Index size (103K × 2880-dim) | **27 MB** (PQ codes) | 806 MB (full vectors) |
-| Recall@10 | **100%** (pool=200) | 97.7% |
-| Latency | 60 ms | 14 ms |
+| Recall@10 | 79–88% (tunable) | 97% |
+| Latency (warm, single query) | **5 ms** PQ-only | 14 ms |
+| Latency (avg over 20 queries) | 13–21 ms PQ-only | 14 ms |
 | Separate index needed? | No — PK prefix is the IVF | Yes — HNSW graph |
 | External dependency | None | pgvector extension |
 | Scales to 1M vectors | ~260 MB | ~8 GB |
 
-PQ trades some latency for 30x smaller storage and higher recall. At scale,
-the storage difference dominates: 8 GB HNSW index vs 260 MB PQ codes at 1M
-vectors.
+PQ is competitive on latency (5 ms warm) and 30x smaller on storage.
+Recall is tunable via `nprobe` and `rerank_topk`. At scale, the storage
+difference dominates: 8 GB HNSW index vs 260 MB PQ codes at 1M vectors.
 
 ### svec type
 
@@ -226,7 +227,7 @@ SELECT pg_sorted_heap.sorted_heap_compact('vectors');
 SELECT * FROM pg_sorted_heap.svec_ann_search(
     'vectors', query_vec, nprobe := 10, lim := 10);
 
--- 5b. Search with exact reranking (highest recall, ~60ms)
+-- 5b. Search with exact reranking (higher recall)
 SELECT * FROM pg_sorted_heap.svec_ann_search(
     'vectors', query_vec, nprobe := 10, lim := 10, rerank_topk := 200);
 
@@ -244,7 +245,7 @@ query vector
     │     → partition_id IN (3, 17, 42, ...)
     │
     ├─ PQ ADC scan: for each candidate row, sum M precomputed distances
-    │     → O(M) per row using 180-byte PQ code (no TOAST decompression)
+    │     → O(M) per row using M-byte PQ code (no TOAST decompression)
     │
     ├─ Top-K: max-heap selects best candidates
     │
@@ -255,22 +256,27 @@ Physical clustering by `(partition_id, id)` means IVF probe translates directly
 to a contiguous block range scan — sorted_heap's zone map skips all other
 partitions at the I/O level.
 
-### Performance (103K vectors, 2880-dim)
+### Performance (103K vectors, 2880-dim, 1 Gi k8s pod)
+
+`svec_ann_scan` (C-level IVF-PQ), M=720, 256 IVF partitions,
+20 queries averaged:
+
+| nprobe | rerank | Avg latency | Recall@10 |
+|---|---|---|---|
+| 5 | — | 13 ms | 76% |
+| 10 | — | 21 ms | 79% |
+| 20 | — | 35 ms | 83% |
+| 10 | top-200 | 93 ms | 89% |
+
+Single warm query (buffers cached): **5.2 ms** (nprobe=10, PQ-only).
+
+For comparison:
 
 | Method | Recall@10 | Avg latency | Index size |
 |---|---|---|---|
-| Exact brute-force | 10.0/10 | 996 ms | — |
-| pgvector HNSW ef=100 | 9.7/10 | 14 ms | 806 MB |
-| PQ two-phase pool=200 | 10.0/10 | 60 ms | 27 MB |
-
-PQ timing breakdown (single query):
-
-| Phase | Time |
-|---|---|
-| Distance table precompute | 15.6 ms |
-| ADC scan (103K codes) | 25.5 ms |
-| Exact rerank (200 candidates) | 22.8 ms |
-| **Total** | **63.9 ms** |
+| Exact brute-force | 100% | 996 ms | — |
+| pgvector HNSW ef=100 | 97% | 14 ms | 806 MB |
+| IVF-PQ nprobe=10 | 79% | 21 ms | 27 MB |
 
 ## SQL API
 
