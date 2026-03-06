@@ -584,7 +584,7 @@ BEGIN
     IF rerank_topk > 0 THEN
         -- Two-stage: PQ coarse → exact cosine rerank
         _sql := format(
-            'SELECT c.id, c.embedding::text::@extschema@.svec <=> $1 AS distance
+            'SELECT c.id, c.embedding::@extschema@.svec <=> $1 AS distance
              FROM (
                  SELECT i.id, i.embedding
                  FROM %s i
@@ -592,7 +592,7 @@ BEGIN
                  ORDER BY @extschema@.svec_pq_adc($1, i.pq_code, $5)
                  LIMIT $4
              ) c
-             ORDER BY c.embedding::text::@extschema@.svec <=> $1
+             ORDER BY c.embedding::@extschema@.svec <=> $1
              LIMIT $3',
             tbl);
         RETURN QUERY EXECUTE _sql USING query, nprobe, lim, rerank_topk, cb_id;

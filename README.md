@@ -152,6 +152,126 @@ make test-dump-restore         # pg_dump/restore lifecycle (10 checks)
 make test-pg-upgrade           # pg_upgrade 17->18 (13 checks)
 ```
 
+## Vector search
+
+pg_sorted_heap includes a built-in vector type (`svec`) and IVF-PQ approximate
+nearest neighbor search. The key insight: sorted_heap's physical clustering by
+primary key prefix **is** the inverted file index — no separate index structure,
+no pgvector dependency, no 800 MB HNSW graph.
+
+### Why not pgvector?
+
+| | pg_sorted_heap IVF-PQ | pgvector HNSW |
+|---|---|---|
+| Index size (103K × 2880-dim) | **27 MB** (PQ codes) | 806 MB (full vectors) |
+| Recall@10 | **100%** (pool=200) | 97.7% |
+| Latency | 60 ms | 14 ms |
+| Separate index needed? | No — PK prefix is the IVF | Yes — HNSW graph |
+| External dependency | None | pgvector extension |
+| Scales to 1M vectors | ~260 MB | ~8 GB |
+
+PQ trades some latency for 30x smaller storage and higher recall. At scale,
+the storage difference dominates: 8 GB HNSW index vs 260 MB PQ codes at 1M
+vectors.
+
+### svec type
+
+```sql
+-- Declare a 768-dimensional vector column
+CREATE TABLE items (
+    id    text PRIMARY KEY,
+    embedding svec(768)
+) USING sorted_heap;
+
+-- Insert with bracket notation
+INSERT INTO items VALUES ('doc1', '[0.1, 0.2, 0.3, ...]');
+
+-- Cosine distance operator
+SELECT a.id, a.embedding <=> b.embedding AS distance
+FROM items a, items b
+WHERE a.id = 'doc1' AND b.id = 'doc2';
+```
+
+### ANN search workflow
+
+```sql
+-- 1. Create table with IVF partition + PQ code as generated columns
+CREATE TABLE vectors (
+    id           text,
+    partition_id int2 GENERATED ALWAYS AS (
+                     pg_sorted_heap.svec_ivf_assign(embedding)) STORED,
+    embedding    pg_sorted_heap.svec(2880),
+    pq_code      bytea GENERATED ALWAYS AS (
+                     pg_sorted_heap.svec_pq_encode(embedding)) STORED,
+    PRIMARY KEY (partition_id, id)
+) USING sorted_heap;
+
+-- 2. Load data (COPY path sorts by PK automatically)
+INSERT INTO vectors (id, embedding)
+SELECT id, embedding FROM source_table;
+SELECT pg_sorted_heap.sorted_heap_compact('vectors');
+
+-- 3. Train IVF centroids + PQ codebook
+SELECT * FROM pg_sorted_heap.svec_ann_train(
+    'SELECT embedding FROM vectors',
+    nlist := 64,    -- IVF partitions
+    m := 180        -- PQ subvectors (2880/180 = 16-dim each)
+);
+
+-- 4. Re-encode with trained codebook (updates generated columns)
+-- After training, compact again to re-cluster by new partition_id
+SELECT pg_sorted_heap.sorted_heap_compact('vectors');
+
+-- 5. Search — PQ-only (fastest, ~40ms)
+SELECT * FROM pg_sorted_heap.svec_ann_search(
+    'vectors', query_vec, nprobe := 10, lim := 10);
+
+-- 5b. Search with exact reranking (highest recall, ~60ms)
+SELECT * FROM pg_sorted_heap.svec_ann_search(
+    'vectors', query_vec, nprobe := 10, lim := 10, rerank_topk := 200);
+
+-- 5c. C-level scan (maximum throughput, same API)
+SELECT * FROM pg_sorted_heap.svec_ann_scan(
+    'vectors', query_vec, nprobe := 10, lim := 10, rerank_topk := 200);
+```
+
+### How IVF-PQ works
+
+```
+query vector
+    │
+    ├─ IVF probe: find nearest nprobe centroids (nprobe × L2 distance)
+    │     → partition_id IN (3, 17, 42, ...)
+    │
+    ├─ PQ ADC scan: for each candidate row, sum M precomputed distances
+    │     → O(M) per row using 180-byte PQ code (no TOAST decompression)
+    │
+    ├─ Top-K: max-heap selects best candidates
+    │
+    └─ Optional rerank: exact cosine on top-200 → return top-10
+```
+
+Physical clustering by `(partition_id, id)` means IVF probe translates directly
+to a contiguous block range scan — sorted_heap's zone map skips all other
+partitions at the I/O level.
+
+### Performance (103K vectors, 2880-dim)
+
+| Method | Recall@10 | Avg latency | Index size |
+|---|---|---|---|
+| Exact brute-force | 10.0/10 | 996 ms | — |
+| pgvector HNSW ef=100 | 9.7/10 | 14 ms | 806 MB |
+| PQ two-phase pool=200 | 10.0/10 | 60 ms | 27 MB |
+
+PQ timing breakdown (single query):
+
+| Phase | Time |
+|---|---|
+| Distance table precompute | 15.6 ms |
+| ADC scan (103K codes) | 25.5 ms |
+| Exact rerank (200 candidates) | 22.8 ms |
+| **Total** | **63.9 ms** |
+
 ## SQL API
 
 ### Compaction
@@ -232,6 +352,9 @@ CREATE INDEX ON t USING btree (key_col);
 | `sorted_heap_scan.c` | 1,547 | Custom scan provider: planner hook, parallel scan, multi-col pruning, runtime params |
 | `sorted_heap_online.c` | 1,053 | Online compact + online merge: trigger, copy, replay, swap |
 | `pg_sorted_heap.c` | 1,537 | Extension entry point, legacy clustered index AM, GUC registration |
+| `svec.h` / `svec.c` | 35 + 280 | svec vector type: I/O, typmod, cosine distance `<=>` |
+| `sorted_vector_hash.c` | 590 | Vector hash functions: SimHash, VQ, RVQ, RPVQ, CVQ |
+| `pq.h` / `pq.c` | 55 + 2,568 | Product Quantization, IVF, ANN scan (training, encode, ADC, top-K) |
 
 ### Zone map details
 

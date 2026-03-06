@@ -50,6 +50,10 @@ normalize_vector(float *v, int dim)
 		norm += (double) v[i] * v[i];
 
 	norm = sqrt(norm);
+	if (!isfinite(norm))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("vector contains NaN or Inf values")));
 	if (norm < 1e-30)
 		return;					/* zero vector, leave as-is */
 
@@ -2378,15 +2382,19 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 	}
 	pfree(centroid_dists);
 
-	/* ---- Step 3: SPI fetch candidate rows ---- */
+	/* ---- Resolve table and extension names (used by Steps 3 & 6) ---- */
 	caller_ctx = CurrentMemoryContext;
 	{
 		char	   *relname = get_rel_name(tbl_oid);
-		Oid			nspid = get_rel_namespace(tbl_oid);
-		char	   *nspname = get_namespace_name(nspid);
-		const char *qname = quote_qualified_identifier(nspname, relname);
+		Oid			rel_nspid = get_rel_namespace(tbl_oid);
+		char	   *rel_nspname = get_namespace_name(rel_nspid);
+		const char *qname = quote_qualified_identifier(rel_nspname, relname);
+		Oid			fn_nspid = get_func_namespace(fcinfo->flinfo->fn_oid);
+		char	   *fn_nspname = get_namespace_name(fn_nspid);
+		const char *qsvec = quote_qualified_identifier(fn_nspname, "svec");
 		StringInfoData sql;
 
+		/* ---- Step 3: SPI fetch candidate rows ---- */
 		initStringInfo(&sql);
 		appendStringInfo(&sql,
 						 "SELECT id::text, pq_code "
@@ -2411,136 +2419,128 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 		n_cand = (int) SPI_processed;
 		tuptable = SPI_tuptable;
 		tupdesc = tuptable->tupdesc;
-	}
 
-	/* ---- Step 4: ADC scan in tight C loop ---- */
-	{
-		MemoryContext old = MemoryContextSwitchTo(caller_ctx);
+		/* ---- Step 4: ADC scan in tight C loop ---- */
+		{
+			MemoryContext old = MemoryContextSwitchTo(caller_ctx);
 
-		heap = palloc(sizeof(TopKEntry) * effective_topk);
-		MemoryContextSwitchTo(old);
-	}
-	heap_size = 0;
+			heap = palloc(sizeof(TopKEntry) * effective_topk);
+			MemoryContextSwitchTo(old);
+		}
+		heap_size = 0;
 
-	for (i = 0; i < n_cand; i++)
-	{
-		bool	isnull;
-		Datum	code_d;
-		bytea  *code;
-		uint8  *codes;
-		int		code_len;
-		float	dist;
+		for (i = 0; i < n_cand; i++)
+		{
+			bool	isnull;
+			Datum	code_d;
+			bytea  *code;
+			uint8  *codes;
+			int		code_len;
+			float	dist;
 
-		code_d = SPI_getbinval(tuptable->vals[i], tupdesc, 2, &isnull);
-		if (isnull)
-			continue;
+			code_d = SPI_getbinval(tuptable->vals[i], tupdesc, 2, &isnull);
+			if (isnull)
+				continue;
 
-		code = DatumGetByteaPP(code_d);
-		codes = (uint8 *) VARDATA_ANY(code);
-		code_len = VARSIZE_ANY_EXHDR(code);
-		if (code_len != M)
-			continue;
+			code = DatumGetByteaPP(code_d);
+			codes = (uint8 *) VARDATA_ANY(code);
+			code_len = VARSIZE_ANY_EXHDR(code);
+			if (code_len != M)
+				continue;
 
-		dist = 0.0f;
-		for (m = 0; m < M; m++)
-			dist += dist_table[m * PQ_KSUB + codes[m]];
+			dist = 0.0f;
+			for (m = 0; m < M; m++)
+				dist += dist_table[m * PQ_KSUB + codes[m]];
 
-		topk_insert(heap, &heap_size, effective_topk, i, dist);
-	}
+			topk_insert(heap, &heap_size, effective_topk, i, dist);
+		}
 
-	/* ---- Step 5: Extract results into caller context ---- */
-	MemoryContextSwitchTo(caller_ctx);
-	results = palloc(sizeof(AnnResult) * heap_size);
-	for (j = 0; j < heap_size; j++)
-	{
-		int		idx = heap[j].idx;
-		bool	isnull;
-		Datum	id_d;
-
-		id_d = SPI_getbinval(tuptable->vals[idx], tupdesc, 1, &isnull);
-		results[j].id = isnull ? pstrdup("") : TextDatumGetCString(id_d);
-		results[j].distance = (float8) heap[j].dist;
-	}
-
-	/* ---- Step 6: Optional exact cosine reranking via second SPI query ---- */
-	if (rerank_topk > 0 && heap_size > 0)
-	{
-		char	   *relname = get_rel_name(tbl_oid);
-		Oid			nspid = get_rel_namespace(tbl_oid);
-		Oid			fn_nspid = get_func_namespace(fcinfo->flinfo->fn_oid);
-		char	   *nspname = get_namespace_name(nspid);
-		char	   *fn_nspname = get_namespace_name(fn_nspid);
-		const char *qname = quote_qualified_identifier(nspname, relname);
-		const char *qsvec = quote_qualified_identifier(fn_nspname, "svec");
-		char	   *query_text;
-		StringInfoData rerank_sql;
-
-		query_text = DatumGetCString(
-			DirectFunctionCall1(svec_out, PointerGetDatum(query)));
-
-		initStringInfo(&rerank_sql);
-		appendStringInfo(&rerank_sql,
-						 "SELECT id::text, "
-						 "(embedding <=> '%s'::%s(%d)) AS exact_dist "
-						 "FROM %s WHERE id IN (",
-						 query_text, qsvec, dim, qname);
-		pfree(query_text);
-		pfree(fn_nspname);
-
+		/* ---- Step 5: Extract results into caller context ---- */
+		MemoryContextSwitchTo(caller_ctx);
+		results = palloc(sizeof(AnnResult) * heap_size);
 		for (j = 0; j < heap_size; j++)
 		{
-			char *esc = quote_literal_cstr(results[j].id);
+			int		idx = heap[j].idx;
+			bool	isnull;
+			Datum	id_d;
 
-			if (j > 0) appendStringInfoChar(&rerank_sql, ',');
-			appendStringInfoString(&rerank_sql, esc);
-			pfree(esc);
+			id_d = SPI_getbinval(tuptable->vals[idx], tupdesc, 1, &isnull);
+			results[j].id = isnull ? pstrdup("") : TextDatumGetCString(id_d);
+			results[j].distance = (float8) heap[j].dist;
 		}
-		appendStringInfoChar(&rerank_sql, ')');
 
-		ret = SPI_execute(rerank_sql.data, true, 0);
-		pfree(rerank_sql.data);
-
-		if (ret == SPI_OK_SELECT)
+		/* ---- Step 6: Optional exact cosine reranking ---- */
+		if (rerank_topk > 0 && heap_size > 0)
 		{
-			SPITupleTable *rt = SPI_tuptable;
-			TupleDesc	rd = rt->tupdesc;
-			int			nrows = (int) SPI_processed;
+			char	   *query_text;
+			StringInfoData rerank_sql;
 
-			for (i = 0; i < nrows; i++)
+			query_text = DatumGetCString(
+				DirectFunctionCall1(svec_out, PointerGetDatum(query)));
+
+			initStringInfo(&rerank_sql);
+			appendStringInfo(&rerank_sql,
+							 "SELECT id::text, "
+							 "(embedding <=> '%s'::%s(%d)) AS exact_dist "
+							 "FROM %s WHERE id IN (",
+							 query_text, qsvec, dim, qname);
+			pfree(query_text);
+
+			for (j = 0; j < heap_size; j++)
 			{
-				bool	isnull;
-				Datum	id_d, dist_d;
-				char   *rid;
+				char *esc = quote_literal_cstr(results[j].id);
 
-				id_d = SPI_getbinval(rt->vals[i], rd, 1, &isnull);
-				if (isnull) continue;
-				rid = TextDatumGetCString(id_d);
+				if (j > 0) appendStringInfoChar(&rerank_sql, ',');
+				appendStringInfoString(&rerank_sql, esc);
+				pfree(esc);
+			}
+			appendStringInfoChar(&rerank_sql, ')');
 
-				dist_d = SPI_getbinval(rt->vals[i], rd, 2, &isnull);
-				if (isnull) continue;
+			ret = SPI_execute(rerank_sql.data, true, 0);
+			pfree(rerank_sql.data);
 
-				/* Find matching result and update distance */
-				for (j = 0; j < heap_size; j++)
+			if (ret == SPI_OK_SELECT)
+			{
+				SPITupleTable *rt = SPI_tuptable;
+				TupleDesc	rd = rt->tupdesc;
+				int			nrows = (int) SPI_processed;
+
+				for (i = 0; i < nrows; i++)
 				{
-					if (strcmp(results[j].id, rid) == 0)
+					bool	isnull;
+					Datum	id_d, dist_d;
+					char   *rid;
+
+					id_d = SPI_getbinval(rt->vals[i], rd, 1, &isnull);
+					if (isnull) continue;
+					rid = TextDatumGetCString(id_d);
+
+					dist_d = SPI_getbinval(rt->vals[i], rd, 2, &isnull);
+					if (isnull) continue;
+
+					/* Find matching result and update distance */
+					for (j = 0; j < heap_size; j++)
 					{
-						results[j].distance = DatumGetFloat8(dist_d);
-						break;
+						if (strcmp(results[j].id, rid) == 0)
+						{
+							results[j].distance = DatumGetFloat8(dist_d);
+							break;
+						}
 					}
 				}
 			}
+
+			qsort(results, heap_size, sizeof(AnnResult), cmp_ann_result);
+			if (heap_size > lim)
+				heap_size = lim;
+		}
+		else
+		{
+			qsort(results, heap_size, sizeof(AnnResult), cmp_ann_result);
 		}
 
-		qsort(results, heap_size, sizeof(AnnResult), cmp_ann_result);
-		if (heap_size > lim)
-			heap_size = lim;
+		SPI_finish();
 	}
-	else
-	{
-		qsort(results, heap_size, sizeof(AnnResult), cmp_ann_result);
-	}
-
-	SPI_finish();
 
 	/* ---- Step 7: Write to tuplestore ---- */
 	for (j = 0; j < heap_size; j++)
