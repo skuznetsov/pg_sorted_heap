@@ -256,8 +256,8 @@ echo "--- Test 2B: concurrent merge_online x2 ---"
 
 PSQL -c "
 INSERT INTO conc_guard_test
-  SELECT g, 'overlap'
-  FROM generate_series(-5000, -1) g
+  SELECT g, repeat('y', 2000)
+  FROM generate_series(-100000, -1) g
   ON CONFLICT (id) DO NOTHING;
 "
 pre_count=$(PSQL -c "SELECT count(*) FROM conc_guard_test")
@@ -292,8 +292,8 @@ echo "--- Test 2C: compact_online vs merge_online ---"
 
 PSQL -c "
 INSERT INTO conc_guard_test
-  SELECT g, 'overlap2'
-  FROM generate_series(-10000, -5001) g
+  SELECT g, repeat('z', 2000)
+  FROM generate_series(-200000, -100001) g
   ON CONFLICT (id) DO NOTHING;
 "
 pre_count=$(PSQL -c "SELECT count(*) FROM conc_guard_test")
