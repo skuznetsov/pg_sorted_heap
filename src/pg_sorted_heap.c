@@ -46,7 +46,7 @@ PG_FUNCTION_INFO_V1(pg_sorted_heap_locator_cmp);
 PG_FUNCTION_INFO_V1(pg_sorted_heap_locator_advance_major);
 PG_FUNCTION_INFO_V1(pg_sorted_heap_locator_next_minor);
 
-#define CLUSTERED_PG_EXTENSION_VERSION "0.9.7"
+#define CLUSTERED_PG_EXTENSION_VERSION "0.9.8"
 #define CLUSTERED_PG_OBS_API_VERSION 1
 
 typedef struct ClusteredPgStats

@@ -1,7 +1,7 @@
 CREATE EXTENSION pg_sorted_heap;
 SELECT public.version();
 SELECT public.pg_sorted_heap_observability() AS observability_bootstrap;
-SELECT (public.pg_sorted_heap_observability() ~ 'pg_sorted_heap=0.9.7') AS observability_probe;
+SELECT (public.pg_sorted_heap_observability() ~ 'pg_sorted_heap=0.9.8') AS observability_probe;
 
 -- ====================================================================
 -- Functional regression tests: multi-type index, JOIN UNNEST rescan,
@@ -2069,5 +2069,74 @@ DEALLOCATE ALL;
 DROP TABLE sh17;
 
 DROP FUNCTION sh6_plan_contains(text, text);
+
+-- ================================================================
+-- SH18: hsvec (half-precision float16 vector) type
+-- Tests I/O, typmod, cosine distance, casts, precision, edge cases.
+-- ================================================================
+
+-- SH18-1: Text I/O roundtrip
+SELECT '[1.5,2.0,3.0]'::hsvec;
+SELECT '[0,0,0,0]'::hsvec;
+SELECT '[-1.0, 0.5, 1.0]'::hsvec;
+
+-- SH18-2: Typmod parsing
+SELECT '[1,2,3]'::hsvec(3);
+
+-- SH18-3: Dimension limits — 1 dim ok, 32001 rejected
+SELECT '[42]'::hsvec AS dim_1;
+\set ON_ERROR_STOP off
+SELECT ('[' || array_to_string(array_fill(1.0::float, ARRAY[32001]), ',') || ']')::hsvec;
+\set ON_ERROR_STOP on
+
+-- SH18-4: Parse errors
+\set ON_ERROR_STOP off
+SELECT '1,2,3'::hsvec;
+SELECT '[1,2,3'::hsvec;
+SELECT '[]'::hsvec;
+\set ON_ERROR_STOP on
+
+-- SH18-5: Cosine distance — identical vectors = 0
+SELECT ('[1,0,0]'::hsvec <=> '[1,0,0]'::hsvec) AS dist_identical;
+
+-- SH18-6: Cosine distance — orthogonal vectors = 1
+SELECT ('[1,0,0]'::hsvec <=> '[0,1,0]'::hsvec) AS dist_orthogonal;
+
+-- SH18-7: Cosine distance — opposite vectors = 2
+SELECT ('[1,0,0]'::hsvec <=> '[-1,0,0]'::hsvec) AS dist_opposite;
+
+-- SH18-8: Cosine distance — zero vector = NaN
+SELECT ('[1,0,0]'::hsvec <=> '[0,0,0]'::hsvec) AS dist_zero;
+
+-- SH18-9: Cosine distance — dimension mismatch
+\set ON_ERROR_STOP off
+SELECT '[1,2]'::hsvec <=> '[1,2,3]'::hsvec;
+\set ON_ERROR_STOP on
+
+-- SH18-10: Cast hsvec → svec (implicit, lossless)
+SELECT pg_typeof('[1,2,3]'::hsvec::svec) AS cast_type;
+SELECT '[1,2,3]'::hsvec::svec;
+
+-- SH18-11: Cast svec → hsvec (assignment, lossy)
+SELECT pg_typeof('[1,2,3]'::svec::hsvec) AS cast_type;
+SELECT '[1,2,3]'::svec::hsvec;
+
+-- SH18-12: Precision — fp16 roundtrip preserves typical values
+SELECT '[0.5,1.0,2.0,0.25,0.125]'::hsvec;
+
+-- SH18-13: hsvec cosine matches svec cosine within fp16 precision
+SELECT
+    abs(('[0.3,0.7,0.1]'::hsvec <=> '[0.9,0.2,0.5]'::hsvec)
+      - ('[0.3,0.7,0.1]'::svec  <=> '[0.9,0.2,0.5]'::svec)) < 0.01 AS dist_close;
+
+-- SH18-14: hsvec in table column
+CREATE TABLE sh18_vec(id serial, v hsvec(3));
+INSERT INTO sh18_vec(v) VALUES ('[1,0,0]'), ('[0,1,0]'), ('[0,0,1]');
+SELECT id, v FROM sh18_vec ORDER BY id;
+SELECT id, v <=> '[1,0,0]'::hsvec AS dist FROM sh18_vec ORDER BY dist;
+DROP TABLE sh18_vec;
+
+-- SH18-15: Implicit cast allows hsvec in svec functions
+SELECT svec_cosine_distance('[1,0,0]'::hsvec, '[0,1,0]'::hsvec) AS implicit_cast_dist;
 
 DROP EXTENSION pg_sorted_heap;
