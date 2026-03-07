@@ -55,7 +55,7 @@ trap cleanup EXIT
 
 # --- Create ephemeral cluster ---
 TMP_DIR="$(mktemp -d "$TMP_ROOT/pg_crud_bench.XXXXXX")"
-make -C "$ROOT_DIR" install >/dev/null 2>&1 || true
+make -C "$ROOT_DIR" install >/dev/null 2>&1 || { echo "FATAL: make install failed" >&2; exit 1; }
 "$PG_BINDIR/initdb" -D "$TMP_DIR/data" -A trust --no-locale >/dev/null 2>&1
 
 cat >> "$TMP_DIR/data/postgresql.conf" <<PGCONF
