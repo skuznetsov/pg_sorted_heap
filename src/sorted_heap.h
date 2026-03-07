@@ -129,6 +129,7 @@ typedef struct SortedHeapRelInfo
 	uint32		zm_overflow_nentries;		/* entries in overflow pages */
 	uint32		zm_total_entries;			/* zm_nentries + zm_overflow_nentries */
 	uint32		zm_overflow_npages;			/* number of overflow pages */
+	uint64		zm_gen;						/* generation when zone map was loaded */
 } SortedHeapRelInfo;
 
 /*
@@ -162,6 +163,8 @@ extern Datum sorted_heap_compact_online(PG_FUNCTION_ARGS);
 extern Datum sorted_heap_merge(PG_FUNCTION_ARGS);
 extern Datum sorted_heap_merge_online(PG_FUNCTION_ARGS);
 extern BlockNumber sorted_heap_detect_sorted_prefix(SortedHeapRelInfo *info);
+extern void sorted_heap_bump_zm_generation(void);
+extern uint64 sorted_heap_read_zm_generation(void);
 extern void sorted_heap_zonemap_load(Relation rel, SortedHeapRelInfo *info);
 extern void sorted_heap_rebuild_zonemap_internal(Relation rel, Oid pk_typid,
 												 AttrNumber pk_attnum,
@@ -174,6 +177,7 @@ typedef struct SortedHeapSharedStats
 	pg_atomic_uint64 total_scans;
 	pg_atomic_uint64 blocks_scanned;
 	pg_atomic_uint64 blocks_pruned;
+	pg_atomic_uint64 zm_generation;		/* bumped on any zone map mutation */
 } SortedHeapSharedStats;
 
 /* GUC variables */

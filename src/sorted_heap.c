@@ -317,6 +317,19 @@ sorted_heap_get_relinfo(Relation rel)
 		info->zm_overflow_npages = 0;
 		info->zm_col2_usable = false;
 		info->zm_pk_typid2 = InvalidOid;
+		info->zm_gen = 0;
+	}
+	else
+	{
+		/*
+		 * Cross-backend cache invalidation: if another backend mutated
+		 * the zone map, our cached zm_sorted / zm_scan_valid may be stale.
+		 * Force reload from disk on generation mismatch.
+		 */
+		uint64	current_gen = sorted_heap_read_zm_generation();
+
+		if (current_gen != 0 && info->zm_gen != current_gen)
+			info->zm_loaded = false;
 	}
 
 	if (!info->pk_probed)
@@ -586,6 +599,7 @@ sorted_heap_zonemap_load(Relation rel, SortedHeapRelInfo *info)
 		info->zm_total_entries = 0;
 		info->zm_overflow_npages = 0;
 		info->zm_loaded = true;
+		info->zm_gen = sorted_heap_read_zm_generation();
 		UnlockReleaseBuffer(metabuf);
 		return;
 	}
@@ -692,6 +706,7 @@ sorted_heap_zonemap_load(Relation rel, SortedHeapRelInfo *info)
 		}
 
 		info->zm_loaded = true;
+		info->zm_gen = sorted_heap_read_zm_generation();
 		return;
 	}
 
@@ -878,11 +893,13 @@ sorted_heap_zonemap_load(Relation rel, SortedHeapRelInfo *info)
 			info->zm_overflow_nentries = total_overflow;
 			info->zm_total_entries = n + total_overflow;
 			info->zm_loaded = true;
+			info->zm_gen = sorted_heap_read_zm_generation();
 			return;		/* already released metabuf */
 		}
 	}
 
 	info->zm_loaded = true;
+	info->zm_gen = sorted_heap_read_zm_generation();
 	UnlockReleaseBuffer(metabuf);
 }
 
@@ -947,6 +964,9 @@ sorted_heap_zonemap_flush(Relation rel, SortedHeapRelInfo *info)
 
 	GenericXLogFinish(state);
 	UnlockReleaseBuffer(metabuf);
+
+	/* Notify other backends that zone map changed */
+	sorted_heap_bump_zm_generation();
 }
 
 /* ----------------------------------------------------------------
@@ -1266,6 +1286,7 @@ sorted_heap_rebuild_zonemap_internal(Relation rel, Oid pk_typid,
 
 	/* Invalidate relinfo cache so next access re-reads */
 	sorted_heap_relinfo_invalidate(RelationGetRelid(rel));
+	sorted_heap_bump_zm_generation();
 }
 
 /* ----------------------------------------------------------------
@@ -1542,6 +1563,7 @@ sorted_heap_multi_insert(Relation rel, TupleTableSlot **slots,
 	if (info->zm_usable)
 	{
 		bool	zm_dirty = false;
+		bool	needs_invalidate = false;
 		int		i;
 
 		if (!info->zm_loaded)
@@ -1561,7 +1583,15 @@ sorted_heap_multi_insert(Relation rel, TupleTableSlot **slots,
 				continue;		/* skip meta page */
 			zmidx = blk - 1;	/* data block 1 → index 0 */
 			if (zmidx >= SORTED_HEAP_ZONEMAP_MAX)
-				continue;		/* beyond meta page capacity */
+			{
+				/*
+				 * Block beyond inline meta page capacity.  We can't update
+				 * overflow entries here, so invalidate zone map to prevent
+				 * stale overflow entries from causing incorrect pruning.
+				 */
+				needs_invalidate = true;
+				continue;
+			}
 
 			val = slot_getattr(slots[i], info->attNums[0], &isnull);
 			if (isnull)
@@ -1618,6 +1648,41 @@ sorted_heap_multi_insert(Relation rel, TupleTableSlot **slots,
 
 		if (zm_dirty)
 			sorted_heap_zonemap_flush(rel, info);
+
+		if (needs_invalidate && info->zm_scan_valid)
+		{
+			/*
+			 * At least one tuple landed on a page beyond inline zone map
+			 * capacity.  Invalidate zone map validity on disk so other
+			 * backends also see it, same as single-insert uncovered path.
+			 */
+			Buffer				metabuf;
+			Page				metapage;
+			SortedHeapMetaPageData *meta;
+
+			metabuf = ReadBufferExtended(rel, MAIN_FORKNUM,
+										 SORTED_HEAP_META_BLOCK,
+										 RBM_NORMAL, NULL);
+			LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+			metapage = BufferGetPage(metabuf);
+			meta = (SortedHeapMetaPageData *)
+				PageGetSpecialPointer(metapage);
+
+			if (meta->shm_flags & SHM_FLAG_ZONEMAP_VALID)
+			{
+				GenericXLogState *state = GenericXLogStart(rel);
+
+				metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
+				meta = (SortedHeapMetaPageData *)
+					PageGetSpecialPointer(metapage);
+				meta->shm_flags &= ~SHM_FLAG_ZONEMAP_VALID;
+				GenericXLogFinish(state);
+			}
+
+			UnlockReleaseBuffer(metabuf);
+			info->zm_scan_valid = false;
+			sorted_heap_bump_zm_generation();
+		}
 	}
 }
 
@@ -2002,6 +2067,7 @@ sorted_heap_tuple_insert(Relation rel, TupleTableSlot *slot,
 
 			UnlockReleaseBuffer(metabuf);
 			info->zm_scan_valid = false;
+			sorted_heap_bump_zm_generation();
 		}
 	}
 }

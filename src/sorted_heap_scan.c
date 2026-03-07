@@ -222,7 +222,28 @@ sorted_heap_shmem_startup(void)
 		pg_atomic_init_u64(&sh_shared_stats->total_scans, 0);
 		pg_atomic_init_u64(&sh_shared_stats->blocks_scanned, 0);
 		pg_atomic_init_u64(&sh_shared_stats->blocks_pruned, 0);
+		pg_atomic_init_u64(&sh_shared_stats->zm_generation, 1);
 	}
+}
+
+/*
+ * Zone map generation counter — cross-backend cache invalidation.
+ * Bumped by any zone map mutation; checked in sorted_heap_get_relinfo()
+ * to detect stale per-backend caches.
+ */
+void
+sorted_heap_bump_zm_generation(void)
+{
+	if (sh_shared_stats)
+		pg_atomic_fetch_add_u64(&sh_shared_stats->zm_generation, 1);
+}
+
+uint64
+sorted_heap_read_zm_generation(void)
+{
+	if (sh_shared_stats)
+		return pg_atomic_read_u64(&sh_shared_stats->zm_generation);
+	return 0;
 }
 
 /* ----------------------------------------------------------------
@@ -255,6 +276,7 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	BlockNumber			start_block, nblocks, total_blocks;
 	CustomPath		   *cpath;
 	double				sel;
+	bool				skip_narrow_dml;
 
 	/* Chain to previous hook */
 	if (prev_set_rel_pathlist_hook)
@@ -320,6 +342,15 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 		if (total_blocks <= 1)
 			return;
 
+		/*
+		 * For UPDATE/DELETE targeting this relation, skip CustomScan when the
+		 * block range is narrow (<=4 blocks).  IndexScan's direct TID access
+		 * beats CustomScan's per-block filtering for point DML, while
+		 * CustomScan's sequential I/O pattern still wins for wider ranges.
+		 */
+		skip_narrow_dml = (root->parse->commandType != CMD_SELECT &&
+						   (int) rti == root->parse->resultRelation);
+
 		/* Create CustomPath */
 		cpath = makeNode(CustomPath);
 		cpath->path.type = T_CustomPath;
@@ -343,9 +374,12 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 			if (nblocks >= total_blocks)
 				return;
 
+			if (skip_narrow_dml && nblocks <= 4)
+				return;
+
 			sel = (double) nblocks / (double) total_blocks;
-			cpath->path.rows = clamp_row_est(rel->rows * sel);
-			cpath->path.startup_cost = 0;
+			cpath->path.rows = rel->rows;
+			cpath->path.startup_cost = random_page_cost;
 			cpath->path.total_cost = seq_page_cost * nblocks +
 				cpu_tuple_cost * rel->tuples * sel +
 				cpu_operator_cost * rel->tuples * sel;
@@ -393,9 +427,12 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 			if (nblocks < 1)
 				nblocks = 1;
 
+			if (skip_narrow_dml && nblocks <= 4)
+				return;
+
 			sel = (double) nblocks / (double) total_blocks;
-			cpath->path.rows = clamp_row_est(rel->rows * sel);
-			cpath->path.startup_cost = 0;
+			cpath->path.rows = rel->rows;
+			cpath->path.startup_cost = random_page_cost;
 			cpath->path.total_cost = seq_page_cost * nblocks +
 				cpu_tuple_cost * rel->tuples * sel +
 				cpu_operator_cost * rel->tuples * sel;
@@ -825,7 +862,7 @@ sorted_heap_resolve_runtime_bounds(SortedHeapScanState *shstate)
 		i++;
 	}
 
-	/* Compute block range from zone map using resolved bounds */
+	/* Compute block range from zone map using current relation size */
 	shstate->total_blocks = RelationGetNumberOfBlocks(rel);
 	sorted_heap_compute_block_range(shstate->relinfo, &shstate->bounds,
 									shstate->total_blocks,
@@ -1268,12 +1305,29 @@ sorted_heap_scan_next(ScanState *ss)
 	CustomScanState *node = (CustomScanState *) ss;
 	SortedHeapScanState *shstate = (SortedHeapScanState *) node;
 	TupleTableSlot *slot = ss->ss_ScanTupleSlot;
+	SortedHeapRelInfo *info = shstate->relinfo;
+
+	/*
+	 * For narrow scans (<=4 blocks), heap_setscanlimits already restricts
+	 * to the matching blocks.  The per-block zone map check is redundant
+	 * because compute_block_range already verified overlap.
+	 */
+	bool		skip_zone_check = (shstate->scan_nblocks <= 4);
+
+	/*
+	 * For sorted zone maps (post-compact), tuples within each page are in
+	 * PK order.  We can skip tuples before the lower bound and stop early
+	 * once we pass the upper bound — avoiding both getnextslot and
+	 * ExecScan qual evaluation for non-matching tuples.
+	 */
+	bool		pk_prefilter = info->zm_sorted;
 
 	while (table_scan_getnextslot(shstate->heap_scan,
 								  ForwardScanDirection, slot))
 	{
 		BlockNumber blk = ItemPointerGetBlockNumber(&slot->tts_tid);
 		bool		new_block = (blk != shstate->last_blk);
+		bool		blk_in_prefix;
 
 		/* Track block transitions for EXPLAIN ANALYZE */
 		if (new_block)
@@ -1282,17 +1336,49 @@ sorted_heap_scan_next(ScanState *ss)
 			shstate->last_blk = blk;
 		}
 
+		blk_in_prefix = (blk >= 1 &&
+						 (blk - 1) < info->zm_total_entries);
+
 		/* Per-block zone map check for fine-grained pruning */
-		if (blk >= 1 && (blk - 1) < shstate->relinfo->zm_total_entries)
+		if (!skip_zone_check && blk_in_prefix)
 		{
 			SortedHeapZoneMapEntry *e =
-				sorted_heap_get_zm_entry(shstate->relinfo, blk - 1);
+				sorted_heap_get_zm_entry(info, blk - 1);
 
 			if (!sorted_heap_zone_overlaps(e, &shstate->bounds))
 			{
 				if (new_block)
 					shstate->pruned_blocks++;
 				continue;
+			}
+		}
+
+		/*
+		 * PK-ordered pre-filter: skip tuples below lower bound, terminate
+		 * scan once past upper bound.  Only safe for pages within the
+		 * sorted prefix (covered by monotonic zone map entries).
+		 */
+		if (pk_prefilter && blk_in_prefix)
+		{
+			bool	isnull;
+			Datum	pk_datum;
+			int64	pk_val;
+
+			pk_datum = slot_getattr(slot, info->attNums[0], &isnull);
+			if (!isnull &&
+				sorted_heap_key_to_int64(pk_datum, info->zm_pk_typid,
+										 &pk_val))
+			{
+				/* Below lower bound — skip without qual evaluation */
+				if (shstate->bounds.has_lo && pk_val < shstate->bounds.lo)
+					continue;
+
+				/*
+				 * Past upper bound — all remaining tuples are higher,
+				 * so terminate the scan immediately.
+				 */
+				if (shstate->bounds.has_hi && pk_val > shstate->bounds.hi)
+					return NULL;
 			}
 		}
 
