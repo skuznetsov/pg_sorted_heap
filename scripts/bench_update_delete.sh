@@ -152,11 +152,13 @@ for tbl in sh_bench heap_bench; do
   cat > "$TMP_DIR/bench/mixed_${tbl}.sql" <<SQL
 \\set r random(1, :scale)
 \\set op random(1, 10)
-SELECT CASE
-  WHEN :op <= 5 THEN (SELECT val FROM ${tbl} WHERE id = :r)
-  WHEN :op <= 8 THEN (SELECT val FROM (UPDATE ${tbl} SET val = 'mix-' || :r WHERE id = :r RETURNING val) t)
-  ELSE (SELECT val FROM (INSERT INTO ${tbl} VALUES (:r, (:r % 100)::int, 'new-' || :r) ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val RETURNING val) t)
-END;
+\\if :op <= 5
+SELECT val FROM ${tbl} WHERE id = :r;
+\\elif :op <= 8
+UPDATE ${tbl} SET val = 'mix-' || :r WHERE id = :r;
+\\else
+INSERT INTO ${tbl} VALUES (:r, (:r % 100)::int, 'new-' || :r) ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val;
+\\endif
 SQL
 done
 
