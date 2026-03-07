@@ -10,6 +10,7 @@
  */
 #include "postgres.h"
 
+#include "common/shortest_dec.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "libpq/pqformat.h"
@@ -127,6 +128,8 @@ hsvec_in(PG_FUNCTION_ARGS)
 
 /* ----------------------------------------------------------------
  *  Text output: Hsvec → '[1,2,3]'
+ *
+ *  Uses Ryu (float_to_shortest_decimal_bufn) for fast float-to-string.
  * ---------------------------------------------------------------- */
 PG_FUNCTION_INFO_V1(hsvec_out);
 Datum
@@ -134,22 +137,26 @@ hsvec_out(PG_FUNCTION_ARGS)
 {
 	Hsvec	   *vec = PG_GETARG_HSVEC_P(0);
 	int			dim = vec->dim;
-	StringInfoData buf;
+	char	   *buf;
+	char	   *ptr;
 	int			i;
 
-	initStringInfo(&buf);
-	appendStringInfoChar(&buf, '[');
+	buf = (char *) palloc(FLOAT_SHORTEST_DECIMAL_LEN * dim + 2);
+	ptr = buf;
+
+	*ptr++ = '[';
 
 	for (i = 0; i < dim; i++)
 	{
 		if (i > 0)
-			appendStringInfoChar(&buf, ',');
-		appendStringInfo(&buf, "%g", (double) HalfToFloat4(vec->x[i]));
+			*ptr++ = ',';
+		ptr += float_to_shortest_decimal_bufn(HalfToFloat4(vec->x[i]), ptr);
 	}
 
-	appendStringInfoChar(&buf, ']');
+	*ptr++ = ']';
+	*ptr = '\0';
 
-	PG_RETURN_CSTRING(buf.data);
+	PG_RETURN_CSTRING(buf);
 }
 
 /* ----------------------------------------------------------------

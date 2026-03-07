@@ -8,6 +8,7 @@
  */
 #include "postgres.h"
 
+#include "common/shortest_dec.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "libpq/pqformat.h"
@@ -124,6 +125,10 @@ svec_in(PG_FUNCTION_ARGS)
 
 /* ----------------------------------------------------------------
  *  Text output: Svec → '[1,2,3]'
+ *
+ *  Uses Ryu (float_to_shortest_decimal_bufn) for fast float-to-string
+ *  conversion — same approach as pgvector.  Pre-allocates the output
+ *  buffer to avoid StringInfo realloc overhead.
  * ---------------------------------------------------------------- */
 PG_FUNCTION_INFO_V1(svec_out);
 Datum
@@ -131,22 +136,33 @@ svec_out(PG_FUNCTION_ARGS)
 {
 	Svec	   *vec = PG_GETARG_SVEC_P(0);
 	int			dim = vec->dim;
-	StringInfoData buf;
+	char	   *buf;
+	char	   *ptr;
 	int			i;
 
-	initStringInfo(&buf);
-	appendStringInfoChar(&buf, '[');
+	/*
+	 * FLOAT_SHORTEST_DECIMAL_LEN (16) covers the longest float output
+	 * including NaN/Inf/sign/exponent plus NUL.  We need:
+	 *   dim * (FLOAT_SHORTEST_DECIMAL_LEN - 1) for values
+	 *   dim - 1 for commas
+	 *   3 for '[', ']', '\0'
+	 */
+	buf = (char *) palloc(FLOAT_SHORTEST_DECIMAL_LEN * dim + 2);
+	ptr = buf;
+
+	*ptr++ = '[';
 
 	for (i = 0; i < dim; i++)
 	{
 		if (i > 0)
-			appendStringInfoChar(&buf, ',');
-		appendStringInfo(&buf, "%g", (double) vec->x[i]);
+			*ptr++ = ',';
+		ptr += float_to_shortest_decimal_bufn(vec->x[i], ptr);
 	}
 
-	appendStringInfoChar(&buf, ']');
+	*ptr++ = ']';
+	*ptr = '\0';
 
-	PG_RETURN_CSTRING(buf.data);
+	PG_RETURN_CSTRING(buf);
 }
 
 /* ----------------------------------------------------------------
