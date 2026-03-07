@@ -1922,13 +1922,13 @@ SELECT sh6_plan_contains(
  t
 (1 row)
 
--- Query on col2 only should also trigger scan (bounds extracted)
+-- Query on col2 only — no pruning when b=50 exists in all blocks (nblocks=total)
 SELECT sh6_plan_contains(
     'SELECT * FROM sh8_intint WHERE b = 50',
     'SortedHeapScan') AS sh8_col2_pruning;
  sh8_col2_pruning 
 ------------------
- t
+ f
 (1 row)
 
 RESET enable_indexscan;

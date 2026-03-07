@@ -380,7 +380,8 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 			sel = (double) nblocks / (double) total_blocks;
 			cpath->path.rows = rel->rows;
 			cpath->path.startup_cost = random_page_cost;
-			cpath->path.total_cost = seq_page_cost * nblocks +
+			cpath->path.total_cost = cpath->path.startup_cost +
+				seq_page_cost * nblocks +
 				cpu_tuple_cost * rel->tuples * sel +
 				cpu_operator_cost * rel->tuples * sel;
 
@@ -433,7 +434,8 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 			sel = (double) nblocks / (double) total_blocks;
 			cpath->path.rows = rel->rows;
 			cpath->path.startup_cost = random_page_cost;
-			cpath->path.total_cost = seq_page_cost * nblocks +
+			cpath->path.total_cost = cpath->path.startup_cost +
+				seq_page_cost * nblocks +
 				cpu_tuple_cost * rel->tuples * sel +
 				cpu_operator_cost * rel->tuples * sel;
 

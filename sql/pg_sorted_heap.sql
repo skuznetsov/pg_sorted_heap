@@ -1262,7 +1262,7 @@ SET enable_bitmapscan = off;
 SELECT sh6_plan_contains(
     'SELECT * FROM sh8_intint WHERE a = 3',
     'SortedHeapScan') AS sh8_col1_pruning;
--- Query on col2 only should also trigger scan (bounds extracted)
+-- Query on col2 only — no pruning when b=50 exists in all blocks (nblocks=total)
 SELECT sh6_plan_contains(
     'SELECT * FROM sh8_intint WHERE b = 50',
     'SortedHeapScan') AS sh8_col2_pruning;
