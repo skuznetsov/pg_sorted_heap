@@ -88,6 +88,11 @@ generated automatically — you only INSERT `id` and `embedding`.
 
 ### 2. Train codebooks
 
+> **Permissions:** Training creates internal metadata tables in the extension
+> schema. The calling role needs `CREATE` privilege on that schema (or be the
+> extension owner / superuser). For non-superuser roles:
+> `GRANT CREATE ON SCHEMA <ext_schema> TO <role>;`
+
 ```sql
 -- Train IVF centroids (nlist partitions) + PQ codebook (M subvectors)
 SELECT * FROM pg_sorted_heap.svec_ann_train(

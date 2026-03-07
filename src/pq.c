@@ -23,8 +23,11 @@
 #include "fmgr.h"
 #include "funcapi.h"
 #include "catalog/pg_type_d.h"
+#include "catalog/pg_namespace.h"
 #include "commands/extension.h"
 #include "executor/spi.h"
+#include "miscadmin.h"
+#include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -47,6 +50,29 @@ get_ext_schema(void)
 	Oid		ext_oid = get_extension_oid("pg_sorted_heap", false);
 
 	return quote_identifier(get_namespace_name(get_extension_schema(ext_oid)));
+}
+
+/* ----------------------------------------------------------------
+ *  Check that the current user has CREATE privilege on the extension
+ *  schema.  Training functions create metadata tables (_pq_*, _ivf_*)
+ *  lazily, so they need CREATE on the schema.
+ * ---------------------------------------------------------------- */
+static void
+check_training_privileges(void)
+{
+	Oid		ext_oid = get_extension_oid("pg_sorted_heap", false);
+	Oid		schema_oid = get_extension_schema(ext_oid);
+
+	if (object_aclcheck(NamespaceRelationId, schema_oid,
+						GetUserId(), ACL_CREATE) != ACLCHECK_OK)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied: training requires CREATE privilege "
+						"on schema \"%s\"",
+						get_namespace_name(schema_oid)),
+				 errhint("GRANT CREATE ON SCHEMA \"%s\" TO current_user; "
+						 "or run training as the extension owner.",
+						 get_namespace_name(schema_oid))));
 }
 
 /* ----------------------------------------------------------------
@@ -475,6 +501,8 @@ svec_pq_train(PG_FUNCTION_ARGS)
 	MemoryContext tmp_ctx;
 	MemoryContext old_ctx;
 
+	check_training_privileges();
+
 	if (M < 1 || M > PQ_MAX_M)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -824,6 +852,8 @@ svec_pq_train_residual(PG_FUNCTION_ARGS)
 	MemoryContext func_ctx;
 	MemoryContext tmp_ctx;
 	MemoryContext old_ctx;
+
+	check_training_privileges();
 
 	if (M < 1 || M > PQ_MAX_M)
 		ereport(ERROR,
@@ -1627,6 +1657,8 @@ svec_ivf_train(PG_FUNCTION_ARGS)
 	MemoryContext func_ctx;
 	MemoryContext tmp_ctx;
 	MemoryContext old_ctx;
+
+	check_training_privileges();
 
 	if (nlist < 1 || nlist > IVF_MAX_NLIST)
 		ereport(ERROR,

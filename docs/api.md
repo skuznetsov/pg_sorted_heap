@@ -150,6 +150,13 @@ SET sorted_heap.vacuum_rebuild_zonemap = off;
 
 See the [Vector Search guide](vector-search) for a full tutorial.
 
+### Training permissions
+
+All training functions (`svec_ann_train`, `svec_pq_train`, `svec_pq_train_residual`,
+`svec_ivf_train`) create internal metadata tables in the extension schema on first
+call. The calling role must have `CREATE` privilege on the extension schema, or be
+the extension owner / superuser.
+
 ### `svec_ann_train(source_query, nlist, m, n_iter, max_samples)`
 
 Trains both IVF centroids and raw PQ codebook from a SQL query returning
