@@ -656,9 +656,9 @@ svec_pq_train(PG_FUNCTION_ARGS)
 				 "  cb_id int NOT NULL,"
 				 "  sub_id int NOT NULL,"
 				 "  cent_id int NOT NULL,"
-				 "  centroid svec NOT NULL,"
+				 "  centroid %s.svec NOT NULL,"
 				 "  PRIMARY KEY (cb_id, sub_id, cent_id)"
-				 ")", es);
+				 ")", es, es);
 		ret = SPI_execute(sql, false, 0);
 
 		if (ret != SPI_OK_UTILITY)
@@ -747,7 +747,7 @@ svec_pq_train(PG_FUNCTION_ARGS)
 					appendStringInfoChar(&insert_buf, ',');
 				appendStringInfo(&insert_buf, "%.9g", (double) cent[k]);
 			}
-			appendStringInfo(&insert_buf, "]'::svec)");
+			appendStringInfo(&insert_buf, "]'::%s.svec)", get_ext_schema());
 		}
 
 		MemoryContextSwitchTo(old_ctx);
@@ -1025,9 +1025,9 @@ svec_pq_train_residual(PG_FUNCTION_ARGS)
 				 "  cb_id int NOT NULL,"
 				 "  sub_id int NOT NULL,"
 				 "  cent_id int NOT NULL,"
-				 "  centroid svec NOT NULL,"
+				 "  centroid %s.svec NOT NULL,"
 				 "  PRIMARY KEY (cb_id, sub_id, cent_id)"
-				 ")", es);
+				 ")", es, es);
 		ret = SPI_execute(sql, false, 0);
 
 		/* Get next cb_id */
@@ -1104,7 +1104,7 @@ svec_pq_train_residual(PG_FUNCTION_ARGS)
 					appendStringInfoChar(&insert_buf, ',');
 				appendStringInfo(&insert_buf, "%.9g", (double) cent[k]);
 			}
-			appendStringInfo(&insert_buf, "]'::svec)");
+			appendStringInfo(&insert_buf, "]'::%s.svec)", get_ext_schema());
 		}
 
 		MemoryContextSwitchTo(old_ctx);
@@ -1786,9 +1786,9 @@ svec_ivf_train(PG_FUNCTION_ARGS)
 				 "CREATE TABLE IF NOT EXISTS %s._ivf_centroids ("
 				 "  cb_id int NOT NULL,"
 				 "  centroid_id int NOT NULL,"
-				 "  centroid svec NOT NULL,"
+				 "  centroid %s.svec NOT NULL,"
 				 "  PRIMARY KEY (cb_id, centroid_id)"
-				 ")", es);
+				 ")", es, es);
 		ret = SPI_execute(sql, false, 0);
 
 		if (ret != SPI_OK_UTILITY)
@@ -1869,7 +1869,7 @@ svec_ivf_train(PG_FUNCTION_ARGS)
 						appendStringInfoChar(&insert_buf, ',');
 					appendStringInfo(&insert_buf, "%.9g", (double) cent[k]);
 				}
-				appendStringInfo(&insert_buf, "]'::svec)");
+				appendStringInfo(&insert_buf, "]'::%s.svec)", get_ext_schema());
 			}
 
 			MemoryContextSwitchTo(old_ctx);
