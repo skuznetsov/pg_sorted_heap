@@ -22,6 +22,7 @@
 #include "catalog/pg_am.h"
 #include "commands/cluster.h"
 #include "commands/defrem.h"
+#include "commands/extension.h"
 #include "commands/trigger.h"
 #include "executor/spi.h"
 #include "miscadmin.h"
@@ -107,16 +108,24 @@ create_log_infrastructure(Oid relid, const char *relname,
 	resetStringInfo(&sql);
 
 	/* Install AFTER trigger to capture concurrent DML */
-	appendStringInfo(&sql,
-					 "CREATE TRIGGER _sh_compact_trigger "
-					 "AFTER INSERT OR UPDATE OR DELETE ON %s.%s "
-					 "FOR EACH ROW EXECUTE FUNCTION "
-					 "sorted_heap_compact_trigger('%s', '%d', '%s')",
-					 quoted_schema,
-					 quoted_relname,
-					 log_table_name,	/* trigger arg 0: table name */
-					 pk_attnum,			/* trigger arg 1: PK attnum */
-					 schema_name);		/* trigger arg 2: schema name */
+	{
+		Oid		ext_oid = get_extension_oid("pg_sorted_heap", false);
+		Oid		ext_schema_oid = get_extension_schema(ext_oid);
+		const char *quoted_ext_schema =
+			quote_identifier(get_namespace_name(ext_schema_oid));
+
+		appendStringInfo(&sql,
+						 "CREATE TRIGGER _sh_compact_trigger "
+						 "AFTER INSERT OR UPDATE OR DELETE ON %s.%s "
+						 "FOR EACH ROW EXECUTE FUNCTION "
+						 "%s.sorted_heap_compact_trigger('%s', '%d', '%s')",
+						 quoted_schema,
+						 quoted_relname,
+						 quoted_ext_schema,
+						 log_table_name,	/* trigger arg 0: table name */
+						 pk_attnum,			/* trigger arg 1: PK attnum */
+						 schema_name);		/* trigger arg 2: schema name */
+	}
 	ret = SPI_execute(sql.data, false, 0);
 	if (ret != SPI_OK_UTILITY)
 		elog(ERROR, "sorted_heap: CREATE TRIGGER failed: %d", ret);

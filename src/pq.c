@@ -23,6 +23,7 @@
 #include "fmgr.h"
 #include "funcapi.h"
 #include "catalog/pg_type_d.h"
+#include "commands/extension.h"
 #include "executor/spi.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -35,6 +36,18 @@
 
 #include "svec.h"
 #include "pq.h"
+
+/* ----------------------------------------------------------------
+ *  Return the quoted schema name of the pg_sorted_heap extension.
+ *  Used to schema-qualify internal metadata tables (_pq_*, _ivf_*).
+ * ---------------------------------------------------------------- */
+static const char *
+get_ext_schema(void)
+{
+	Oid		ext_oid = get_extension_oid("pg_sorted_heap", false);
+
+	return quote_identifier(get_namespace_name(get_extension_schema(ext_oid)));
+}
 
 /* ----------------------------------------------------------------
  *  L2-normalize a float vector in-place (for cosine ↔ L2 equivalence)
@@ -103,8 +116,8 @@ pq_load_codebook(int cb_id)
 
 	/* Read codebook metadata first */
 	snprintf(sql, sizeof(sql),
-			 "SELECT m, dsub FROM public._pq_codebook_meta WHERE cb_id = %d",
-			 cb_id);
+			 "SELECT m, dsub FROM %s._pq_codebook_meta WHERE cb_id = %d",
+			 get_ext_schema(), cb_id);
 
 	SPI_connect();
 	ret = SPI_execute(sql, true, 1);
@@ -132,9 +145,9 @@ pq_load_codebook(int cb_id)
 	/* Read all centroids */
 	snprintf(sql, sizeof(sql),
 			 "SELECT sub_id, cent_id, centroid "
-			 "FROM public._pq_codebooks WHERE cb_id = %d "
+			 "FROM %s._pq_codebooks WHERE cb_id = %d "
 			 "ORDER BY sub_id, cent_id",
-			 cb_id);
+			 get_ext_schema(), cb_id);
 
 	SPI_connect();
 	ret = SPI_execute(sql, true, 0);
@@ -240,8 +253,8 @@ ivf_load_centroids(int cb_id)
 
 	/* Read meta */
 	snprintf(sql, sizeof(sql),
-			 "SELECT nlist, dim FROM public._ivf_meta WHERE cb_id = %d",
-			 cb_id);
+			 "SELECT nlist, dim FROM %s._ivf_meta WHERE cb_id = %d",
+			 get_ext_schema(), cb_id);
 
 	SPI_connect();
 	ret = SPI_execute(sql, true, 1);
@@ -271,9 +284,9 @@ ivf_load_centroids(int cb_id)
 	/* Read all centroids */
 	snprintf(sql, sizeof(sql),
 			 "SELECT centroid_id, centroid "
-			 "FROM public._ivf_centroids WHERE cb_id = %d "
+			 "FROM %s._ivf_centroids WHERE cb_id = %d "
 			 "ORDER BY centroid_id",
-			 cb_id);
+			 get_ext_schema(), cb_id);
 
 	SPI_connect();
 	ret = SPI_execute(sql, true, 0);
@@ -618,58 +631,64 @@ svec_pq_train(PG_FUNCTION_ARGS)
 
 	/* Create tables and get codebook ID */
 	SPI_connect();
-
-	/* Create meta table if not exists */
-	ret = SPI_execute(
-		"CREATE TABLE IF NOT EXISTS public._pq_codebook_meta ("
-		"  cb_id int PRIMARY KEY,"
-		"  m int NOT NULL,"
-		"  dsub int NOT NULL,"
-		"  total_dim int NOT NULL"
-		")", false, 0);
-
-	if (ret != SPI_OK_UTILITY)
 	{
-		SPI_finish();
-		ereport(ERROR, (errmsg("failed to create _pq_codebook_meta")));
+		const char *es = get_ext_schema();
+
+		/* Create meta table if not exists */
+		snprintf(sql, sizeof(sql),
+				 "CREATE TABLE IF NOT EXISTS %s._pq_codebook_meta ("
+				 "  cb_id int PRIMARY KEY,"
+				 "  m int NOT NULL,"
+				 "  dsub int NOT NULL,"
+				 "  total_dim int NOT NULL"
+				 ")", es);
+		ret = SPI_execute(sql, false, 0);
+
+		if (ret != SPI_OK_UTILITY)
+		{
+			SPI_finish();
+			ereport(ERROR, (errmsg("failed to create _pq_codebook_meta")));
+		}
+
+		/* Create codebook table if not exists */
+		snprintf(sql, sizeof(sql),
+				 "CREATE TABLE IF NOT EXISTS %s._pq_codebooks ("
+				 "  cb_id int NOT NULL,"
+				 "  sub_id int NOT NULL,"
+				 "  cent_id int NOT NULL,"
+				 "  centroid svec NOT NULL,"
+				 "  PRIMARY KEY (cb_id, sub_id, cent_id)"
+				 ")", es);
+		ret = SPI_execute(sql, false, 0);
+
+		if (ret != SPI_OK_UTILITY)
+		{
+			SPI_finish();
+			ereport(ERROR, (errmsg("failed to create _pq_codebooks")));
+		}
+
+		/* Get next cb_id */
+		snprintf(sql, sizeof(sql),
+				 "SELECT COALESCE(MAX(cb_id), 0) + 1 FROM %s._pq_codebook_meta",
+				 es);
+		ret = SPI_execute(sql, true, 1);
+
+		if (ret != SPI_OK_SELECT || SPI_processed != 1)
+		{
+			SPI_finish();
+			ereport(ERROR, (errmsg("failed to get next cb_id")));
+		}
+
+		cb_id = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+											SPI_tuptable->tupdesc, 1,
+											&(bool){false}));
+
+		/* Insert meta row */
+		snprintf(sql, sizeof(sql),
+				 "INSERT INTO %s._pq_codebook_meta (cb_id, m, dsub, total_dim) "
+				 "VALUES (%d, %d, %d, %d)",
+				 es, cb_id, M, dsub, dim);
 	}
-
-	/* Create codebook table if not exists */
-	ret = SPI_execute(
-		"CREATE TABLE IF NOT EXISTS public._pq_codebooks ("
-		"  cb_id int NOT NULL,"
-		"  sub_id int NOT NULL,"
-		"  cent_id int NOT NULL,"
-		"  centroid svec NOT NULL,"
-		"  PRIMARY KEY (cb_id, sub_id, cent_id)"
-		")", false, 0);
-
-	if (ret != SPI_OK_UTILITY)
-	{
-		SPI_finish();
-		ereport(ERROR, (errmsg("failed to create _pq_codebooks")));
-	}
-
-	/* Get next cb_id */
-	ret = SPI_execute(
-		"SELECT COALESCE(MAX(cb_id), 0) + 1 FROM public._pq_codebook_meta",
-		true, 1);
-
-	if (ret != SPI_OK_SELECT || SPI_processed != 1)
-	{
-		SPI_finish();
-		ereport(ERROR, (errmsg("failed to get next cb_id")));
-	}
-
-	cb_id = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
-										SPI_tuptable->tupdesc, 1,
-										&(bool){false}));
-
-	/* Insert meta row */
-	snprintf(sql, sizeof(sql),
-			 "INSERT INTO public._pq_codebook_meta (cb_id, m, dsub, total_dim) "
-			 "VALUES (%d, %d, %d, %d)",
-			 cb_id, M, dsub, dim);
 	ret = SPI_execute(sql, false, 0);
 
 	if (ret != SPI_OK_INSERT)
@@ -709,8 +728,9 @@ svec_pq_train(PG_FUNCTION_ARGS)
 		old_ctx = MemoryContextSwitchTo(tmp_ctx);
 		initStringInfo(&insert_buf);
 		appendStringInfo(&insert_buf,
-						 "INSERT INTO public._pq_codebooks "
-						 "(cb_id, sub_id, cent_id, centroid) VALUES ");
+						 "INSERT INTO %s._pq_codebooks "
+						 "(cb_id, sub_id, cent_id, centroid) VALUES ",
+						 get_ext_schema());
 
 		for (j = 0; j < PQ_KSUB; j++)
 		{
@@ -976,53 +996,63 @@ svec_pq_train_residual(PG_FUNCTION_ARGS)
 
 	/* Create tables and get codebook ID */
 	SPI_connect();
-
-	ret = SPI_execute(
-		"CREATE TABLE IF NOT EXISTS public._pq_codebook_meta ("
-		"  cb_id int PRIMARY KEY,"
-		"  m int NOT NULL,"
-		"  dsub int NOT NULL,"
-		"  total_dim int NOT NULL"
-		")", false, 0);
-
-	/* Add residual columns if missing */
-	SPI_execute("ALTER TABLE public._pq_codebook_meta "
-				"ADD COLUMN IF NOT EXISTS residual boolean DEFAULT false",
-				false, 0);
-	SPI_execute("ALTER TABLE public._pq_codebook_meta "
-				"ADD COLUMN IF NOT EXISTS ivf_cb_id int",
-				false, 0);
-
-	ret = SPI_execute(
-		"CREATE TABLE IF NOT EXISTS public._pq_codebooks ("
-		"  cb_id int NOT NULL,"
-		"  sub_id int NOT NULL,"
-		"  cent_id int NOT NULL,"
-		"  centroid svec NOT NULL,"
-		"  PRIMARY KEY (cb_id, sub_id, cent_id)"
-		")", false, 0);
-
-	/* Get next cb_id */
-	ret = SPI_execute(
-		"SELECT COALESCE(MAX(cb_id), 0) + 1 FROM public._pq_codebook_meta",
-		true, 1);
-
-	if (ret != SPI_OK_SELECT || SPI_processed != 1)
 	{
-		SPI_finish();
-		ereport(ERROR, (errmsg("failed to get next cb_id")));
+		const char *es = get_ext_schema();
+
+		snprintf(sql, sizeof(sql),
+				 "CREATE TABLE IF NOT EXISTS %s._pq_codebook_meta ("
+				 "  cb_id int PRIMARY KEY,"
+				 "  m int NOT NULL,"
+				 "  dsub int NOT NULL,"
+				 "  total_dim int NOT NULL"
+				 ")", es);
+		ret = SPI_execute(sql, false, 0);
+
+		/* Add residual columns if missing */
+		snprintf(sql, sizeof(sql),
+				 "ALTER TABLE %s._pq_codebook_meta "
+				 "ADD COLUMN IF NOT EXISTS residual boolean DEFAULT false",
+				 es);
+		SPI_execute(sql, false, 0);
+		snprintf(sql, sizeof(sql),
+				 "ALTER TABLE %s._pq_codebook_meta "
+				 "ADD COLUMN IF NOT EXISTS ivf_cb_id int",
+				 es);
+		SPI_execute(sql, false, 0);
+
+		snprintf(sql, sizeof(sql),
+				 "CREATE TABLE IF NOT EXISTS %s._pq_codebooks ("
+				 "  cb_id int NOT NULL,"
+				 "  sub_id int NOT NULL,"
+				 "  cent_id int NOT NULL,"
+				 "  centroid svec NOT NULL,"
+				 "  PRIMARY KEY (cb_id, sub_id, cent_id)"
+				 ")", es);
+		ret = SPI_execute(sql, false, 0);
+
+		/* Get next cb_id */
+		snprintf(sql, sizeof(sql),
+				 "SELECT COALESCE(MAX(cb_id), 0) + 1 FROM %s._pq_codebook_meta",
+				 es);
+		ret = SPI_execute(sql, true, 1);
+
+		if (ret != SPI_OK_SELECT || SPI_processed != 1)
+		{
+			SPI_finish();
+			ereport(ERROR, (errmsg("failed to get next cb_id")));
+		}
+
+		cb_id = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+											SPI_tuptable->tupdesc, 1,
+											&(bool){false}));
+
+		/* Insert meta row with residual flag */
+		snprintf(sql, sizeof(sql),
+				 "INSERT INTO %s._pq_codebook_meta "
+				 "(cb_id, m, dsub, total_dim, residual, ivf_cb_id) "
+				 "VALUES (%d, %d, %d, %d, true, %d)",
+				 es, cb_id, M, dsub, dim, ivf_cb_id);
 	}
-
-	cb_id = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
-										SPI_tuptable->tupdesc, 1,
-										&(bool){false}));
-
-	/* Insert meta row with residual flag */
-	snprintf(sql, sizeof(sql),
-			 "INSERT INTO public._pq_codebook_meta "
-			 "(cb_id, m, dsub, total_dim, residual, ivf_cb_id) "
-			 "VALUES (%d, %d, %d, %d, true, %d)",
-			 cb_id, M, dsub, dim, ivf_cb_id);
 	ret = SPI_execute(sql, false, 0);
 
 	if (ret != SPI_OK_INSERT)
@@ -1055,8 +1085,9 @@ svec_pq_train_residual(PG_FUNCTION_ARGS)
 		old_ctx = MemoryContextSwitchTo(tmp_ctx);
 		initStringInfo(&insert_buf);
 		appendStringInfo(&insert_buf,
-						 "INSERT INTO public._pq_codebooks "
-						 "(cb_id, sub_id, cent_id, centroid) VALUES ");
+						 "INSERT INTO %s._pq_codebooks "
+						 "(cb_id, sub_id, cent_id, centroid) VALUES ",
+						 get_ext_schema());
 
 		for (j = 0; j < PQ_KSUB; j++)
 		{
@@ -1734,54 +1765,60 @@ svec_ivf_train(PG_FUNCTION_ARGS)
 
 	/* Create tables and get codebook ID */
 	SPI_connect();
-
-	ret = SPI_execute(
-		"CREATE TABLE IF NOT EXISTS public._ivf_meta ("
-		"  cb_id int PRIMARY KEY,"
-		"  nlist int NOT NULL,"
-		"  dim int NOT NULL"
-		")", false, 0);
-
-	if (ret != SPI_OK_UTILITY)
 	{
-		SPI_finish();
-		ereport(ERROR, (errmsg("failed to create _ivf_meta")));
+		const char *es = get_ext_schema();
+
+		snprintf(sql, sizeof(sql),
+				 "CREATE TABLE IF NOT EXISTS %s._ivf_meta ("
+				 "  cb_id int PRIMARY KEY,"
+				 "  nlist int NOT NULL,"
+				 "  dim int NOT NULL"
+				 ")", es);
+		ret = SPI_execute(sql, false, 0);
+
+		if (ret != SPI_OK_UTILITY)
+		{
+			SPI_finish();
+			ereport(ERROR, (errmsg("failed to create _ivf_meta")));
+		}
+
+		snprintf(sql, sizeof(sql),
+				 "CREATE TABLE IF NOT EXISTS %s._ivf_centroids ("
+				 "  cb_id int NOT NULL,"
+				 "  centroid_id int NOT NULL,"
+				 "  centroid svec NOT NULL,"
+				 "  PRIMARY KEY (cb_id, centroid_id)"
+				 ")", es);
+		ret = SPI_execute(sql, false, 0);
+
+		if (ret != SPI_OK_UTILITY)
+		{
+			SPI_finish();
+			ereport(ERROR, (errmsg("failed to create _ivf_centroids")));
+		}
+
+		/* Get next cb_id */
+		snprintf(sql, sizeof(sql),
+				 "SELECT COALESCE(MAX(cb_id), 0) + 1 FROM %s._ivf_meta",
+				 es);
+		ret = SPI_execute(sql, true, 1);
+
+		if (ret != SPI_OK_SELECT || SPI_processed != 1)
+		{
+			SPI_finish();
+			ereport(ERROR, (errmsg("failed to get next IVF cb_id")));
+		}
+
+		cb_id = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+											SPI_tuptable->tupdesc, 1,
+											&(bool){false}));
+
+		/* Insert meta row */
+		snprintf(sql, sizeof(sql),
+				 "INSERT INTO %s._ivf_meta (cb_id, nlist, dim) "
+				 "VALUES (%d, %d, %d)",
+				 es, cb_id, nlist, dim);
 	}
-
-	ret = SPI_execute(
-		"CREATE TABLE IF NOT EXISTS public._ivf_centroids ("
-		"  cb_id int NOT NULL,"
-		"  centroid_id int NOT NULL,"
-		"  centroid svec NOT NULL,"
-		"  PRIMARY KEY (cb_id, centroid_id)"
-		")", false, 0);
-
-	if (ret != SPI_OK_UTILITY)
-	{
-		SPI_finish();
-		ereport(ERROR, (errmsg("failed to create _ivf_centroids")));
-	}
-
-	/* Get next cb_id */
-	ret = SPI_execute(
-		"SELECT COALESCE(MAX(cb_id), 0) + 1 FROM public._ivf_meta",
-		true, 1);
-
-	if (ret != SPI_OK_SELECT || SPI_processed != 1)
-	{
-		SPI_finish();
-		ereport(ERROR, (errmsg("failed to get next IVF cb_id")));
-	}
-
-	cb_id = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
-										SPI_tuptable->tupdesc, 1,
-										&(bool){false}));
-
-	/* Insert meta row */
-	snprintf(sql, sizeof(sql),
-			 "INSERT INTO public._ivf_meta (cb_id, nlist, dim) "
-			 "VALUES (%d, %d, %d)",
-			 cb_id, nlist, dim);
 	ret = SPI_execute(sql, false, 0);
 
 	if (ret != SPI_OK_INSERT)
@@ -1813,8 +1850,9 @@ svec_ivf_train(PG_FUNCTION_ARGS)
 			old_ctx = MemoryContextSwitchTo(tmp_ctx);
 			initStringInfo(&insert_buf);
 			appendStringInfo(&insert_buf,
-							 "INSERT INTO public._ivf_centroids "
-							 "(cb_id, centroid_id, centroid) VALUES ");
+							 "INSERT INTO %s._ivf_centroids "
+							 "(cb_id, centroid_id, centroid) VALUES ",
+							 get_ext_schema());
 
 			for (b = batch_start; b < batch_end; b++)
 			{
