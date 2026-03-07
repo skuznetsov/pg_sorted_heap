@@ -245,6 +245,7 @@ SELECT id, embedding FROM source_table;
 SELECT pg_sorted_heap.sorted_heap_compact('vectors');
 
 -- 3. Train IVF centroids + PQ codebook
+--    (requires CREATE privilege on the extension schema; see docs/vector-search.md)
 SELECT * FROM pg_sorted_heap.svec_ann_train(
     'SELECT embedding FROM vectors',
     nlist := 64,    -- IVF partitions
@@ -523,7 +524,7 @@ INSERT INTO bench (id, embedding)
 SELECT id, embedding FROM your_source_table;
 SELECT pg_sorted_heap.sorted_heap_compact('bench');
 
--- 3. Train IVF + residual PQ (one-time)
+-- 3. Train IVF + residual PQ (one-time, requires CREATE on extension schema)
 SELECT * FROM pg_sorted_heap.svec_ann_train(
     'SELECT embedding FROM bench',
     nlist := 64, m := 192);
