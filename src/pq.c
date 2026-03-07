@@ -103,7 +103,7 @@ pq_load_codebook(int cb_id)
 
 	/* Read codebook metadata first */
 	snprintf(sql, sizeof(sql),
-			 "SELECT m, dsub FROM _pq_codebook_meta WHERE cb_id = %d",
+			 "SELECT m, dsub FROM public._pq_codebook_meta WHERE cb_id = %d",
 			 cb_id);
 
 	SPI_connect();
@@ -132,7 +132,7 @@ pq_load_codebook(int cb_id)
 	/* Read all centroids */
 	snprintf(sql, sizeof(sql),
 			 "SELECT sub_id, cent_id, centroid "
-			 "FROM _pq_codebooks WHERE cb_id = %d "
+			 "FROM public._pq_codebooks WHERE cb_id = %d "
 			 "ORDER BY sub_id, cent_id",
 			 cb_id);
 
@@ -240,7 +240,7 @@ ivf_load_centroids(int cb_id)
 
 	/* Read meta */
 	snprintf(sql, sizeof(sql),
-			 "SELECT nlist, dim FROM _ivf_meta WHERE cb_id = %d",
+			 "SELECT nlist, dim FROM public._ivf_meta WHERE cb_id = %d",
 			 cb_id);
 
 	SPI_connect();
@@ -271,7 +271,7 @@ ivf_load_centroids(int cb_id)
 	/* Read all centroids */
 	snprintf(sql, sizeof(sql),
 			 "SELECT centroid_id, centroid "
-			 "FROM _ivf_centroids WHERE cb_id = %d "
+			 "FROM public._ivf_centroids WHERE cb_id = %d "
 			 "ORDER BY centroid_id",
 			 cb_id);
 
@@ -621,7 +621,7 @@ svec_pq_train(PG_FUNCTION_ARGS)
 
 	/* Create meta table if not exists */
 	ret = SPI_execute(
-		"CREATE TABLE IF NOT EXISTS _pq_codebook_meta ("
+		"CREATE TABLE IF NOT EXISTS public._pq_codebook_meta ("
 		"  cb_id int PRIMARY KEY,"
 		"  m int NOT NULL,"
 		"  dsub int NOT NULL,"
@@ -636,7 +636,7 @@ svec_pq_train(PG_FUNCTION_ARGS)
 
 	/* Create codebook table if not exists */
 	ret = SPI_execute(
-		"CREATE TABLE IF NOT EXISTS _pq_codebooks ("
+		"CREATE TABLE IF NOT EXISTS public._pq_codebooks ("
 		"  cb_id int NOT NULL,"
 		"  sub_id int NOT NULL,"
 		"  cent_id int NOT NULL,"
@@ -652,7 +652,7 @@ svec_pq_train(PG_FUNCTION_ARGS)
 
 	/* Get next cb_id */
 	ret = SPI_execute(
-		"SELECT COALESCE(MAX(cb_id), 0) + 1 FROM _pq_codebook_meta",
+		"SELECT COALESCE(MAX(cb_id), 0) + 1 FROM public._pq_codebook_meta",
 		true, 1);
 
 	if (ret != SPI_OK_SELECT || SPI_processed != 1)
@@ -667,7 +667,7 @@ svec_pq_train(PG_FUNCTION_ARGS)
 
 	/* Insert meta row */
 	snprintf(sql, sizeof(sql),
-			 "INSERT INTO _pq_codebook_meta (cb_id, m, dsub, total_dim) "
+			 "INSERT INTO public._pq_codebook_meta (cb_id, m, dsub, total_dim) "
 			 "VALUES (%d, %d, %d, %d)",
 			 cb_id, M, dsub, dim);
 	ret = SPI_execute(sql, false, 0);
@@ -709,7 +709,7 @@ svec_pq_train(PG_FUNCTION_ARGS)
 		old_ctx = MemoryContextSwitchTo(tmp_ctx);
 		initStringInfo(&insert_buf);
 		appendStringInfo(&insert_buf,
-						 "INSERT INTO _pq_codebooks "
+						 "INSERT INTO public._pq_codebooks "
 						 "(cb_id, sub_id, cent_id, centroid) VALUES ");
 
 		for (j = 0; j < PQ_KSUB; j++)
@@ -978,7 +978,7 @@ svec_pq_train_residual(PG_FUNCTION_ARGS)
 	SPI_connect();
 
 	ret = SPI_execute(
-		"CREATE TABLE IF NOT EXISTS _pq_codebook_meta ("
+		"CREATE TABLE IF NOT EXISTS public._pq_codebook_meta ("
 		"  cb_id int PRIMARY KEY,"
 		"  m int NOT NULL,"
 		"  dsub int NOT NULL,"
@@ -986,15 +986,15 @@ svec_pq_train_residual(PG_FUNCTION_ARGS)
 		")", false, 0);
 
 	/* Add residual columns if missing */
-	SPI_execute("ALTER TABLE _pq_codebook_meta "
+	SPI_execute("ALTER TABLE public._pq_codebook_meta "
 				"ADD COLUMN IF NOT EXISTS residual boolean DEFAULT false",
 				false, 0);
-	SPI_execute("ALTER TABLE _pq_codebook_meta "
+	SPI_execute("ALTER TABLE public._pq_codebook_meta "
 				"ADD COLUMN IF NOT EXISTS ivf_cb_id int",
 				false, 0);
 
 	ret = SPI_execute(
-		"CREATE TABLE IF NOT EXISTS _pq_codebooks ("
+		"CREATE TABLE IF NOT EXISTS public._pq_codebooks ("
 		"  cb_id int NOT NULL,"
 		"  sub_id int NOT NULL,"
 		"  cent_id int NOT NULL,"
@@ -1004,7 +1004,7 @@ svec_pq_train_residual(PG_FUNCTION_ARGS)
 
 	/* Get next cb_id */
 	ret = SPI_execute(
-		"SELECT COALESCE(MAX(cb_id), 0) + 1 FROM _pq_codebook_meta",
+		"SELECT COALESCE(MAX(cb_id), 0) + 1 FROM public._pq_codebook_meta",
 		true, 1);
 
 	if (ret != SPI_OK_SELECT || SPI_processed != 1)
@@ -1019,7 +1019,7 @@ svec_pq_train_residual(PG_FUNCTION_ARGS)
 
 	/* Insert meta row with residual flag */
 	snprintf(sql, sizeof(sql),
-			 "INSERT INTO _pq_codebook_meta "
+			 "INSERT INTO public._pq_codebook_meta "
 			 "(cb_id, m, dsub, total_dim, residual, ivf_cb_id) "
 			 "VALUES (%d, %d, %d, %d, true, %d)",
 			 cb_id, M, dsub, dim, ivf_cb_id);
@@ -1055,7 +1055,7 @@ svec_pq_train_residual(PG_FUNCTION_ARGS)
 		old_ctx = MemoryContextSwitchTo(tmp_ctx);
 		initStringInfo(&insert_buf);
 		appendStringInfo(&insert_buf,
-						 "INSERT INTO _pq_codebooks "
+						 "INSERT INTO public._pq_codebooks "
 						 "(cb_id, sub_id, cent_id, centroid) VALUES ");
 
 		for (j = 0; j < PQ_KSUB; j++)
@@ -1736,7 +1736,7 @@ svec_ivf_train(PG_FUNCTION_ARGS)
 	SPI_connect();
 
 	ret = SPI_execute(
-		"CREATE TABLE IF NOT EXISTS _ivf_meta ("
+		"CREATE TABLE IF NOT EXISTS public._ivf_meta ("
 		"  cb_id int PRIMARY KEY,"
 		"  nlist int NOT NULL,"
 		"  dim int NOT NULL"
@@ -1749,7 +1749,7 @@ svec_ivf_train(PG_FUNCTION_ARGS)
 	}
 
 	ret = SPI_execute(
-		"CREATE TABLE IF NOT EXISTS _ivf_centroids ("
+		"CREATE TABLE IF NOT EXISTS public._ivf_centroids ("
 		"  cb_id int NOT NULL,"
 		"  centroid_id int NOT NULL,"
 		"  centroid svec NOT NULL,"
@@ -1764,7 +1764,7 @@ svec_ivf_train(PG_FUNCTION_ARGS)
 
 	/* Get next cb_id */
 	ret = SPI_execute(
-		"SELECT COALESCE(MAX(cb_id), 0) + 1 FROM _ivf_meta",
+		"SELECT COALESCE(MAX(cb_id), 0) + 1 FROM public._ivf_meta",
 		true, 1);
 
 	if (ret != SPI_OK_SELECT || SPI_processed != 1)
@@ -1779,7 +1779,7 @@ svec_ivf_train(PG_FUNCTION_ARGS)
 
 	/* Insert meta row */
 	snprintf(sql, sizeof(sql),
-			 "INSERT INTO _ivf_meta (cb_id, nlist, dim) "
+			 "INSERT INTO public._ivf_meta (cb_id, nlist, dim) "
 			 "VALUES (%d, %d, %d)",
 			 cb_id, nlist, dim);
 	ret = SPI_execute(sql, false, 0);
@@ -1813,7 +1813,7 @@ svec_ivf_train(PG_FUNCTION_ARGS)
 			old_ctx = MemoryContextSwitchTo(tmp_ctx);
 			initStringInfo(&insert_buf);
 			appendStringInfo(&insert_buf,
-							 "INSERT INTO _ivf_centroids "
+							 "INSERT INTO public._ivf_centroids "
 							 "(cb_id, centroid_id, centroid) VALUES ");
 
 			for (b = batch_start; b < batch_end; b++)

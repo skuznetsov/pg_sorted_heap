@@ -84,14 +84,14 @@ create_log_infrastructure(Oid relid, const char *relname,
 
 	initStringInfo(&sql);
 
-	/* Create unlogged log table for minimal WAL overhead */
+	/* Create unlogged log table in the target relation's schema */
 	appendStringInfo(&sql,
-					 "CREATE UNLOGGED TABLE %s ("
+					 "CREATE UNLOGGED TABLE %s.%s ("
 					 "  id bigserial,"
 					 "  action char(1) NOT NULL,"
 					 "  pk_val int8 NOT NULL"
 					 ")",
-					 quoted_log_table);
+					 quoted_schema, quoted_log_table);
 	ret = SPI_execute(sql.data, false, 0);
 	if (ret != SPI_OK_UTILITY)
 		elog(ERROR, "sorted_heap: CREATE TABLE for log failed: %d", ret);
@@ -99,8 +99,8 @@ create_log_infrastructure(Oid relid, const char *relname,
 
 	/* Index on id for efficient ordered reads */
 	appendStringInfo(&sql,
-					 "CREATE INDEX ON %s (id)",
-					 quoted_log_table);
+					 "CREATE INDEX ON %s.%s (id)",
+					 quoted_schema, quoted_log_table);
 	ret = SPI_execute(sql.data, false, 0);
 	if (ret != SPI_OK_UTILITY)
 		elog(ERROR, "sorted_heap: CREATE INDEX on log table failed: %d", ret);
@@ -111,11 +111,12 @@ create_log_infrastructure(Oid relid, const char *relname,
 					 "CREATE TRIGGER _sh_compact_trigger "
 					 "AFTER INSERT OR UPDATE OR DELETE ON %s.%s "
 					 "FOR EACH ROW EXECUTE FUNCTION "
-					 "sorted_heap_compact_trigger('%s', '%d')",
+					 "sorted_heap_compact_trigger('%s', '%d', '%s')",
 					 quoted_schema,
 					 quoted_relname,
-					 log_table_name,	/* trigger arg, not SQL identifier */
-					 pk_attnum);
+					 log_table_name,	/* trigger arg 0: table name */
+					 pk_attnum,			/* trigger arg 1: PK attnum */
+					 schema_name);		/* trigger arg 2: schema name */
 	ret = SPI_execute(sql.data, false, 0);
 	if (ret != SPI_OK_UTILITY)
 		elog(ERROR, "sorted_heap: CREATE TRIGGER failed: %d", ret);
@@ -150,9 +151,10 @@ drop_log_infrastructure(Oid relid, const char *log_table_name)
 	SPI_execute(sql.data, false, 0);
 	resetStringInfo(&sql);
 
-	/* Drop log table */
+	/* Drop log table (schema-qualified) */
 	appendStringInfo(&sql,
-					 "DROP TABLE IF EXISTS %s",
+					 "DROP TABLE IF EXISTS %s.%s",
+					 quote_identifier(schema_name),
 					 quote_identifier(log_table_name));
 	SPI_execute(sql.data, false, 0);
 
@@ -191,8 +193,8 @@ sorted_heap_compact_trigger(PG_FUNCTION_ARGS)
 		elog(ERROR, "sorted_heap_compact_trigger: must be FOR EACH ROW");
 
 	/* Parse trigger arguments */
-	if (trigdata->tg_trigger->tgnargs != 2)
-		elog(ERROR, "sorted_heap_compact_trigger: expected 2 args (log_table, pk_attnum)");
+	if (trigdata->tg_trigger->tgnargs != 3)
+		elog(ERROR, "sorted_heap_compact_trigger: expected 3 args (log_table, pk_attnum, schema)");
 
 	log_table_name = trigdata->tg_trigger->tgargs[0];
 	pk_attnum = atoi(trigdata->tg_trigger->tgargs[1]);
@@ -201,13 +203,18 @@ sorted_heap_compact_trigger(PG_FUNCTION_ARGS)
 	pk_typid = TupleDescAttr(trigdata->tg_relation->rd_att,
 							 pk_attnum - 1)->atttypid;
 
-	/* Insert into log table via SPI */
-	SPI_connect();
+	/* Insert into log table via SPI (schema-qualified) */
+	{
+		char   *log_schema_name = trigdata->tg_trigger->tgargs[2];
 
-	initStringInfo(&sql);
-	appendStringInfo(&sql,
-					 "INSERT INTO %s (action, pk_val) VALUES ($1, $2)",
-					 log_table_name);
+		SPI_connect();
+
+		initStringInfo(&sql);
+		appendStringInfo(&sql,
+						 "INSERT INTO %s.%s (action, pk_val) VALUES ($1, $2)",
+						 quote_identifier(log_schema_name),
+						 quote_identifier(log_table_name));
+	}
 
 	argtypes[0] = CHAROID;
 	argtypes[1] = INT8OID;
@@ -367,6 +374,7 @@ sorted_heap_copy_sorted(Relation old_rel, Relation new_rel,
 static int64
 sorted_heap_replay_log(Relation old_rel, Relation new_rel,
 					   const char *log_table_name,
+					   const char *log_schema_name,
 					   int64 *last_processed_id,
 					   HTAB *pk_tid_map,
 					   AttrNumber pk_attnum, Oid pk_typid,
@@ -380,9 +388,10 @@ sorted_heap_replay_log(Relation old_rel, Relation new_rel,
 
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
-					 "SELECT id, action, pk_val FROM %s "
+					 "SELECT id, action, pk_val FROM %s.%s "
 					 "WHERE id > %lld ORDER BY id",
-					 log_table_name,
+					 quote_identifier(log_schema_name),
+					 quote_identifier(log_table_name),
 					 (long long) *last_processed_id);
 
 	ret = SPI_execute(sql.data, true, 0);
@@ -526,6 +535,7 @@ sorted_heap_compact_online(PG_FUNCTION_ARGS)
 	Oid				pk_index_oid;
 	Oid				table_am_oid;
 	char		   *log_table_name = NULL;
+	char		   *log_schema_name = NULL;
 	Oid				new_relid = InvalidOid;
 	HASHCTL			hashctl;
 	HTAB		   *pk_tid_map;
@@ -573,6 +583,9 @@ sorted_heap_compact_online(PG_FUNCTION_ARGS)
 				 errmsg("online compact is not supported for %s primary keys",
 						format_type_be(pk_typid)),
 				 errhint("Use sorted_heap_compact() instead.")));
+
+	/* Resolve schema for log table placement */
+	log_schema_name = get_namespace_name(get_rel_namespace(relid));
 
 	ereport(NOTICE,
 			(errmsg("online compact: starting for \"%s\"",
@@ -629,6 +642,7 @@ sorted_heap_compact_online(PG_FUNCTION_ARGS)
 
 			new_rel = table_open(new_relid, RowExclusiveLock);
 			replayed = sorted_heap_replay_log(rel, new_rel, log_table_name,
+											  log_schema_name,
 											  &last_id, pk_tid_map,
 											  pk_attnum, pk_typid,
 											  pk_index_oid);
@@ -651,6 +665,7 @@ sorted_heap_compact_online(PG_FUNCTION_ARGS)
 
 		/* Final replay: process any last changes */
 		sorted_heap_replay_log(rel, new_rel, log_table_name,
+							   log_schema_name,
 							   &last_id, pk_tid_map,
 							   pk_attnum, pk_typid, pk_index_oid);
 
@@ -914,6 +929,7 @@ sorted_heap_merge_online(PG_FUNCTION_ARGS)
 	BlockNumber		prefix_pages;
 	BlockNumber		tail_nblocks;
 	char		   *log_table_name = NULL;
+	char		   *log_schema_name = NULL;
 	Oid				new_relid = InvalidOid;
 	HASHCTL			hashctl;
 	HTAB		   *pk_tid_map;
@@ -995,6 +1011,9 @@ sorted_heap_merge_online(PG_FUNCTION_ARGS)
 
 	table_close(rel, ShareUpdateExclusiveLock);
 
+	/* Resolve schema for log table placement */
+	log_schema_name = get_namespace_name(get_rel_namespace(relid));
+
 	ereport(NOTICE,
 			(errmsg("online merge: starting for \"%s\"",
 					get_rel_name(relid)),
@@ -1062,6 +1081,7 @@ sorted_heap_merge_online(PG_FUNCTION_ARGS)
 
 			new_rel = table_open(new_relid, RowExclusiveLock);
 			replayed = sorted_heap_replay_log(rel, new_rel, log_table_name,
+											  log_schema_name,
 											  &last_id, pk_tid_map,
 											  pk_attnum, pk_typid,
 											  pk_index_oid);
@@ -1084,6 +1104,7 @@ sorted_heap_merge_online(PG_FUNCTION_ARGS)
 
 		/* Final replay: process any last changes */
 		sorted_heap_replay_log(rel, new_rel, log_table_name,
+							   log_schema_name,
 							   &last_id, pk_tid_map,
 							   pk_attnum, pk_typid, pk_index_oid);
 
