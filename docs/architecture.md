@@ -106,10 +106,25 @@ relation. When it finds a sorted_heap table with a valid zone map and WHERE
 restrictions on PK columns, it:
 
 1. **Extracts bounds** from `=`, `<`, `<=`, `>`, `>=`, `BETWEEN` operators
+   and `IN` / `= ANY(array)` expressions
 2. **Computes the block range** using the zone map:
    - If entries are monotonically sorted: **binary search** (O(log N))
    - Otherwise: linear scan (O(N entries))
 3. **Adds a CustomPath** with the computed cost (based on blocks to read)
+
+### IN / ANY pruning
+
+For `WHERE pk IN (...)` or `WHERE pk = ANY(ARRAY[...])`, the scan provider:
+
+1. **Extracts all array elements** and converts them to `int64` zone map keys
+2. **Computes a bounding box** (min/max of the values) to limit the scan range
+3. **Sorts the values** and stores them for per-block filtering
+4. At scan time, each block's zone map entry is checked against the sorted
+   value list using **O(log K) binary search** — blocks where no target value
+   falls within `[zme_min, zme_max]` are skipped
+
+This works with both literal arrays (resolved at plan time) and parameterized
+arrays in generic prepared statements (resolved at execution time).
 
 ### Runtime parameter resolution
 
@@ -119,6 +134,8 @@ The scan provider defers resolution to the executor, where it:
 - Evaluates parameter expressions via `ExecEvalExpr`
 - Merges parameter bounds with any constant bounds
 - Recomputes the block range on each rescan (supports NestLoop joins)
+- For `= ANY($1)` arrays: deconstructs the array, computes bounding box
+  and sorted value list at execution time
 
 ### EXPLAIN output
 
