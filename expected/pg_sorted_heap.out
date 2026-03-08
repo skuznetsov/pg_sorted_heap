@@ -3431,6 +3431,42 @@ DEALLOCATE sh19_q;
 RESET plan_cache_mode;
 RESET enable_indexscan;
 RESET enable_bitmapscan;
+-- SH19-9: PARAM_EXEC array from LATERAL/NestLoop uses SortedHeapScan
+CREATE FUNCTION sh19_make_arr(i int) RETURNS int[] AS $$
+BEGIN
+  RETURN ARRAY[i, 10000];
+END;
+$$ LANGUAGE plpgsql VOLATILE;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET max_parallel_workers_per_gather = 0;
+\t on
+SELECT sh19_plan_contains(
+    $$SELECT o.i, s.cnt
+      FROM (SELECT g AS i, sh19_make_arr(g) AS arr FROM generate_series(1,2) g) o
+      CROSS JOIN LATERAL (
+        SELECT count(*) AS cnt FROM sh19 WHERE a = ANY(o.arr)
+      ) s$$,
+    'SortedHeapScan') AS sh19_lateral_plan;
+ t
+
+-- SH19-10: LATERAL runtime ANY executes correctly (would crash before fix)
+SELECT array_agg(s.cnt ORDER BY o.i)
+FROM (SELECT g AS i, sh19_make_arr(g) AS arr FROM generate_series(1,2) g) o
+CROSS JOIN LATERAL (
+  SELECT count(*) AS cnt FROM sh19 WHERE a = ANY(o.arr)
+) s;
+ {2,2}
+
+\t off
+DROP FUNCTION sh19_make_arr(int);
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET max_parallel_workers_per_gather;
 DROP TABLE sh19;
 DROP FUNCTION sh19_plan_contains(text, text);
 DROP EXTENSION pg_sorted_heap;

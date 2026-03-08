@@ -92,9 +92,13 @@ typedef struct SortedHeapScanState
 	bool		   *runtime_is_col2;
 	Oid			   *runtime_typids;
 	SortedHeapScanBounds const_bounds;	/* Const-only baseline for rescan */
+	bool			runtime_resolve_pending;	/* defer initial ParamExec resolution */
 	/* IN-list values for per-block pruning (sorted, col1 only) */
 	int				n_in_values;
 	int64		   *in_values;		/* sorted array, NULL if no IN clause */
+	/* Zone map generation at scan start — detect mid-scan invalidation */
+	uint64			zm_gen_at_start;
+	bool			zm_stale;		/* set if generation changed mid-scan */
 } SortedHeapScanState;
 
 /* ----------------------------------------------------------------
@@ -125,6 +129,7 @@ static void sorted_heap_compute_block_range(SortedHeapRelInfo *info,
 											BlockNumber *nblocks);
 static bool sorted_heap_zone_overlaps(SortedHeapZoneMapEntry *e,
 									  SortedHeapScanBounds *bounds);
+static bool sorted_heap_exprs_need_deferred_runtime_resolve(List *exprs);
 
 /* CustomPath callback */
 static Plan *sorted_heap_plan_custom_path(PlannerInfo *root,
@@ -253,6 +258,24 @@ sorted_heap_read_zm_generation(void)
 	if (sh_shared_stats)
 		return pg_atomic_read_u64(&sh_shared_stats->zm_generation);
 	return 0;
+}
+
+static bool
+sorted_heap_exprs_need_deferred_runtime_resolve(List *exprs)
+{
+	ListCell   *lc;
+
+	foreach(lc, exprs)
+	{
+		Node   *expr = (Node *) lfirst(lc);
+
+		if (expr != NULL &&
+			IsA(expr, Param) &&
+			((Param *) expr)->paramkind == PARAM_EXEC)
+			return true;
+	}
+
+	return false;
 }
 
 /* ----------------------------------------------------------------
@@ -482,39 +505,52 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 		}
 	}
 
-	add_path(rel, &cpath->path);
-
-	/* Also offer a parallel partial path if beneficial */
-	if (rel->consider_parallel && nblocks > 0)
+	/*
+	 * Save fields we need for the parallel path BEFORE add_path(),
+	 * because add_path() may pfree(cpath) if it's dominated by an
+	 * existing path (e.g. SeqScan).  Using cpath after add_path()
+	 * would be a use-after-free.
+	 */
 	{
-		int		pw;
+		List	   *saved_custom_private = cpath->custom_private;
+		Cardinality	saved_rows = cpath->path.rows;
+		Cost		saved_total_cost = cpath->path.total_cost;
 
-		pw = compute_parallel_worker(rel, (double) nblocks, -1,
-									 max_parallel_workers_per_gather);
-		if (pw > 0)
+		add_path(rel, &cpath->path);
+		/* cpath may be freed here — do NOT dereference it below */
+
+		/* Also offer a parallel partial path if beneficial */
+		if (rel->consider_parallel && nblocks > 0)
 		{
-			CustomPath *ppath = makeNode(CustomPath);
+			int		pw;
 
-			ppath->path.type = T_CustomPath;
-			ppath->path.pathtype = T_CustomScan;
-			ppath->path.parent = rel;
-			ppath->path.pathtarget = rel->reltarget;
-			ppath->path.param_info = NULL;
-			ppath->path.parallel_aware = true;
-			ppath->path.parallel_safe = true;
-			ppath->path.parallel_workers = pw;
-			ppath->path.pathkeys = NIL;
+			pw = compute_parallel_worker(rel, (double) nblocks, -1,
+										 max_parallel_workers_per_gather);
+			if (pw > 0)
+			{
+				CustomPath *ppath = makeNode(CustomPath);
 
-			/* Per-worker cost: divide total among participants */
-			ppath->path.rows = cpath->path.rows;
-			ppath->path.startup_cost = 0;
-			ppath->path.total_cost = cpath->path.total_cost / (pw + 1);
+				ppath->path.type = T_CustomPath;
+				ppath->path.pathtype = T_CustomScan;
+				ppath->path.parent = rel;
+				ppath->path.pathtarget = rel->reltarget;
+				ppath->path.param_info = NULL;
+				ppath->path.parallel_aware = true;
+				ppath->path.parallel_safe = true;
+				ppath->path.parallel_workers = pw;
+				ppath->path.pathkeys = NIL;
 
-			ppath->flags = 0;
-			ppath->methods = &sorted_heap_path_methods;
-			ppath->custom_private = cpath->custom_private;
+				/* Per-worker cost: divide total among participants */
+				ppath->path.rows = saved_rows;
+				ppath->path.startup_cost = 0;
+				ppath->path.total_cost = saved_total_cost / (pw + 1);
 
-			add_partial_path(rel, &ppath->path);
+				ppath->flags = 0;
+				ppath->methods = &sorted_heap_path_methods;
+				ppath->custom_private = saved_custom_private;
+
+				add_partial_path(rel, &ppath->path);
+			}
 		}
 	}
 }
@@ -1387,6 +1423,9 @@ sorted_heap_begin_custom_scan(CustomScanState *node, EState *estate,
 	shstate->last_blk = InvalidBlockNumber;
 	shstate->pscan = NULL;
 	shstate->runtime_bounds = false;
+	shstate->runtime_resolve_pending = false;
+	shstate->zm_gen_at_start = sorted_heap_read_zm_generation();
+	shstate->zm_stale = false;
 
 	/*
 	 * Path A: custom_private has 3 elements (range_list, bounds_list,
@@ -1464,8 +1503,14 @@ sorted_heap_begin_custom_scan(CustomScanState *node, EState *estate,
 			shstate->const_bounds.has_hi2 = false;
 		}
 
-		/* Resolve runtime bounds: evaluate Params, compute block range */
-		sorted_heap_resolve_runtime_bounds(shstate);
+		/*
+		 * PARAM_EXEC values from NestLoop/LATERAL are not set yet during
+		 * BeginCustomScan.  Defer their first resolution until rescan/execution.
+		 */
+		if (sorted_heap_exprs_need_deferred_runtime_resolve(cscan->custom_exprs))
+			shstate->runtime_resolve_pending = true;
+		else
+			sorted_heap_resolve_runtime_bounds(shstate);
 	}
 	else
 	{
@@ -1560,7 +1605,11 @@ sorted_heap_begin_custom_scan(CustomScanState *node, EState *estate,
 	{
 		shstate->heap_scan = table_beginscan(rel, estate->es_snapshot,
 											 0, NULL);
-		if (shstate->scan_nblocks > 0)
+		if (shstate->runtime_bounds && shstate->runtime_resolve_pending)
+		{
+			/* Full scan for now; first rescan/execution will narrow it. */
+		}
+		else if (shstate->scan_nblocks > 0)
 			heap_setscanlimits(shstate->heap_scan,
 							   shstate->scan_start,
 							   shstate->scan_nblocks);
@@ -1602,6 +1651,30 @@ sorted_heap_scan_next(ScanState *ss)
 	 */
 	bool		pk_prefilter = info->zm_sorted;
 
+	if (shstate->runtime_bounds && shstate->runtime_resolve_pending)
+	{
+		sorted_heap_resolve_runtime_bounds(shstate);
+		shstate->runtime_resolve_pending = false;
+		shstate->scanned_blocks = 0;
+		shstate->pruned_blocks = 0;
+		shstate->last_blk = InvalidBlockNumber;
+
+		if (shstate->heap_scan)
+		{
+			table_rescan(shstate->heap_scan, NULL);
+
+			if (shstate->scan_nblocks > 0)
+				heap_setscanlimits(shstate->heap_scan,
+							   shstate->scan_start,
+							   shstate->scan_nblocks);
+			else
+				heap_setscanlimits(shstate->heap_scan, 1, 0);
+		}
+
+		skip_zone_check = (shstate->scan_nblocks <= 4 &&
+						   shstate->n_in_values == 0);
+	}
+
 	while (table_scan_getnextslot(shstate->heap_scan,
 								  ForwardScanDirection, slot))
 	{
@@ -1614,13 +1687,27 @@ sorted_heap_scan_next(ScanState *ss)
 		{
 			shstate->scanned_blocks++;
 			shstate->last_blk = blk;
+
+			/*
+			 * Mid-scan staleness check: if another backend mutated
+			 * the zone map since we started, stop trusting it and let
+			 * the executor quals handle filtering.  One atomic read
+			 * per block transition — negligible cost.
+			 */
+			if (!shstate->zm_stale &&
+				shstate->zm_gen_at_start != 0)
+			{
+				uint64 cur = sorted_heap_read_zm_generation();
+				if (cur != shstate->zm_gen_at_start)
+					shstate->zm_stale = true;
+			}
 		}
 
 		blk_in_prefix = (blk >= 1 &&
 						 (blk - 1) < info->zm_total_entries);
 
 		/* Per-block zone map check for fine-grained pruning */
-		if (!skip_zone_check && blk_in_prefix)
+		if (!skip_zone_check && !shstate->zm_stale && blk_in_prefix)
 		{
 			SortedHeapZoneMapEntry *e =
 				sorted_heap_get_zm_entry(info, blk - 1);
@@ -1645,7 +1732,7 @@ sorted_heap_scan_next(ScanState *ss)
 		 * scan once past upper bound.  Only safe for pages within the
 		 * sorted prefix (covered by monotonic zone map entries).
 		 */
-		if (pk_prefilter && blk_in_prefix)
+		if (pk_prefilter && !shstate->zm_stale && blk_in_prefix)
 		{
 			bool	isnull;
 			Datum	pk_datum;
@@ -1803,10 +1890,15 @@ sorted_heap_rescan_custom_scan(CustomScanState *node)
 {
 	SortedHeapScanState *shstate = (SortedHeapScanState *) node;
 
+	/* Reset mid-scan staleness so rescan gets a fresh generation snapshot */
+	shstate->zm_gen_at_start = sorted_heap_read_zm_generation();
+	shstate->zm_stale = false;
+
 	/* Path B: re-evaluate runtime bounds (params may change in NestLoop) */
 	if (shstate->runtime_bounds)
 	{
 		sorted_heap_resolve_runtime_bounds(shstate);
+		shstate->runtime_resolve_pending = false;
 		shstate->scanned_blocks = 0;
 		shstate->pruned_blocks = 0;
 		shstate->last_blk = InvalidBlockNumber;
