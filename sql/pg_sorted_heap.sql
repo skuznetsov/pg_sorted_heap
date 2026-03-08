@@ -2251,4 +2251,108 @@ RESET max_parallel_workers_per_gather;
 DROP TABLE sh19;
 DROP FUNCTION sh19_plan_contains(text, text);
 
+-- ====================================================================
+-- ANN regression tests: svec_ann_scan correctness, dimension check,
+-- ann_timing non-crash smoke
+-- ====================================================================
+
+CREATE TABLE ann_test(
+	id text NOT NULL,
+	embedding svec NOT NULL,
+	partition_id int2 NOT NULL DEFAULT 0,
+	pq_code bytea,
+	PRIMARY KEY (partition_id, id)
+);
+
+-- 300 deterministic 8-dim vectors
+INSERT INTO ann_test(id, embedding)
+SELECT 'v' || lpad(i::text, 3, '0'),
+       ('[' || (i % 10) || ',' || (i % 7) || ',' || (i % 11) || ','
+            || (i % 13) || ',' || (i % 3) || ',' || (i % 5) || ','
+            || (i % 9) || ',' || (i % 4) || ']')::svec
+FROM generate_series(1, 300) i;
+
+-- Train IVF (nlist=2) + PQ (M=2, dsub=4), assign partitions, encode PQ
+-- Suppress training progress NOTICEs (byte counts are non-deterministic)
+SET client_min_messages = warning;
+DO $$
+DECLARE
+	_ivf int4;
+	_pq  int4;
+BEGIN
+	SELECT ivf_cb_id, pq_cb_id INTO _ivf, _pq
+	FROM svec_ann_train('SELECT embedding FROM ann_test', 2, 2, 10, 300);
+
+	EXECUTE format(
+		'UPDATE ann_test SET partition_id = svec_ivf_assign(embedding, %s)',
+		_ivf);
+	EXECUTE format(
+		'UPDATE ann_test SET pq_code = svec_pq_encode(embedding, %s)',
+		_pq);
+
+	PERFORM set_config('ann_test.pq_cb_id', _pq::text, false);
+	PERFORM set_config('ann_test.ivf_cb_id', _ivf::text, false);
+END;
+$$;
+RESET client_min_messages;
+ANALYZE ann_test;
+
+-- ANN-1: PQ-only scan returns correct count with non-negative distances
+SELECT count(*) AS ann_pq_count,
+       bool_and(distance >= 0) AS ann_pq_nonneg
+FROM svec_ann_scan(
+	'ann_test',
+	'[5,3,6,7,1,2,4,2]'::svec,
+	2, 5, 0,
+	current_setting('ann_test.pq_cb_id')::int4,
+	current_setting('ann_test.ivf_cb_id')::int4
+);
+
+-- ANN-2: rerank all 300 candidates; self-query has cosine distance ≈ 0
+SELECT count(*) AS ann_rerank_count,
+       bool_and(distance < 1e-6) AS ann_rerank_near_zero
+FROM svec_ann_scan(
+	'ann_test',
+	(SELECT embedding FROM ann_test WHERE id = 'v001'),
+	2, 1, 300,
+	current_setting('ann_test.pq_cb_id')::int4,
+	current_setting('ann_test.ivf_cb_id')::int4
+);
+
+-- ANN-3: sorted_heap.ann_timing GUC does not crash
+SET sorted_heap.ann_timing = on;
+SELECT count(*) AS ann_timing_count
+FROM svec_ann_scan(
+	'ann_test',
+	'[5,3,6,7,1,2,4,2]'::svec,
+	2, 5, 0,
+	current_setting('ann_test.pq_cb_id')::int4,
+	current_setting('ann_test.ivf_cb_id')::int4
+);
+RESET sorted_heap.ann_timing;
+
+-- ANN-4: dimension mismatch in rerank path raises ERROR
+INSERT INTO ann_test(id, embedding, partition_id, pq_code)
+VALUES ('bad', '[1,2,3]'::svec, 0,
+        (SELECT pq_code FROM ann_test WHERE partition_id = 0 ORDER BY id LIMIT 1));
+DO $$
+BEGIN
+	PERFORM * FROM svec_ann_scan(
+		'ann_test',
+		'[5,3,6,7,1,2,4,2]'::svec,
+		2, 5, 500,
+		current_setting('ann_test.pq_cb_id')::int4,
+		current_setting('ann_test.ivf_cb_id')::int4
+	);
+	RAISE NOTICE 'ANN-4 FAIL: expected dimension mismatch error not raised';
+EXCEPTION WHEN data_exception THEN
+	RAISE NOTICE 'ANN-4 OK: %', SQLERRM;
+END;
+$$;
+DELETE FROM ann_test WHERE id = 'bad';
+
+-- Cleanup: drop codebook tables (have svec columns) before extension
+DROP TABLE ann_test;
+DROP TABLE IF EXISTS _ivf_centroids, _pq_codebooks, _ivf_meta, _pq_codebook_meta;
+
 DROP EXTENSION pg_sorted_heap;
