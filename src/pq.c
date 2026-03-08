@@ -20,8 +20,12 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
+#include "access/stratnum.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "catalog/pg_am.h"
+#include "commands/defrem.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
 #include "funcapi.h"
@@ -37,6 +41,7 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
 #include "utils/snapmgr.h"
 
 #include <float.h>
@@ -2265,7 +2270,6 @@ svec_pq_adc(PG_FUNCTION_ARGS)
 
 typedef struct
 {
-	int				idx;
 	float			dist;
 	ItemPointerData	tid;
 } TopKEntry;
@@ -2314,19 +2318,19 @@ topk_siftup(TopKEntry *heap, int i)
 
 static void
 topk_insert(TopKEntry *heap, int *heap_size, int max_k,
-			int idx, float dist)
+			float dist, ItemPointerData *tid)
 {
 	if (*heap_size < max_k)
 	{
-		heap[*heap_size].idx = idx;
 		heap[*heap_size].dist = dist;
+		ItemPointerCopy(tid, &heap[*heap_size].tid);
 		(*heap_size)++;
 		topk_siftup(heap, *heap_size - 1);
 	}
 	else if (dist < heap[0].dist)
 	{
-		heap[0].idx = idx;
 		heap[0].dist = dist;
+		ItemPointerCopy(tid, &heap[0].tid);
 		topk_siftdown(heap, *heap_size, 0);
 	}
 }
@@ -2368,7 +2372,7 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 	char	   *pq_col = text_to_cstring(PG_GETARG_TEXT_PP(7));
 	bool		is_residual = (ivf_id > 0);
 	int			dim, M, dsub, nlist;
-	int			effective_topk, n_cand, ret;
+	int			effective_topk, n_cand;
 	int			i, j, m, c, p;
 	float	   *dist_table = NULL;
 	float	   *per_centroid_dt = NULL;
@@ -2378,9 +2382,6 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 	TopKEntry  *heap;
 	int			heap_size;
 	AnnResult  *results;
-	SPITupleTable *tuptable;
-	TupleDesc	tupdesc;
-	MemoryContext caller_ctx;
 	instr_time	t_start, t_ivf, t_dt, t_fetch, t_adc, t_rerank, t_out;
 
 	/* Setup materialized SRF (tuplestore) */
@@ -2528,225 +2529,204 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 	if (sorted_heap_ann_timing)
 		INSTR_TIME_SET_CURRENT(t_ivf);
 
-	/* ---- Resolve table and extension names ---- */
-	caller_ctx = CurrentMemoryContext;
+	/* ---- Step 3+4: Direct index scan + ADC ---- */
 	{
-		char	   *relname = get_rel_name(tbl_oid);
-		Oid			rel_nspid = get_rel_namespace(tbl_oid);
-		char	   *rel_nspname = get_namespace_name(rel_nspid);
-		const char *qname = quote_qualified_identifier(rel_nspname, relname);
-		StringInfoData sql;
+		Relation		rel;
+		Relation		pk_index;
+		Snapshot		snapshot;
+		TupleDesc		td;
+		TupleTableSlot *slot;
+		AttrNumber		pq_attno;
+		AttrNumber		id_attno;
+		Oid				id_typid;
+		Oid				typoutput;
+		bool			typisvarlena;
+		ScanKeyData		skey[1];
+		Oid				partid_typid;
+		RegProcedure	eq_proc;
 
-		/* ---- Step 3: SPI fetch candidate rows ---- */
-		initStringInfo(&sql);
-		appendStringInfo(&sql,
-						 "SELECT %s, partition_id, ctid "
-						 "FROM %s WHERE partition_id IN (",
-						 quote_identifier(pq_col), qname);
+		rel = table_open(tbl_oid, AccessShareLock);
+		td = RelationGetDescr(rel);
+		snapshot = GetActiveSnapshot();
+		slot = table_slot_create(rel, NULL);
 
-		for (p = 0; p < nprobe; p++)
-			appendStringInfo(&sql, "%s%d", p > 0 ? "," : "",
-							 probe_ids[p]);
-		appendStringInfoChar(&sql, ')');
-
-		SPI_connect();
-		ret = SPI_execute(sql.data, true, 0);
-		pfree(sql.data);
-
-		if (ret != SPI_OK_SELECT)
-		{
-			SPI_finish();
+		/* Find PK index */
+		if (!rel->rd_indexvalid)
+			RelationGetIndexList(rel);
+		if (!OidIsValid(rel->rd_pkindex))
 			ereport(ERROR,
-					(errmsg("svec_ann_scan: SPI query failed")));
+					(errmsg("svec_ann_scan: table has no primary key")));
+		pk_index = index_open(rel->rd_pkindex, AccessShareLock);
+
+		/* Resolve attribute numbers */
+		pq_attno = get_attnum(tbl_oid, pq_col);
+		id_attno = get_attnum(tbl_oid, "id");
+		id_typid = TupleDescAttr(td, id_attno - 1)->atttypid;
+		getTypeOutputInfo(id_typid, &typoutput, &typisvarlena);
+
+		/* Build equality operator for partition_id (first PK column) */
+		{
+			AttrNumber	pk_first_heap_attno;
+			Oid			opclass, opfamily, eq_opr;
+
+			pk_first_heap_attno = pk_index->rd_index->indkey.values[0];
+			partid_typid = TupleDescAttr(td, pk_first_heap_attno - 1)->atttypid;
+			opclass = GetDefaultOpClass(partid_typid, BTREE_AM_OID);
+			opfamily = get_opclass_family(opclass);
+			eq_opr = get_opfamily_member(opfamily, partid_typid,
+										 partid_typid,
+										 BTEqualStrategyNumber);
+			eq_proc = get_opcode(eq_opr);
 		}
 
-		n_cand = (int) SPI_processed;
-		tuptable = SPI_tuptable;
-		tupdesc = tuptable->tupdesc;
+		heap = palloc(sizeof(TopKEntry) * effective_topk);
+		heap_size = 0;
+		n_cand = 0;
 
 		if (sorted_heap_ann_timing)
 			INSTR_TIME_SET_CURRENT(t_fetch);
 
-		/* ---- Step 4: ADC scan in tight C loop ---- */
+		/* Scan each probe partition via PK index */
+		for (p = 0; p < nprobe; p++)
 		{
-			MemoryContext old = MemoryContextSwitchTo(caller_ctx);
-
-			heap = palloc(sizeof(TopKEntry) * effective_topk);
-			MemoryContextSwitchTo(old);
-		}
-		heap_size = 0;
-
-		for (i = 0; i < n_cand; i++)
-		{
-			bool	isnull;
-			Datum	code_d;
-			bytea  *code;
-			uint8  *codes;
-			int		code_len;
-			float	dist;
+			IndexScanDesc iscan;
 			float  *dt;
 
-			/* col 1 = pq_code, col 2 = partition_id, col 3 = ctid */
-			code_d = SPI_getbinval(tuptable->vals[i], tupdesc, 1, &isnull);
-			if (isnull)
-				continue;
-
-			code = DatumGetByteaPP(code_d);
-			codes = (uint8 *) VARDATA_ANY(code);
-			code_len = VARSIZE_ANY_EXHDR(code);
-			if (code_len != M)
-				continue;
-
-			/* Select appropriate distance table */
+			/* Select per-centroid distance table */
 			if (is_residual)
-			{
-				int		part_id;
-				int		probe_idx;
+				dt = per_centroid_dt + (size_t) p * M * PQ_KSUB;
+			else
+				dt = dist_table;
 
-				part_id = DatumGetInt16(SPI_getbinval(tuptable->vals[i],
-													 tupdesc, 2, &isnull));
+			ScanKeyInit(&skey[0],
+						1,		/* first index column = partition_id */
+						BTEqualStrategyNumber,
+						eq_proc,
+						Int16GetDatum(probe_ids[p]));
+
+#if PG_VERSION_NUM < 180000
+			iscan = index_beginscan(rel, pk_index, snapshot, 1, 0);
+#else
+			iscan = index_beginscan(rel, pk_index, snapshot, NULL, 1, 0);
+#endif
+			index_rescan(iscan, skey, 1, NULL, 0);
+
+			while (index_getnext_slot(iscan, ForwardScanDirection, slot))
+			{
+				bool	isnull;
+				Datum	code_d;
+				bytea  *code;
+				uint8  *codes;
+				int		code_len;
+				float	dist;
+				ItemPointerData row_tid;
+
+				n_cand++;
+
+				code_d = slot_getattr(slot, pq_attno, &isnull);
 				if (isnull)
 					continue;
-				probe_idx = centroid_to_probe[part_id];
-				if (probe_idx < 0)
+
+				code = DatumGetByteaPP(code_d);
+				codes = (uint8 *) VARDATA_ANY(code);
+				code_len = VARSIZE_ANY_EXHDR(code);
+				if (code_len != M)
 					continue;
-				dt = per_centroid_dt + (size_t) probe_idx * M * PQ_KSUB;
-			}
-			else
-			{
-				dt = dist_table;
+
+				dist = 0.0f;
+				for (m = 0; m < M; m++)
+					dist += dt[m * PQ_KSUB + codes[m]];
+
+				ItemPointerCopy(&slot->tts_tid, &row_tid);
+				topk_insert(heap, &heap_size, effective_topk, dist, &row_tid);
 			}
 
-			dist = 0.0f;
-			for (m = 0; m < M; m++)
-				dist += dt[m * PQ_KSUB + codes[m]];
-
-			topk_insert(heap, &heap_size, effective_topk, i, dist);
+			index_endscan(iscan);
 		}
+
+		index_close(pk_index, AccessShareLock);
 
 		if (sorted_heap_ann_timing)
 			INSTR_TIME_SET_CURRENT(t_adc);
 
-		/* ---- Step 5: Copy top-K TIDs + dists into caller context ---- */
-		MemoryContextSwitchTo(caller_ctx);
+		/* ---- Step 5: Copy top-K into results array ---- */
 		results = palloc(sizeof(AnnResult) * heap_size);
 		for (j = 0; j < heap_size; j++)
 		{
-			int		idx = heap[j].idx;
-			bool	isnull;
-			Datum	tid_d;
-
-			/* Extract ctid (col 3) and copy immediately */
-			tid_d = SPI_getbinval(tuptable->vals[idx], tupdesc, 3, &isnull);
-			if (!isnull)
-				ItemPointerCopy(DatumGetItemPointer(tid_d), &results[j].tid);
-			else
-				ItemPointerSetInvalid(&results[j].tid);
-
+			ItemPointerCopy(&heap[j].tid, &results[j].tid);
 			results[j].id = NULL;
 			results[j].distance = (float8) heap[j].dist;
 		}
 
-		/* Close SPI before rerank — frees candidate tuptable memory */
-		SPI_finish();
-
 		/* ---- Step 6: C-level rerank + id extraction via table AM ---- */
+		if (rerank_topk > 0 && heap_size > 0)
 		{
-			Relation	rel;
-			TupleTableSlot *slot;
-			TupleDesc	td;
-			AttrNumber	id_attno;
-			Oid			id_typid;
-			Oid			typoutput;
-			bool		typisvarlena;
+			/* Rerank: fetch embedding + id in single pass */
+			AttrNumber	emb_attno = get_attnum(tbl_oid, "embedding");
 
-			rel = table_open(tbl_oid, AccessShareLock);
-			td = RelationGetDescr(rel);
-			slot = table_slot_create(rel, NULL);
-
-			/* Look up id column output function */
-			id_attno = get_attnum(tbl_oid, "id");
-			id_typid = TupleDescAttr(td, id_attno - 1)->atttypid;
-			getTypeOutputInfo(id_typid, &typoutput, &typisvarlena);
-
-			if (rerank_topk > 0 && heap_size > 0)
+			for (j = 0; j < heap_size; j++)
 			{
-				/* Rerank: fetch embedding + id in single pass */
-				AttrNumber	emb_attno = get_attnum(tbl_oid, "embedding");
+				bool	isnull;
+				Datum	emb_d, id_d;
+				Svec   *candidate;
 
-				for (j = 0; j < heap_size; j++)
+				if (!table_tuple_fetch_row_version(rel, &results[j].tid,
+												   snapshot, slot))
 				{
-					if (!ItemPointerIsValid(&results[j].tid) ||
-						!table_tuple_fetch_row_version(rel, &results[j].tid,
-													   GetActiveSnapshot(),
-													   slot))
-					{
-						results[j].id = pstrdup("");
-						continue;
-					}
-
-					{
-						bool	isnull;
-						Datum	emb_d, id_d;
-						Svec   *candidate;
-
-						/* Extract embedding for exact cosine distance */
-						emb_d = slot_getattr(slot, emb_attno, &isnull);
-						if (!isnull)
-						{
-							candidate = DatumGetSvecP(emb_d);
-							results[j].distance =
-								svec_cosine_distance_internal(query,
-															  candidate);
-						}
-
-						/* Extract id */
-						id_d = slot_getattr(slot, id_attno, &isnull);
-						results[j].id = isnull ? pstrdup("")
-							: OidOutputFunctionCall(typoutput, id_d);
-					}
-
-					ExecClearTuple(slot);
+					results[j].id = pstrdup("");
+					continue;
 				}
 
-				qsort(results, heap_size, sizeof(AnnResult), cmp_ann_result);
-				if (heap_size > lim)
-					heap_size = lim;
-			}
-			else
-			{
-				/* No rerank: fetch id only for final results */
-				qsort(results, heap_size, sizeof(AnnResult), cmp_ann_result);
-				if (heap_size > lim)
-					heap_size = lim;
-
-				for (j = 0; j < heap_size; j++)
+				/* Extract embedding for exact cosine distance */
+				emb_d = slot_getattr(slot, emb_attno, &isnull);
+				if (!isnull)
 				{
-					if (!ItemPointerIsValid(&results[j].tid) ||
-						!table_tuple_fetch_row_version(rel, &results[j].tid,
-													   GetActiveSnapshot(),
-													   slot))
-					{
-						results[j].id = pstrdup("");
-						continue;
-					}
-
-					{
-						bool	isnull;
-						Datum	id_d;
-
-						id_d = slot_getattr(slot, id_attno, &isnull);
-						results[j].id = isnull ? pstrdup("")
-							: OidOutputFunctionCall(typoutput, id_d);
-					}
-
-					ExecClearTuple(slot);
+					candidate = DatumGetSvecP(emb_d);
+					results[j].distance =
+						svec_cosine_distance_internal(query, candidate);
 				}
+
+				/* Extract id */
+				id_d = slot_getattr(slot, id_attno, &isnull);
+				results[j].id = isnull ? pstrdup("")
+					: OidOutputFunctionCall(typoutput, id_d);
+
+				ExecClearTuple(slot);
 			}
 
-			ExecDropSingleTupleTableSlot(slot);
-			table_close(rel, AccessShareLock);
+			qsort(results, heap_size, sizeof(AnnResult), cmp_ann_result);
+			if (heap_size > lim)
+				heap_size = lim;
 		}
+		else
+		{
+			/* No rerank: fetch id only for final results */
+			qsort(results, heap_size, sizeof(AnnResult), cmp_ann_result);
+			if (heap_size > lim)
+				heap_size = lim;
+
+			for (j = 0; j < heap_size; j++)
+			{
+				bool	isnull;
+				Datum	id_d;
+
+				if (!table_tuple_fetch_row_version(rel, &results[j].tid,
+												   snapshot, slot))
+				{
+					results[j].id = pstrdup("");
+					continue;
+				}
+
+				id_d = slot_getattr(slot, id_attno, &isnull);
+				results[j].id = isnull ? pstrdup("")
+					: OidOutputFunctionCall(typoutput, id_d);
+
+				ExecClearTuple(slot);
+			}
+		}
+
+		ExecDropSingleTupleTableSlot(slot);
+		table_close(rel, AccessShareLock);
 
 		if (sorted_heap_ann_timing)
 			INSTR_TIME_SET_CURRENT(t_rerank);
