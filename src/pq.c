@@ -2396,7 +2396,7 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 	TopKEntry  *heap;
 	int			heap_size;
 	AnnResult  *results;
-	instr_time	t_start, t_ivf, t_dt, t_fetch, t_adc, t_rerank, t_out;
+	instr_time	t_start, t_ivf, t_dt, t_scan, t_rerank, t_out;
 
 	/* Setup materialized SRF (tuplestore) */
 	if (sorted_heap_ann_timing)
@@ -2597,9 +2597,6 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 		heap_size = 0;
 		n_cand = 0;
 
-		if (sorted_heap_ann_timing)
-			INSTR_TIME_SET_CURRENT(t_fetch);
-
 		/* Scan each probe partition via PK index */
 		for (p = 0; p < nprobe; p++)
 		{
@@ -2661,7 +2658,7 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 		index_close(pk_index, AccessShareLock);
 
 		if (sorted_heap_ann_timing)
-			INSTR_TIME_SET_CURRENT(t_adc);
+			INSTR_TIME_SET_CURRENT(t_scan);
 
 		/* ---- Step 5: Copy top-K into results array ---- */
 		results = palloc(sizeof(AnnResult) * heap_size);
@@ -2710,6 +2707,12 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 				if (!isnull)
 				{
 					candidate = DatumGetSvecP(emb_d);
+					if (candidate->dim != query->dim)
+						ereport(ERROR,
+								(errcode(ERRCODE_DATA_EXCEPTION),
+								 errmsg("svec_ann_scan rerank: embedding "
+										"dimension %d doesn't match query "
+										"(%d)", candidate->dim, query->dim)));
 					results[j].distance =
 						svec_cosine_distance_internal(query, candidate);
 				}
@@ -2782,14 +2785,13 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 	if (sorted_heap_ann_timing)
 	{
 		INSTR_TIME_SET_CURRENT(t_out);
-		elog(DEBUG1, "svec_ann_scan: dt=%.3fms ivf=%.3fms fetch=%.3fms "
-			 "adc=%.3fms rerank=%.3fms out=%.3fms total=%.3fms "
+		elog(DEBUG1, "svec_ann_scan: dt=%.3fms ivf=%.3fms "
+			 "scan=%.3fms rerank=%.3fms out=%.3fms total=%.3fms "
 			 "(cand=%d topk=%d)",
 			 INSTR_TIME_GET_MILLISEC(t_dt) - INSTR_TIME_GET_MILLISEC(t_start),
 			 INSTR_TIME_GET_MILLISEC(t_ivf) - INSTR_TIME_GET_MILLISEC(t_dt),
-			 INSTR_TIME_GET_MILLISEC(t_fetch) - INSTR_TIME_GET_MILLISEC(t_ivf),
-			 INSTR_TIME_GET_MILLISEC(t_adc) - INSTR_TIME_GET_MILLISEC(t_fetch),
-			 INSTR_TIME_GET_MILLISEC(t_rerank) - INSTR_TIME_GET_MILLISEC(t_adc),
+			 INSTR_TIME_GET_MILLISEC(t_scan) - INSTR_TIME_GET_MILLISEC(t_ivf),
+			 INSTR_TIME_GET_MILLISEC(t_rerank) - INSTR_TIME_GET_MILLISEC(t_scan),
 			 INSTR_TIME_GET_MILLISEC(t_out) - INSTR_TIME_GET_MILLISEC(t_rerank),
 			 INSTR_TIME_GET_MILLISEC(t_out) - INSTR_TIME_GET_MILLISEC(t_start),
 			 n_cand, heap_size);
