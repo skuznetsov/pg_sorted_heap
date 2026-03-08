@@ -18,6 +18,10 @@
 
 #include <math.h>
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 #include "svec.h"
 
 /* ----------------------------------------------------------------
@@ -262,11 +266,47 @@ float8
 svec_cosine_distance_internal(const Svec *a, const Svec *b)
 {
 	int			dim = a->dim;
-	double		dot = 0.0;
-	double		norm_a = 0.0;
-	double		norm_b = 0.0;
+	double		dot;
+	double		norm_a;
+	double		norm_b;
 	double		similarity;
 	int			i;
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+	{
+		float32x4_t vdot = vdupq_n_f32(0.0f);
+		float32x4_t vna = vdupq_n_f32(0.0f);
+		float32x4_t vnb = vdupq_n_f32(0.0f);
+
+		for (i = 0; i + 3 < dim; i += 4)
+		{
+			float32x4_t va = vld1q_f32(&a->x[i]);
+			float32x4_t vb = vld1q_f32(&b->x[i]);
+
+			vdot = vfmaq_f32(vdot, va, vb);
+			vna = vfmaq_f32(vna, va, va);
+			vnb = vfmaq_f32(vnb, vb, vb);
+		}
+
+		dot = (double) vaddvq_f32(vdot);
+		norm_a = (double) vaddvq_f32(vna);
+		norm_b = (double) vaddvq_f32(vnb);
+
+		/* Scalar tail for non-multiple-of-4 */
+		for (; i < dim; i++)
+		{
+			double	ai = (double) a->x[i];
+			double	bi = (double) b->x[i];
+
+			dot += ai * bi;
+			norm_a += ai * ai;
+			norm_b += bi * bi;
+		}
+	}
+#else
+	dot = 0.0;
+	norm_a = 0.0;
+	norm_b = 0.0;
 
 	for (i = 0; i < dim; i++)
 	{
@@ -277,6 +317,7 @@ svec_cosine_distance_internal(const Svec *a, const Svec *b)
 		norm_a += ai * ai;
 		norm_b += bi * bi;
 	}
+#endif
 
 	/* Handle zero vectors */
 	if (norm_a == 0.0 || norm_b == 0.0)

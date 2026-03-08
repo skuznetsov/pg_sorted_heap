@@ -35,6 +35,7 @@
 #include "executor/spi.h"
 #include "miscadmin.h"
 #include "portability/instr_time.h"
+#include "storage/bufmgr.h"
 #include "storage/itemptr.h"
 #include "utils/acl.h"
 #include "utils/array.h"
@@ -2355,6 +2356,19 @@ cmp_ann_result(const void *a, const void *b)
 	return 0;
 }
 
+static int
+cmp_ann_result_by_blk(const void *a, const void *b)
+{
+	BlockNumber ba = ItemPointerGetBlockNumber(&((const AnnResult *) a)->tid);
+	BlockNumber bb = ItemPointerGetBlockNumber(&((const AnnResult *) b)->tid);
+
+	if (ba < bb) return -1;
+	if (ba > bb) return 1;
+	return 0;
+}
+
+#define RERANK_PREFETCH_DISTANCE	32
+
 /* --- Main scan function --- */
 
 PG_FUNCTION_INFO_V1(svec_ann_scan);
@@ -2661,23 +2675,37 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 		/* ---- Step 6: C-level rerank + id extraction via table AM ---- */
 		if (rerank_topk > 0 && heap_size > 0)
 		{
-			/* Rerank: fetch embedding + id in single pass */
 			AttrNumber	emb_attno = get_attnum(tbl_oid, "embedding");
 
+			/* Sort by block number for sequential I/O */
+			qsort(results, heap_size, sizeof(AnnResult),
+				  cmp_ann_result_by_blk);
+
+			/* Prefetch initial batch of heap pages */
+			for (j = 0; j < Min(RERANK_PREFETCH_DISTANCE, heap_size); j++)
+				PrefetchBuffer(rel, MAIN_FORKNUM,
+							   ItemPointerGetBlockNumber(&results[j].tid));
+
+			/* Rerank: fetch embedding only, compute exact distance */
 			for (j = 0; j < heap_size; j++)
 			{
 				bool	isnull;
-				Datum	emb_d, id_d;
+				Datum	emb_d;
 				Svec   *candidate;
+
+				/* Prefetch ahead */
+				if (j + RERANK_PREFETCH_DISTANCE < heap_size)
+					PrefetchBuffer(rel, MAIN_FORKNUM,
+								   ItemPointerGetBlockNumber(
+									   &results[j + RERANK_PREFETCH_DISTANCE].tid));
 
 				if (!table_tuple_fetch_row_version(rel, &results[j].tid,
 												   snapshot, slot))
 				{
-					results[j].id = pstrdup("");
+					results[j].distance = DBL_MAX;
 					continue;
 				}
 
-				/* Extract embedding for exact cosine distance */
 				emb_d = slot_getattr(slot, emb_attno, &isnull);
 				if (!isnull)
 				{
@@ -2686,43 +2714,40 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 						svec_cosine_distance_internal(query, candidate);
 				}
 
-				/* Extract id */
-				id_d = slot_getattr(slot, id_attno, &isnull);
-				results[j].id = isnull ? pstrdup("")
-					: OidOutputFunctionCall(typoutput, id_d);
-
 				ExecClearTuple(slot);
 			}
 
+			/* Sort by exact distance, keep top-lim */
 			qsort(results, heap_size, sizeof(AnnResult), cmp_ann_result);
 			if (heap_size > lim)
 				heap_size = lim;
 		}
 		else
 		{
-			/* No rerank: fetch id only for final results */
+			/* No rerank: sort by ADC distance, keep top-lim */
 			qsort(results, heap_size, sizeof(AnnResult), cmp_ann_result);
 			if (heap_size > lim)
 				heap_size = lim;
+		}
 
-			for (j = 0; j < heap_size; j++)
+		/* Fetch id for final results only */
+		for (j = 0; j < heap_size; j++)
+		{
+			bool	isnull;
+			Datum	id_d;
+
+			if (!table_tuple_fetch_row_version(rel, &results[j].tid,
+											   snapshot, slot))
 			{
-				bool	isnull;
-				Datum	id_d;
-
-				if (!table_tuple_fetch_row_version(rel, &results[j].tid,
-												   snapshot, slot))
-				{
-					results[j].id = pstrdup("");
-					continue;
-				}
-
-				id_d = slot_getattr(slot, id_attno, &isnull);
-				results[j].id = isnull ? pstrdup("")
-					: OidOutputFunctionCall(typoutput, id_d);
-
-				ExecClearTuple(slot);
+				results[j].id = pstrdup("");
+				continue;
 			}
+
+			id_d = slot_getattr(slot, id_attno, &isnull);
+			results[j].id = isnull ? pstrdup("")
+				: OidOutputFunctionCall(typoutput, id_d);
+
+			ExecClearTuple(slot);
 		}
 
 		ExecDropSingleTupleTableSlot(slot);
