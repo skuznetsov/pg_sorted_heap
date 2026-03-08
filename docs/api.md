@@ -112,6 +112,36 @@ direct use.
 
 ---
 
+## Scan pruning
+
+### IN / ANY support
+
+SortedHeapScan prunes blocks for `IN` and `= ANY(array)` queries on the
+leading primary key column. Each block's zone map entry is checked against
+the sorted list of target values using O(log K) binary search — blocks that
+contain no matching values are skipped entirely.
+
+Both literal arrays and parameterized arrays (generic prepared statements)
+are supported.
+
+```sql
+-- Literal IN-list — pruned at plan time
+SELECT * FROM events WHERE id IN (100, 200, 300);
+
+-- Literal ANY — same pruning
+SELECT * FROM events WHERE id = ANY(ARRAY[100, 200, 300]);
+
+-- Generic prepared statement — pruned at execution time
+PREPARE q(int[]) AS SELECT * FROM events WHERE id = ANY($1);
+SET plan_cache_mode = force_generic_plan;
+EXECUTE q(ARRAY[100, 200, 300]);
+```
+
+The scan computes a bounding box (min/max of the array values) to limit the
+block range, then applies per-block IN-value filtering within that range.
+
+---
+
 ## Configuration (GUCs)
 
 ### `sorted_heap.enable_scan_pruning`
