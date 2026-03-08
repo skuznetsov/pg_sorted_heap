@@ -32,6 +32,11 @@ btree-competitive query performance without a separate index structure.
 - **Prepared statement support** -- Runtime parameter resolution enables scan
   pruning for parameterized queries (`$1`, `$2`), not just literal constants.
 
+- **IN / ANY pruning** -- `WHERE pk IN (...)` and `pk = ANY(array)` queries
+  benefit from per-block zone map pruning with O(log K) binary search.
+  Works with literal arrays, prepared statements, and LATERAL/NestLoop
+  runtime parameters.
+
 - **Vector search** -- Built-in `svec` (float32, up to 16K dim) and `hsvec`
   (float16, up to 32K dim) vector types with cosine distance and IVF-PQ
   approximate nearest neighbor search. 30x smaller index than HNSW, no

@@ -33,8 +33,9 @@ reranking.
 4. **Scan pruning** — A `set_rel_pathlist_hook` injects a `SortedHeapScan`
    custom path when the WHERE clause has PK predicates. The executor calls
    `heap_setscanlimits()` to physically skip pruned blocks, then does per-block
-   zone map checks for fine-grained filtering. Supports both literal constants
-   and parameterized queries (prepared statements).
+   zone map checks for fine-grained filtering. Supports literal constants,
+   parameterized queries (prepared statements), `IN`/`ANY(array)` with per-block
+   value filtering, and `LATERAL`/NestLoop runtime parameters.
 
 ```
 COPY → sort by PK → heap insert → update zone map
@@ -411,15 +412,15 @@ CREATE INDEX ON t USING btree (key_col);
 
 | File | Lines | Purpose |
 |------|------:|---------|
-| `sorted_heap.h` | 183 | Meta page layout, zone map structs (v6), SortedHeapRelInfo |
-| `sorted_heap.c` | 2,452 | Table AM: sorted multi_insert, zone map persistence, compact, merge, vacuum |
-| `sorted_heap_scan.c` | 1,547 | Custom scan provider: planner hook, parallel scan, multi-col pruning, runtime params |
-| `sorted_heap_online.c` | 1,053 | Online compact + online merge: trigger, copy, replay, swap |
+| `sorted_heap.h` | 187 | Meta page layout, zone map structs (v6), SortedHeapRelInfo |
+| `sorted_heap.c` | 2,536 | Table AM: sorted multi_insert, zone map persistence, compact, merge, vacuum |
+| `sorted_heap_scan.c` | 2,016 | Custom scan provider: planner hook, parallel scan, multi-col pruning, IN/ANY, runtime params |
+| `sorted_heap_online.c` | 1,171 | Online compact + online merge: trigger, copy, replay, swap |
 | `pg_sorted_heap.c` | 1,537 | Extension entry point, legacy clustered index AM, GUC registration |
-| `svec.h` / `svec.c` | 35 + 280 | svec vector type (float32): I/O, typmod, cosine distance `<=>` |
-| `hsvec.h` / `hsvec.c` | 155 + 351 | hsvec vector type (float16): I/O, cosine distance, casts to/from svec |
-| `sorted_vector_hash.c` | 590 | Vector hash functions: SimHash, VQ, RVQ, RPVQ, CVQ |
-| `pq.h` / `pq.c` | 55 + 2,568 | Product Quantization, IVF, ANN scan (training, encode, ADC, top-K) |
+| `svec.h` / `svec.c` | 38 + 301 | svec vector type (float32): I/O, typmod, cosine distance `<=>` |
+| `hsvec.h` / `hsvec.c` | 165 + 358 | hsvec vector type (float16): I/O, cosine distance, casts to/from svec |
+| `sorted_vector_hash.c` | 882 | Vector hash functions: SimHash, VQ, RVQ, RPVQ, CVQ |
+| `pq.h` / `pq.c` | 57 + 2,714 | Product Quantization, IVF, ANN scan (training, encode, ADC, top-K) |
 
 ### Zone map details
 
@@ -440,6 +441,9 @@ CREATE INDEX ON t USING btree (key_col);
 - Computes contiguous block range from zone map overlap
 - Uses `heap_setscanlimits(start, nblocks)` for physical I/O skip
 - Per-block zone map check in `ExecCustomScan` for fine-grained pruning
+- `IN`/`ANY(array)` pruning: per-block binary search against sorted value list
+- LATERAL/NestLoop: deferred PARAM_EXEC resolution at first rescan/execution
+- Mid-scan staleness detection: atomic zone map generation counter per block
 - Parallel-aware: `add_partial_path` + Gather for multi-worker scans
 - Prepared statements: runtime parameter resolution via `ExecEvalExprSwitchContext`
 - EXPLAIN shows: `Zone Map: N of M blocks (pruned P)`

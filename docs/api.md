@@ -122,7 +122,7 @@ the sorted list of target values using O(log K) binary search — blocks that
 contain no matching values are skipped entirely.
 
 Both literal arrays and parameterized arrays (generic prepared statements)
-are supported.
+are supported, including LATERAL/NestLoop runtime parameters.
 
 ```sql
 -- Literal IN-list — pruned at plan time
@@ -135,10 +135,20 @@ SELECT * FROM events WHERE id = ANY(ARRAY[100, 200, 300]);
 PREPARE q(int[]) AS SELECT * FROM events WHERE id = ANY($1);
 SET plan_cache_mode = force_generic_plan;
 EXECUTE q(ARRAY[100, 200, 300]);
+
+-- LATERAL join with runtime array — pruned per outer row
+SELECT o.i, s.cnt
+FROM (SELECT g AS i, make_arr(g) AS arr FROM generate_series(1,10) g) o
+CROSS JOIN LATERAL (
+    SELECT count(*) AS cnt FROM events WHERE id = ANY(o.arr)
+) s;
 ```
 
 The scan computes a bounding box (min/max of the array values) to limit the
 block range, then applies per-block IN-value filtering within that range.
+
+For LATERAL/NestLoop joins, runtime array parameters (`PARAM_EXEC`) are
+resolved at first rescan when outer values become available.
 
 ---
 

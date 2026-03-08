@@ -29,7 +29,7 @@ SELECT WHERE pk op const --> planner hook --> extract bounds
 |------|---------|
 | `src/pg_sorted_heap.c` | Extension entry point, index AM handler, GUC registration, observability |
 | `src/sorted_heap.c` | Table AM handler, zone map persistence (load/flush), compact, merge, vacuum rebuild, PK auto-detection, multi\_insert sorting |
-| `src/sorted_heap_scan.c` | Custom scan provider: planner hook, bounds extraction, block range computation, parallel scan, runtime parameter resolution |
+| `src/sorted_heap_scan.c` | Custom scan provider: planner hook, bounds extraction, block range computation, parallel scan, IN/ANY pruning, LATERAL/NestLoop deferred params, mid-scan staleness detection |
 | `src/sorted_heap_online.c` | Online (non-blocking) compact and merge: trigger-based change capture, PK-to-TID hash, multi-pass replay |
 | `src/sorted_heap.h` | Shared header: data structures, version/magic constants, function declarations |
 
@@ -136,6 +136,33 @@ The scan provider defers resolution to the executor, where it:
 - Recomputes the block range on each rescan (supports NestLoop joins)
 - For `= ANY($1)` arrays: deconstructs the array, computes bounding box
   and sorted value list at execution time
+
+### LATERAL / NestLoop deferred resolution
+
+When `SortedHeapScan` appears as the inner side of a NestLoop or LATERAL
+join with `PARAM_EXEC` parameters (e.g., `WHERE id = ANY(outer.arr)`),
+the parameter values are not yet available during `BeginCustomScan`.
+
+The scan provider detects `PARAM_EXEC` nodes in the runtime expression
+list and defers bounds resolution until the first `ReScanCustomScan` call
+(when the outer node has populated the parameters). This prevents crashes
+from evaluating uninitialized executor parameters.
+
+### Mid-scan zone map staleness detection
+
+If another backend modifies the zone map while a scan is in progress
+(e.g., concurrent `compact` or `rebuild_zonemap`), the scan could apply
+stale zone map entries and skip blocks that now contain matching rows.
+
+To prevent this, each scan snapshots the cluster-wide **zone map
+generation counter** (`zm_generation`, an atomic uint64 in shared memory)
+at start. On each block transition, the scan compares the current
+generation against its snapshot. If the generation has changed, the scan
+disables zone map pruning and per-page PK prefiltering for the remainder
+of the scan, falling back to executor qual evaluation. The generation
+snapshot is refreshed on each rescan.
+
+This adds one atomic read per block transition — negligible cost.
 
 ### EXPLAIN output
 
