@@ -2139,4 +2139,83 @@ DROP TABLE sh18_vec;
 -- SH18-15: Implicit cast allows hsvec in svec functions
 SELECT svec_cosine_distance('[1,0,0]'::hsvec, '[0,1,0]'::hsvec) AS implicit_cast_dist;
 
+-- ================================================================
+-- sorted_heap Table AM: Phase 19 tests (IN/ANY scan pruning)
+-- ================================================================
+
+-- Helper: check if EXPLAIN plan contains a pattern
+CREATE FUNCTION sh19_plan_contains(query text, pattern text) RETURNS boolean AS $$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN EXECUTE 'EXPLAIN (COSTS OFF) ' || query
+    LOOP
+        IF r."QUERY PLAN" LIKE '%' || pattern || '%' THEN
+            RETURN true;
+        END IF;
+    END LOOP;
+    RETURN false;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TABLE sh19 (a int PRIMARY KEY, val text) USING sorted_heap;
+INSERT INTO sh19 SELECT g, 'row-' || g FROM generate_series(1, 10000) g;
+SELECT sorted_heap_compact('sh19'::regclass);
+ANALYZE sh19;
+
+-- Disable index scans to force SortedHeapScan for IN/ANY
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+
+-- SH19-1: IN on PK uses SortedHeapScan
+SELECT sh19_plan_contains(
+    'SELECT * FROM sh19 WHERE a IN (100, 200, 300)',
+    'SortedHeapScan') AS sh19_in_plan;
+
+-- SH19-2: = ANY(ARRAY[...]) uses SortedHeapScan
+SELECT sh19_plan_contains(
+    'SELECT * FROM sh19 WHERE a = ANY(ARRAY[100, 200, 300])',
+    'SortedHeapScan') AS sh19_any_plan;
+
+-- SH19-3: IN results are correct
+SELECT a FROM sh19 WHERE a IN (1, 5000, 9999) ORDER BY a;
+
+-- SH19-4: Single-element IN works
+SELECT a FROM sh19 WHERE a IN (42);
+
+-- SH19-5: IN with sparse values — per-block pruning skips middle blocks
+-- (values far apart forces scan of bounding box, but IN pruning prunes middle)
+SELECT count(*) AS sh19_sparse_count
+FROM sh19 WHERE a IN (100, 5000, 9900);
+
+-- SH19-6: Verify correctness across different IN sizes
+SELECT count(*) AS sh19_two_vals FROM sh19 WHERE a IN (1, 10000);
+SELECT count(*) AS sh19_many_vals FROM sh19 WHERE a IN (10, 20, 30, 40, 50, 60, 70, 80, 90, 100);
+
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+
+-- SH19-7: With index scans enabled, close values still use SortedHeapScan
+SELECT sh19_plan_contains(
+    'SELECT * FROM sh19 WHERE a IN (100, 101, 102)',
+    'SortedHeapScan') AS sh19_close_vals;
+
+-- SH19-8: Generic prepared plan with Param array uses SortedHeapScan
+SET plan_cache_mode = force_generic_plan;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+PREPARE sh19_q(int[]) AS SELECT a FROM sh19 WHERE a = ANY($1);
+SELECT sh19_plan_contains(
+    'EXECUTE sh19_q(ARRAY[100, 200, 300])',
+    'SortedHeapScan') AS sh19_generic_plan;
+-- Verify results with generic plan
+EXECUTE sh19_q(ARRAY[1, 5000, 9999]);
+DEALLOCATE sh19_q;
+RESET plan_cache_mode;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+
+DROP TABLE sh19;
+DROP FUNCTION sh19_plan_contains(text, text);
+
 DROP EXTENSION pg_sorted_heap;

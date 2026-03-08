@@ -34,6 +34,7 @@
 #include "storage/ipc.h"
 #include "storage/shmem.h"
 #include "funcapi.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -41,6 +42,9 @@
 #include "access/parallel.h"
 
 #include "sorted_heap.h"
+
+/* Marker strategy for runtime IN-list array (Param) in runtime_meta */
+#define SH_RUNTIME_IN_ARRAY  (-1)
 
 /* ----------------------------------------------------------------
  *  Bounds extracted from WHERE clause
@@ -88,6 +92,9 @@ typedef struct SortedHeapScanState
 	bool		   *runtime_is_col2;
 	Oid			   *runtime_typids;
 	SortedHeapScanBounds const_bounds;	/* Const-only baseline for rescan */
+	/* IN-list values for per-block pruning (sorted, col1 only) */
+	int				n_in_values;
+	int64		   *in_values;		/* sorted array, NULL if no IN clause */
 } SortedHeapScanState;
 
 /* ----------------------------------------------------------------
@@ -105,10 +112,12 @@ static bool sorted_heap_extract_bounds(RelOptInfo *rel,
 									   SortedHeapScanBounds *bounds,
 									   List **runtime_exprs,
 									   List **runtime_meta,
-									   List **pk_clauses);
+									   List **pk_clauses,
+									   List **in_values_out);
 static void sorted_heap_apply_bound(SortedHeapScanBounds *bounds,
 									int strategy, bool is_col2, int64 val);
 static void sorted_heap_resolve_runtime_bounds(SortedHeapScanState *shstate);
+static int sorted_heap_int64_cmp(const void *a, const void *b);
 static void sorted_heap_compute_block_range(SortedHeapRelInfo *info,
 											SortedHeapScanBounds *bounds,
 											BlockNumber total_blocks,
@@ -321,6 +330,7 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 		List	   *runtime_exprs = NIL;
 		List	   *runtime_meta = NIL;
 		List	   *pk_clauses = NIL;
+		List	   *in_values = NIL;
 
 		if (!sorted_heap_extract_bounds(rel, info->attNums[0],
 										info->zm_pk_typid,
@@ -330,7 +340,8 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 										&bounds,
 										&runtime_exprs,
 										&runtime_meta,
-										&pk_clauses))
+										&pk_clauses,
+										&in_values))
 		{
 			table_close(table_rel, NoLock);
 			return;
@@ -412,7 +423,8 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 				bounds_list = lappend_int(bounds_list, (int32) (bounds.hi2 >> 32));
 				bounds_list = lappend_int(bounds_list, (int32) (bounds.hi2 & 0xFFFFFFFF));
 
-				cpath->custom_private = list_make2(range_list, bounds_list);
+				cpath->custom_private = list_make3(range_list, bounds_list,
+											  in_values);
 			}
 		}
 		else
@@ -463,9 +475,10 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 			const_bounds_list = lappend_int(const_bounds_list, (int32) (bounds.hi2 >> 32));
 			const_bounds_list = lappend_int(const_bounds_list, (int32) (bounds.hi2 & 0xFFFFFFFF));
 
-			cpath->custom_private = list_make4(meta_list, runtime_meta,
+			cpath->custom_private = list_make5(meta_list, runtime_meta,
 											   const_bounds_list,
-											   runtime_exprs);
+											   runtime_exprs,
+											   in_values);
 		}
 	}
 
@@ -626,7 +639,8 @@ sorted_heap_extract_bounds(RelOptInfo *rel, AttrNumber pk_attno,
 						   SortedHeapScanBounds *bounds,
 						   List **runtime_exprs,
 						   List **runtime_meta,
-						   List **pk_clauses_out)
+						   List **pk_clauses_out,
+						   List **in_values_out)
 {
 	ListCell   *lc;
 	Oid			opfamily;
@@ -637,6 +651,7 @@ sorted_heap_extract_bounds(RelOptInfo *rel, AttrNumber pk_attno,
 	*runtime_exprs = NIL;
 	*runtime_meta = NIL;
 	*pk_clauses_out = NIL;
+	*in_values_out = NIL;
 
 	/* Get btree opfamily for column 1 */
 	opcid = GetDefaultOpClass(pk_typid, BTREE_AM_OID);
@@ -666,6 +681,110 @@ sorted_heap_extract_bounds(RelOptInfo *rel, AttrNumber pk_attno,
 		bool		is_const;
 		bool		is_col2 = false;
 		Oid			match_typid;
+
+		/* Handle IN / = ANY(array) on PK column 1 */
+		if (IsA(rinfo->clause, ScalarArrayOpExpr))
+		{
+			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) rinfo->clause;
+			Var		   *saop_var;
+			Node	   *arr_node;
+			ArrayType  *arr;
+			Datum	   *elems;
+			bool	   *nulls;
+			int			nelems;
+			int			saop_strategy;
+			int			k;
+
+			/* Only handle ANY (OR semantics), not ALL */
+			if (!saop->useOr)
+				continue;
+
+			/* args: [0] = scalar (Var), [1] = array */
+			if (list_length(saop->args) != 2)
+				continue;
+			if (!IsA(linitial(saop->args), Var))
+				continue;
+			saop_var = (Var *) linitial(saop->args);
+
+			/* Must match PK column 1 */
+			if (saop_var->varattno != pk_attno)
+				continue;
+
+			/* Must be equality operator */
+			saop_strategy = get_op_opfamily_strategy(saop->opno, opfamily);
+			if (saop_strategy != BTEqualStrategyNumber)
+				continue;
+
+			/* Array: Const (plan-time) or Param (deferred to executor) */
+			arr_node = (Node *) lsecond(saop->args);
+			if (IsA(arr_node, Param))
+			{
+				/* Param array — defer to executor (Path B) */
+				*runtime_exprs = lappend(*runtime_exprs, arr_node);
+				*runtime_meta = lappend_int(*runtime_meta, SH_RUNTIME_IN_ARRAY);
+				*runtime_meta = lappend_int(*runtime_meta, 0);
+				*runtime_meta = lappend_int(*runtime_meta, (int) pk_typid);
+				*pk_clauses_out = lappend(*pk_clauses_out, rinfo);
+				continue;
+			}
+			if (!IsA(arr_node, Const))
+				continue;
+			if (((Const *) arr_node)->constisnull)
+				continue;
+
+			arr = DatumGetArrayTypeP(((Const *) arr_node)->constvalue);
+			{
+				int16	typlen;
+				bool	typbyval;
+				char	typalign;
+
+				get_typlenbyvalalign(pk_typid, &typlen, &typbyval, &typalign);
+				deconstruct_array(arr, pk_typid, typlen, typbyval, typalign,
+								  &elems, &nulls, &nelems);
+			}
+
+			if (nelems < 1)
+				continue;
+
+			/* Convert all non-null elements to int64, compute bounding box */
+			{
+				int64	val_min = PG_INT64_MAX;
+				int64	val_max = PG_INT64_MIN;
+				List   *vals = NIL;
+
+				for (k = 0; k < nelems; k++)
+				{
+					int64	iv;
+
+					if (nulls[k])
+						continue;
+					if (!sorted_heap_key_to_int64(elems[k], pk_typid, &iv))
+						continue;
+					vals = lappend_int(vals, (int32)(iv >> 32));
+					vals = lappend_int(vals, (int32)(iv & 0xFFFFFFFF));
+					if (iv < val_min) val_min = iv;
+					if (iv > val_max) val_max = iv;
+				}
+
+				if (vals == NIL)
+					continue;
+
+				/* Apply bounding box as lo/hi bounds */
+				sorted_heap_apply_bound(bounds, BTEqualStrategyNumber,
+										false, val_min);
+				if (val_max != val_min)
+				{
+					/* Widen to range [val_min, val_max] inclusive */
+					bounds->hi = val_max;
+					bounds->hi_inclusive = true;
+				}
+
+				*in_values_out = vals;
+			}
+
+			*pk_clauses_out = lappend(*pk_clauses_out, rinfo);
+			continue;
+		}
 
 		if (!IsA(rinfo->clause, OpExpr))
 			continue;
@@ -843,6 +962,14 @@ sorted_heap_resolve_runtime_bounds(SortedHeapScanState *shstate)
 	/* Start from Const-only baseline */
 	shstate->bounds = shstate->const_bounds;
 
+	/* Reset any previous IN-values (rescan may call this again) */
+	if (shstate->in_values)
+	{
+		pfree(shstate->in_values);
+		shstate->in_values = NULL;
+	}
+	shstate->n_in_values = 0;
+
 	/* Evaluate each runtime Param expression and apply bound */
 	i = 0;
 	foreach(lc, shstate->runtime_exprstates)
@@ -853,8 +980,73 @@ sorted_heap_resolve_runtime_bounds(SortedHeapScanState *shstate)
 		int64		int_val;
 
 		val = ExecEvalExprSwitchContext(exprstate, econtext, &isnull);
-		if (!isnull &&
-			sorted_heap_key_to_int64(val, shstate->runtime_typids[i], &int_val))
+		if (isnull)
+		{
+			i++;
+			continue;
+		}
+
+		/* IN-list array Param: deconstruct and compute bounding box */
+		if (shstate->runtime_strategies[i] == SH_RUNTIME_IN_ARRAY)
+		{
+			ArrayType  *arr = DatumGetArrayTypeP(val);
+			Datum	   *elems;
+			bool	   *nulls;
+			int			nelems, k, nvalid = 0;
+			int64		val_min = PG_INT64_MAX, val_max = PG_INT64_MIN;
+			Oid			typid = shstate->runtime_typids[i];
+			int16		typlen;
+			bool		typbyval;
+			char		typalign;
+
+			get_typlenbyvalalign(typid, &typlen, &typbyval, &typalign);
+			deconstruct_array(arr, typid, typlen, typbyval, typalign,
+							  &elems, &nulls, &nelems);
+
+			if (nelems > 0)
+			{
+				int64  *vals = palloc(sizeof(int64) * nelems);
+
+				for (k = 0; k < nelems; k++)
+				{
+					int64	iv;
+
+					if (nulls[k])
+						continue;
+					if (!sorted_heap_key_to_int64(elems[k], typid, &iv))
+						continue;
+					vals[nvalid++] = iv;
+					if (iv < val_min) val_min = iv;
+					if (iv > val_max) val_max = iv;
+				}
+
+				if (nvalid > 0)
+				{
+					sorted_heap_apply_bound(&shstate->bounds,
+											BTEqualStrategyNumber,
+											false, val_min);
+					if (val_max != val_min)
+					{
+						shstate->bounds.hi = val_max;
+						shstate->bounds.hi_inclusive = true;
+					}
+
+					qsort(vals, nvalid, sizeof(int64),
+						  sorted_heap_int64_cmp);
+					shstate->in_values = vals;
+					shstate->n_in_values = nvalid;
+				}
+				else
+				{
+					pfree(vals);
+				}
+			}
+			i++;
+			continue;
+		}
+
+		/* Regular scalar Param: convert and apply as bound */
+		if (sorted_heap_key_to_int64(val, shstate->runtime_typids[i], &int_val))
 		{
 			sorted_heap_apply_bound(&shstate->bounds,
 									shstate->runtime_strategies[i],
@@ -1071,6 +1263,48 @@ sorted_heap_zone_overlaps(SortedHeapZoneMapEntry *e,
 }
 
 /* ----------------------------------------------------------------
+ *  qsort comparator for int64 (used to sort IN-values)
+ * ---------------------------------------------------------------- */
+static int
+sorted_heap_int64_cmp(const void *a, const void *b)
+{
+	int64	va = *(const int64 *) a;
+	int64	vb = *(const int64 *) b;
+
+	if (va < vb) return -1;
+	if (va > vb) return 1;
+	return 0;
+}
+
+/* ----------------------------------------------------------------
+ *  Check if any IN-value falls within a zone map entry's range.
+ *  Values must be pre-sorted.  O(log K) per block via binary search.
+ * ---------------------------------------------------------------- */
+static bool
+zone_overlaps_in_values(SortedHeapZoneMapEntry *e,
+						int64 *values, int nvalues)
+{
+	int		lo = 0, hi = nvalues;
+
+	if (e->zme_min == PG_INT64_MAX)
+		return false;
+
+	/* Binary search: find first value >= zme_min */
+	while (lo < hi)
+	{
+		int mid = lo + (hi - lo) / 2;
+
+		if (values[mid] < e->zme_min)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+
+	/* If that value exists and <= zme_max, there's overlap */
+	return (lo < nvalues && values[lo] <= e->zme_max);
+}
+
+/* ----------------------------------------------------------------
  *  PlanCustomPath: convert CustomPath to CustomScan plan node
  * ---------------------------------------------------------------- */
 static Plan *
@@ -1089,17 +1323,19 @@ sorted_heap_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 	 * custom_private[3] to custom_exprs so PG deep-copies Param
 	 * nodes for generic plan caching.
 	 *
-	 * Path A: custom_private has 2 elements (range_list, bounds_list)
-	 * Path B: custom_private has 4 elements (meta, runtime_meta,
-	 *         const_bounds, runtime_exprs)
+	 * Path A: custom_private has 3 elements (range_list, bounds_list,
+	 *         in_values)
+	 * Path B: custom_private has 5 elements (meta, runtime_meta,
+	 *         const_bounds, runtime_exprs, in_values)
 	 */
 	{
-		if (list_length(best_path->custom_private) == 4)
+		if (list_length(best_path->custom_private) == 5)
 		{
 			cscan->custom_exprs = (List *) lfourth(best_path->custom_private);
-			cscan->custom_private = list_make3(linitial(best_path->custom_private),
+			cscan->custom_private = list_make4(linitial(best_path->custom_private),
 											   lsecond(best_path->custom_private),
-											   lthird(best_path->custom_private));
+											   lthird(best_path->custom_private),
+											   list_nth(best_path->custom_private, 4));
 		}
 		else
 		{
@@ -1153,16 +1389,18 @@ sorted_heap_begin_custom_scan(CustomScanState *node, EState *estate,
 	shstate->runtime_bounds = false;
 
 	/*
-	 * Path A: custom_private has 2 elements (range_list, bounds_list)
-	 * Path B: custom_private has 3 elements (meta_list, runtime_meta,
-	 *         const_bounds_list) — runtime_exprs moved to custom_exprs
-	 *         by plan_custom_path.
+	 * Path A: custom_private has 3 elements (range_list, bounds_list,
+	 *         in_values)
+	 * Path B: custom_private has 4 elements (meta_list, runtime_meta,
+	 *         const_bounds_list, in_values) — runtime_exprs moved to
+	 *         custom_exprs by plan_custom_path.
 	 */
-	if (list_length(cscan->custom_private) == 3)
+	if (list_length(cscan->custom_private) == 4)
 	{
 		/*
 		 * Path B: runtime bounds with Param nodes.
-		 * custom_private = list_make3(meta_list, runtime_meta, const_bounds_list)
+		 * custom_private = list_make4(meta, runtime_meta, const_bounds,
+		 *                             in_values)
 		 * custom_exprs = runtime Expr* nodes (Param/Const)
 		 */
 		List	   *meta_list = (List *) linitial(cscan->custom_private);
@@ -1233,7 +1471,7 @@ sorted_heap_begin_custom_scan(CustomScanState *node, EState *estate,
 	{
 		/*
 		 * Path A: all Const bounds — block range computed at plan time.
-		 * custom_private = list_make2(range_list, bounds_list)
+		 * custom_private = list_make3(range_list, bounds_list, in_values)
 		 */
 		List	   *range_list = (List *) linitial(cscan->custom_private);
 		List	   *bounds_list = (List *) lsecond(cscan->custom_private);
@@ -1268,6 +1506,43 @@ sorted_heap_begin_custom_scan(CustomScanState *node, EState *estate,
 		{
 			shstate->bounds.has_lo2 = false;
 			shstate->bounds.has_hi2 = false;
+		}
+	}
+
+	/*
+	 * Unpack IN-values from custom_private (last element in both paths).
+	 * Packed as pairs of int32 (hi32, lo32) representing int64 values.
+	 */
+	{
+		List   *in_vals_packed;
+		int		packed_len;
+
+		if (list_length(cscan->custom_private) == 4)
+			in_vals_packed = (List *) lfourth(cscan->custom_private);
+		else
+			in_vals_packed = (List *) lthird(cscan->custom_private);
+
+		packed_len = list_length(in_vals_packed);
+		if (packed_len >= 2)
+		{
+			int		nvals = packed_len / 2;
+			int		i;
+
+			shstate->in_values = palloc(sizeof(int64) * nvals);
+			shstate->n_in_values = nvals;
+
+			for (i = 0; i < nvals; i++)
+			{
+				int32 hi = list_nth_int(in_vals_packed, i * 2);
+				int32 lo = list_nth_int(in_vals_packed, i * 2 + 1);
+
+				shstate->in_values[i] = ((int64) hi << 32) |
+					((int64) (uint32) lo);
+			}
+
+			/* Sort for binary search in zone_overlaps_in_values */
+			qsort(shstate->in_values, nvals, sizeof(int64),
+				  sorted_heap_int64_cmp);
 		}
 	}
 
@@ -1313,8 +1588,11 @@ sorted_heap_scan_next(ScanState *ss)
 	 * For narrow scans (<=4 blocks), heap_setscanlimits already restricts
 	 * to the matching blocks.  The per-block zone map check is redundant
 	 * because compute_block_range already verified overlap.
+	 * Exception: IN-list queries need per-block pruning even for narrow
+	 * scans to skip blocks between sparse IN-values.
 	 */
-	bool		skip_zone_check = (shstate->scan_nblocks <= 4);
+	bool		skip_zone_check = (shstate->scan_nblocks <= 4 &&
+								   shstate->n_in_values == 0);
 
 	/*
 	 * For sorted zone maps (post-compact), tuples within each page are in
@@ -1346,8 +1624,15 @@ sorted_heap_scan_next(ScanState *ss)
 		{
 			SortedHeapZoneMapEntry *e =
 				sorted_heap_get_zm_entry(info, blk - 1);
+			bool	overlaps;
 
-			if (!sorted_heap_zone_overlaps(e, &shstate->bounds))
+			if (shstate->n_in_values > 0)
+				overlaps = zone_overlaps_in_values(e, shstate->in_values,
+												   shstate->n_in_values);
+			else
+				overlaps = sorted_heap_zone_overlaps(e, &shstate->bounds);
+
+			if (!overlaps)
 			{
 				if (new_block)
 					shstate->pruned_blocks++;
