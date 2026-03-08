@@ -183,5 +183,6 @@ typedef struct SortedHeapSharedStats
 /* GUC variables */
 extern bool sorted_heap_enable_scan_pruning;
 extern bool sorted_heap_vacuum_rebuild_zonemap;
+extern bool sorted_heap_ann_timing;
 
 #endif							/* SORTED_HEAP_H */

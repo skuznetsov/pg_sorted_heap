@@ -20,6 +20,9 @@
  */
 #include "postgres.h"
 
+#include "access/table.h"
+#include "access/tableam.h"
+#include "executor/tuptable.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "catalog/pg_type_d.h"
@@ -27,11 +30,14 @@
 #include "commands/extension.h"
 #include "executor/spi.h"
 #include "miscadmin.h"
+#include "portability/instr_time.h"
+#include "storage/itemptr.h"
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/snapmgr.h"
 
 #include <float.h>
 #include <math.h>
@@ -39,6 +45,10 @@
 
 #include "svec.h"
 #include "pq.h"
+#include "sorted_heap.h"
+
+/* GUC: log svec_ann_scan phase timing via DEBUG1 */
+bool sorted_heap_ann_timing = false;
 
 /* ----------------------------------------------------------------
  *  Return the quoted schema name of the pg_sorted_heap extension.
@@ -2255,8 +2265,9 @@ svec_pq_adc(PG_FUNCTION_ARGS)
 
 typedef struct
 {
-	int		idx;
-	float	dist;
+	int				idx;
+	float			dist;
+	ItemPointerData	tid;
 } TopKEntry;
 
 static void
@@ -2324,8 +2335,9 @@ topk_insert(TopKEntry *heap, int *heap_size, int max_k,
 
 typedef struct
 {
-	char   *id;
-	float8	distance;
+	char		   *id;
+	float8			distance;
+	ItemPointerData	tid;
 } AnnResult;
 
 static int
@@ -2369,8 +2381,12 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 	SPITupleTable *tuptable;
 	TupleDesc	tupdesc;
 	MemoryContext caller_ctx;
+	instr_time	t_start, t_ivf, t_dt, t_fetch, t_adc, t_rerank, t_out;
 
 	/* Setup materialized SRF (tuplestore) */
+	if (sorted_heap_ann_timing)
+		INSTR_TIME_SET_CURRENT(t_start);
+
 	InitMaterializedSRF(fcinfo, 0);
 
 	/* Load codebooks (cached in TopMemoryContext) */
@@ -2427,6 +2443,9 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 		pfree(norm_q);
 	}
 	/* Residual PQ distance tables computed after IVF probe (Step 2b) */
+
+	if (sorted_heap_ann_timing)
+		INSTR_TIME_SET_CURRENT(t_dt);
 
 	/* ---- Step 2: IVF probe (raw query, not normalized) ---- */
 	centroid_dists = palloc(sizeof(float) * nlist);
@@ -2506,22 +2525,22 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 		}
 	}
 
-	/* ---- Resolve table and extension names (used by Steps 3 & 6) ---- */
+	if (sorted_heap_ann_timing)
+		INSTR_TIME_SET_CURRENT(t_ivf);
+
+	/* ---- Resolve table and extension names ---- */
 	caller_ctx = CurrentMemoryContext;
 	{
 		char	   *relname = get_rel_name(tbl_oid);
 		Oid			rel_nspid = get_rel_namespace(tbl_oid);
 		char	   *rel_nspname = get_namespace_name(rel_nspid);
 		const char *qname = quote_qualified_identifier(rel_nspname, relname);
-		Oid			fn_nspid = get_func_namespace(fcinfo->flinfo->fn_oid);
-		char	   *fn_nspname = get_namespace_name(fn_nspid);
-		const char *qsvec = quote_qualified_identifier(fn_nspname, "svec");
 		StringInfoData sql;
 
 		/* ---- Step 3: SPI fetch candidate rows ---- */
 		initStringInfo(&sql);
 		appendStringInfo(&sql,
-						 "SELECT id::text, %s, partition_id "
+						 "SELECT %s, partition_id, ctid "
 						 "FROM %s WHERE partition_id IN (",
 						 quote_identifier(pq_col), qname);
 
@@ -2545,6 +2564,9 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 		tuptable = SPI_tuptable;
 		tupdesc = tuptable->tupdesc;
 
+		if (sorted_heap_ann_timing)
+			INSTR_TIME_SET_CURRENT(t_fetch);
+
 		/* ---- Step 4: ADC scan in tight C loop ---- */
 		{
 			MemoryContext old = MemoryContextSwitchTo(caller_ctx);
@@ -2564,7 +2586,8 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 			float	dist;
 			float  *dt;
 
-			code_d = SPI_getbinval(tuptable->vals[i], tupdesc, 2, &isnull);
+			/* col 1 = pq_code, col 2 = partition_id, col 3 = ctid */
+			code_d = SPI_getbinval(tuptable->vals[i], tupdesc, 1, &isnull);
 			if (isnull)
 				continue;
 
@@ -2581,7 +2604,7 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 				int		probe_idx;
 
 				part_id = DatumGetInt16(SPI_getbinval(tuptable->vals[i],
-													 tupdesc, 3, &isnull));
+													 tupdesc, 2, &isnull));
 				if (isnull)
 					continue;
 				probe_idx = centroid_to_probe[part_id];
@@ -2601,91 +2624,132 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 			topk_insert(heap, &heap_size, effective_topk, i, dist);
 		}
 
-		/* ---- Step 5: Extract results into caller context ---- */
+		if (sorted_heap_ann_timing)
+			INSTR_TIME_SET_CURRENT(t_adc);
+
+		/* ---- Step 5: Copy top-K TIDs + dists into caller context ---- */
 		MemoryContextSwitchTo(caller_ctx);
 		results = palloc(sizeof(AnnResult) * heap_size);
 		for (j = 0; j < heap_size; j++)
 		{
 			int		idx = heap[j].idx;
 			bool	isnull;
-			Datum	id_d;
+			Datum	tid_d;
 
-			id_d = SPI_getbinval(tuptable->vals[idx], tupdesc, 1, &isnull);
-			results[j].id = isnull ? pstrdup("") : TextDatumGetCString(id_d);
+			/* Extract ctid (col 3) and copy immediately */
+			tid_d = SPI_getbinval(tuptable->vals[idx], tupdesc, 3, &isnull);
+			if (!isnull)
+				ItemPointerCopy(DatumGetItemPointer(tid_d), &results[j].tid);
+			else
+				ItemPointerSetInvalid(&results[j].tid);
+
+			results[j].id = NULL;
 			results[j].distance = (float8) heap[j].dist;
 		}
 
-		/* ---- Step 6: Optional exact cosine reranking ---- */
-		if (rerank_topk > 0 && heap_size > 0)
+		/* Close SPI before rerank — frees candidate tuptable memory */
+		SPI_finish();
+
+		/* ---- Step 6: C-level rerank + id extraction via table AM ---- */
 		{
-			char	   *query_text;
-			StringInfoData rerank_sql;
+			Relation	rel;
+			TupleTableSlot *slot;
+			TupleDesc	td;
+			AttrNumber	id_attno;
+			Oid			id_typid;
+			Oid			typoutput;
+			bool		typisvarlena;
 
-			query_text = DatumGetCString(
-				DirectFunctionCall1(svec_out, PointerGetDatum(query)));
+			rel = table_open(tbl_oid, AccessShareLock);
+			td = RelationGetDescr(rel);
+			slot = table_slot_create(rel, NULL);
 
-			initStringInfo(&rerank_sql);
-			appendStringInfo(&rerank_sql,
-							 "SELECT id::text, "
-							 "(embedding <=> '%s'::%s(%d)) AS exact_dist "
-							 "FROM %s WHERE id IN (",
-							 query_text, qsvec, dim, qname);
-			pfree(query_text);
+			/* Look up id column output function */
+			id_attno = get_attnum(tbl_oid, "id");
+			id_typid = TupleDescAttr(td, id_attno - 1)->atttypid;
+			getTypeOutputInfo(id_typid, &typoutput, &typisvarlena);
 
-			for (j = 0; j < heap_size; j++)
+			if (rerank_topk > 0 && heap_size > 0)
 			{
-				char *esc = quote_literal_cstr(results[j].id);
+				/* Rerank: fetch embedding + id in single pass */
+				AttrNumber	emb_attno = get_attnum(tbl_oid, "embedding");
 
-				if (j > 0) appendStringInfoChar(&rerank_sql, ',');
-				appendStringInfoString(&rerank_sql, esc);
-				pfree(esc);
-			}
-			appendStringInfoChar(&rerank_sql, ')');
-
-			ret = SPI_execute(rerank_sql.data, true, 0);
-			pfree(rerank_sql.data);
-
-			if (ret == SPI_OK_SELECT)
-			{
-				SPITupleTable *rt = SPI_tuptable;
-				TupleDesc	rd = rt->tupdesc;
-				int			nrows = (int) SPI_processed;
-
-				for (i = 0; i < nrows; i++)
+				for (j = 0; j < heap_size; j++)
 				{
-					bool	isnull;
-					Datum	id_d, dist_d;
-					char   *rid;
-
-					id_d = SPI_getbinval(rt->vals[i], rd, 1, &isnull);
-					if (isnull) continue;
-					rid = TextDatumGetCString(id_d);
-
-					dist_d = SPI_getbinval(rt->vals[i], rd, 2, &isnull);
-					if (isnull) continue;
-
-					/* Find matching result and update distance */
-					for (j = 0; j < heap_size; j++)
+					if (!ItemPointerIsValid(&results[j].tid) ||
+						!table_tuple_fetch_row_version(rel, &results[j].tid,
+													   GetActiveSnapshot(),
+													   slot))
 					{
-						if (strcmp(results[j].id, rid) == 0)
-						{
-							results[j].distance = DatumGetFloat8(dist_d);
-							break;
-						}
+						results[j].id = pstrdup("");
+						continue;
 					}
+
+					{
+						bool	isnull;
+						Datum	emb_d, id_d;
+						Svec   *candidate;
+
+						/* Extract embedding for exact cosine distance */
+						emb_d = slot_getattr(slot, emb_attno, &isnull);
+						if (!isnull)
+						{
+							candidate = DatumGetSvecP(emb_d);
+							results[j].distance =
+								svec_cosine_distance_internal(query,
+															  candidate);
+						}
+
+						/* Extract id */
+						id_d = slot_getattr(slot, id_attno, &isnull);
+						results[j].id = isnull ? pstrdup("")
+							: OidOutputFunctionCall(typoutput, id_d);
+					}
+
+					ExecClearTuple(slot);
+				}
+
+				qsort(results, heap_size, sizeof(AnnResult), cmp_ann_result);
+				if (heap_size > lim)
+					heap_size = lim;
+			}
+			else
+			{
+				/* No rerank: fetch id only for final results */
+				qsort(results, heap_size, sizeof(AnnResult), cmp_ann_result);
+				if (heap_size > lim)
+					heap_size = lim;
+
+				for (j = 0; j < heap_size; j++)
+				{
+					if (!ItemPointerIsValid(&results[j].tid) ||
+						!table_tuple_fetch_row_version(rel, &results[j].tid,
+													   GetActiveSnapshot(),
+													   slot))
+					{
+						results[j].id = pstrdup("");
+						continue;
+					}
+
+					{
+						bool	isnull;
+						Datum	id_d;
+
+						id_d = slot_getattr(slot, id_attno, &isnull);
+						results[j].id = isnull ? pstrdup("")
+							: OidOutputFunctionCall(typoutput, id_d);
+					}
+
+					ExecClearTuple(slot);
 				}
 			}
 
-			qsort(results, heap_size, sizeof(AnnResult), cmp_ann_result);
-			if (heap_size > lim)
-				heap_size = lim;
-		}
-		else
-		{
-			qsort(results, heap_size, sizeof(AnnResult), cmp_ann_result);
+			ExecDropSingleTupleTableSlot(slot);
+			table_close(rel, AccessShareLock);
 		}
 
-		SPI_finish();
+		if (sorted_heap_ann_timing)
+			INSTR_TIME_SET_CURRENT(t_rerank);
 	}
 
 	/* ---- Step 7: Write to tuplestore ---- */
@@ -2694,7 +2758,7 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 		Datum	values[2];
 		bool	nulls[2] = {false, false};
 
-		values[0] = CStringGetTextDatum(results[j].id);
+		values[0] = CStringGetTextDatum(results[j].id ? results[j].id : "");
 		values[1] = Float8GetDatum(results[j].distance);
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
 							values, nulls);
@@ -2709,6 +2773,22 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 	if (centroid_to_probe)
 		pfree(centroid_to_probe);
 	pfree(probe_ids);
+
+	if (sorted_heap_ann_timing)
+	{
+		INSTR_TIME_SET_CURRENT(t_out);
+		elog(DEBUG1, "svec_ann_scan: dt=%.3fms ivf=%.3fms fetch=%.3fms "
+			 "adc=%.3fms rerank=%.3fms out=%.3fms total=%.3fms "
+			 "(cand=%d topk=%d)",
+			 INSTR_TIME_GET_MILLISEC(t_dt) - INSTR_TIME_GET_MILLISEC(t_start),
+			 INSTR_TIME_GET_MILLISEC(t_ivf) - INSTR_TIME_GET_MILLISEC(t_dt),
+			 INSTR_TIME_GET_MILLISEC(t_fetch) - INSTR_TIME_GET_MILLISEC(t_ivf),
+			 INSTR_TIME_GET_MILLISEC(t_adc) - INSTR_TIME_GET_MILLISEC(t_fetch),
+			 INSTR_TIME_GET_MILLISEC(t_rerank) - INSTR_TIME_GET_MILLISEC(t_adc),
+			 INSTR_TIME_GET_MILLISEC(t_out) - INSTR_TIME_GET_MILLISEC(t_rerank),
+			 INSTR_TIME_GET_MILLISEC(t_out) - INSTR_TIME_GET_MILLISEC(t_start),
+			 n_cand, heap_size);
+	}
 
 	return (Datum) 0;
 }

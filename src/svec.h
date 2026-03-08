@@ -22,7 +22,8 @@ typedef struct Svec
 #define SVEC_SIZE(dim)		(offsetof(Svec, x) + sizeof(float) * (dim))
 #define SVEC_MAX_DIM		16000
 
-#define PG_GETARG_SVEC_P(n)	((Svec *) PG_DETOAST_DATUM(PG_GETARG_DATUM(n)))
+#define DatumGetSvecP(d)		((Svec *) PG_DETOAST_DATUM(d))
+#define PG_GETARG_SVEC_P(n)	DatumGetSvecP(PG_GETARG_DATUM(n))
 #define PG_RETURN_SVEC_P(x)	PG_RETURN_POINTER(x)
 
 /* I/O functions */
@@ -34,5 +35,6 @@ extern Datum svec_send(PG_FUNCTION_ARGS);
 
 /* Distance */
 extern Datum svec_cosine_distance(PG_FUNCTION_ARGS);
+extern float8 svec_cosine_distance_internal(const Svec *a, const Svec *b);
 
 #endif							/* SVEC_H */

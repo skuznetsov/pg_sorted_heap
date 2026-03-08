@@ -254,26 +254,19 @@ svec_send(PG_FUNCTION_ARGS)
 
 /* ----------------------------------------------------------------
  *  Cosine distance: 1 - dot(a,b) / (|a| * |b|)
+ *
+ *  Internal helper (callable from C without fmgr overhead) +
+ *  SQL-callable wrapper.
  * ---------------------------------------------------------------- */
-PG_FUNCTION_INFO_V1(svec_cosine_distance);
-Datum
-svec_cosine_distance(PG_FUNCTION_ARGS)
+float8
+svec_cosine_distance_internal(const Svec *a, const Svec *b)
 {
-	Svec	   *a = PG_GETARG_SVEC_P(0);
-	Svec	   *b = PG_GETARG_SVEC_P(1);
-	int			dim;
+	int			dim = a->dim;
 	double		dot = 0.0;
 	double		norm_a = 0.0;
 	double		norm_b = 0.0;
 	double		similarity;
 	int			i;
-
-	if (a->dim != b->dim)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_EXCEPTION),
-				 errmsg("svec dimensions must match: %d vs %d", a->dim, b->dim)));
-
-	dim = a->dim;
 
 	for (i = 0; i < dim; i++)
 	{
@@ -287,7 +280,7 @@ svec_cosine_distance(PG_FUNCTION_ARGS)
 
 	/* Handle zero vectors */
 	if (norm_a == 0.0 || norm_b == 0.0)
-		PG_RETURN_FLOAT8(get_float8_nan());
+		return get_float8_nan();
 
 	similarity = dot / (sqrt(norm_a) * sqrt(norm_b));
 
@@ -297,5 +290,20 @@ svec_cosine_distance(PG_FUNCTION_ARGS)
 	else if (similarity < -1.0)
 		similarity = -1.0;
 
-	PG_RETURN_FLOAT8(1.0 - similarity);
+	return 1.0 - similarity;
+}
+
+PG_FUNCTION_INFO_V1(svec_cosine_distance);
+Datum
+svec_cosine_distance(PG_FUNCTION_ARGS)
+{
+	Svec	   *a = PG_GETARG_SVEC_P(0);
+	Svec	   *b = PG_GETARG_SVEC_P(1);
+
+	if (a->dim != b->dim)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("svec dimensions must match: %d vs %d", a->dim, b->dim)));
+
+	PG_RETURN_FLOAT8(svec_cosine_distance_internal(a, b));
 }

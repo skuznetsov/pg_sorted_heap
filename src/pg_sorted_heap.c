@@ -1540,6 +1540,15 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("sorted_heap.ann_timing",
+							 "Log svec_ann_scan phase timing via DEBUG1.",
+							 NULL,
+							 &sorted_heap_ann_timing,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("sorted_heap");
 
 	CacheRegisterRelcacheCallback(pg_sorted_heap_relcache_callback, (Datum) 0);
