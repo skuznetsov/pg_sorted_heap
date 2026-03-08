@@ -1,0 +1,5 @@
+-- pg_sorted_heap upgrade: 0.9.8 → 0.9.9
+-- No SQL-level changes; this release contains C-level fixes only:
+--   - Use-after-free fix in parallel path creation (PG 18 add_path pfree)
+--   - Mid-scan zone map staleness detection via generation counter
+--   - PARAM_EXEC deferral for NestLoop/LATERAL runtime bounds
