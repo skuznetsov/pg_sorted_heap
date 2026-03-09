@@ -2351,6 +2351,34 @@ END;
 $$;
 DELETE FROM ann_test WHERE id = 'bad';
 
+-- ANN-5: lim < 1 raises ERROR
+DO $$
+BEGIN
+	PERFORM * FROM svec_ann_scan(
+		'ann_test',
+		'[5,3,6,7,1,2,4,2]'::svec,
+		2, 0, 0,
+		current_setting('ann_test.pq_cb_id')::int4,
+		current_setting('ann_test.ivf_cb_id')::int4
+	);
+	RAISE NOTICE 'ANN-5 FAIL: expected lim error not raised';
+EXCEPTION WHEN invalid_parameter_value THEN
+	RAISE NOTICE 'ANN-5 OK: %', SQLERRM;
+END;
+$$;
+
+-- ANN-6: rerank_topk < lim returns at least lim rows
+-- With lim=5 and rerank_topk=2 (< lim), we must still get 5 rows
+SELECT count(*) AS ann_rerank_lt_lim_count,
+       bool_and(distance >= 0) AS ann_rerank_lt_lim_nonneg
+FROM svec_ann_scan(
+	'ann_test',
+	'[5,3,6,7,1,2,4,2]'::svec,
+	2, 5, 2,
+	current_setting('ann_test.pq_cb_id')::int4,
+	current_setting('ann_test.ivf_cb_id')::int4
+);
+
 -- Cleanup: drop codebook tables (have svec columns) before extension
 DROP TABLE ann_test;
 DROP TABLE IF EXISTS _ivf_centroids, _pq_codebooks, _ivf_meta, _pq_codebook_meta;
