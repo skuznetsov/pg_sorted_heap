@@ -2843,6 +2843,8 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 			TupleTableSlot *sketch_slot;
 			TupleDesc		sketch_td;
 			AttrNumber		sketch_attno;
+			AttrNumber		sk_part_attno, sk_id_attno;
+			int				pk_part_pos, pk_id_pos;  /* 0-based in PK */
 			IndexScanDesc	sk_iscan;
 			ScanKeyData		sk_skey[2];
 			RegProcedure	sk_eq_part, sk_eq_id;
@@ -2876,23 +2878,59 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 								"has no primary key", sketch_tbl_name)));
 			sketch_pk = index_open(sketch_rel->rd_pkindex, AccessShareLock);
 
-			/* PK column 1: partition_id */
+			/*
+			 * Look up partition_id and id columns by name, then find
+			 * their positions within the PK index.  This handles any
+			 * PK column order (partition_id, id) or (id, partition_id).
+			 */
+			sk_part_attno = get_attnum(sketch_tbl_oid, "partition_id");
+			sk_id_attno = get_attnum(sketch_tbl_oid, "id");
+
+			if (sk_part_attno == InvalidAttrNumber ||
+				sk_id_attno == InvalidAttrNumber)
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_COLUMN),
+						 errmsg("svec_ann_scan: sidecar table \"%s\" "
+								"must have \"partition_id\" and \"id\" columns",
+								sketch_tbl_name)));
+
+			pk_part_pos = -1;
+			pk_id_pos = -1;
 			{
-				AttrNumber	att = sketch_pk->rd_index->indkey.values[0];
-				Oid			t = TupleDescAttr(sketch_td, att - 1)->atttypid;
-				Oid			oc = GetDefaultOpClass(t, BTREE_AM_OID);
-				Oid			of = get_opclass_family(oc);
+				int			nkeycols = sketch_pk->rd_index->indnatts;
+				int			k;
+
+				for (k = 0; k < nkeycols; k++)
+				{
+					AttrNumber	a = sketch_pk->rd_index->indkey.values[k];
+
+					if (a == sk_part_attno)
+						pk_part_pos = k;
+					else if (a == sk_id_attno)
+						pk_id_pos = k;
+				}
+			}
+
+			if (pk_part_pos < 0 || pk_id_pos < 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+						 errmsg("svec_ann_scan: sidecar table \"%s\" PK "
+								"must include \"partition_id\" and \"id\"",
+								sketch_tbl_name)));
+
+			/* Build equality operators for each PK column */
+			{
+				Oid	t = TupleDescAttr(sketch_td, sk_part_attno - 1)->atttypid;
+				Oid	oc = GetDefaultOpClass(t, BTREE_AM_OID);
+				Oid	of = get_opclass_family(oc);
 
 				sk_eq_part = get_opcode(
 					get_opfamily_member(of, t, t, BTEqualStrategyNumber));
 			}
-
-			/* PK column 2: id */
 			{
-				AttrNumber	att = sketch_pk->rd_index->indkey.values[1];
-				Oid			t = TupleDescAttr(sketch_td, att - 1)->atttypid;
-				Oid			oc = GetDefaultOpClass(t, BTREE_AM_OID);
-				Oid			of = get_opclass_family(oc);
+				Oid	t = TupleDescAttr(sketch_td, sk_id_attno - 1)->atttypid;
+				Oid	oc = GetDefaultOpClass(t, BTREE_AM_OID);
+				Oid	of = get_opclass_family(oc);
 
 				sk_eq_id = get_opcode(
 					get_opfamily_member(of, t, t, BTEqualStrategyNumber));
@@ -2966,11 +3004,13 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 				if (results[j].distance == DBL_MAX)
 					continue;
 
-				ScanKeyInit(&sk_skey[0], 1, BTEqualStrategyNumber,
-							sk_eq_part,
+				/* Keys must be ordered by PK position for btree */
+				ScanKeyInit(&sk_skey[pk_part_pos], pk_part_pos + 1,
+							BTEqualStrategyNumber, sk_eq_part,
 							Int16GetDatum(results[j].partition_id));
-				ScanKeyInit(&sk_skey[1], 2, BTEqualStrategyNumber,
-							sk_eq_id, id_datums[j]);
+				ScanKeyInit(&sk_skey[pk_id_pos], pk_id_pos + 1,
+							BTEqualStrategyNumber, sk_eq_id,
+							id_datums[j]);
 
 				index_rescan(sk_iscan, sk_skey, 2, NULL, 0);
 

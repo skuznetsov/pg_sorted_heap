@@ -3695,6 +3695,33 @@ END;
 $$;
 NOTICE:  ANN-9 OK: missing sidecar row detected
 DROP TABLE ann_test_sketch;
+-- ANN-10: reversed PK order in sidecar (id, partition_id) must still work
+CREATE TABLE ann_test_sketch_rev (
+    id text,
+    partition_id int2,
+    sketch hsvec(8),
+    PRIMARY KEY (id, partition_id)
+);
+INSERT INTO ann_test_sketch_rev
+SELECT id, partition_id, embedding::hsvec
+FROM ann_test;
+SELECT count(*) AS ann10_count,
+       bool_and(distance >= 0) AS ann10_nonneg
+FROM svec_ann_scan(
+	'ann_test',
+	'[5,3,6,7,1,2,4,2]'::svec,
+	2, 5, 100,
+	current_setting('ann_test.pq_cb_id')::int4,
+	current_setting('ann_test.ivf_cb_id')::int4,
+	'pq_code',
+	'ann_test_sketch_rev', 10
+);
+ ann10_count | ann10_nonneg 
+-------------+--------------
+           5 | t
+(1 row)
+
+DROP TABLE ann_test_sketch_rev;
 -- Cleanup: drop codebook tables (have svec columns) before extension
 DROP TABLE ann_test;
 DROP TABLE IF EXISTS _ivf_centroids, _pq_codebooks, _ivf_meta, _pq_codebook_meta;
