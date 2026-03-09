@@ -2379,6 +2379,31 @@ FROM svec_ann_scan(
 	current_setting('ann_test.ivf_cb_id')::int4
 );
 
+-- ANN-7: three-stage rerank with sidecar sketch table
+CREATE TABLE ann_test_sketch (
+	partition_id int2 NOT NULL,
+	id text NOT NULL,
+	sketch hsvec(8) NOT NULL,
+	PRIMARY KEY (partition_id, id)
+);
+INSERT INTO ann_test_sketch
+SELECT partition_id, id, embedding::hsvec
+FROM ann_test;
+
+SELECT count(*) AS ann_sketch_count,
+       bool_and(distance >= 0) AS ann_sketch_nonneg
+FROM svec_ann_scan(
+	'ann_test',
+	'[5,3,6,7,1,2,4,2]'::svec,
+	2, 5, 100,
+	current_setting('ann_test.pq_cb_id')::int4,
+	current_setting('ann_test.ivf_cb_id')::int4,
+	'pq_code',
+	'ann_test_sketch', 10
+);
+
+DROP TABLE ann_test_sketch;
+
 -- Cleanup: drop codebook tables (have svec columns) before extension
 DROP TABLE ann_test;
 DROP TABLE IF EXISTS _ivf_centroids, _pq_codebooks, _ivf_meta, _pq_codebook_meta;

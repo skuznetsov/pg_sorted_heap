@@ -40,6 +40,8 @@
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/datum.h"
+#include "utils/float.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -50,6 +52,7 @@
 #include <string.h>
 
 #include "svec.h"
+#include "hsvec.h"
 #include "pq.h"
 #include "sorted_heap.h"
 
@@ -2343,12 +2346,46 @@ svec_pq_adc(PG_FUNCTION_ARGS)
  *  dominates the SQL-level svec_pq_adc approach.
  * ================================================================ */
 
+/* --- Mixed-precision cosine distance (float32 query × float16 sketch) --- */
+
+static float8
+cosine_distance_f32_f16(const float *a, const half *b, int dim)
+{
+	double		dot = 0.0,
+				norm_a = 0.0,
+				norm_b = 0.0;
+	double		similarity;
+	int			i;
+
+	for (i = 0; i < dim; i++)
+	{
+		double		ai = (double) a[i];
+		double		bi = (double) HalfToFloat4(b[i]);
+
+		dot += ai * bi;
+		norm_a += ai * ai;
+		norm_b += bi * bi;
+	}
+
+	if (norm_a == 0.0 || norm_b == 0.0)
+		return get_float8_nan();
+
+	similarity = dot / (sqrt(norm_a) * sqrt(norm_b));
+	if (similarity > 1.0)
+		similarity = 1.0;
+	else if (similarity < -1.0)
+		similarity = -1.0;
+
+	return 1.0 - similarity;
+}
+
 /* --- Max-heap for top-K selection --- */
 
 typedef struct
 {
 	float			dist;
 	ItemPointerData	tid;
+	int16			partition_id;
 } TopKEntry;
 
 static void
@@ -2395,12 +2432,13 @@ topk_siftup(TopKEntry *heap, int i)
 
 static void
 topk_insert(TopKEntry *heap, int *heap_size, int max_k,
-			float dist, ItemPointerData *tid)
+			float dist, ItemPointerData *tid, int16 partition_id)
 {
 	if (*heap_size < max_k)
 	{
 		heap[*heap_size].dist = dist;
 		ItemPointerCopy(tid, &heap[*heap_size].tid);
+		heap[*heap_size].partition_id = partition_id;
 		(*heap_size)++;
 		topk_siftup(heap, *heap_size - 1);
 	}
@@ -2408,6 +2446,7 @@ topk_insert(TopKEntry *heap, int *heap_size, int max_k,
 	{
 		heap[0].dist = dist;
 		ItemPointerCopy(tid, &heap[0].tid);
+		heap[0].partition_id = partition_id;
 		topk_siftdown(heap, *heap_size, 0);
 	}
 }
@@ -2419,6 +2458,7 @@ typedef struct
 	char		   *id;
 	float8			distance;
 	ItemPointerData	tid;
+	int16			partition_id;
 } AnnResult;
 
 static int
@@ -2460,9 +2500,12 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 	int			cb_id = PG_GETARG_INT32(5);
 	int			ivf_id = PG_GETARG_INT32(6);
 	char	   *pq_col = text_to_cstring(PG_GETARG_TEXT_PP(7));
+	char	   *sketch_tbl_name = text_to_cstring(PG_GETARG_TEXT_PP(8));
+	int			sketch_topk = PG_GETARG_INT32(9);
 	bool		is_residual = (ivf_id > 0);
 	int			dim, M, dsub, nlist;
 	int			effective_topk, n_cand;
+	int			sketch_out = 0;
 	int64		n_early_term = 0, n_subtable_evals = 0;
 	int			i, j, m, c, p;
 	float	   *dist_table = NULL;
@@ -2473,7 +2516,7 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 	TopKEntry  *heap;
 	int			heap_size;
 	AnnResult  *results;
-	instr_time	t_start, t_ivf, t_dt, t_scan, t_rerank, t_out;
+	instr_time	t_start, t_ivf, t_dt, t_scan, t_sketch, t_rerank, t_out;
 
 	/* Setup materialized SRF (tuplestore) */
 	if (sorted_heap_ann_timing)
@@ -2761,7 +2804,7 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 
 						ItemPointerCopy(&slot->tts_tid, &row_tid);
 						topk_insert(heap, &heap_size, effective_topk,
-									dist, &row_tid);
+									dist, &row_tid, probe_ids[p]);
 					}
 
 			next_row:
@@ -2775,7 +2818,10 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 		index_close(pk_index, AccessShareLock);
 
 		if (sorted_heap_ann_timing)
+		{
 			INSTR_TIME_SET_CURRENT(t_scan);
+			t_sketch = t_scan;	/* default: zero delta when sketch unused */
+		}
 
 		/* ---- Step 5: Copy top-K into results array ---- */
 		results = palloc(sizeof(AnnResult) * heap_size);
@@ -2784,9 +2830,186 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 			ItemPointerCopy(&heap[j].tid, &results[j].tid);
 			results[j].id = NULL;
 			results[j].distance = (float8) heap[j].dist;
+			results[j].partition_id = heap[j].partition_id;
 		}
 
-		/* ---- Step 6: C-level rerank + id extraction via table AM ---- */
+		/* ---- Step 6a: Sketch rerank via sidecar table ---- */
+		if (sketch_tbl_name[0] != '\0' && sketch_topk > 0
+			&& rerank_topk > 0 && heap_size > 0)
+		{
+			Oid				sketch_tbl_oid;
+			Relation		sketch_rel;
+			Relation		sketch_pk;
+			TupleTableSlot *sketch_slot;
+			TupleDesc		sketch_td;
+			AttrNumber		sketch_attno;
+			IndexScanDesc	sk_iscan;
+			ScanKeyData		sk_skey[2];
+			RegProcedure	sk_eq_part, sk_eq_id;
+			Datum		   *id_datums;
+			int				sketch_effective;
+
+			sketch_effective = Max(sketch_topk, lim);
+
+			/* Resolve sidecar table */
+			sketch_tbl_oid = DatumGetObjectId(
+				DirectFunctionCall1(regclassin,
+									CStringGetDatum(sketch_tbl_name)));
+			sketch_rel = table_open(sketch_tbl_oid, AccessShareLock);
+			sketch_td = RelationGetDescr(sketch_rel);
+			sketch_slot = table_slot_create(sketch_rel, NULL);
+			sketch_attno = get_attnum(sketch_tbl_oid, "sketch");
+
+			if (sketch_attno == InvalidAttrNumber)
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_COLUMN),
+						 errmsg("svec_ann_scan: sidecar table \"%s\" "
+								"has no \"sketch\" column",
+								sketch_tbl_name)));
+
+			/* Find sidecar PK and build equality operators */
+			if (!sketch_rel->rd_indexvalid)
+				RelationGetIndexList(sketch_rel);
+			if (!OidIsValid(sketch_rel->rd_pkindex))
+				ereport(ERROR,
+						(errmsg("svec_ann_scan: sidecar table \"%s\" "
+								"has no primary key", sketch_tbl_name)));
+			sketch_pk = index_open(sketch_rel->rd_pkindex, AccessShareLock);
+
+			/* PK column 1: partition_id */
+			{
+				AttrNumber	att = sketch_pk->rd_index->indkey.values[0];
+				Oid			t = TupleDescAttr(sketch_td, att - 1)->atttypid;
+				Oid			oc = GetDefaultOpClass(t, BTREE_AM_OID);
+				Oid			of = get_opclass_family(oc);
+
+				sk_eq_part = get_opcode(
+					get_opfamily_member(of, t, t, BTEqualStrategyNumber));
+			}
+
+			/* PK column 2: id */
+			{
+				AttrNumber	att = sketch_pk->rd_index->indkey.values[1];
+				Oid			t = TupleDescAttr(sketch_td, att - 1)->atttypid;
+				Oid			oc = GetDefaultOpClass(t, BTREE_AM_OID);
+				Oid			of = get_opclass_family(oc);
+
+				sk_eq_id = get_opcode(
+					get_opfamily_member(of, t, t, BTEqualStrategyNumber));
+			}
+
+			/* Phase A: fetch id from main table for all candidates */
+			id_datums = palloc(sizeof(Datum) * heap_size);
+
+			qsort(results, heap_size, sizeof(AnnResult),
+				  cmp_ann_result_by_blk);
+
+			for (j = 0; j < Min(RERANK_PREFETCH_DISTANCE, heap_size); j++)
+				PrefetchBuffer(rel, MAIN_FORKNUM,
+							   ItemPointerGetBlockNumber(&results[j].tid));
+
+			for (j = 0; j < heap_size; j++)
+			{
+				bool	isnull;
+				Datum	id_d;
+
+				if (j + RERANK_PREFETCH_DISTANCE < heap_size)
+					PrefetchBuffer(rel, MAIN_FORKNUM,
+								   ItemPointerGetBlockNumber(
+									   &results[j + RERANK_PREFETCH_DISTANCE].tid));
+
+				if (!table_tuple_fetch_row_version(rel, &results[j].tid,
+												   snapshot, slot))
+				{
+					results[j].distance = DBL_MAX;
+					id_datums[j] = (Datum) 0;
+					continue;
+				}
+
+				/* Read id (inline, no TOAST decompression) */
+				id_d = slot_getattr(slot, id_attno, &isnull);
+				if (isnull)
+				{
+					results[j].distance = DBL_MAX;
+					id_datums[j] = (Datum) 0;
+				}
+				else
+				{
+					/*
+					 * Copy the datum so it survives ExecClearTuple.  For
+					 * pass-by-reference types (text, varchar, etc.) we must
+					 * datumCopy; for pass-by-value (int4, int8) the Datum
+					 * itself is the value.
+					 */
+					id_datums[j] = datumCopy(id_d,
+											 TupleDescAttr(td, id_attno - 1)->attbyval,
+											 TupleDescAttr(td, id_attno - 1)->attlen);
+				}
+				ExecClearTuple(slot);
+			}
+
+			/* Phase B: look up sidecar, compute sketch distance */
+#if PG_VERSION_NUM < 180000
+			sk_iscan = index_beginscan(sketch_rel, sketch_pk,
+									   snapshot, 2, 0);
+#else
+			sk_iscan = index_beginscan(sketch_rel, sketch_pk,
+									   snapshot, NULL, 2, 0);
+#endif
+
+			for (j = 0; j < heap_size; j++)
+			{
+				bool	isnull;
+				Datum	sketch_d;
+				Hsvec  *sk;
+
+				if (results[j].distance == DBL_MAX)
+					continue;
+
+				ScanKeyInit(&sk_skey[0], 1, BTEqualStrategyNumber,
+							sk_eq_part,
+							Int16GetDatum(results[j].partition_id));
+				ScanKeyInit(&sk_skey[1], 2, BTEqualStrategyNumber,
+							sk_eq_id, id_datums[j]);
+
+				index_rescan(sk_iscan, sk_skey, 2, NULL, 0);
+
+				if (index_getnext_slot(sk_iscan, ForwardScanDirection,
+									   sketch_slot))
+				{
+					sketch_d = slot_getattr(sketch_slot, sketch_attno,
+											&isnull);
+					if (!isnull)
+					{
+						sk = (Hsvec *) PG_DETOAST_DATUM(sketch_d);
+						results[j].distance =
+							cosine_distance_f32_f16(query->x,
+													sk->x, sk->dim);
+					}
+					ExecClearTuple(sketch_slot);
+				}
+				else
+					results[j].distance = DBL_MAX;
+			}
+
+			index_endscan(sk_iscan);
+
+			/* Sort by sketch distance, keep top sketch_effective */
+			qsort(results, heap_size, sizeof(AnnResult), cmp_ann_result);
+			if (heap_size > sketch_effective)
+				heap_size = sketch_effective;
+			sketch_out = heap_size;
+
+			pfree(id_datums);
+			ExecDropSingleTupleTableSlot(sketch_slot);
+			index_close(sketch_pk, AccessShareLock);
+			table_close(sketch_rel, AccessShareLock);
+
+			if (sorted_heap_ann_timing)
+				INSTR_TIME_SET_CURRENT(t_sketch);
+		}
+
+		/* ---- Step 6b: C-level rerank + id extraction via table AM ---- */
 		if (rerank_topk > 0 && heap_size > 0)
 		{
 			AttrNumber	emb_attno = get_attnum(tbl_oid, "embedding");
@@ -2903,15 +3126,18 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 	{
 		INSTR_TIME_SET_CURRENT(t_out);
 		elog(DEBUG1, "svec_ann_scan: dt=%.3fms ivf=%.3fms "
-			 "scan=%.3fms rerank=%.3fms out=%.3fms total=%.3fms "
-			 "(cand=%d topk=%d early_term=%ld/%d avg_m=%.0f)",
+			 "scan=%.3fms sketch=%.3fms rerank=%.3fms "
+			 "out=%.3fms total=%.3fms "
+			 "(cand=%d topk=%d sketch_out=%d "
+			 "early_term=%ld/%d avg_m=%.0f)",
 			 INSTR_TIME_GET_MILLISEC(t_dt) - INSTR_TIME_GET_MILLISEC(t_start),
 			 INSTR_TIME_GET_MILLISEC(t_ivf) - INSTR_TIME_GET_MILLISEC(t_dt),
 			 INSTR_TIME_GET_MILLISEC(t_scan) - INSTR_TIME_GET_MILLISEC(t_ivf),
-			 INSTR_TIME_GET_MILLISEC(t_rerank) - INSTR_TIME_GET_MILLISEC(t_scan),
+			 INSTR_TIME_GET_MILLISEC(t_sketch) - INSTR_TIME_GET_MILLISEC(t_scan),
+			 INSTR_TIME_GET_MILLISEC(t_rerank) - INSTR_TIME_GET_MILLISEC(t_sketch),
 			 INSTR_TIME_GET_MILLISEC(t_out) - INSTR_TIME_GET_MILLISEC(t_rerank),
 			 INSTR_TIME_GET_MILLISEC(t_out) - INSTR_TIME_GET_MILLISEC(t_start),
-			 n_cand, heap_size,
+			 n_cand, heap_size, sketch_out,
 			 (long) n_early_term, n_cand,
 			 n_cand > 0
 			 ? (double) n_subtable_evals / n_cand : 0.0);
