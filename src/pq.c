@@ -2982,6 +2982,12 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 					if (!isnull)
 					{
 						sk = (Hsvec *) PG_DETOAST_DATUM(sketch_d);
+						if (sk->dim > query->dim)
+							ereport(ERROR,
+									(errcode(ERRCODE_DATA_EXCEPTION),
+									 errmsg("svec_ann_scan: sketch dimension "
+											"%d exceeds query dimension %d",
+											sk->dim, query->dim)));
 						results[j].distance =
 							cosine_distance_f32_f16(query->x,
 													sk->x, sk->dim);
@@ -2989,7 +2995,12 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 					ExecClearTuple(sketch_slot);
 				}
 				else
-					results[j].distance = DBL_MAX;
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_EXCEPTION),
+							 errmsg("svec_ann_scan: sidecar row not found "
+									"for partition_id=%d in \"%s\"",
+									results[j].partition_id,
+									sketch_tbl_name)));
 			}
 
 			index_endscan(sk_iscan);
