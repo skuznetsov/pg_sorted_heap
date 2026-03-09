@@ -33,7 +33,7 @@ COPY --from=builder /usr/lib/postgresql/18/lib/pg_sorted_heap.so \
      /usr/lib/postgresql/18/lib/pg_sorted_heap.so
 COPY --from=builder /usr/share/postgresql/18/extension/pg_sorted_heap.control \
      /usr/share/postgresql/18/extension/pg_sorted_heap.control
-COPY --from=builder /usr/share/postgresql/18/extension/pg_sorted_heap--0.9.7.sql \
-     /usr/share/postgresql/18/extension/pg_sorted_heap--0.9.7.sql
+COPY --from=builder /usr/share/postgresql/18/extension/pg_sorted_heap--*.sql \
+     /usr/share/postgresql/18/extension/
 
 USER 26
