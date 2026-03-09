@@ -3405,8 +3405,6 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 	if (sorted_heap_ann_timing)
 		INSTR_TIME_SET_CURRENT(t_start);
 
-	InitMaterializedSRF(fcinfo, 0);
-
 	if (ef_search < 1) ef_search = 1;
 	if (lim < 1) lim = 1;
 	if (ef_search < lim) ef_search = lim;
@@ -3444,18 +3442,33 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 						"primary key", graph_tbl_name)));
 	graph_pk = index_open(graph_rel->rd_pkindex, AccessShareLock);
 
-	/* Build equality operator for nid (first PK column) */
+	/* Validate and build equality operator for nid (first PK column) */
 	{
 		AttrNumber	pk_att = graph_pk->rd_index->indkey.values[0];
-		Oid			t = TupleDescAttr(graph_td, pk_att - 1)->atttypid;
-		Oid			oc = GetDefaultOpClass(t, BTREE_AM_OID);
-		Oid			of = get_opclass_family(oc);
+		Oid			pk_typid = TupleDescAttr(graph_td, pk_att - 1)->atttypid;
+		Oid			oc, of;
+		const char *pk_colname = NameStr(
+			TupleDescAttr(graph_td, pk_att - 1)->attname);
+
+		if (pk_typid != INT4OID)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("svec_graph_scan: first PK column \"%s\" of "
+							"\"%s\" must be int4, got %s",
+							pk_colname, graph_tbl_name,
+							format_type_be(pk_typid))));
+
+		oc = GetDefaultOpClass(pk_typid, BTREE_AM_OID);
+		of = get_opclass_family(oc);
 
 		graph_eq = get_opcode(
-			get_opfamily_member(of, t, t, BTEqualStrategyNumber));
+			get_opfamily_member(of, pk_typid, pk_typid,
+								BTEqualStrategyNumber));
 	}
 
-	/* ---- Initialize search structures ---- */
+	/* All validation passed — initialize SRF and search structures */
+	InitMaterializedSRF(fcinfo, 0);
+
 	cand_cap = Max(ef_search * 32, 4096);
 	candidates = palloc(sizeof(GraphEntry) * cand_cap);
 	res_heap = palloc(sizeof(GraphEntry) * (ef_search + 1));

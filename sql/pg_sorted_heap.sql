@@ -2530,6 +2530,42 @@ FROM svec_graph_scan(
 
 DROP TABLE ann_test_graph;
 
+-- ANN-12: graph scan negative tests - bad PK type
+CREATE TABLE ann_bad_graph (
+    bad_id text PRIMARY KEY,
+    sketch hsvec(8) NOT NULL,
+    neighbors int4[] NOT NULL,
+    src_id text NOT NULL,
+    src_tid tid NOT NULL
+);
+\set ON_ERROR_STOP off
+SELECT svec_graph_scan('ann_test', '[5,3,6,7,1,2,4,2]'::svec,
+                        'ann_bad_graph', 16, 5);
+\set ON_ERROR_STOP on
+
+-- ANN-13: graph scan negative tests - missing columns
+CREATE TABLE ann_no_sketch (
+    nid int4 PRIMARY KEY,
+    neighbors int4[] NOT NULL
+);
+\set ON_ERROR_STOP off
+SELECT svec_graph_scan('ann_test', '[5,3,6,7,1,2,4,2]'::svec,
+                        'ann_no_sketch', 16, 5);
+\set ON_ERROR_STOP on
+
+-- ANN-14: graph scan negative tests - no PK
+CREATE TABLE ann_no_pk (
+    nid int4,
+    sketch hsvec(8) NOT NULL,
+    neighbors int4[] NOT NULL
+);
+\set ON_ERROR_STOP off
+SELECT svec_graph_scan('ann_test', '[5,3,6,7,1,2,4,2]'::svec,
+                        'ann_no_pk', 16, 5);
+\set ON_ERROR_STOP on
+
+DROP TABLE ann_bad_graph, ann_no_sketch, ann_no_pk;
+
 -- Cleanup: drop codebook tables (have svec columns) before extension
 DROP TABLE ann_test;
 DROP TABLE IF EXISTS _ivf_centroids, _pq_codebooks, _ivf_meta, _pq_codebook_meta;
