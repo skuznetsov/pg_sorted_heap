@@ -118,6 +118,27 @@ normalize_vector(float *v, int dim)
 }
 
 /* ----------------------------------------------------------------
+ *  Subquantizer reordering helpers (used by codebook cache + ADC scan)
+ *
+ *  qsort comparator: sorts sub-quantizer indices by descending
+ *  spread so high-spread sub-quantizers are evaluated first,
+ *  enabling earlier ADC termination.
+ * ---------------------------------------------------------------- */
+static float *pq_perm_spread;
+
+static int
+pq_perm_cmp(const void *a, const void *b)
+{
+	float sa = pq_perm_spread[*(const int *) a];
+	float sb = pq_perm_spread[*(const int *) b];
+
+	/* descending order */
+	if (sa > sb) return -1;
+	if (sa < sb) return 1;
+	return 0;
+}
+
+/* ----------------------------------------------------------------
  *  Backend-local codebook cache
  * ---------------------------------------------------------------- */
 typedef struct PQCodebookCache
@@ -127,9 +148,10 @@ typedef struct PQCodebookCache
 	int			dsub;			/* dimensions per subvector */
 	int			total_dim;		/* M * dsub = original vector dimension */
 	float	   *centroids;		/* M * 256 * dsub floats, row-major */
+	int		   *perm;			/* sub-quantizer eval order (descending spread) */
 } PQCodebookCache;
 
-static PQCodebookCache cached_pq = {-1, 0, 0, 0, NULL};
+static PQCodebookCache cached_pq = {-1, 0, 0, 0, NULL, NULL};
 
 /*
  * Load codebook from _pq_codebooks table into cache.
@@ -153,6 +175,11 @@ pq_load_codebook(int cb_id)
 	{
 		pfree(cached_pq.centroids);
 		cached_pq.centroids = NULL;
+		if (cached_pq.perm != NULL)
+		{
+			pfree(cached_pq.perm);
+			cached_pq.perm = NULL;
+		}
 		cached_pq.cb_id = -1;
 	}
 
@@ -253,6 +280,55 @@ pq_load_codebook(int cb_id)
 	cached_pq.M = M;
 	cached_pq.dsub = dsub;
 	cached_pq.total_dim = M * dsub;
+
+	/*
+	 * Compute global sub-quantizer permutation by centroid variance.
+	 *
+	 * For each sub-quantizer, compute the total variance of its 256
+	 * centroids across all dsub dimensions.  High-variance sub-quantizers
+	 * have widely spread centroids, so their ADC distance contributions
+	 * vary more across codes — evaluating them first makes early
+	 * termination kick in sooner.
+	 *
+	 * Cost: O(M * 256 * dsub) — negligible, computed once at load time.
+	 */
+	{
+		float	sub_spread[PQ_MAX_M];
+		int		mi, ci, d;
+
+		for (mi = 0; mi < M; mi++)
+		{
+			float  *cents = cached_pq.centroids
+				+ (size_t) mi * PQ_KSUB * dsub;
+			double	total_var = 0.0;
+
+			for (d = 0; d < dsub; d++)
+			{
+				double	sum = 0.0, sum2 = 0.0;
+
+				for (ci = 0; ci < PQ_KSUB; ci++)
+				{
+					double	v = (double) cents[ci * dsub + d];
+
+					sum += v;
+					sum2 += v * v;
+				}
+				total_var += sum2 / PQ_KSUB
+					- (sum / PQ_KSUB) * (sum / PQ_KSUB);
+			}
+			sub_spread[mi] = (float) total_var;
+		}
+
+		oldctx = MemoryContextSwitchTo(TopMemoryContext);
+		cached_pq.perm = palloc(sizeof(int) * M);
+		MemoryContextSwitchTo(oldctx);
+
+		for (mi = 0; mi < M; mi++)
+			cached_pq.perm[mi] = mi;
+
+		pq_perm_spread = sub_spread;
+		qsort(cached_pq.perm, M, sizeof(int), pq_perm_cmp);
+	}
 }
 
 /* ----------------------------------------------------------------
@@ -2387,6 +2463,7 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 	bool		is_residual = (ivf_id > 0);
 	int			dim, M, dsub, nlist;
 	int			effective_topk, n_cand;
+	int64		n_early_term = 0, n_subtable_evals = 0;
 	int			i, j, m, c, p;
 	float	   *dist_table = NULL;
 	float	   *per_centroid_dt = NULL;
@@ -2420,12 +2497,17 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_DATA_EXCEPTION),
 				 errmsg("query dimension %d doesn't match codebook "
 						"(expected %d)", query->dim, dim)));
+	if (lim < 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("svec_ann_scan: lim must be at least 1")));
+
 	if (nprobe > nlist)
 		nprobe = nlist;
 	if (nprobe < 1)
 		nprobe = 1;
 
-	effective_topk = rerank_topk > 0 ? rerank_topk : lim;
+	effective_topk = rerank_topk > 0 ? Max(rerank_topk, lim) : lim;
 
 	/* ---- Step 1: Compute PQ distance table (raw PQ only) ---- */
 	if (!is_residual)
@@ -2597,59 +2679,94 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 		heap_size = 0;
 		n_cand = 0;
 
-		/* Scan each probe partition via PK index */
-		for (p = 0; p < nprobe; p++)
+		/* Phase 3: hoist index_beginscan outside nprobe loop */
 		{
 			IndexScanDesc iscan;
-			float  *dt;
-
-			/* Select per-centroid distance table */
-			if (is_residual)
-				dt = per_centroid_dt + (size_t) p * M * PQ_KSUB;
-			else
-				dt = dist_table;
-
-			ScanKeyInit(&skey[0],
-						1,		/* first index column = partition_id */
-						BTEqualStrategyNumber,
-						eq_proc,
-						Int16GetDatum(probe_ids[p]));
 
 #if PG_VERSION_NUM < 180000
 			iscan = index_beginscan(rel, pk_index, snapshot, 1, 0);
 #else
 			iscan = index_beginscan(rel, pk_index, snapshot, NULL, 1, 0);
 #endif
-			index_rescan(iscan, skey, 1, NULL, 0);
 
-			while (index_getnext_slot(iscan, ForwardScanDirection, slot))
+			/* Scan each probe partition via PK index */
+			for (p = 0; p < nprobe; p++)
 			{
-				bool	isnull;
-				Datum	code_d;
-				bytea  *code;
-				uint8  *codes;
-				int		code_len;
-				float	dist;
-				ItemPointerData row_tid;
+				float  *dt;
+				int	   *cur_perm = cached_pq.perm;
 
-				n_cand++;
+				/* Select per-centroid distance table */
+				if (is_residual)
+					dt = per_centroid_dt + (size_t) p * M * PQ_KSUB;
+				else
+					dt = dist_table;
 
-				code_d = slot_getattr(slot, pq_attno, &isnull);
-				if (isnull)
-					continue;
+				ScanKeyInit(&skey[0],
+							1,		/* first index column = partition_id */
+							BTEqualStrategyNumber,
+							eq_proc,
+							Int16GetDatum(probe_ids[p]));
+				index_rescan(iscan, skey, 1, NULL, 0);
 
-				code = DatumGetByteaPP(code_d);
-				codes = (uint8 *) VARDATA_ANY(code);
-				code_len = VARSIZE_ANY_EXHDR(code);
-				if (code_len != M)
-					continue;
+				while (index_getnext_slot(iscan, ForwardScanDirection, slot))
+				{
+					bool	isnull;
+					Datum	code_d;
+					bytea  *code;
+					uint8  *codes;
+					int		code_len;
+					float	dist;
+					float	threshold;
 
-				dist = 0.0f;
-				for (m = 0; m < M; m++)
-					dist += dt[m * PQ_KSUB + codes[m]];
+					n_cand++;
 
-				ItemPointerCopy(&slot->tts_tid, &row_tid);
-				topk_insert(heap, &heap_size, effective_topk, dist, &row_tid);
+					code_d = slot_getattr(slot, pq_attno, &isnull);
+					if (isnull)
+						continue;
+
+					code = DatumGetByteaPP(code_d);
+					codes = (uint8 *) VARDATA_ANY(code);
+					code_len = VARSIZE_ANY_EXHDR(code);
+					if (code_len != M)
+						continue;
+
+					/* Phase 1: ADC with early termination + reordering */
+					threshold = (heap_size < effective_topk)
+						? FLT_MAX : heap[0].dist;
+					dist = 0.0f;
+					for (m = 0; m < M; m++)
+					{
+						int		pm = cur_perm[m];
+
+						dist += dt[pm * PQ_KSUB + codes[pm]];
+
+						if ((m & (PQ_EARLY_TERM_STRIDE - 1))
+							== (PQ_EARLY_TERM_STRIDE - 1)
+							&& dist >= threshold)
+						{
+							n_early_term++;
+							n_subtable_evals += (m + 1);
+							goto next_row;
+						}
+					}
+					n_subtable_evals += M;
+
+					/* Phase 2: skip TID copy for rejected rows */
+					if (heap_size >= effective_topk
+						&& dist >= heap[0].dist)
+						continue;
+
+					{
+						ItemPointerData row_tid;
+
+						ItemPointerCopy(&slot->tts_tid, &row_tid);
+						topk_insert(heap, &heap_size, effective_topk,
+									dist, &row_tid);
+					}
+
+			next_row:
+					;	/* early-terminated row */
+				}
 			}
 
 			index_endscan(iscan);
@@ -2787,14 +2904,17 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 		INSTR_TIME_SET_CURRENT(t_out);
 		elog(DEBUG1, "svec_ann_scan: dt=%.3fms ivf=%.3fms "
 			 "scan=%.3fms rerank=%.3fms out=%.3fms total=%.3fms "
-			 "(cand=%d topk=%d)",
+			 "(cand=%d topk=%d early_term=%ld/%d avg_m=%.0f)",
 			 INSTR_TIME_GET_MILLISEC(t_dt) - INSTR_TIME_GET_MILLISEC(t_start),
 			 INSTR_TIME_GET_MILLISEC(t_ivf) - INSTR_TIME_GET_MILLISEC(t_dt),
 			 INSTR_TIME_GET_MILLISEC(t_scan) - INSTR_TIME_GET_MILLISEC(t_ivf),
 			 INSTR_TIME_GET_MILLISEC(t_rerank) - INSTR_TIME_GET_MILLISEC(t_scan),
 			 INSTR_TIME_GET_MILLISEC(t_out) - INSTR_TIME_GET_MILLISEC(t_rerank),
 			 INSTR_TIME_GET_MILLISEC(t_out) - INSTR_TIME_GET_MILLISEC(t_start),
-			 n_cand, heap_size);
+			 n_cand, heap_size,
+			 (long) n_early_term, n_cand,
+			 n_cand > 0
+			 ? (double) n_subtable_evals / n_cand : 0.0);
 	}
 
 	return (Datum) 0;

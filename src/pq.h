@@ -23,6 +23,9 @@
 /* Centroids per subvector (fixed at 256 for 1-byte codes) */
 #define PQ_KSUB			256
 
+/* ADC early termination: check threshold every N sub-quantizers */
+#define PQ_EARLY_TERM_STRIDE	16
+
 /* Maximum iterations for k-means training */
 #define PQ_MAX_ITER		50
 
