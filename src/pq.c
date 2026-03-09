@@ -3196,3 +3196,690 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 
 	return (Datum) 0;
 }
+
+/* ================================================================
+ *  svec_graph_scan: NSW graph search via btree-backed sidecar
+ *
+ *  svec_graph_scan(tbl regclass, query svec,
+ *                  graph_table text,
+ *                  ef_search int4 DEFAULT 64,
+ *                  lim int4 DEFAULT 10)
+ *  RETURNS TABLE(id text, distance float8)
+ *
+ *  Performs greedy best-first search on a Navigable Small World
+ *  graph stored as a regular table with btree PK on nid (int4).
+ *
+ *  Graph table expected schema:
+ *    nid          int4 PRIMARY KEY
+ *    sketch       hsvec        -- reduced-dim embedding (MRL prefix)
+ *    neighbors    int4[]       -- neighbor node IDs
+ *    src_id       text         -- id in main table (for output)
+ *    src_tid      tid          -- ctid in main table (for exact rerank)
+ *
+ *  For best performance, create a covering index:
+ *    CREATE UNIQUE INDEX ON graph_tbl (nid)
+ *        INCLUDE (sketch, neighbors);
+ *  and VACUUM the graph table so navigation uses index-only scan.
+ *
+ *  Pipeline:
+ *    1. NSW greedy search using sketch distances (hsvec, reduced dim)
+ *    2. Exact rerank: fetch full embedding from main table via src_tid
+ *    3. Return top-lim by exact cosine distance
+ * ================================================================ */
+
+/* --- Graph search entry (used in both candidate and result heaps) --- */
+
+typedef struct
+{
+	float8		dist;
+	int32		nid;
+} GraphEntry;
+
+/* Min-heap: pop closest candidate first */
+static void
+graph_minheap_siftup(GraphEntry *heap, int i)
+{
+	while (i > 0)
+	{
+		int			parent = (i - 1) / 2;
+		GraphEntry	tmp;
+
+		if (heap[i].dist >= heap[parent].dist)
+			break;
+		tmp = heap[i];
+		heap[i] = heap[parent];
+		heap[parent] = tmp;
+		i = parent;
+	}
+}
+
+static void
+graph_minheap_siftdown(GraphEntry *heap, int n, int i)
+{
+	for (;;)
+	{
+		int			smallest = i;
+		int			left = 2 * i + 1;
+		int			right = 2 * i + 2;
+		GraphEntry	tmp;
+
+		if (left < n && heap[left].dist < heap[smallest].dist)
+			smallest = left;
+		if (right < n && heap[right].dist < heap[smallest].dist)
+			smallest = right;
+		if (smallest == i)
+			break;
+		tmp = heap[i];
+		heap[i] = heap[smallest];
+		heap[smallest] = tmp;
+		i = smallest;
+	}
+}
+
+/* Max-heap: bounded result set, evict furthest */
+static void
+graph_maxheap_siftup(GraphEntry *heap, int i)
+{
+	while (i > 0)
+	{
+		int			parent = (i - 1) / 2;
+		GraphEntry	tmp;
+
+		if (heap[i].dist <= heap[parent].dist)
+			break;
+		tmp = heap[i];
+		heap[i] = heap[parent];
+		heap[parent] = tmp;
+		i = parent;
+	}
+}
+
+static void
+graph_maxheap_siftdown(GraphEntry *heap, int n, int i)
+{
+	for (;;)
+	{
+		int			largest = i;
+		int			left = 2 * i + 1;
+		int			right = 2 * i + 2;
+		GraphEntry	tmp;
+
+		if (left < n && heap[left].dist > heap[largest].dist)
+			largest = left;
+		if (right < n && heap[right].dist > heap[largest].dist)
+			largest = right;
+		if (largest == i)
+			break;
+		tmp = heap[i];
+		heap[i] = heap[largest];
+		heap[largest] = tmp;
+		i = largest;
+	}
+}
+
+/* --- Graph result for rerank phase --- */
+
+typedef struct
+{
+	int32			nid;
+	float8			distance;
+	char		   *src_id;
+	ItemPointerData	src_tid;
+} GraphResult;
+
+static int
+cmp_graph_result(const void *a, const void *b)
+{
+	float8	da = ((const GraphResult *) a)->distance;
+	float8	db = ((const GraphResult *) b)->distance;
+
+	if (da < db) return -1;
+	if (da > db) return 1;
+	return 0;
+}
+
+static int
+cmp_graph_result_by_blk(const void *a, const void *b)
+{
+	const GraphResult *ra = (const GraphResult *) a;
+	const GraphResult *rb = (const GraphResult *) b;
+
+	if (!ItemPointerIsValid(&ra->src_tid))
+		return 1;
+	if (!ItemPointerIsValid(&rb->src_tid))
+		return -1;
+
+	{
+		BlockNumber ba = ItemPointerGetBlockNumber(&ra->src_tid);
+		BlockNumber bb = ItemPointerGetBlockNumber(&rb->src_tid);
+
+		if (ba < bb) return -1;
+		if (ba > bb) return 1;
+	}
+	return 0;
+}
+
+/* --- Main graph scan function --- */
+
+PG_FUNCTION_INFO_V1(svec_graph_scan);
+Datum
+svec_graph_scan(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo  *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Oid				tbl_oid = PG_GETARG_OID(0);
+	Svec		   *query = PG_GETARG_SVEC_P(1);
+	char		   *graph_tbl_name = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	int				ef_search = PG_GETARG_INT32(3);
+	int				lim = PG_GETARG_INT32(4);
+
+	/* Graph table state */
+	Oid				graph_oid;
+	Relation		graph_rel;
+	Relation		graph_pk;
+	TupleTableSlot *graph_slot;
+	TupleDesc		graph_td;
+	Snapshot		snapshot;
+	AttrNumber		g_att_sketch, g_att_nbrs, g_att_src_id, g_att_src_tid;
+	IndexScanDesc	graph_iscan;
+	ScanKeyData		graph_skey[1];
+	RegProcedure	graph_eq;
+
+	/* Search state */
+	GraphEntry	   *candidates;		/* min-heap */
+	int				cand_size = 0;
+	int				cand_cap;
+	GraphEntry	   *res_heap;		/* max-heap, bounded to ef_search */
+	int				res_size = 0;
+	bool		   *visited;
+	int				visited_cap;
+	int				n_visited = 0;
+	int				n_explored = 0;
+	int				sketch_dim = 0;
+
+	/* Timing */
+	instr_time		t_start, t_search, t_rerank, t_out;
+
+	int				j;
+
+	/* ---- Setup ---- */
+	if (sorted_heap_ann_timing)
+		INSTR_TIME_SET_CURRENT(t_start);
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	if (ef_search < 1) ef_search = 1;
+	if (lim < 1) lim = 1;
+	if (ef_search < lim) ef_search = lim;
+
+	/* ---- Open graph table ---- */
+	graph_oid = DatumGetObjectId(
+		DirectFunctionCall1(regclassin,
+							CStringGetDatum(graph_tbl_name)));
+	graph_rel = table_open(graph_oid, AccessShareLock);
+	graph_td = RelationGetDescr(graph_rel);
+	graph_slot = table_slot_create(graph_rel, NULL);
+	snapshot = GetActiveSnapshot();
+
+	/* Resolve columns */
+	g_att_sketch = get_attnum(graph_oid, "sketch");
+	g_att_nbrs = get_attnum(graph_oid, "neighbors");
+	g_att_src_id = get_attnum(graph_oid, "src_id");
+	g_att_src_tid = get_attnum(graph_oid, "src_tid");
+
+	if (g_att_sketch == InvalidAttrNumber ||
+		g_att_nbrs == InvalidAttrNumber)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("svec_graph_scan: graph table \"%s\" must have "
+						"\"sketch\" (hsvec) and \"neighbors\" (int4[]) "
+						"columns", graph_tbl_name)));
+
+	/* Find PK index */
+	if (!graph_rel->rd_indexvalid)
+		RelationGetIndexList(graph_rel);
+	if (!OidIsValid(graph_rel->rd_pkindex))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("svec_graph_scan: graph table \"%s\" has no "
+						"primary key", graph_tbl_name)));
+	graph_pk = index_open(graph_rel->rd_pkindex, AccessShareLock);
+
+	/* Build equality operator for nid (first PK column) */
+	{
+		AttrNumber	pk_att = graph_pk->rd_index->indkey.values[0];
+		Oid			t = TupleDescAttr(graph_td, pk_att - 1)->atttypid;
+		Oid			oc = GetDefaultOpClass(t, BTREE_AM_OID);
+		Oid			of = get_opclass_family(oc);
+
+		graph_eq = get_opcode(
+			get_opfamily_member(of, t, t, BTEqualStrategyNumber));
+	}
+
+	/* ---- Initialize search structures ---- */
+	cand_cap = Max(ef_search * 32, 4096);
+	candidates = palloc(sizeof(GraphEntry) * cand_cap);
+	res_heap = palloc(sizeof(GraphEntry) * (ef_search + 1));
+
+	visited_cap = Max((int) graph_rel->rd_rel->reltuples + 1024, 65536);
+	visited = palloc0(sizeof(bool) * visited_cap);
+
+	/* ---- Begin index scan ---- */
+#if PG_VERSION_NUM < 180000
+	graph_iscan = index_beginscan(graph_rel, graph_pk, snapshot, 1, 0);
+#else
+	graph_iscan = index_beginscan(graph_rel, graph_pk, snapshot,
+								  NULL, 1, 0);
+#endif
+
+	/* ---- Entry point (nid=0) ---- */
+	{
+		int32		entry_nid = 0;
+		bool		isnull;
+		Datum		sk_d;
+		Hsvec	   *sk;
+		float8		d;
+
+		ScanKeyInit(&graph_skey[0], 1, BTEqualStrategyNumber,
+					graph_eq, Int32GetDatum(entry_nid));
+		index_rescan(graph_iscan, graph_skey, 1, NULL, 0);
+
+		if (!index_getnext_slot(graph_iscan, ForwardScanDirection,
+								graph_slot))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("svec_graph_scan: entry point nid=0 not "
+							"found in \"%s\"", graph_tbl_name)));
+
+		sk_d = slot_getattr(graph_slot, g_att_sketch, &isnull);
+		if (isnull)
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("svec_graph_scan: null sketch at nid=0")));
+
+		sk = (Hsvec *) PG_DETOAST_DATUM(sk_d);
+		if (sk->dim > query->dim)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("svec_graph_scan: sketch dim %d > query "
+							"dim %d", sk->dim, query->dim)));
+
+		sketch_dim = sk->dim;
+		d = cosine_distance_f32_f16(query->x, sk->x, sketch_dim);
+		ExecClearTuple(graph_slot);
+
+		if (entry_nid < visited_cap)
+			visited[entry_nid] = true;
+		n_visited++;
+
+		candidates[0].dist = d;
+		candidates[0].nid = entry_nid;
+		cand_size = 1;
+
+		res_heap[0].dist = d;
+		res_heap[0].nid = entry_nid;
+		res_size = 1;
+	}
+
+	/* ---- NSW greedy search ---- */
+	while (cand_size > 0)
+	{
+		float8		c_dist;
+		int32		c_nid;
+		float8		f_dist;
+		bool		isnull;
+		Datum		nbrs_d;
+		ArrayType  *nbrs_arr;
+		int32	   *nbrs;
+		int			n_nbrs;
+		int32	   *nbrs_copy;
+		int			k;
+
+		/* Pop closest candidate (min-heap root) */
+		c_dist = candidates[0].dist;
+		c_nid = candidates[0].nid;
+		cand_size--;
+		if (cand_size > 0)
+		{
+			candidates[0] = candidates[cand_size];
+			graph_minheap_siftdown(candidates, cand_size, 0);
+		}
+
+		/* Convergence check */
+		f_dist = res_heap[0].dist;	/* max-heap root = furthest */
+		if (res_size >= ef_search && c_dist > f_dist)
+			break;
+
+		n_explored++;
+
+		/* Read explored node's neighbors */
+		ScanKeyInit(&graph_skey[0], 1, BTEqualStrategyNumber,
+					graph_eq, Int32GetDatum(c_nid));
+		index_rescan(graph_iscan, graph_skey, 1, NULL, 0);
+
+		if (!index_getnext_slot(graph_iscan, ForwardScanDirection,
+								graph_slot))
+			continue;
+
+		nbrs_d = slot_getattr(graph_slot, g_att_nbrs, &isnull);
+		if (isnull)
+		{
+			ExecClearTuple(graph_slot);
+			continue;
+		}
+
+		nbrs_arr = DatumGetArrayTypeP(nbrs_d);
+		nbrs = (int32 *) ARR_DATA_PTR(nbrs_arr);
+		n_nbrs = ArrayGetNItems(ARR_NDIM(nbrs_arr), ARR_DIMS(nbrs_arr));
+
+		/* Copy neighbors before clearing tuple */
+		nbrs_copy = palloc(sizeof(int32) * n_nbrs);
+		memcpy(nbrs_copy, nbrs, sizeof(int32) * n_nbrs);
+		ExecClearTuple(graph_slot);
+
+		/* Evaluate each unvisited neighbor */
+		for (k = 0; k < n_nbrs; k++)
+		{
+			int32		n_nid = nbrs_copy[k];
+			Datum		sk_d;
+			Hsvec	   *sk;
+			float8		n_dist;
+
+			if (n_nid < 0)
+				continue;
+
+			/* Expand visited bitmap if needed */
+			if (n_nid >= visited_cap)
+			{
+				int		new_cap = Max(visited_cap * 2, n_nid + 1024);
+
+				visited = repalloc(visited, sizeof(bool) * new_cap);
+				memset(visited + visited_cap, 0,
+					   sizeof(bool) * (new_cap - visited_cap));
+				visited_cap = new_cap;
+			}
+
+			if (visited[n_nid])
+				continue;
+			visited[n_nid] = true;
+			n_visited++;
+
+			/* Read neighbor's sketch */
+			ScanKeyInit(&graph_skey[0], 1, BTEqualStrategyNumber,
+						graph_eq, Int32GetDatum(n_nid));
+			index_rescan(graph_iscan, graph_skey, 1, NULL, 0);
+
+			if (!index_getnext_slot(graph_iscan, ForwardScanDirection,
+									graph_slot))
+				continue;
+
+			sk_d = slot_getattr(graph_slot, g_att_sketch, &isnull);
+			if (isnull)
+			{
+				ExecClearTuple(graph_slot);
+				continue;
+			}
+
+			sk = (Hsvec *) PG_DETOAST_DATUM(sk_d);
+			n_dist = cosine_distance_f32_f16(query->x, sk->x,
+											  Min(sk->dim, query->dim));
+			ExecClearTuple(graph_slot);
+
+			f_dist = (res_size >= ef_search)
+				? res_heap[0].dist : DBL_MAX;
+
+			if (n_dist < f_dist || res_size < ef_search)
+			{
+				/* Add to candidates min-heap */
+				if (cand_size >= cand_cap)
+				{
+					cand_cap *= 2;
+					candidates = repalloc(candidates,
+										   sizeof(GraphEntry) * cand_cap);
+				}
+				candidates[cand_size].dist = n_dist;
+				candidates[cand_size].nid = n_nid;
+				cand_size++;
+				graph_minheap_siftup(candidates, cand_size - 1);
+
+				/* Update results max-heap */
+				if (res_size < ef_search)
+				{
+					res_heap[res_size].dist = n_dist;
+					res_heap[res_size].nid = n_nid;
+					res_size++;
+					graph_maxheap_siftup(res_heap, res_size - 1);
+				}
+				else if (n_dist < res_heap[0].dist)
+				{
+					res_heap[0].dist = n_dist;
+					res_heap[0].nid = n_nid;
+					graph_maxheap_siftdown(res_heap, res_size, 0);
+				}
+			}
+		}
+		pfree(nbrs_copy);
+	}
+
+	index_endscan(graph_iscan);
+
+	if (sorted_heap_ann_timing)
+		INSTR_TIME_SET_CURRENT(t_search);
+
+	/* ---- Rerank phase ---- */
+	{
+		GraphResult	   *gresults;
+		bool			do_exact_rerank;
+		int				n_out;
+
+		gresults = palloc(sizeof(GraphResult) * res_size);
+		for (j = 0; j < res_size; j++)
+		{
+			gresults[j].nid = res_heap[j].nid;
+			gresults[j].distance = res_heap[j].dist;
+			gresults[j].src_id = NULL;
+			ItemPointerSetInvalid(&gresults[j].src_tid);
+		}
+
+		do_exact_rerank = (g_att_src_tid != InvalidAttrNumber);
+
+		/* Read src_id (and src_tid if available) from graph table */
+#if PG_VERSION_NUM < 180000
+		graph_iscan = index_beginscan(graph_rel, graph_pk,
+									   snapshot, 1, 0);
+#else
+		graph_iscan = index_beginscan(graph_rel, graph_pk,
+									   snapshot, NULL, 1, 0);
+#endif
+
+		for (j = 0; j < res_size; j++)
+		{
+			bool	isnull;
+
+			ScanKeyInit(&graph_skey[0], 1, BTEqualStrategyNumber,
+						graph_eq, Int32GetDatum(gresults[j].nid));
+			index_rescan(graph_iscan, graph_skey, 1, NULL, 0);
+
+			if (!index_getnext_slot(graph_iscan, ForwardScanDirection,
+									graph_slot))
+				continue;
+
+			/* Read src_id */
+			if (g_att_src_id != InvalidAttrNumber)
+			{
+				Datum	id_d = slot_getattr(graph_slot, g_att_src_id,
+											 &isnull);
+
+				if (!isnull)
+				{
+					Oid		g_typout;
+					bool	g_typisvar;
+					Oid		g_typid = TupleDescAttr(graph_td,
+								g_att_src_id - 1)->atttypid;
+
+					getTypeOutputInfo(g_typid, &g_typout, &g_typisvar);
+					gresults[j].src_id = pstrdup(
+						OidOutputFunctionCall(g_typout, id_d));
+				}
+			}
+
+			/* Read src_tid */
+			if (g_att_src_tid != InvalidAttrNumber)
+			{
+				Datum	tid_d = slot_getattr(graph_slot, g_att_src_tid,
+											  &isnull);
+
+				if (!isnull)
+					ItemPointerCopy(DatumGetItemPointer(tid_d),
+									&gresults[j].src_tid);
+			}
+
+			ExecClearTuple(graph_slot);
+		}
+
+		index_endscan(graph_iscan);
+
+		/* Exact rerank via main table */
+		if (do_exact_rerank)
+		{
+			Relation		main_rel;
+			TupleTableSlot *main_slot;
+			TupleDesc		main_td;
+			AttrNumber		emb_attno;
+			AttrNumber		id_attno;
+			Oid				id_typid, typoutput;
+			bool			typisvarlena;
+
+			main_rel = table_open(tbl_oid, AccessShareLock);
+			main_td = RelationGetDescr(main_rel);
+			main_slot = table_slot_create(main_rel, NULL);
+
+			emb_attno = get_attnum(tbl_oid, "embedding");
+			id_attno = get_attnum(tbl_oid, "id");
+			id_typid = TupleDescAttr(main_td,
+									  id_attno - 1)->atttypid;
+			getTypeOutputInfo(id_typid, &typoutput, &typisvarlena);
+
+			/* Sort by block for sequential I/O */
+			qsort(gresults, res_size, sizeof(GraphResult),
+				  cmp_graph_result_by_blk);
+
+			/* Prefetch initial batch */
+			for (j = 0; j < Min(RERANK_PREFETCH_DISTANCE, res_size); j++)
+			{
+				if (ItemPointerIsValid(&gresults[j].src_tid))
+					PrefetchBuffer(main_rel, MAIN_FORKNUM,
+								   ItemPointerGetBlockNumber(
+									   &gresults[j].src_tid));
+			}
+
+			for (j = 0; j < res_size; j++)
+			{
+				bool	isnull;
+				Datum	emb_d;
+				Svec   *candidate;
+
+				if (!ItemPointerIsValid(&gresults[j].src_tid))
+				{
+					gresults[j].distance = DBL_MAX;
+					continue;
+				}
+
+				/* Prefetch ahead */
+				if (j + RERANK_PREFETCH_DISTANCE < res_size &&
+					ItemPointerIsValid(
+						&gresults[j + RERANK_PREFETCH_DISTANCE].src_tid))
+					PrefetchBuffer(main_rel, MAIN_FORKNUM,
+								   ItemPointerGetBlockNumber(
+									   &gresults[j + RERANK_PREFETCH_DISTANCE].src_tid));
+
+				if (!table_tuple_fetch_row_version(main_rel,
+												   &gresults[j].src_tid,
+												   snapshot, main_slot))
+				{
+					gresults[j].distance = DBL_MAX;
+					continue;
+				}
+
+				emb_d = slot_getattr(main_slot, emb_attno, &isnull);
+				if (!isnull)
+				{
+					candidate = DatumGetSvecP(emb_d);
+					if (candidate->dim != query->dim)
+						ereport(ERROR,
+								(errcode(ERRCODE_DATA_EXCEPTION),
+								 errmsg("svec_graph_scan: embedding dim "
+										"%d != query dim %d",
+										candidate->dim, query->dim)));
+					gresults[j].distance =
+						svec_cosine_distance_internal(query, candidate);
+				}
+
+				/* Read id from main table if not already set */
+				if (gresults[j].src_id == NULL)
+				{
+					Datum	mid = slot_getattr(main_slot, id_attno,
+											   &isnull);
+
+					if (!isnull)
+						gresults[j].src_id = pstrdup(
+							OidOutputFunctionCall(typoutput, mid));
+				}
+
+				ExecClearTuple(main_slot);
+			}
+
+			ExecDropSingleTupleTableSlot(main_slot);
+			table_close(main_rel, AccessShareLock);
+		}
+
+		if (sorted_heap_ann_timing)
+			INSTR_TIME_SET_CURRENT(t_rerank);
+
+		/* Sort by distance, keep top lim */
+		qsort(gresults, res_size, sizeof(GraphResult), cmp_graph_result);
+		n_out = Min(res_size, lim);
+
+		/* ---- Output to tuplestore ---- */
+		for (j = 0; j < n_out; j++)
+		{
+			Datum	values[2];
+			bool	nulls[2] = {false, false};
+
+			values[0] = CStringGetTextDatum(
+				gresults[j].src_id ? gresults[j].src_id : "");
+			values[1] = Float8GetDatum(gresults[j].distance);
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+								values, nulls);
+		}
+
+		pfree(gresults);
+	}
+
+	/* ---- Cleanup ---- */
+	ExecDropSingleTupleTableSlot(graph_slot);
+	index_close(graph_pk, AccessShareLock);
+	table_close(graph_rel, AccessShareLock);
+
+	pfree(candidates);
+	pfree(res_heap);
+	pfree(visited);
+
+	if (sorted_heap_ann_timing)
+	{
+		INSTR_TIME_SET_CURRENT(t_out);
+		elog(DEBUG1, "svec_graph_scan: search=%.3fms rerank=%.3fms "
+			 "out=%.3fms total=%.3fms "
+			 "(visited=%d explored=%d results=%d sketch_dim=%d)",
+			 INSTR_TIME_GET_MILLISEC(t_search) -
+			 INSTR_TIME_GET_MILLISEC(t_start),
+			 INSTR_TIME_GET_MILLISEC(t_rerank) -
+			 INSTR_TIME_GET_MILLISEC(t_search),
+			 INSTR_TIME_GET_MILLISEC(t_out) -
+			 INSTR_TIME_GET_MILLISEC(t_rerank),
+			 INSTR_TIME_GET_MILLISEC(t_out) -
+			 INSTR_TIME_GET_MILLISEC(t_start),
+			 n_visited, n_explored, res_size, sketch_dim);
+	}
+
+	return (Datum) 0;
+}

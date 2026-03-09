@@ -53,6 +53,9 @@ extern Datum svec_ivf_probe(PG_FUNCTION_ARGS);
 /* C-level ANN scan (IVF probe + PQ ADC + rerank in single C call) */
 extern Datum svec_ann_scan(PG_FUNCTION_ARGS);
 
+/* NSW graph scan via btree-backed sidecar table */
+extern Datum svec_graph_scan(PG_FUNCTION_ARGS);
+
 /* K-means (used by both PQ and IVF training) */
 extern void kmeans_train(float *data, int npts, int dsub, int k,
 						 int n_iter, float *centroids_out);

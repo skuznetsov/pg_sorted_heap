@@ -2488,6 +2488,48 @@ FROM svec_ann_scan(
 
 DROP TABLE ann_test_sketch_rev;
 
+-- ANN-11: graph scan via btree-backed NSW sidecar
+CREATE TABLE ann_test_graph (
+    nid          int4 PRIMARY KEY,
+    sketch       hsvec(8) NOT NULL,
+    neighbors    int4[] NOT NULL,
+    src_id       text NOT NULL,
+    src_tid      tid NOT NULL
+);
+
+-- Build simple ring graph: each node connects to nid±1, nid±2
+WITH cnt AS (SELECT count(*)::int4 AS n FROM ann_test),
+numbered AS (
+    SELECT (row_number() OVER (ORDER BY id) - 1)::int4 AS nid,
+           id AS src_id,
+           ctid AS src_tid,
+           embedding::hsvec AS sketch
+    FROM ann_test
+    ORDER BY id
+)
+INSERT INTO ann_test_graph
+SELECT nid, sketch,
+       ARRAY[
+           ((nid + 1) % (SELECT n FROM cnt)),
+           ((nid + 2) % (SELECT n FROM cnt)),
+           ((nid - 1 + (SELECT n FROM cnt)) % (SELECT n FROM cnt)),
+           ((nid - 2 + (SELECT n FROM cnt)) % (SELECT n FROM cnt))
+       ],
+       src_id, src_tid
+FROM numbered;
+
+VACUUM ann_test_graph;
+
+SELECT count(*) AS ann11_count,
+       bool_and(distance >= 0) AS ann11_nonneg
+FROM svec_graph_scan(
+    'ann_test',
+    '[5,3,6,7,1,2,4,2]'::svec,
+    'ann_test_graph', 16, 5
+);
+
+DROP TABLE ann_test_graph;
+
 -- Cleanup: drop codebook tables (have svec columns) before extension
 DROP TABLE ann_test;
 DROP TABLE IF EXISTS _ivf_centroids, _pq_codebooks, _ivf_meta, _pq_codebook_meta;
