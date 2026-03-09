@@ -46,6 +46,9 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "access/visibilitymap.h"
+#include "catalog/index.h"
+#include "catalog/pg_index.h"
 
 #include <float.h>
 #include <math.h>
@@ -3359,6 +3362,90 @@ cmp_graph_result_by_blk(const void *a, const void *b)
 	return 0;
 }
 
+/*
+ * Find a covering btree index on (nid) INCLUDE (sketch, neighbors).
+ * Returns the index OID if found, InvalidOid otherwise.
+ * The covering index must:
+ *   - be btree
+ *   - have exactly 1 key column matching the PK's first column
+ *   - include "sketch" and "neighbors" as non-key (INCLUDE) columns
+ */
+static Oid
+find_covering_graph_index(Relation graph_rel, AttrNumber pk_att,
+						  AttrNumber att_sketch, AttrNumber att_nbrs)
+{
+	List	   *indexlist;
+	ListCell   *lc;
+
+	indexlist = RelationGetIndexList(graph_rel);
+
+	foreach(lc, indexlist)
+	{
+		Oid			idx_oid = lfirst_oid(lc);
+		Relation	idx;
+		Form_pg_index idx_form;
+		int			nkeyatts, natts;
+
+		if (idx_oid == graph_rel->rd_pkindex)
+			continue;		/* skip the PK itself */
+
+		idx = index_open(idx_oid, AccessShareLock);
+		idx_form = idx->rd_index;
+
+		/* Must be btree, unique, valid, ready */
+		if (idx->rd_rel->relam != BTREE_AM_OID ||
+			!idx_form->indisunique ||
+			!idx_form->indisvalid ||
+			!idx_form->indisready)
+		{
+			index_close(idx, AccessShareLock);
+			continue;
+		}
+
+		nkeyatts = idx_form->indnkeyatts;
+		natts = idx_form->indnatts;
+
+		/* Must have 1 key column (nid) + at least 2 INCLUDE columns */
+		if (nkeyatts != 1 || natts < 3 ||
+			idx_form->indkey.values[0] != pk_att)
+		{
+			index_close(idx, AccessShareLock);
+			continue;
+		}
+
+		/* Check that sketch and neighbors are among the INCLUDE columns */
+		{
+			bool	has_sketch = false;
+			bool	has_nbrs = false;
+			int		i;
+
+			for (i = nkeyatts; i < natts; i++)
+			{
+				AttrNumber a = idx_form->indkey.values[i];
+
+				if (a == att_sketch)
+					has_sketch = true;
+				else if (a == att_nbrs)
+					has_nbrs = true;
+			}
+
+			if (has_sketch && has_nbrs)
+			{
+				Oid result = idx_oid;
+
+				index_close(idx, AccessShareLock);
+				list_free(indexlist);
+				return result;
+			}
+		}
+
+		index_close(idx, AccessShareLock);
+	}
+
+	list_free(indexlist);
+	return InvalidOid;
+}
+
 /* --- Main graph scan function --- */
 
 PG_FUNCTION_INFO_V1(svec_graph_scan);
@@ -3375,7 +3462,7 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 	/* Graph table state */
 	Oid				graph_oid;
 	Relation		graph_rel;
-	Relation		graph_pk;
+	Relation		graph_pk;		/* PK or covering index */
 	TupleTableSlot *graph_slot;
 	TupleDesc		graph_td;
 	Snapshot		snapshot;
@@ -3383,6 +3470,12 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 	IndexScanDesc	graph_iscan;
 	ScanKeyData		graph_skey[1];
 	RegProcedure	graph_eq;
+
+	/* Index-only scan state (when covering index available) */
+	bool			use_ios = false;
+	Oid				pk_index_oid;	/* saved PK OID for rerank phase */
+	int				ios_att_sketch = 0;	/* index attr pos for sketch */
+	int				ios_att_nbrs = 0;	/* index attr pos for neighbors */
 
 	/* Search state */
 	GraphEntry	   *candidates;		/* min-heap */
@@ -3440,30 +3533,67 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("svec_graph_scan: graph table \"%s\" has no "
 						"primary key", graph_tbl_name)));
-	graph_pk = index_open(graph_rel->rd_pkindex, AccessShareLock);
+	pk_index_oid = graph_rel->rd_pkindex;
 
-	/* Validate and build equality operator for nid (first PK column) */
+	/* Validate first PK column is int4 */
 	{
-		AttrNumber	pk_att = graph_pk->rd_index->indkey.values[0];
-		Oid			pk_typid = TupleDescAttr(graph_td, pk_att - 1)->atttypid;
+		Relation	pk_tmp = index_open(graph_rel->rd_pkindex,
+										 AccessShareLock);
+		AttrNumber	pk_att = pk_tmp->rd_index->indkey.values[0];
+		Oid			pk_typid = TupleDescAttr(graph_td,
+											   pk_att - 1)->atttypid;
 		Oid			oc, of;
-		const char *pk_colname = NameStr(
-			TupleDescAttr(graph_td, pk_att - 1)->attname);
 
 		if (pk_typid != INT4OID)
+		{
+			const char *pk_colname = NameStr(
+				TupleDescAttr(graph_td, pk_att - 1)->attname);
+
+			index_close(pk_tmp, AccessShareLock);
 			ereport(ERROR,
 					(errcode(ERRCODE_DATATYPE_MISMATCH),
 					 errmsg("svec_graph_scan: first PK column \"%s\" of "
 							"\"%s\" must be int4, got %s",
 							pk_colname, graph_tbl_name,
 							format_type_be(pk_typid))));
+		}
 
 		oc = GetDefaultOpClass(pk_typid, BTREE_AM_OID);
 		of = get_opclass_family(oc);
-
 		graph_eq = get_opcode(
 			get_opfamily_member(of, pk_typid, pk_typid,
 								BTEqualStrategyNumber));
+
+		/* Try to find covering index: (nid) INCLUDE (sketch, neighbors) */
+		{
+			Oid	cover_oid = find_covering_graph_index(
+				graph_rel, pk_att, g_att_sketch, g_att_nbrs);
+
+			if (OidIsValid(cover_oid))
+			{
+				index_close(pk_tmp, AccessShareLock);
+				graph_pk = index_open(cover_oid, AccessShareLock);
+				use_ios = true;
+
+				/* Map table attnums to index attribute positions */
+				{
+					Form_pg_index ci = graph_pk->rd_index;
+					int			i;
+
+					for (i = 0; i < ci->indnatts; i++)
+					{
+						if (ci->indkey.values[i] == g_att_sketch)
+							ios_att_sketch = i + 1; /* 1-based */
+						else if (ci->indkey.values[i] == g_att_nbrs)
+							ios_att_nbrs = i + 1;
+					}
+				}
+			}
+			else
+			{
+				graph_pk = pk_tmp;	/* use PK index (regular scan) */
+			}
+		}
 	}
 
 	/* All validation passed — initialize SRF and search structures */
@@ -3484,6 +3614,9 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 								  NULL, 1, 0);
 #endif
 
+	if (use_ios)
+		graph_iscan->xs_want_itup = true;
+
 	/* ---- Entry point (nid=0) ---- */
 	{
 		int32		entry_nid = 0;
@@ -3496,14 +3629,34 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 					graph_eq, Int32GetDatum(entry_nid));
 		index_rescan(graph_iscan, graph_skey, 1, NULL, 0);
 
-		if (!index_getnext_slot(graph_iscan, ForwardScanDirection,
-								graph_slot))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_EXCEPTION),
-					 errmsg("svec_graph_scan: entry point nid=0 not "
-							"found in \"%s\"", graph_tbl_name)));
+		if (use_ios)
+		{
+			ItemPointer tid;
 
-		sk_d = slot_getattr(graph_slot, g_att_sketch, &isnull);
+			tid = index_getnext_tid(graph_iscan, ForwardScanDirection);
+			if (tid == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_EXCEPTION),
+						 errmsg("svec_graph_scan: entry point nid=0 not "
+								"found in \"%s\"", graph_tbl_name)));
+
+			sk_d = index_getattr(graph_iscan->xs_itup,
+								  ios_att_sketch,
+								  graph_iscan->xs_itupdesc,
+								  &isnull);
+		}
+		else
+		{
+			if (!index_getnext_slot(graph_iscan, ForwardScanDirection,
+									graph_slot))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_EXCEPTION),
+						 errmsg("svec_graph_scan: entry point nid=0 not "
+								"found in \"%s\"", graph_tbl_name)));
+
+			sk_d = slot_getattr(graph_slot, g_att_sketch, &isnull);
+		}
+
 		if (isnull)
 			ereport(ERROR,
 					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
@@ -3518,7 +3671,8 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 
 		sketch_dim = sk->dim;
 		d = cosine_distance_f32_f16(query->x, sk->x, sketch_dim);
-		ExecClearTuple(graph_slot);
+		if (!use_ios)
+			ExecClearTuple(graph_slot);
 
 		if (entry_nid < visited_cap)
 			visited[entry_nid] = true;
@@ -3569,14 +3723,30 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 					graph_eq, Int32GetDatum(c_nid));
 		index_rescan(graph_iscan, graph_skey, 1, NULL, 0);
 
-		if (!index_getnext_slot(graph_iscan, ForwardScanDirection,
-								graph_slot))
-			continue;
+		if (use_ios)
+		{
+			ItemPointer tid = index_getnext_tid(graph_iscan,
+												 ForwardScanDirection);
+			if (tid == NULL)
+				continue;
 
-		nbrs_d = slot_getattr(graph_slot, g_att_nbrs, &isnull);
+			nbrs_d = index_getattr(graph_iscan->xs_itup,
+									ios_att_nbrs,
+									graph_iscan->xs_itupdesc,
+									&isnull);
+		}
+		else
+		{
+			if (!index_getnext_slot(graph_iscan, ForwardScanDirection,
+									graph_slot))
+				continue;
+
+			nbrs_d = slot_getattr(graph_slot, g_att_nbrs, &isnull);
+		}
+
 		if (isnull)
 		{
-			ExecClearTuple(graph_slot);
+			if (!use_ios) ExecClearTuple(graph_slot);
 			continue;
 		}
 
@@ -3587,7 +3757,7 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 		/* Copy neighbors before clearing tuple */
 		nbrs_copy = palloc(sizeof(int32) * n_nbrs);
 		memcpy(nbrs_copy, nbrs, sizeof(int32) * n_nbrs);
-		ExecClearTuple(graph_slot);
+		if (!use_ios) ExecClearTuple(graph_slot);
 
 		/* Evaluate each unvisited neighbor */
 		for (k = 0; k < n_nbrs; k++)
@@ -3621,21 +3791,37 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 						graph_eq, Int32GetDatum(n_nid));
 			index_rescan(graph_iscan, graph_skey, 1, NULL, 0);
 
-			if (!index_getnext_slot(graph_iscan, ForwardScanDirection,
-									graph_slot))
-				continue;
+			if (use_ios)
+			{
+				ItemPointer tid = index_getnext_tid(graph_iscan,
+													 ForwardScanDirection);
+				if (tid == NULL)
+					continue;
 
-			sk_d = slot_getattr(graph_slot, g_att_sketch, &isnull);
+				sk_d = index_getattr(graph_iscan->xs_itup,
+									  ios_att_sketch,
+									  graph_iscan->xs_itupdesc,
+									  &isnull);
+			}
+			else
+			{
+				if (!index_getnext_slot(graph_iscan, ForwardScanDirection,
+										graph_slot))
+					continue;
+
+				sk_d = slot_getattr(graph_slot, g_att_sketch, &isnull);
+			}
+
 			if (isnull)
 			{
-				ExecClearTuple(graph_slot);
+				if (!use_ios) ExecClearTuple(graph_slot);
 				continue;
 			}
 
 			sk = (Hsvec *) PG_DETOAST_DATUM(sk_d);
 			n_dist = cosine_distance_f32_f16(query->x, sk->x,
 											  Min(sk->dim, query->dim));
-			ExecClearTuple(graph_slot);
+			if (!use_ios) ExecClearTuple(graph_slot);
 
 			f_dist = (res_size >= ef_search)
 				? res_heap[0].dist : DBL_MAX;
@@ -3695,61 +3881,78 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 
 		do_exact_rerank = (g_att_src_tid != InvalidAttrNumber);
 
-		/* Read src_id (and src_tid if available) from graph table */
+		/* Read src_id (and src_tid if available) from graph table.
+		 * For rerank, always use PK index (need heap for src_id/src_tid). */
+		{
+			Relation	rerank_idx;
+			bool		rerank_opened_pk = false;
+
+			if (use_ios)
+			{
+				rerank_idx = index_open(pk_index_oid, AccessShareLock);
+				rerank_opened_pk = true;
+			}
+			else
+				rerank_idx = graph_pk;
+
 #if PG_VERSION_NUM < 180000
-		graph_iscan = index_beginscan(graph_rel, graph_pk,
-									   snapshot, 1, 0);
+			graph_iscan = index_beginscan(graph_rel, rerank_idx,
+										   snapshot, 1, 0);
 #else
-		graph_iscan = index_beginscan(graph_rel, graph_pk,
-									   snapshot, NULL, 1, 0);
+			graph_iscan = index_beginscan(graph_rel, rerank_idx,
+										   snapshot, NULL, 1, 0);
 #endif
 
-		for (j = 0; j < res_size; j++)
-		{
-			bool	isnull;
-
-			ScanKeyInit(&graph_skey[0], 1, BTEqualStrategyNumber,
-						graph_eq, Int32GetDatum(gresults[j].nid));
-			index_rescan(graph_iscan, graph_skey, 1, NULL, 0);
-
-			if (!index_getnext_slot(graph_iscan, ForwardScanDirection,
-									graph_slot))
-				continue;
-
-			/* Read src_id */
-			if (g_att_src_id != InvalidAttrNumber)
+			for (j = 0; j < res_size; j++)
 			{
-				Datum	id_d = slot_getattr(graph_slot, g_att_src_id,
-											 &isnull);
+				bool	isnull;
 
-				if (!isnull)
+				ScanKeyInit(&graph_skey[0], 1, BTEqualStrategyNumber,
+							graph_eq, Int32GetDatum(gresults[j].nid));
+				index_rescan(graph_iscan, graph_skey, 1, NULL, 0);
+
+				if (!index_getnext_slot(graph_iscan, ForwardScanDirection,
+										graph_slot))
+					continue;
+
+				/* Read src_id */
+				if (g_att_src_id != InvalidAttrNumber)
 				{
-					Oid		g_typout;
-					bool	g_typisvar;
-					Oid		g_typid = TupleDescAttr(graph_td,
-								g_att_src_id - 1)->atttypid;
+					Datum	id_d = slot_getattr(graph_slot, g_att_src_id,
+												 &isnull);
 
-					getTypeOutputInfo(g_typid, &g_typout, &g_typisvar);
-					gresults[j].src_id = pstrdup(
-						OidOutputFunctionCall(g_typout, id_d));
+					if (!isnull)
+					{
+						Oid		g_typout;
+						bool	g_typisvar;
+						Oid		g_typid = TupleDescAttr(graph_td,
+									g_att_src_id - 1)->atttypid;
+
+						getTypeOutputInfo(g_typid, &g_typout, &g_typisvar);
+						gresults[j].src_id = pstrdup(
+							OidOutputFunctionCall(g_typout, id_d));
+					}
 				}
+
+				/* Read src_tid */
+				if (g_att_src_tid != InvalidAttrNumber)
+				{
+					Datum	tid_d = slot_getattr(graph_slot, g_att_src_tid,
+												  &isnull);
+
+					if (!isnull)
+						ItemPointerCopy(DatumGetItemPointer(tid_d),
+										&gresults[j].src_tid);
+				}
+
+				ExecClearTuple(graph_slot);
 			}
 
-			/* Read src_tid */
-			if (g_att_src_tid != InvalidAttrNumber)
-			{
-				Datum	tid_d = slot_getattr(graph_slot, g_att_src_tid,
-											  &isnull);
+			index_endscan(graph_iscan);
 
-				if (!isnull)
-					ItemPointerCopy(DatumGetItemPointer(tid_d),
-									&gresults[j].src_tid);
-			}
-
-			ExecClearTuple(graph_slot);
+			if (rerank_opened_pk)
+				index_close(rerank_idx, AccessShareLock);
 		}
-
-		index_endscan(graph_iscan);
 
 		/* Exact rerank via main table */
 		if (do_exact_rerank)
