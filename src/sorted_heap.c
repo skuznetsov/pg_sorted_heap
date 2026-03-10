@@ -313,8 +313,10 @@ sorted_heap_get_relinfo(Relation rel)
 		info->zm_nentries = 0;
 		info->zm_overflow = NULL;
 		info->zm_overflow_nentries = 0;
+		info->zm_overflow_alloc = 0;
 		info->zm_total_entries = 0;
 		info->zm_overflow_npages = 0;
+		info->zm_overflow_blocks = NULL;
 		info->zm_col2_usable = false;
 		info->zm_pk_typid2 = InvalidOid;
 		info->zm_gen = 0;
@@ -515,7 +517,13 @@ sorted_heap_relcache_callback(Datum arg, Oid relid)
 				pfree(info->zm_overflow);
 				info->zm_overflow = NULL;
 			}
+			if (info->zm_overflow_blocks)
+			{
+				pfree(info->zm_overflow_blocks);
+				info->zm_overflow_blocks = NULL;
+			}
 			info->zm_overflow_nentries = 0;
+			info->zm_overflow_alloc = 0;
 			info->zm_total_entries = 0;
 		}
 	}
@@ -535,7 +543,13 @@ sorted_heap_relcache_callback(Datum arg, Oid relid)
 				pfree(info->zm_overflow);
 				info->zm_overflow = NULL;
 			}
+			if (info->zm_overflow_blocks)
+			{
+				pfree(info->zm_overflow_blocks);
+				info->zm_overflow_blocks = NULL;
+			}
 			info->zm_overflow_nentries = 0;
+			info->zm_overflow_alloc = 0;
 			info->zm_total_entries = 0;
 		}
 	}
@@ -553,10 +567,18 @@ sorted_heap_relinfo_invalidate(Oid relid)
 		return;
 
 	info = hash_search(sorted_heap_relinfo_hash, &relid, HASH_FIND, NULL);
-	if (info != NULL && info->zm_overflow != NULL)
+	if (info != NULL)
 	{
-		pfree(info->zm_overflow);
-		info->zm_overflow = NULL;
+		if (info->zm_overflow)
+		{
+			pfree(info->zm_overflow);
+			info->zm_overflow = NULL;
+		}
+		if (info->zm_overflow_blocks)
+		{
+			pfree(info->zm_overflow_blocks);
+			info->zm_overflow_blocks = NULL;
+		}
 	}
 
 	hash_search(sorted_heap_relinfo_hash, &relid, HASH_REMOVE, NULL);
@@ -596,6 +618,7 @@ sorted_heap_zonemap_load(Relation rel, SortedHeapRelInfo *info)
 		info->zm_nentries = 0;
 		info->zm_scan_valid = false;
 		info->zm_overflow_nentries = 0;
+		info->zm_overflow_alloc = 0;
 		info->zm_total_entries = 0;
 		info->zm_overflow_npages = 0;
 		info->zm_loaded = true;
@@ -734,10 +757,12 @@ sorted_heap_zonemap_load(Relation rel, SortedHeapRelInfo *info)
 		/* Read overflow pages if present */
 		if (meta_ovfl_npages > 0)
 		{
-			BlockNumber	ovfl_blocks[SORTED_HEAP_META_OVERFLOW_SLOTS];
+			BlockNumber	meta_ovfl_blks[SORTED_HEAP_META_OVERFLOW_SLOTS];
 			uint32		total_overflow = 0;
 			uint32		alloc_overflow;
 			uint32		entries_per_page;
+			uint32		alloc_pages;
+			uint32		actual_npages = 0;
 			int			p;
 			bool		is_v6 = (version >= 6);
 
@@ -747,8 +772,9 @@ sorted_heap_zonemap_load(Relation rel, SortedHeapRelInfo *info)
 
 			/* Initial allocation for meta-slot pages */
 			alloc_overflow = (uint32) meta_ovfl_npages * entries_per_page;
+			alloc_pages = meta_ovfl_npages + 16;	/* room for chain */
 
-			memcpy(ovfl_blocks, meta->shm_overflow_blocks,
+			memcpy(meta_ovfl_blks, meta->shm_overflow_blocks,
 				   meta_ovfl_npages * sizeof(BlockNumber));
 
 			UnlockReleaseBuffer(metabuf);
@@ -758,11 +784,19 @@ sorted_heap_zonemap_load(Relation rel, SortedHeapRelInfo *info)
 				pfree(info->zm_overflow);
 				info->zm_overflow = NULL;
 			}
+			if (info->zm_overflow_blocks)
+			{
+				pfree(info->zm_overflow_blocks);
+				info->zm_overflow_blocks = NULL;
+			}
 
 			info->zm_overflow = (SortedHeapZoneMapEntry *)
 				MemoryContextAllocZero(TopMemoryContext,
 									   alloc_overflow *
 									   sizeof(SortedHeapZoneMapEntry));
+			info->zm_overflow_blocks = (BlockNumber *)
+				MemoryContextAlloc(TopMemoryContext,
+								   alloc_pages * sizeof(BlockNumber));
 
 			/* Phase 1: read overflow pages referenced by meta page */
 			for (p = 0; p < meta_ovfl_npages; p++)
@@ -771,11 +805,13 @@ sorted_heap_zonemap_load(Relation rel, SortedHeapRelInfo *info)
 				Page		ovfl_page;
 				uint16		ne;
 
-				if (ovfl_blocks[p] == InvalidBlockNumber)
+				if (meta_ovfl_blks[p] == InvalidBlockNumber)
 					break;
 
+				info->zm_overflow_blocks[actual_npages++] = meta_ovfl_blks[p];
+
 				ovfl_buf = ReadBufferExtended(rel, MAIN_FORKNUM,
-											  ovfl_blocks[p], RBM_NORMAL,
+											  meta_ovfl_blks[p], RBM_NORMAL,
 											  NULL);
 				LockBuffer(ovfl_buf, BUFFER_LOCK_SHARE);
 				ovfl_page = BufferGetPage(ovfl_buf);
@@ -822,7 +858,7 @@ sorted_heap_zonemap_load(Relation rel, SortedHeapRelInfo *info)
 			if (is_v6 && meta_ovfl_npages > 0)
 			{
 				BlockNumber	last_meta_blk =
-					ovfl_blocks[meta_ovfl_npages - 1];
+					meta_ovfl_blks[meta_ovfl_npages - 1];
 				BlockNumber	next_blk = InvalidBlockNumber;
 				Buffer		ovfl_buf;
 				Page		ovfl_page;
@@ -859,6 +895,15 @@ sorted_heap_zonemap_load(Relation rel, SortedHeapRelInfo *info)
 							   (alloc_overflow - total_overflow) *
 							   sizeof(SortedHeapZoneMapEntry));
 					}
+					if (actual_npages >= alloc_pages)
+					{
+						alloc_pages = alloc_pages * 2;
+						info->zm_overflow_blocks = (BlockNumber *)
+							repalloc(info->zm_overflow_blocks,
+									 alloc_pages * sizeof(BlockNumber));
+					}
+
+					info->zm_overflow_blocks[actual_npages++] = next_blk;
 
 					ovfl_buf = ReadBufferExtended(rel, MAIN_FORKNUM,
 												  next_blk, RBM_NORMAL,
@@ -884,13 +929,14 @@ sorted_heap_zonemap_load(Relation rel, SortedHeapRelInfo *info)
 						total_overflow += ne;
 					}
 
-					info->zm_overflow_npages++;
 					next_blk = ovfl->shmo_next_block;
 					UnlockReleaseBuffer(ovfl_buf);
 				}
 			}
 
+			info->zm_overflow_npages = actual_npages;
 			info->zm_overflow_nentries = total_overflow;
+			info->zm_overflow_alloc = alloc_overflow;
 			info->zm_total_entries = n + total_overflow;
 			info->zm_loaded = true;
 			info->zm_gen = sorted_heap_read_zm_generation();
@@ -967,6 +1013,136 @@ sorted_heap_zonemap_flush(Relation rel, SortedHeapRelInfo *info)
 
 	/* Notify other backends that zone map changed */
 	sorted_heap_bump_zm_generation();
+}
+
+/*
+ * Flush a single overflow page from the in-memory cache to disk.
+ * page_idx is the 0-based index into info->zm_overflow_blocks[].
+ * Only touches one buffer — much cheaper than a full zonemap_flush.
+ */
+static void
+sorted_heap_zonemap_flush_overflow_page(Relation rel,
+										SortedHeapRelInfo *info,
+										uint32 page_idx)
+{
+	BlockNumber		blkno;
+	Buffer			buf;
+	Page			page;
+	GenericXLogState *state;
+	SortedHeapOverflowPageData *ovfl;
+	uint32			entry_start;	/* overflow-relative index */
+	uint32			count;
+
+	Assert(page_idx < info->zm_overflow_npages);
+	blkno = info->zm_overflow_blocks[page_idx];
+	Assert(blkno != InvalidBlockNumber);
+
+	/* Compute which overflow entries this page covers */
+	entry_start = (uint32) page_idx * SORTED_HEAP_OVERFLOW_ENTRIES_PER_PAGE;
+	count = Min(SORTED_HEAP_OVERFLOW_ENTRIES_PER_PAGE,
+				info->zm_overflow_nentries - entry_start);
+
+	buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, NULL);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+
+	state = GenericXLogStart(rel);
+	page = GenericXLogRegisterBuffer(state, buf, 0);
+	ovfl = (SortedHeapOverflowPageData *) PageGetSpecialPointer(page);
+
+	Assert(ovfl->shmo_magic == SORTED_HEAP_MAGIC);
+
+	ovfl->shmo_nentries = count;
+	memcpy(ovfl->shmo_entries, &info->zm_overflow[entry_start],
+		   count * sizeof(SortedHeapZoneMapEntry));
+
+	GenericXLogFinish(state);
+	UnlockReleaseBuffer(buf);
+
+	sorted_heap_bump_zm_generation();
+}
+
+/*
+ * Update a zone map entry for the given block, creating or widening
+ * min/max as needed.  Returns true if the entry was modified.
+ * Works for both inline (zmidx < zm_nentries) and overflow entries.
+ */
+static bool
+sorted_heap_zonemap_update_entry(SortedHeapRelInfo *info,
+								 uint32 zmidx,
+								 TupleTableSlot *slot)
+{
+	SortedHeapZoneMapEntry *e;
+	Datum		val;
+	bool		isnull;
+	int64		key;
+	bool		changed = false;
+
+	if (zmidx >= info->zm_total_entries)
+		return false;	/* beyond coverage — caller handles */
+
+	val = slot_getattr(slot, info->attNums[0], &isnull);
+	if (isnull)
+		return false;
+	if (!sorted_heap_key_to_int64(val, info->zm_pk_typid, &key))
+		return false;
+
+	e = sorted_heap_get_zm_entry(info, zmidx);
+
+	if (e->zme_min == PG_INT64_MAX)
+	{
+		/* First tuple tracked on this page */
+		e->zme_min = key;
+		e->zme_max = key;
+		changed = true;
+	}
+	else
+	{
+		if (key < e->zme_min)
+		{
+			e->zme_min = key;
+			changed = true;
+		}
+		if (key > e->zme_max)
+		{
+			e->zme_max = key;
+			changed = true;
+		}
+	}
+
+	/* Track column 2 */
+	if (info->zm_col2_usable)
+	{
+		Datum	val2;
+		bool	isnull2;
+		int64	key2;
+
+		val2 = slot_getattr(slot, info->attNums[1], &isnull2);
+		if (!isnull2 &&
+			sorted_heap_key_to_int64(val2, info->zm_pk_typid2, &key2))
+		{
+			if (e->zme_min2 == PG_INT64_MAX)
+			{
+				e->zme_min2 = key2;
+				e->zme_max2 = key2;
+				changed = true;
+			}
+			else
+			{
+				if (key2 < e->zme_min2)
+				{
+					e->zme_min2 = key2;
+					changed = true;
+				}
+				if (key2 > e->zme_max2)
+				{
+					e->zme_max2 = key2;
+					changed = true;
+				}
+			}
+		}
+	}
+
+	return changed;
 }
 
 /* ----------------------------------------------------------------
@@ -1562,12 +1738,16 @@ sorted_heap_multi_insert(Relation rel, TupleTableSlot **slots,
 	/* Phase 3: update zone map from placed tuples */
 	if (info->zm_usable)
 	{
-		bool	zm_dirty = false;
-		bool	needs_invalidate = false;
+		bool	inline_dirty = false;
+		bool   *ovfl_page_dirty = NULL;
 		int		i;
 
 		if (!info->zm_loaded)
 			sorted_heap_zonemap_load(rel, info);
+
+		/* Track which overflow pages need flushing */
+		if (info->zm_overflow_npages > 0)
+			ovfl_page_dirty = palloc0(sizeof(bool) * info->zm_overflow_npages);
 
 		for (i = 0; i < nslots; i++)
 		{
@@ -1582,106 +1762,102 @@ sorted_heap_multi_insert(Relation rel, TupleTableSlot **slots,
 			if (blk < 1)
 				continue;		/* skip meta page */
 			zmidx = blk - 1;	/* data block 1 → index 0 */
-			if (zmidx >= SORTED_HEAP_ZONEMAP_MAX)
+
+			if (zmidx < SORTED_HEAP_ZONEMAP_CACHE_MAX)
 			{
 				/*
-				 * Block beyond inline meta page capacity.  We can't update
-				 * overflow entries here, so invalidate zone map to prevent
-				 * stale overflow entries from causing incorrect pruning.
+				 * Inline entry — can grow zm_nentries up to CACHE_MAX.
+				 * This handles both initial population and updates.
 				 */
-				needs_invalidate = true;
-				continue;
+				val = slot_getattr(slots[i], info->attNums[0], &isnull);
+				if (isnull)
+					continue;
+				if (!sorted_heap_key_to_int64(val, info->zm_pk_typid, &key))
+					continue;
+
+				e = &info->zm_entries[zmidx];
+				if (e->zme_min == PG_INT64_MAX)
+				{
+					e->zme_min = key;
+					e->zme_max = key;
+				}
+				else
+				{
+					if (key < e->zme_min)
+						e->zme_min = key;
+					if (key > e->zme_max)
+						e->zme_max = key;
+				}
+
+				if (info->zm_col2_usable)
+				{
+					Datum	val2;
+					bool	isnull2;
+					int64	key2;
+
+					val2 = slot_getattr(slots[i], info->attNums[1], &isnull2);
+					if (!isnull2 &&
+						sorted_heap_key_to_int64(val2, info->zm_pk_typid2, &key2))
+					{
+						if (e->zme_min2 == PG_INT64_MAX)
+						{
+							e->zme_min2 = key2;
+							e->zme_max2 = key2;
+						}
+						else
+						{
+							if (key2 < e->zme_min2)
+								e->zme_min2 = key2;
+							if (key2 > e->zme_max2)
+								e->zme_max2 = key2;
+						}
+					}
+				}
+
+				if (zmidx >= info->zm_nentries)
+					info->zm_nentries = zmidx + 1;
+
+				inline_dirty = true;
 			}
-
-			val = slot_getattr(slots[i], info->attNums[0], &isnull);
-			if (isnull)
-				continue;
-			if (!sorted_heap_key_to_int64(val, info->zm_pk_typid, &key))
-				continue;
-
-			e = &info->zm_entries[zmidx];
-			if (e->zme_min == PG_INT64_MAX)
+			else if (zmidx < info->zm_total_entries)
 			{
-				/* First tuple tracked on this page */
-				e->zme_min = key;
-				e->zme_max = key;
+				/*
+				 * Overflow entry within loaded coverage.
+				 * Update in-place and mark the overflow page dirty.
+				 */
+				if (sorted_heap_zonemap_update_entry(info, zmidx, slots[i]))
+				{
+					uint32 ovfl_idx = zmidx - info->zm_nentries;
+					uint32 page_idx = ovfl_idx /
+						SORTED_HEAP_OVERFLOW_ENTRIES_PER_PAGE;
+
+					if (page_idx < info->zm_overflow_npages)
+						ovfl_page_dirty[page_idx] = true;
+				}
 			}
 			else
 			{
-				if (key < e->zme_min)
-					e->zme_min = key;
-				if (key > e->zme_max)
-					e->zme_max = key;
+				/*
+				 * Page beyond current zone map coverage.  Don't
+				 * invalidate — the scan path handles uncovered pages
+				 * conservatively (includes them in the scan range).
+				 */
+				info->zm_sorted = false;
 			}
-
-			/* Track column 2 */
-			if (info->zm_col2_usable)
-			{
-				Datum	val2;
-				bool	isnull2;
-				int64	key2;
-
-				val2 = slot_getattr(slots[i], info->attNums[1], &isnull2);
-				if (!isnull2 &&
-					sorted_heap_key_to_int64(val2, info->zm_pk_typid2, &key2))
-				{
-					if (e->zme_min2 == PG_INT64_MAX)
-					{
-						e->zme_min2 = key2;
-						e->zme_max2 = key2;
-					}
-					else
-					{
-						if (key2 < e->zme_min2)
-							e->zme_min2 = key2;
-						if (key2 > e->zme_max2)
-							e->zme_max2 = key2;
-					}
-				}
-			}
-
-			if (zmidx >= info->zm_nentries)
-				info->zm_nentries = zmidx + 1;
-
-			zm_dirty = true;
 		}
 
-		if (zm_dirty)
+		if (inline_dirty)
 			sorted_heap_zonemap_flush(rel, info);
 
-		if (needs_invalidate && info->zm_scan_valid)
+		/* Flush only the overflow pages that changed */
+		if (ovfl_page_dirty)
 		{
-			/*
-			 * At least one tuple landed on a page beyond inline zone map
-			 * capacity.  Invalidate zone map validity on disk so other
-			 * backends also see it, same as single-insert uncovered path.
-			 */
-			Buffer				metabuf;
-			Page				metapage;
-			SortedHeapMetaPageData *meta;
-
-			metabuf = ReadBufferExtended(rel, MAIN_FORKNUM,
-										 SORTED_HEAP_META_BLOCK,
-										 RBM_NORMAL, NULL);
-			LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
-			metapage = BufferGetPage(metabuf);
-			meta = (SortedHeapMetaPageData *)
-				PageGetSpecialPointer(metapage);
-
-			if (meta->shm_flags & SHM_FLAG_ZONEMAP_VALID)
+			for (i = 0; i < (int) info->zm_overflow_npages; i++)
 			{
-				GenericXLogState *state = GenericXLogStart(rel);
-
-				metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
-				meta = (SortedHeapMetaPageData *)
-					PageGetSpecialPointer(metapage);
-				meta->shm_flags &= ~SHM_FLAG_ZONEMAP_VALID;
-				GenericXLogFinish(state);
+				if (ovfl_page_dirty[i])
+					sorted_heap_zonemap_flush_overflow_page(rel, info, i);
 			}
-
-			UnlockReleaseBuffer(metabuf);
-			info->zm_scan_valid = false;
-			sorted_heap_bump_zm_generation();
+			pfree(ovfl_page_dirty);
 		}
 	}
 }
@@ -1943,10 +2119,10 @@ sorted_heap_index_validate_scan(Relation tableRelation,
  *
  *  Delegates to heap, then either:
  *  (a) updates the zone map entry in-place if the tuple landed in
- *      a block already covered by the zone map, preserving scan
- *      pruning validity; or
- *  (b) clears SHM_FLAG_ZONEMAP_VALID if the tuple landed outside
- *      zone map coverage (new/uncovered page).
+ *      a block covered by the zone map (inline or overflow),
+ *      preserving scan pruning validity; or
+ *  (b) does nothing if the tuple landed outside zone map coverage
+ *      (scan path handles uncovered pages conservatively).
  * ---------------------------------------------------------------- */
 static void
 sorted_heap_tuple_insert(Relation rel, TupleTableSlot *slot,
@@ -1965,109 +2141,45 @@ sorted_heap_tuple_insert(Relation rel, TupleTableSlot *slot,
 		BlockNumber		blk = ItemPointerGetBlockNumber(&slot->tts_tid);
 		uint32			zmidx = (blk >= 1) ? (blk - 1) : 0;
 
-		if (blk >= 1 && zmidx < info->zm_nentries)
+		if (blk < 1)
+			return;		/* meta page, nothing to track */
+
+		slot_getallattrs(slot);
+
+		if (zmidx < info->zm_total_entries)
 		{
 			/*
-			 * Block within zone map coverage — update entry in-place.
-			 * Extract PK value and widen min/max if needed.
+			 * Block within zone map coverage (inline or overflow).
+			 * Update entry in-place.
 			 */
-			Datum		val;
-			bool		isnull;
-			int64		key;
-
-			slot_getallattrs(slot);
-			val = slot_getattr(slot, info->attNums[0], &isnull);
-
-			if (!isnull && sorted_heap_key_to_int64(val, info->zm_pk_typid, &key))
+			if (sorted_heap_zonemap_update_entry(info, zmidx, slot))
 			{
-				SortedHeapZoneMapEntry *cached = &info->zm_entries[zmidx];
-				bool		need_update = false;
-
-				if (key < cached->zme_min)
+				if (zmidx < info->zm_nentries)
 				{
-					cached->zme_min = key;
-					need_update = true;
-				}
-				if (key > cached->zme_max)
-				{
-					cached->zme_max = key;
-					need_update = true;
-				}
-
-				/* Track column 2 */
-				if (info->zm_col2_usable)
-				{
-					Datum	val2;
-					bool	isnull2;
-					int64	key2;
-
-					val2 = slot_getattr(slot, info->attNums[1], &isnull2);
-					if (!isnull2 &&
-						sorted_heap_key_to_int64(val2, info->zm_pk_typid2, &key2))
-					{
-						if (key2 < cached->zme_min2 || cached->zme_min2 == PG_INT64_MAX)
-						{
-							cached->zme_min2 = key2;
-							need_update = true;
-						}
-						if (key2 > cached->zme_max2 || cached->zme_max2 == PG_INT64_MIN)
-						{
-							cached->zme_max2 = key2;
-							need_update = true;
-						}
-					}
-				}
-
-				if (need_update)
-				{
-					/* Flush updated entry via version-aware flush */
 					sorted_heap_zonemap_flush(rel, info);
-					info->zm_sorted = false;
 				}
+				else
+				{
+					uint32 ovfl_idx = zmidx - info->zm_nentries;
+					uint32 page_idx = ovfl_idx /
+						SORTED_HEAP_OVERFLOW_ENTRIES_PER_PAGE;
+
+					if (page_idx < info->zm_overflow_npages)
+						sorted_heap_zonemap_flush_overflow_page(
+							rel, info, page_idx);
+				}
+				info->zm_sorted = false;
 			}
 			/* Zone map stays valid — pruning preserved */
 		}
 		else
 		{
 			/*
-			 * Block outside zone map coverage — invalidate.
-			 * Conservative: can't prune without zone map data.
+			 * Page beyond current zone map coverage.  Don't invalidate —
+			 * the scan path handles uncovered pages conservatively by
+			 * including them in the scan range.
 			 */
-			Buffer				metabuf;
-			Page				metapage;
-			SortedHeapMetaPageData *meta;
-			BlockNumber			nblocks;
-
-			nblocks = RelationGetNumberOfBlocks(rel);
-
-			if (nblocks <= SORTED_HEAP_META_BLOCK)
-			{
-				info->zm_scan_valid = false;
-				return; /* table empty or meta-only: nothing to invalidate */
-			}
-
-			metabuf = ReadBufferExtended(rel, MAIN_FORKNUM,
-										 SORTED_HEAP_META_BLOCK,
-										 RBM_NORMAL, NULL);
-			LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
-			metapage = BufferGetPage(metabuf);
-			meta = (SortedHeapMetaPageData *)
-				PageGetSpecialPointer(metapage);
-
-			if (meta->shm_flags & SHM_FLAG_ZONEMAP_VALID)
-			{
-				GenericXLogState *state = GenericXLogStart(rel);
-
-				metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
-				meta = (SortedHeapMetaPageData *)
-					PageGetSpecialPointer(metapage);
-				meta->shm_flags &= ~SHM_FLAG_ZONEMAP_VALID;
-				GenericXLogFinish(state);
-			}
-
-			UnlockReleaseBuffer(metabuf);
-			info->zm_scan_valid = false;
-			sorted_heap_bump_zm_generation();
+			info->zm_sorted = false;
 		}
 	}
 }

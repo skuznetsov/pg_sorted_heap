@@ -127,8 +127,10 @@ typedef struct SortedHeapRelInfo
 	/* Overflow zone map (for tables > 500 data pages) */
 	SortedHeapZoneMapEntry *zm_overflow;	/* palloc'd, or NULL */
 	uint32		zm_overflow_nentries;		/* entries in overflow pages */
+	uint32		zm_overflow_alloc;			/* allocated slots in zm_overflow */
 	uint32		zm_total_entries;			/* zm_nentries + zm_overflow_nentries */
 	uint32		zm_overflow_npages;			/* number of overflow pages */
+	BlockNumber *zm_overflow_blocks;		/* palloc'd, or NULL; one per overflow page */
 	uint64		zm_gen;						/* generation when zone map was loaded */
 } SortedHeapRelInfo;
 

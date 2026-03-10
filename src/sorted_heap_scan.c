@@ -1196,13 +1196,19 @@ sorted_heap_compute_block_range(SortedHeapRelInfo *info,
 
 		if (!uncovered_safe_to_skip)
 		{
-			/* Must scan all uncovered data pages (but not overflow pages) */
-			BlockNumber last_data_block = data_blocks;
+			/*
+			 * Must scan all uncovered pages.  Use total_blocks - 1
+			 * instead of data_blocks because new data pages can be
+			 * appended after overflow pages by heap.  Overflow pages
+			 * have no tuples (pd_lower == pd_upper) so scanning them
+			 * is harmless.
+			 */
+			BlockNumber last_block = total_blocks - 1;
 
 			if (first_uncovered < first_match)
 				first_match = first_uncovered;
-			if (last_data_block > last_match)
-				last_match = last_data_block;
+			if (last_block > last_match)
+				last_match = last_block;
 		}
 	}
 
