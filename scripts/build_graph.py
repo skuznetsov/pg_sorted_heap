@@ -148,6 +148,10 @@ def main():
                         help='Disable diversification pruning')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for reproducibility')
+    parser.add_argument('--sketch-dim', type=int, default=384,
+                        help='Truncate embedding to this dim for sketch (bootstrap mode)')
+    parser.add_argument('--bootstrap', action='store_true',
+                        help='Build graph from scratch (main table only, no pre-existing graph_nodes)')
     parser.add_argument('--csv-input', default='',
                         help='Read from pre-exported CSV instead of database')
     parser.add_argument('--csv-output', default='',
@@ -196,22 +200,44 @@ def main():
         src_ids = [r[3] for r in rows]
         src_tids = [r[4] for r in rows]
     else:
-        # Slow path: read from database
+        # Database path
         conn = psycopg2.connect(args.dsn)
         conn.set_session(autocommit=True)
         cur = conn.cursor()
 
-        cur.execute(f"""
-            SELECT g.nid, m.partition_id, g.sketch::text, g.src_id, g.src_tid::text
-            FROM {args.graph_table} g
-            JOIN {args.table} m ON m.id = g.src_id
-            ORDER BY g.nid
-        """)
+        if args.bootstrap:
+            # Bootstrap: build from main table directly (no pre-existing graph_nodes)
+            sdim = args.sketch_dim
+            print(f"  Bootstrap mode: reading from {args.table}, sketch_dim={sdim}")
+            cur.execute(f"""
+                SELECT row_number() OVER (ORDER BY partition_id, id) - 1 AS nid,
+                       partition_id,
+                       ('[' || array_to_string(
+                           (string_to_array(trim(both '[]' from embedding::text), ','))[1:{sdim}],
+                           ',') || ']') AS sketch_text,
+                       id::text AS src_id,
+                       ctid::text AS src_tid
+                FROM {args.table}
+                ORDER BY partition_id, id
+            """)
+        else:
+            # Rebuild: read from existing graph_nodes + main table for partition_id
+            # Cast m.id to text to match g.src_id type; use DISTINCT ON to avoid
+            # duplicates when id is not globally unique across partitions.
+            print(f"  Rebuild mode: reading from {args.graph_table} + {args.table}")
+            cur.execute(f"""
+                SELECT DISTINCT ON (g.nid)
+                       g.nid, m.partition_id, g.sketch::text, g.src_id, g.src_tid::text
+                FROM {args.graph_table} g
+                JOIN {args.table} m ON m.id::text = g.src_id
+                ORDER BY g.nid, m.partition_id
+            """)
+
         rows = cur.fetchall()
         n = len(rows)
         print(f"  Loaded {n} rows from database")
 
-        old_nids = np.array([r[0] for r in rows], dtype=np.int32)
+        old_nids = np.array([int(r[0]) for r in rows], dtype=np.int32)
         partition_ids = np.array([int(r[1]) for r in rows], dtype=np.int16)
         sketches_text = [r[2] for r in rows]
         src_ids = [r[3] for r in rows]
