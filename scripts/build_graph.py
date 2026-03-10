@@ -441,11 +441,11 @@ def main():
 
     assert new_nid == n, f"Relabeling error: {new_nid} != {n}"
 
-    # Remap neighbor lists
+    # Remap neighbor lists (sorted by new nid for batch scan locality)
     new_neighbors = [None] * n
     for old_idx in range(n):
         new_idx = old_to_new[old_idx]
-        new_neighbors[new_idx] = [int(old_to_new[nb]) for nb in neighbors[old_idx]]
+        new_neighbors[new_idx] = sorted(int(old_to_new[nb]) for nb in neighbors[old_idx])
 
     print(f"  Relabel time: {time.time() - t5:.1f}s")
 

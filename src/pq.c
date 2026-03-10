@@ -3232,6 +3232,16 @@ svec_ann_scan(PG_FUNCTION_ARGS)
  *    3. Return top-lim by exact cosine distance
  * ================================================================ */
 
+/* Minimum contiguous run length to use range scan instead of point probes */
+#define GRAPH_BATCH_MIN 3
+
+/* --- Contiguous nid run (for batch neighbor reads) --- */
+typedef struct
+{
+	int32		lo;
+	int32		hi;		/* inclusive */
+} NidRange;
+
 /* --- Graph search entry (used in both candidate and result heaps) --- */
 
 typedef struct
@@ -3482,9 +3492,13 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 	TupleDesc		graph_td;
 	Snapshot		snapshot;
 	AttrNumber		g_att_sketch, g_att_nbrs, g_att_src_id, g_att_src_tid;
-	IndexScanDesc	graph_iscan;
+	IndexScanDesc	graph_iscan;		/* point probes (1 key: eq) */
+	IndexScanDesc	range_iscan;		/* range scans (2 keys: ge+le) */
 	ScanKeyData		graph_skey[1];
+	ScanKeyData		range_skey[2];
 	RegProcedure	graph_eq;
+	RegProcedure	graph_ge;
+	RegProcedure	graph_le;
 
 	/* Index-only scan state (when covering index available) */
 	bool			use_ios = false;
@@ -3504,6 +3518,9 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 	int				n_visited = 0;
 	int				n_explored = 0;
 	int				sketch_dim = 0;
+	int				n_point_probes = 0;
+	int				n_range_runs = 0;
+	int				n_range_nodes = 0;
 
 	/* Timing */
 	instr_time		t_start, t_search, t_rerank, t_out;
@@ -3579,6 +3596,12 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 		graph_eq = get_opcode(
 			get_opfamily_member(of, pk_typid, pk_typid,
 								BTEqualStrategyNumber));
+		graph_ge = get_opcode(
+			get_opfamily_member(of, pk_typid, pk_typid,
+								BTGreaterEqualStrategyNumber));
+		graph_le = get_opcode(
+			get_opfamily_member(of, pk_typid, pk_typid,
+								BTLessEqualStrategyNumber));
 
 		/* Try to find covering index: (nid) INCLUDE (sketch, neighbors) */
 		{
@@ -3625,7 +3648,7 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 	visited_cap = Max((int) graph_rel->rd_rel->reltuples + 1024, 65536);
 	visited = palloc0(sizeof(bool) * visited_cap);
 
-	/* ---- Begin index scan ---- */
+	/* ---- Begin index scans ---- */
 #if PG_VERSION_NUM < 180000
 	graph_iscan = index_beginscan(graph_rel, graph_pk, snapshot, 1, 0);
 #else
@@ -3633,8 +3656,19 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 								  NULL, 1, 0);
 #endif
 
+	/* Range scan descriptor (2 keys: ge + le) */
+#if PG_VERSION_NUM < 180000
+	range_iscan = index_beginscan(graph_rel, graph_pk, snapshot, 2, 0);
+#else
+	range_iscan = index_beginscan(graph_rel, graph_pk, snapshot,
+								   NULL, 2, 0);
+#endif
+
 	if (use_ios)
+	{
 		graph_iscan->xs_want_itup = true;
+		range_iscan->xs_want_itup = true;
+	}
 
 	/* ---- Entry points ---- */
 	if (entry_tbl_name[0] != '\0')
@@ -3942,107 +3976,309 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 		memcpy(nbrs_copy, nbrs, sizeof(int32) * n_nbrs);
 		if (!use_ios) ExecClearTuple(graph_slot);
 
-		/* Evaluate each unvisited neighbor */
-		for (k = 0; k < n_nbrs; k++)
+		/*
+		 * Batch neighbor reads: neighbor lists are sorted by nid
+		 * (from builder relabel).  Filter visited, detect contiguous
+		 * runs, use range scan for runs >= GRAPH_BATCH_MIN.
+		 */
 		{
-			int32		n_nid = nbrs_copy[k];
-			Datum		sk_d;
-			Hsvec	   *sk;
-			float8		n_dist;
+			int32	   *unvisited;
+			int			n_unvisited = 0;
+			NidRange   *runs;
+			int			n_runs = 0;
+			int32	   *singles;
+			int			n_singles = 0;
+			int			r, s;
 
-			if (n_nid < 0)
-				continue;
+			unvisited = palloc(sizeof(int32) * n_nbrs);
 
-			/* Expand visited bitmap if needed */
-			if (n_nid >= visited_cap)
+			/* Filter out visited and negative nids */
+			for (k = 0; k < n_nbrs; k++)
 			{
-				int		new_cap = Max(visited_cap * 2, n_nid + 1024);
+				int32	n_nid = nbrs_copy[k];
 
-				visited = repalloc(visited, sizeof(bool) * new_cap);
-				memset(visited + visited_cap, 0,
-					   sizeof(bool) * (new_cap - visited_cap));
-				visited_cap = new_cap;
-			}
-
-			if (visited[n_nid])
-				continue;
-			visited[n_nid] = true;
-			n_visited++;
-
-			/* Read neighbor's sketch */
-			ScanKeyInit(&graph_skey[0], 1, BTEqualStrategyNumber,
-						graph_eq, Int32GetDatum(n_nid));
-			index_rescan(graph_iscan, graph_skey, 1, NULL, 0);
-
-			if (use_ios)
-			{
-				ItemPointer tid = index_getnext_tid(graph_iscan,
-													 ForwardScanDirection);
-				if (tid == NULL)
+				if (n_nid < 0)
 					continue;
 
-				sk_d = index_getattr(graph_iscan->xs_itup,
-									  ios_att_sketch,
-									  graph_iscan->xs_itupdesc,
-									  &isnull);
-			}
-			else
-			{
-				if (!index_getnext_slot(graph_iscan, ForwardScanDirection,
-										graph_slot))
+				/* Expand visited bitmap if needed */
+				if (n_nid >= visited_cap)
+				{
+					int	new_cap = Max(visited_cap * 2, n_nid + 1024);
+
+					visited = repalloc(visited, sizeof(bool) * new_cap);
+					memset(visited + visited_cap, 0,
+						   sizeof(bool) * (new_cap - visited_cap));
+					visited_cap = new_cap;
+				}
+
+				if (visited[n_nid])
 					continue;
 
-				sk_d = slot_getattr(graph_slot, g_att_sketch, &isnull);
+				unvisited[n_unvisited++] = n_nid;
 			}
 
-			if (isnull)
+			/* Detect contiguous runs in sorted unvisited list */
+			runs = palloc(sizeof(NidRange) * (n_unvisited + 1));
+			singles = palloc(sizeof(int32) * n_unvisited);
+
+			if (n_unvisited > 0)
 			{
+				int32	run_lo = unvisited[0];
+				int32	run_hi = unvisited[0];
+
+				for (k = 1; k < n_unvisited; k++)
+				{
+					if (unvisited[k] == run_hi + 1)
+					{
+						run_hi = unvisited[k];
+					}
+					else
+					{
+						/* Emit previous run */
+						if (run_hi - run_lo + 1 >= GRAPH_BATCH_MIN)
+						{
+							runs[n_runs].lo = run_lo;
+							runs[n_runs].hi = run_hi;
+							n_runs++;
+						}
+						else
+						{
+							int32 i;
+							for (i = run_lo; i <= run_hi; i++)
+								singles[n_singles++] = i;
+						}
+						run_lo = unvisited[k];
+						run_hi = unvisited[k];
+					}
+				}
+				/* Emit last run */
+				if (run_hi - run_lo + 1 >= GRAPH_BATCH_MIN)
+				{
+					runs[n_runs].lo = run_lo;
+					runs[n_runs].hi = run_hi;
+					n_runs++;
+				}
+				else
+				{
+					int32 i;
+					for (i = run_lo; i <= run_hi; i++)
+						singles[n_singles++] = i;
+				}
+			}
+
+			/* Mark all unvisited as visited now */
+			for (k = 0; k < n_unvisited; k++)
+			{
+				visited[unvisited[k]] = true;
+				n_visited++;
+			}
+
+			/*
+			 * Process contiguous runs via range scan:
+			 *   nid >= run_lo AND nid <= run_hi
+			 */
+			for (r = 0; r < n_runs; r++)
+			{
+				n_range_runs++;
+
+				ScanKeyInit(&range_skey[0], 1,
+							BTGreaterEqualStrategyNumber,
+							graph_ge, Int32GetDatum(runs[r].lo));
+				ScanKeyInit(&range_skey[1], 1,
+							BTLessEqualStrategyNumber,
+							graph_le, Int32GetDatum(runs[r].hi));
+				index_rescan(range_iscan, range_skey, 2, NULL, 0);
+
+				for (;;)
+				{
+					Datum	sk_d;
+					Hsvec  *sk;
+					float8	n_dist;
+					int32	n_nid;
+
+					if (use_ios)
+					{
+						ItemPointer tid = index_getnext_tid(
+							range_iscan, ForwardScanDirection);
+						if (tid == NULL)
+							break;
+
+						/* Extract nid from index key attr 1 */
+						{
+							bool nid_null;
+							Datum nid_d = index_getattr(
+								range_iscan->xs_itup, 1,
+								range_iscan->xs_itupdesc,
+								&nid_null);
+							n_nid = DatumGetInt32(nid_d);
+						}
+
+						sk_d = index_getattr(range_iscan->xs_itup,
+											  ios_att_sketch,
+											  range_iscan->xs_itupdesc,
+											  &isnull);
+					}
+					else
+					{
+						if (!index_getnext_slot(range_iscan,
+												ForwardScanDirection,
+												graph_slot))
+							break;
+
+						{
+							bool nid_null;
+							Datum nid_d = slot_getattr(
+								graph_slot, 1, &nid_null);
+							n_nid = DatumGetInt32(nid_d);
+						}
+
+						sk_d = slot_getattr(graph_slot, g_att_sketch,
+											&isnull);
+					}
+
+					n_range_nodes++;
+
+					if (isnull)
+					{
+						if (!use_ios) ExecClearTuple(graph_slot);
+						continue;
+					}
+
+					sk = (Hsvec *) PG_DETOAST_DATUM(sk_d);
+					n_dist = cosine_distance_f32_f16(
+						query->x, sk->x,
+						Min(sk->dim, query->dim));
+					if (!use_ios) ExecClearTuple(graph_slot);
+
+					f_dist = (res_size >= ef_search)
+						? res_heap[0].dist : DBL_MAX;
+
+					if (n_dist < f_dist || res_size < ef_search)
+					{
+						if (cand_size >= cand_cap)
+						{
+							cand_cap *= 2;
+							candidates = repalloc(candidates,
+								sizeof(GraphEntry) * cand_cap);
+						}
+						candidates[cand_size].dist = n_dist;
+						candidates[cand_size].nid = n_nid;
+						cand_size++;
+						graph_minheap_siftup(candidates,
+											  cand_size - 1);
+
+						if (res_size < ef_search)
+						{
+							res_heap[res_size].dist = n_dist;
+							res_heap[res_size].nid = n_nid;
+							res_size++;
+							graph_maxheap_siftup(res_heap,
+												  res_size - 1);
+						}
+						else if (n_dist < res_heap[0].dist)
+						{
+							res_heap[0].dist = n_dist;
+							res_heap[0].nid = n_nid;
+							graph_maxheap_siftdown(res_heap,
+												   res_size, 0);
+						}
+					}
+				}
+			}
+
+			/* Process singles via point probes */
+			for (s = 0; s < n_singles; s++)
+			{
+				int32	n_nid = singles[s];
+				Datum	sk_d;
+				Hsvec  *sk;
+				float8	n_dist;
+
+				n_point_probes++;
+
+				ScanKeyInit(&graph_skey[0], 1, BTEqualStrategyNumber,
+							graph_eq, Int32GetDatum(n_nid));
+				index_rescan(graph_iscan, graph_skey, 1, NULL, 0);
+
+				if (use_ios)
+				{
+					ItemPointer tid = index_getnext_tid(
+						graph_iscan, ForwardScanDirection);
+					if (tid == NULL)
+						continue;
+
+					sk_d = index_getattr(graph_iscan->xs_itup,
+										  ios_att_sketch,
+										  graph_iscan->xs_itupdesc,
+										  &isnull);
+				}
+				else
+				{
+					if (!index_getnext_slot(graph_iscan,
+											ForwardScanDirection,
+											graph_slot))
+						continue;
+
+					sk_d = slot_getattr(graph_slot, g_att_sketch,
+										&isnull);
+				}
+
+				if (isnull)
+				{
+					if (!use_ios) ExecClearTuple(graph_slot);
+					continue;
+				}
+
+				sk = (Hsvec *) PG_DETOAST_DATUM(sk_d);
+				n_dist = cosine_distance_f32_f16(
+					query->x, sk->x,
+					Min(sk->dim, query->dim));
 				if (!use_ios) ExecClearTuple(graph_slot);
-				continue;
-			}
 
-			sk = (Hsvec *) PG_DETOAST_DATUM(sk_d);
-			n_dist = cosine_distance_f32_f16(query->x, sk->x,
-											  Min(sk->dim, query->dim));
-			if (!use_ios) ExecClearTuple(graph_slot);
+				f_dist = (res_size >= ef_search)
+					? res_heap[0].dist : DBL_MAX;
 
-			f_dist = (res_size >= ef_search)
-				? res_heap[0].dist : DBL_MAX;
-
-			if (n_dist < f_dist || res_size < ef_search)
-			{
-				/* Add to candidates min-heap */
-				if (cand_size >= cand_cap)
+				if (n_dist < f_dist || res_size < ef_search)
 				{
-					cand_cap *= 2;
-					candidates = repalloc(candidates,
-										   sizeof(GraphEntry) * cand_cap);
-				}
-				candidates[cand_size].dist = n_dist;
-				candidates[cand_size].nid = n_nid;
-				cand_size++;
-				graph_minheap_siftup(candidates, cand_size - 1);
+					if (cand_size >= cand_cap)
+					{
+						cand_cap *= 2;
+						candidates = repalloc(candidates,
+							sizeof(GraphEntry) * cand_cap);
+					}
+					candidates[cand_size].dist = n_dist;
+					candidates[cand_size].nid = n_nid;
+					cand_size++;
+					graph_minheap_siftup(candidates,
+										  cand_size - 1);
 
-				/* Update results max-heap */
-				if (res_size < ef_search)
-				{
-					res_heap[res_size].dist = n_dist;
-					res_heap[res_size].nid = n_nid;
-					res_size++;
-					graph_maxheap_siftup(res_heap, res_size - 1);
-				}
-				else if (n_dist < res_heap[0].dist)
-				{
-					res_heap[0].dist = n_dist;
-					res_heap[0].nid = n_nid;
-					graph_maxheap_siftdown(res_heap, res_size, 0);
+					if (res_size < ef_search)
+					{
+						res_heap[res_size].dist = n_dist;
+						res_heap[res_size].nid = n_nid;
+						res_size++;
+						graph_maxheap_siftup(res_heap,
+											  res_size - 1);
+					}
+					else if (n_dist < res_heap[0].dist)
+					{
+						res_heap[0].dist = n_dist;
+						res_heap[0].nid = n_nid;
+						graph_maxheap_siftdown(res_heap,
+											   res_size, 0);
+					}
 				}
 			}
+
+			pfree(unvisited);
+			pfree(runs);
+			pfree(singles);
 		}
 		pfree(nbrs_copy);
 	}
 
 	index_endscan(graph_iscan);
+	index_endscan(range_iscan);
 
 	if (sorted_heap_ann_timing)
 		INSTR_TIME_SET_CURRENT(t_search);
@@ -4365,7 +4601,8 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 		INSTR_TIME_SET_CURRENT(t_out);
 		elog(DEBUG1, "svec_graph_scan: search=%.3fms rerank=%.3fms "
 			 "out=%.3fms total=%.3fms "
-			 "(visited=%d explored=%d results=%d sketch_dim=%d)",
+			 "(visited=%d explored=%d results=%d sketch_dim=%d "
+			 "point_probes=%d range_runs=%d range_nodes=%d)",
 			 INSTR_TIME_GET_MILLISEC(t_search) -
 			 INSTR_TIME_GET_MILLISEC(t_start),
 			 INSTR_TIME_GET_MILLISEC(t_rerank) -
@@ -4374,7 +4611,8 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 			 INSTR_TIME_GET_MILLISEC(t_rerank),
 			 INSTR_TIME_GET_MILLISEC(t_out) -
 			 INSTR_TIME_GET_MILLISEC(t_start),
-			 n_visited, n_explored, res_size, sketch_dim);
+			 n_visited, n_explored, res_size, sketch_dim,
+			 n_point_probes, n_range_runs, n_range_nodes);
 	}
 
 	return (Datum) 0;
