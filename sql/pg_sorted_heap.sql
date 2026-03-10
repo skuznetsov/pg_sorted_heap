@@ -2528,6 +2528,15 @@ FROM svec_graph_scan(
     'ann_test_graph', 16, 5
 );
 
+-- ANN-11b: graph scan with rerank_topk pre-filter
+SELECT count(*) AS ann11b_count,
+       bool_and(distance >= 0) AS ann11b_nonneg
+FROM svec_graph_scan(
+    'ann_test',
+    '[5,3,6,7,1,2,4,2]'::svec,
+    'ann_test_graph', 16, 5, 8
+);
+
 DROP TABLE ann_test_graph;
 
 -- ANN-12: graph scan negative tests - bad PK type

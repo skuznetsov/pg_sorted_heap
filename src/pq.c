@@ -3458,6 +3458,7 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 	char		   *graph_tbl_name = text_to_cstring(PG_GETARG_TEXT_PP(2));
 	int				ef_search = PG_GETARG_INT32(3);
 	int				lim = PG_GETARG_INT32(4);
+	int				rerank_topk = PG_GETARG_INT32(5);
 
 	/* Graph table state */
 	Oid				graph_oid;
@@ -3884,6 +3885,17 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 		}
 
 		do_exact_rerank = (g_att_src_tid != InvalidAttrNumber);
+
+		/* Pre-filter: narrow candidates by sketch distance before
+		 * expensive exact rerank.  rerank_topk=0 means use all. */
+		if (do_exact_rerank && rerank_topk > 0 && rerank_topk < res_size)
+		{
+			int effective = Max(rerank_topk, lim);
+
+			qsort(gresults, res_size, sizeof(GraphResult),
+				  cmp_graph_result);
+			res_size = Min(effective, res_size);
+		}
 
 		/* Read src_tid for all candidates (needed for exact rerank).
 		 * Defer src_id to after sort — only needed for final top-lim. */
