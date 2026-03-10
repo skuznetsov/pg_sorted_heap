@@ -3491,6 +3491,7 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 	TupleTableSlot *graph_slot;
 	TupleDesc		graph_td;
 	Snapshot		snapshot;
+	AttrNumber		g_att_nid;	/* heap attno of PK nid column */
 	AttrNumber		g_att_sketch, g_att_nbrs, g_att_src_id, g_att_src_tid;
 	IndexScanDesc	graph_iscan;		/* point probes (1 key: eq) */
 	IndexScanDesc	range_iscan;		/* range scans (2 keys: ge+le) */
@@ -3576,6 +3577,8 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 		Oid			pk_typid = TupleDescAttr(graph_td,
 											   pk_att - 1)->atttypid;
 		Oid			oc, of;
+
+		g_att_nid = pk_att;
 
 		if (pk_typid != INT4OID)
 		{
@@ -4128,7 +4131,7 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 						{
 							bool nid_null;
 							Datum nid_d = slot_getattr(
-								graph_slot, 1, &nid_null);
+								graph_slot, g_att_nid, &nid_null);
 							n_nid = DatumGetInt32(nid_d);
 						}
 

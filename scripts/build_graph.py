@@ -221,16 +221,15 @@ def main():
                 ORDER BY partition_id, id
             """)
         else:
-            # Rebuild: read from existing graph_nodes + main table for partition_id
-            # Cast m.id to text to match g.src_id type; use DISTINCT ON to avoid
-            # duplicates when id is not globally unique across partitions.
+            # Rebuild: read from existing graph_nodes + main table for partition_id.
+            # Join on ctid to get the exact main-table row (src_tid is set during
+            # initial build and is stable until VACUUM FULL / rewrite).
             print(f"  Rebuild mode: reading from {args.graph_table} + {args.table}")
             cur.execute(f"""
-                SELECT DISTINCT ON (g.nid)
-                       g.nid, m.partition_id, g.sketch::text, g.src_id, g.src_tid::text
+                SELECT g.nid, m.partition_id, g.sketch::text, g.src_id, g.src_tid::text
                 FROM {args.graph_table} g
-                JOIN {args.table} m ON m.id::text = g.src_id
-                ORDER BY g.nid, m.partition_id
+                JOIN {args.table} m ON m.ctid = g.src_tid
+                ORDER BY g.nid
             """)
 
         rows = cur.fetchall()
