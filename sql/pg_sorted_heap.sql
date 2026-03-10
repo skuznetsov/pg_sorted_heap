@@ -2537,6 +2537,27 @@ FROM svec_graph_scan(
     'ann_test_graph', 16, 5, 8
 );
 
+-- ANN-11c: graph scan with multi-entry points
+CREATE TABLE ann_test_entries (
+    entry_nid  int4 PRIMARY KEY,
+    centroid   hsvec(8) NOT NULL
+);
+
+-- Use first 3 nodes as entry points with their sketches as centroids
+INSERT INTO ann_test_entries
+SELECT nid, sketch
+FROM ann_test_graph
+WHERE nid IN (0, 2, 4);
+
+SELECT count(*) AS ann11c_count,
+       bool_and(distance >= 0) AS ann11c_nonneg
+FROM svec_graph_scan(
+    'ann_test',
+    '[5,3,6,7,1,2,4,2]'::svec,
+    'ann_test_graph', 16, 5, 0, 'ann_test_entries'
+);
+
+DROP TABLE ann_test_entries;
 DROP TABLE ann_test_graph;
 
 -- ANN-12: graph scan negative tests - bad PK type

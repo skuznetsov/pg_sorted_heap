@@ -3206,7 +3206,9 @@ svec_ann_scan(PG_FUNCTION_ARGS)
  *  svec_graph_scan(tbl regclass, query svec,
  *                  graph_table text,
  *                  ef_search int4 DEFAULT 64,
- *                  lim int4 DEFAULT 10)
+ *                  lim int4 DEFAULT 10,
+ *                  rerank_topk int4 DEFAULT 0,
+ *                  entry_table text DEFAULT '')
  *  RETURNS TABLE(id text, distance float8)
  *
  *  Performs greedy best-first search on a Navigable Small World
@@ -3318,6 +3320,17 @@ graph_maxheap_siftdown(GraphEntry *heap, int n, int i)
 		heap[largest] = tmp;
 		i = largest;
 	}
+}
+
+static int
+cmp_graph_entry(const void *a, const void *b)
+{
+	float8	da = ((const GraphEntry *) a)->dist;
+	float8	db = ((const GraphEntry *) b)->dist;
+
+	if (da < db) return -1;
+	if (da > db) return 1;
+	return 0;
 }
 
 /* --- Graph result for rerank phase --- */
@@ -3459,6 +3472,7 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 	int				ef_search = PG_GETARG_INT32(3);
 	int				lim = PG_GETARG_INT32(4);
 	int				rerank_topk = PG_GETARG_INT32(5);
+	char		   *entry_tbl_name = text_to_cstring(PG_GETARG_TEXT_PP(6));
 
 	/* Graph table state */
 	Oid				graph_oid;
@@ -3622,8 +3636,172 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 	if (use_ios)
 		graph_iscan->xs_want_itup = true;
 
-	/* ---- Entry point (nid=0) ---- */
+	/* ---- Entry points ---- */
+	if (entry_tbl_name[0] != '\0')
 	{
+		/* Multi-entry: read entry table, pick closest centroids */
+		Oid			entry_oid;
+		Relation	entry_rel;
+		TableScanDesc entry_scan;
+		TupleTableSlot *entry_slot;
+		AttrNumber	e_att_nid, e_att_centroid;
+		int			n_entries = 0;
+		int			max_seeds = 8;	/* use top-8 closest entry points */
+		GraphEntry *entry_buf;
+		int			entry_buf_cap = 256;
+
+		entry_oid = DatumGetObjectId(
+			DirectFunctionCall1(regclassin,
+								CStringGetDatum(entry_tbl_name)));
+		entry_rel = table_open(entry_oid, AccessShareLock);
+		entry_slot = table_slot_create(entry_rel, NULL);
+
+		e_att_nid = get_attnum(entry_oid, "entry_nid");
+		e_att_centroid = get_attnum(entry_oid, "centroid");
+
+		if (e_att_nid == InvalidAttrNumber ||
+			e_att_centroid == InvalidAttrNumber)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_COLUMN),
+					 errmsg("svec_graph_scan: entry table \"%s\" must have "
+							"\"entry_nid\" (int4) and \"centroid\" (hsvec) "
+							"columns", entry_tbl_name)));
+
+		entry_buf = palloc(sizeof(GraphEntry) * entry_buf_cap);
+
+		entry_scan = table_beginscan(entry_rel, snapshot, 0, NULL);
+
+		while (table_scan_getnextslot(entry_scan, ForwardScanDirection,
+									   entry_slot))
+		{
+			bool	isnull;
+			Datum	nid_d, cent_d;
+			int32	e_nid;
+			Hsvec  *cent;
+			float8	d;
+
+			nid_d = slot_getattr(entry_slot, e_att_nid, &isnull);
+			if (isnull)
+			{
+				ExecClearTuple(entry_slot);
+				continue;
+			}
+			e_nid = DatumGetInt32(nid_d);
+
+			cent_d = slot_getattr(entry_slot, e_att_centroid, &isnull);
+			if (isnull)
+			{
+				ExecClearTuple(entry_slot);
+				continue;
+			}
+
+			cent = (Hsvec *) PG_DETOAST_DATUM(cent_d);
+
+			if (sketch_dim == 0)
+			{
+				if (cent->dim > query->dim)
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_EXCEPTION),
+							 errmsg("svec_graph_scan: centroid dim %d > "
+									"query dim %d", cent->dim, query->dim)));
+				sketch_dim = cent->dim;
+			}
+
+			d = cosine_distance_f32_f16(query->x, cent->x,
+										 Min(cent->dim, query->dim));
+
+			if (n_entries >= entry_buf_cap)
+			{
+				entry_buf_cap *= 2;
+				entry_buf = repalloc(entry_buf,
+									  sizeof(GraphEntry) * entry_buf_cap);
+			}
+			entry_buf[n_entries].dist = d;
+			entry_buf[n_entries].nid = e_nid;
+			n_entries++;
+
+			ExecClearTuple(entry_slot);
+		}
+
+		table_endscan(entry_scan);
+		ExecDropSingleTupleTableSlot(entry_slot);
+		table_close(entry_rel, AccessShareLock);
+
+		if (n_entries == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("svec_graph_scan: entry table \"%s\" is empty",
+							entry_tbl_name)));
+
+		/* Sort by distance, seed from top max_seeds */
+		qsort(entry_buf, n_entries, sizeof(GraphEntry), cmp_graph_entry);
+		{
+			int		n_seeds = Min(max_seeds, n_entries);
+			int		i;
+
+			for (i = 0; i < n_seeds; i++)
+			{
+				int32	e_nid = entry_buf[i].nid;
+				float8	e_dist = entry_buf[i].dist;
+
+				/* Mark visited */
+				if (e_nid >= 0)
+				{
+					if (e_nid >= visited_cap)
+					{
+						int new_cap = Max(visited_cap * 2, e_nid + 1024);
+
+						visited = repalloc(visited,
+											sizeof(bool) * new_cap);
+						memset(visited + visited_cap, 0,
+							   sizeof(bool) * (new_cap - visited_cap));
+						visited_cap = new_cap;
+					}
+					if (visited[e_nid])
+						continue;
+					visited[e_nid] = true;
+					n_visited++;
+				}
+
+				/* Add to candidates min-heap */
+				if (cand_size >= cand_cap)
+				{
+					cand_cap *= 2;
+					candidates = repalloc(candidates,
+										   sizeof(GraphEntry) * cand_cap);
+				}
+				candidates[cand_size].dist = e_dist;
+				candidates[cand_size].nid = e_nid;
+				cand_size++;
+				graph_minheap_siftup(candidates, cand_size - 1);
+
+				/* Add to results max-heap */
+				if (res_size < ef_search)
+				{
+					res_heap[res_size].dist = e_dist;
+					res_heap[res_size].nid = e_nid;
+					res_size++;
+					graph_maxheap_siftup(res_heap, res_size - 1);
+				}
+				else if (e_dist < res_heap[0].dist)
+				{
+					res_heap[0].dist = e_dist;
+					res_heap[0].nid = e_nid;
+					graph_maxheap_siftdown(res_heap, res_size, 0);
+				}
+			}
+		}
+
+		pfree(entry_buf);
+
+		/* Need sketch_dim for navigation — read it from first graph node
+		 * if centroids didn't set it (shouldn't happen, but be safe). */
+		if (sketch_dim == 0)
+			sketch_dim = query->dim;
+	}
+	else
+	{
+		/* Single entry point: nid=0 (original behavior) */
 		int32		entry_nid = 0;
 		bool		isnull;
 		Datum		sk_d;
