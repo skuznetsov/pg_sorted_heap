@@ -3476,6 +3476,7 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 	Oid				pk_index_oid;	/* saved PK OID for rerank phase */
 	int				ios_att_sketch = 0;	/* index attr pos for sketch */
 	int				ios_att_nbrs = 0;	/* index attr pos for neighbors */
+	int				ios_att_src_tid = 0;/* index attr pos for src_tid */
 
 	/* Search state */
 	GraphEntry	   *candidates;		/* min-heap */
@@ -3586,6 +3587,9 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 							ios_att_sketch = i + 1; /* 1-based */
 						else if (ci->indkey.values[i] == g_att_nbrs)
 							ios_att_nbrs = i + 1;
+						else if (g_att_src_tid != InvalidAttrNumber &&
+								 ci->indkey.values[i] == g_att_src_tid)
+							ios_att_src_tid = i + 1;
 					}
 				}
 			}
@@ -3881,77 +3885,104 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 
 		do_exact_rerank = (g_att_src_tid != InvalidAttrNumber);
 
-		/* Read src_id (and src_tid if available) from graph table.
-		 * For rerank, always use PK index (need heap for src_id/src_tid). */
+		/* Read src_tid for all candidates (needed for exact rerank).
+		 * Defer src_id to after sort — only needed for final top-lim. */
+		if (do_exact_rerank)
 		{
-			Relation	rerank_idx;
-			bool		rerank_opened_pk = false;
-
-			if (use_ios)
+			if (use_ios && ios_att_src_tid != 0)
 			{
-				rerank_idx = index_open(pk_index_oid, AccessShareLock);
-				rerank_opened_pk = true;
-			}
-			else
-				rerank_idx = graph_pk;
-
+				/* IOS path: covering index includes src_tid */
 #if PG_VERSION_NUM < 180000
-			graph_iscan = index_beginscan(graph_rel, rerank_idx,
-										   snapshot, 1, 0);
+				graph_iscan = index_beginscan(graph_rel, graph_pk,
+											   snapshot, 1, 0);
 #else
-			graph_iscan = index_beginscan(graph_rel, rerank_idx,
-										   snapshot, NULL, 1, 0);
+				graph_iscan = index_beginscan(graph_rel, graph_pk,
+											   snapshot, NULL, 1, 0);
 #endif
+				graph_iscan->xs_want_itup = true;
 
-			for (j = 0; j < res_size; j++)
-			{
-				bool	isnull;
-
-				ScanKeyInit(&graph_skey[0], 1, BTEqualStrategyNumber,
-							graph_eq, Int32GetDatum(gresults[j].nid));
-				index_rescan(graph_iscan, graph_skey, 1, NULL, 0);
-
-				if (!index_getnext_slot(graph_iscan, ForwardScanDirection,
-										graph_slot))
-					continue;
-
-				/* Read src_id */
-				if (g_att_src_id != InvalidAttrNumber)
+				for (j = 0; j < res_size; j++)
 				{
-					Datum	id_d = slot_getattr(graph_slot, g_att_src_id,
-												 &isnull);
+					bool		isnull;
+					ItemPointer tid;
 
-					if (!isnull)
+					ScanKeyInit(&graph_skey[0], 1, BTEqualStrategyNumber,
+								graph_eq,
+								Int32GetDatum(gresults[j].nid));
+					index_rescan(graph_iscan, graph_skey, 1, NULL, 0);
+
+					tid = index_getnext_tid(graph_iscan,
+											ForwardScanDirection);
+					if (tid == NULL)
+						continue;
+
 					{
-						Oid		g_typout;
-						bool	g_typisvar;
-						Oid		g_typid = TupleDescAttr(graph_td,
-									g_att_src_id - 1)->atttypid;
+						Datum	tid_d = index_getattr(
+							graph_iscan->xs_itup, ios_att_src_tid,
+							graph_iscan->xs_itupdesc, &isnull);
 
-						getTypeOutputInfo(g_typid, &g_typout, &g_typisvar);
-						gresults[j].src_id = pstrdup(
-							OidOutputFunctionCall(g_typout, id_d));
+						if (!isnull)
+							ItemPointerCopy(DatumGetItemPointer(tid_d),
+											&gresults[j].src_tid);
 					}
 				}
 
-				/* Read src_tid */
-				if (g_att_src_tid != InvalidAttrNumber)
-				{
-					Datum	tid_d = slot_getattr(graph_slot, g_att_src_tid,
-												  &isnull);
+				index_endscan(graph_iscan);
+			}
+			else
+			{
+				/* Heap path: PK index → heap for src_tid only */
+				Relation	rerank_idx;
+				bool		rerank_opened_pk = false;
 
-					if (!isnull)
-						ItemPointerCopy(DatumGetItemPointer(tid_d),
-										&gresults[j].src_tid);
+				if (use_ios)
+				{
+					rerank_idx = index_open(pk_index_oid, AccessShareLock);
+					rerank_opened_pk = true;
+				}
+				else
+					rerank_idx = graph_pk;
+
+#if PG_VERSION_NUM < 180000
+				graph_iscan = index_beginscan(graph_rel, rerank_idx,
+											   snapshot, 1, 0);
+#else
+				graph_iscan = index_beginscan(graph_rel, rerank_idx,
+											   snapshot, NULL, 1, 0);
+#endif
+
+				for (j = 0; j < res_size; j++)
+				{
+					bool	isnull;
+
+					ScanKeyInit(&graph_skey[0], 1, BTEqualStrategyNumber,
+								graph_eq,
+								Int32GetDatum(gresults[j].nid));
+					index_rescan(graph_iscan, graph_skey, 1, NULL, 0);
+
+					if (!index_getnext_slot(graph_iscan,
+											ForwardScanDirection,
+											graph_slot))
+						continue;
+
+					{
+						Datum	tid_d = slot_getattr(graph_slot,
+													 g_att_src_tid,
+													 &isnull);
+
+						if (!isnull)
+							ItemPointerCopy(DatumGetItemPointer(tid_d),
+											&gresults[j].src_tid);
+					}
+
+					ExecClearTuple(graph_slot);
 				}
 
-				ExecClearTuple(graph_slot);
+				index_endscan(graph_iscan);
+
+				if (rerank_opened_pk)
+					index_close(rerank_idx, AccessShareLock);
 			}
-
-			index_endscan(graph_iscan);
-
-			if (rerank_opened_pk)
-				index_close(rerank_idx, AccessShareLock);
 		}
 
 		/* Exact rerank via main table */
@@ -4030,8 +4061,7 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 						svec_cosine_distance_internal(query, candidate);
 				}
 
-				/* Read id from main table if not already set */
-				if (gresults[j].src_id == NULL)
+				/* Read id from main table */
 				{
 					Datum	mid = slot_getattr(main_slot, id_attno,
 											   &isnull);
@@ -4054,6 +4084,66 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 		/* Sort by distance, keep top lim */
 		qsort(gresults, res_size, sizeof(GraphResult), cmp_graph_result);
 		n_out = Min(res_size, lim);
+
+		/* Deferred src_id: when no exact rerank, read from graph table
+		 * only for the final top-lim results. */
+		if (!do_exact_rerank && g_att_src_id != InvalidAttrNumber)
+		{
+			Relation	srcid_idx;
+			bool		srcid_opened_pk = false;
+			Oid			g_typid;
+			Oid			g_typout;
+			bool		g_typisvar;
+
+			g_typid = TupleDescAttr(graph_td,
+									g_att_src_id - 1)->atttypid;
+			getTypeOutputInfo(g_typid, &g_typout, &g_typisvar);
+
+			if (use_ios)
+			{
+				srcid_idx = index_open(pk_index_oid, AccessShareLock);
+				srcid_opened_pk = true;
+			}
+			else
+				srcid_idx = graph_pk;
+
+#if PG_VERSION_NUM < 180000
+			graph_iscan = index_beginscan(graph_rel, srcid_idx,
+										   snapshot, 1, 0);
+#else
+			graph_iscan = index_beginscan(graph_rel, srcid_idx,
+										   snapshot, NULL, 1, 0);
+#endif
+
+			for (j = 0; j < n_out; j++)
+			{
+				bool	isnull;
+
+				ScanKeyInit(&graph_skey[0], 1, BTEqualStrategyNumber,
+							graph_eq, Int32GetDatum(gresults[j].nid));
+				index_rescan(graph_iscan, graph_skey, 1, NULL, 0);
+
+				if (!index_getnext_slot(graph_iscan, ForwardScanDirection,
+										graph_slot))
+					continue;
+
+				{
+					Datum	id_d = slot_getattr(graph_slot, g_att_src_id,
+												 &isnull);
+
+					if (!isnull)
+						gresults[j].src_id = pstrdup(
+							OidOutputFunctionCall(g_typout, id_d));
+				}
+
+				ExecClearTuple(graph_slot);
+			}
+
+			index_endscan(graph_iscan);
+
+			if (srcid_opened_pk)
+				index_close(srcid_idx, AccessShareLock);
+		}
 
 		/* ---- Output to tuplestore ---- */
 		for (j = 0; j < n_out; j++)
