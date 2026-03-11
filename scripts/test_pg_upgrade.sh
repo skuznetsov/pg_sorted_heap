@@ -95,7 +95,7 @@ mkdir -p "$TMP_DIR/old" "$TMP_DIR/new"
 # ============================================================
 echo ""
 echo "=== Phase 1: Build for PG 17 ==="
-make -C "$ROOT_DIR" clean install PG_CONFIG="$PG17_BIN/pg_config" >/dev/null 2>&1 || true
+make -C "$ROOT_DIR" clean install PG_CONFIG="$PG17_BIN/pg_config" >/dev/null
 
 # ============================================================
 # Phase 2: Create PG 17 cluster with test data
@@ -153,7 +153,7 @@ check "pre_upgrade_zm_valid" "1" "$zm_valid"
 # ============================================================
 echo ""
 echo "=== Phase 3: Build for PG 18 ==="
-make -C "$ROOT_DIR" clean install PG_CONFIG="$PG18_BIN/pg_config" >/dev/null 2>&1 || true
+make -C "$ROOT_DIR" clean install PG_CONFIG="$PG18_BIN/pg_config" >/dev/null
 
 # ============================================================
 # Phase 4: pg_upgrade

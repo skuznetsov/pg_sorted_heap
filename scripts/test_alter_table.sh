@@ -57,7 +57,7 @@ trap cleanup EXIT
 
 # --- Create ephemeral cluster ---
 TMP_DIR="$(mktemp -d "$TMP_ROOT/pg_sorted_heap_alter.XXXXXX")"
-make -C "$ROOT_DIR" install >/dev/null 2>&1 || true
+make -C "$ROOT_DIR" install >/dev/null
 "$PG_BINDIR/initdb" -D "$TMP_DIR/data" -A trust --no-locale >/dev/null 2>&1
 "$PG_BINDIR/pg_ctl" -D "$TMP_DIR/data" -l "$TMP_DIR/postmaster.log" \
   -o "-k $TMP_DIR -p $PORT" start >/dev/null
