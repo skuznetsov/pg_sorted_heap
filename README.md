@@ -185,7 +185,7 @@ no pgvector dependency, no 800 MB HNSW graph.
 | Index size (103K × 2880-dim) | **27 MB** (PQ codes) | 806 MB (full vectors) |
 | R@1 (cross-query) | 79–99% (tunable) | 97% |
 | Latency (avg, 103K) | **8 ms** PQ-only / 22 ms rerank | 14 ms |
-| Max indexed dimensions | **16,000** (svec) / **32,000** (hsvec) | 2,000 |
+| Max indexed dimensions | **16,000** (svec) / **32,000** (hsvec) | 2,000 (`vector`) / 4,000 (`halfvec`) |
 | Separate index needed? | No — PK prefix is the IVF | Yes — HNSW graph |
 | External dependency | None | pgvector extension |
 | Scales to 1M vectors | ~260 MB | ~8 GB |
@@ -194,10 +194,10 @@ IVF-PQ trades recall for 30x smaller storage. At nprobe=10 with reranking,
 R@1 reaches 97–99% at 22 ms. For self-query workloads (searching your own
 corpus), R@1 is 100% at nprobe=3 / 8 ms. See [FAQ](#faq) for tuning.
 
-**High-dimensional advantage:** pgvector's HNSW and IVFFlat indexes are limited
-to 2,000 dimensions. For larger embeddings (e.g., 2880-dim), pgvector must
-truncate or quantize. svec stores full float32 up to 16,000 dims; hsvec stores
-float16 up to 32,000 dims. IVF-PQ has no dimension limit for either type.
+**High-dimensional advantage:** pgvector's dense `vector` type is limited to
+2,000 dimensions, while `halfvec` extends that to 4,000. svec stores full
+float32 up to 16,000 dims; hsvec stores float16 up to 32,000 dims. IVF-PQ has
+a much larger native dimensional envelope for either type.
 
 ### svec and hsvec types
 
@@ -501,10 +501,9 @@ dims) and `hsvec` (float16, up to 32K dims) — the `<=>` cosine distance
 operator, and full IVF-PQ infrastructure. The PQ index is 30x smaller than
 HNSW. pgvector is only needed if you want HNSW or IVFFlat index types.
 
-pgvector's HNSW/IVFFlat indexes are limited to 2,000 dimensions — for
-embeddings like 2880-dim, pgvector must truncate or quantize to index them.
-svec+IVF-PQ works natively at full precision up to 16K dims, and hsvec
-extends that to 32K dims at half the storage cost.
+pgvector's dense `vector` type is limited to 2,000 dimensions, while
+`halfvec` extends that to 4,000. svec+IVF-PQ works natively at full precision
+up to 16K dims, and hsvec extends that to 32K dims at half the storage cost.
 
 ### How do I reproduce these benchmarks?
 

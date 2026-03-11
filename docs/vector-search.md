@@ -28,10 +28,10 @@ precision.
 without code changes. `svec` casts to `hsvec` via explicit or assignment cast
 (lossy, float32 → float16).
 
-**Advantage over pgvector:** pgvector's HNSW and IVFFlat indexes are limited to
-2,000 dimensions. For larger embeddings (e.g., 2880-dim), pgvector must
-truncate or quantize. svec+IVF-PQ works at full precision up to 16K dims;
-hsvec extends that to 32K dims at half the storage.
+**Dimension envelope:** pgvector's dense `vector` type is limited to 2,000
+dimensions, while `halfvec` extends that to 4,000. `svec` supports up to 16K
+dims and `hsvec` up to 32K dims, so pg_sorted_heap still has a larger native
+ANN/storage envelope for very high-dimensional embeddings.
 
 ```sql
 -- svec: float32, up to 16,000 dimensions
@@ -250,13 +250,13 @@ Same dataset (103K × 2880-dim), same k8s pod.
 | Method | R@1 | Avg latency | Index size | Max dim |
 |---|---|---|---|---|
 | Exact brute-force (svec `<=>`) | 100% | 996 ms | — | 16,000 / 32,000 |
-| pgvector HNSW ef=100 | 97% | 14 ms | 806 MB | 2,000 |
+| pgvector HNSW ef=100 | 97% | 14 ms | 806 MB | 2,000 (`vector`) / 4,000 (`halfvec`) |
 | IVF-PQ nprobe=10, rerank=200 | 97–99% | 22 ms | 27 MB | 16,000 / 32,000 |
 
 IVF-PQ is 30x smaller on storage at comparable recall. HNSW is faster for
-single queries but requires storing full vectors in the index. For dimensions
-above 2,000, pgvector cannot build HNSW/IVFFlat indexes at all. svec handles
-up to 16K dims; hsvec extends to 32K dims at half the storage cost.
+single queries but requires storing full vectors in the index. `svec`/`hsvec`
+still support a much wider dimensional range and keep the ANN path inside the
+table rather than an additional large graph index.
 
 ### Self-query vs cross-query
 
@@ -311,6 +311,47 @@ For the local synthetic `bench_nomic` setup used during graph/IVF tuning, use
 [`scripts/bench_nomic_local_ann.py`](/Users/sergey/Projects/C/clustered_pg/scripts/bench_nomic_local_ann.py)
 to reproduce exact ground truth, `svec_graph_scan`, and `svec_ann_scan`
 latency/recall curves from one command.
+
+To rebuild the graph sidecar used by `svec_graph_scan`, use
+[`scripts/build_graph.py`](/Users/sergey/Projects/C/clustered_pg/scripts/build_graph.py).
+The committed workflow for the local `bench_nomic` setup is:
+
+```bash
+/opt/homebrew/Caskroom/miniconda/base/bin/python3 scripts/build_graph.py \
+  --dsn 'host=/tmp port=65432 dbname=bench_nomic' \
+  --table bench_nomic_8k \
+  --graph-table bench_nomic_graph \
+  --entry-table bench_nomic_graph_entries \
+  --bootstrap \
+  --sketch-dim 384 \
+  --M 32 \
+  --M-max 64 \
+  --n-adjacent 4 \
+  --no-prune \
+  --seed 42
+```
+
+Then benchmark the rebuilt graph against exact and IVF baselines:
+
+```bash
+/opt/homebrew/Caskroom/miniconda/base/bin/python3 scripts/bench_nomic_local_ann.py \
+  --dsn 'host=/tmp port=65432 dbname=bench_nomic' \
+  --graph-table bench_nomic_graph \
+  --entry-table bench_nomic_graph_entries \
+  --query-limit 20 \
+  --graph-efs 128,256,512,1024 \
+  --ivf-nprobes 40 \
+  --warmup 1
+```
+
+Builder notes:
+
+- `--bootstrap` reads directly from the main table and derives `src_tid` from
+  `ctid`.
+- rebuild mode rejoins on `src_tid`/`ctid`, not `id`, so it stays correct for
+  `(partition_id, id)` primary keys where `id` is not globally unique.
+- `M`, `M-max`, and `n-adjacent` change graph topology; re-run the harness
+  after each build rather than carrying over numbers from an older graph.
 
 ---
 
