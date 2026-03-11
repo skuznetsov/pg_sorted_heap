@@ -47,6 +47,22 @@ TEST_DUMP_PORT ?= 65495
 TEST_GRAPH_PORT ?= 65489
 BENCH_PORT ?= 65494
 BENCH_SCALES ?= 1000000,10000000
+VECTOR_BENCH_DSN ?= host=/tmp port=65432 dbname=bench_nomic
+VECTOR_GRAPH_MAIN_TABLE ?= bench_nomic_8k
+VECTOR_GRAPH_TABLE ?= bench_nomic_graph
+VECTOR_ENTRY_TABLE ?= bench_nomic_graph_entries
+VECTOR_EXACT_TABLE ?= bench_nomic_train_8k
+VECTOR_QUERY_TABLE ?= bench_nomic_query_200
+VECTOR_GRAPH_EFS ?= 128,256,512,1024
+VECTOR_IVF_NPROBES ?= 40
+VECTOR_BENCH_WARMUP ?= 1
+VECTOR_BENCH_QUERY_LIMIT ?= 20
+VECTOR_GRAPH_SKETCH_DIM ?= 384
+VECTOR_GRAPH_M ?= 32
+VECTOR_GRAPH_M_MAX ?= 64
+VECTOR_GRAPH_N_ADJACENT ?= 4
+VECTOR_GRAPH_PRUNE ?= off
+VECTOR_GRAPH_SEED ?= 42
 TMP_CLEAN_MIN_AGE_S ?= 0
 PLANNER_PROBE_ROWS ?= 1000,10000,50000
 PLANNER_PROBE_PORT ?= 65496
@@ -446,6 +462,36 @@ test-dump-restore:
 test-graph-builder:
 	./scripts/test_graph_builder.sh $(TMP_SELFTEST_ROOT) $(TEST_GRAPH_PORT)
 
+build-graph-bench-nomic:
+	@PYTHON_BIN="$$(./scripts/find_vector_python.sh)" && \
+	if [ "$(VECTOR_GRAPH_PRUNE)" = "on" ]; then prune_flag="--prune"; else prune_flag="--no-prune"; fi && \
+	"$$PYTHON_BIN" ./scripts/build_graph.py \
+	  --dsn '$(VECTOR_BENCH_DSN)' \
+	  --table $(VECTOR_GRAPH_MAIN_TABLE) \
+	  --graph-table $(VECTOR_GRAPH_TABLE) \
+	  --entry-table $(VECTOR_ENTRY_TABLE) \
+	  --bootstrap \
+	  --sketch-dim $(VECTOR_GRAPH_SKETCH_DIM) \
+	  --M $(VECTOR_GRAPH_M) \
+	  --M-max $(VECTOR_GRAPH_M_MAX) \
+	  --n-adjacent $(VECTOR_GRAPH_N_ADJACENT) \
+	  $$prune_flag \
+	  --seed $(VECTOR_GRAPH_SEED)
+
+bench-nomic-ann:
+	@PYTHON_BIN="$$(./scripts/find_vector_python.sh)" && \
+	"$$PYTHON_BIN" ./scripts/bench_nomic_local_ann.py \
+	  --dsn '$(VECTOR_BENCH_DSN)' \
+	  --exact-table $(VECTOR_EXACT_TABLE) \
+	  --graph-main-table $(VECTOR_GRAPH_MAIN_TABLE) \
+	  --graph-table $(VECTOR_GRAPH_TABLE) \
+	  --entry-table $(VECTOR_ENTRY_TABLE) \
+	  --query-table $(VECTOR_QUERY_TABLE) \
+	  --query-limit $(VECTOR_BENCH_QUERY_LIMIT) \
+	  --graph-efs $(VECTOR_GRAPH_EFS) \
+	  --ivf-nprobes $(VECTOR_IVF_NPROBES) \
+	  --warmup $(VECTOR_BENCH_WARMUP)
+
 TEST_UPGRADE_PORT_OLD ?= 65496
 TEST_UPGRADE_PORT_NEW ?= 65497
 
@@ -529,6 +575,8 @@ help:
 	@echo "  make test-toast TEST_TOAST_PORT=<port>"
 	@echo "  make test-alter-table TEST_ALTER_PORT=<port>"
 	@echo "  make test-graph-builder TEST_GRAPH_PORT=<port>"
+	@echo "  make build-graph-bench-nomic VECTOR_BENCH_DSN='<dsn>' VECTOR_GRAPH_TABLE=<graph_table> VECTOR_ENTRY_TABLE=<entry_table>"
+	@echo "  make bench-nomic-ann VECTOR_BENCH_DSN='<dsn>' VECTOR_GRAPH_TABLE=<graph_table> VECTOR_ENTRY_TABLE=<entry_table>"
 	@echo "  make bench BENCH_PORT=<port> BENCH_SCALES=<comma-separated>"
 	@echo "  make policy-lint-strict"
 	@echo "  make policy-safety-selftest UNNEST_AB_SELFTEST_TMP_ROOT=<abs_tmp_dir> UNNEST_GATE_SELFTEST_TMP_ROOT=<abs_tmp_dir>"
