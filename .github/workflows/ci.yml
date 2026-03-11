@@ -18,6 +18,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install Python dependencies for graph tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy psycopg2-binary
+
       - name: Install PostgreSQL ${{ matrix.pg_version }}
         run: |
           sudo apt-get install -y curl ca-certificates gnupg
