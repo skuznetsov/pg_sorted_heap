@@ -89,5 +89,6 @@ make test-concurrent           # concurrent DML + online ops
 make test-toast                # TOAST integrity + concurrent guard
 make test-alter-table          # ALTER TABLE DDL (36 checks)
 make test-dump-restore         # pg_dump/restore lifecycle (10 checks)
+make test-graph-builder        # graph sidecar bootstrap + rebuild smoke
 make test-pg-upgrade           # pg_upgrade 17->18 (13 checks)
 ```

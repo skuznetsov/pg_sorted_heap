@@ -310,7 +310,15 @@ evaluation. For self-query benchmarks, use `lim := 10` without slicing.
 For the local synthetic `bench_nomic` setup used during graph/IVF tuning, use
 [`scripts/bench_nomic_local_ann.py`](/Users/sergey/Projects/C/clustered_pg/scripts/bench_nomic_local_ann.py)
 to reproduce exact ground truth, `svec_graph_scan`, and `svec_ann_scan`
-latency/recall curves from one command.
+latency/recall curves from one command. The reproducible Make targets are:
+
+```bash
+make build-graph-bench-nomic \
+  VECTOR_BENCH_DSN='host=/tmp port=65432 dbname=bench_nomic'
+
+make bench-nomic-ann \
+  VECTOR_BENCH_DSN='host=/tmp port=65432 dbname=bench_nomic'
+```
 
 To rebuild the graph sidecar used by `svec_graph_scan`, use
 [`scripts/build_graph.py`](/Users/sergey/Projects/C/clustered_pg/scripts/build_graph.py).
