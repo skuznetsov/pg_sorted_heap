@@ -430,8 +430,9 @@ CREATE INDEX ON t USING btree (key_col);
 - Overflow pages: 254 entries/page, linked via `shmo_next_block` chain
 - No capacity limit — overflow chain extends as needed
 - Updated atomically via GenericXLog during `multi_insert`
-- Validity flag (`SHM_FLAG_ZONEMAP_VALID`): set by compact/rebuild, cleared
-  on first single-row INSERT into uncovered page
+- Validity flag (`SHM_FLAG_ZONEMAP_VALID`): set by compact/rebuild and
+  preserved by incremental maintenance; uncovered-page inserts clear the
+  global sorted flag instead of invalidating the whole map
 - Autovacuum rebuilds zone map when flag is not set
 
 ### Custom scan provider

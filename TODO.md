@@ -81,8 +81,9 @@ Basic `sorted_heap` AM that delegates everything to heap.
 - Compute one or more block ranges from zone map overlap
 - `heap_setscanlimits()` for each internal scan range
 - Per-block zone map check in ExecCustomScan for fine-grained pruning
-- `SHM_FLAG_ZONEMAP_VALID` flag: cleared on first INSERT after compact,
-  set during compact/rebuild — prevents stale pruning
+- `SHM_FLAG_ZONEMAP_VALID` flag: set during compact/rebuild and preserved by
+  incremental maintenance; inserts that break monotonicity clear only the
+  global sorted flag — prevents stale pruning without discarding the map
 - Uncovered pages (beyond zone map capacity) included in scan unless
   upper bound falls within covered range
 - EXPLAIN output: "Zone Map: N of M blocks (pruned P)"
