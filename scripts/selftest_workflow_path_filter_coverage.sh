@@ -166,6 +166,7 @@ require_path_filter_twice "$LIGHTWORKFLOW" "scripts/selftest_workflow_files_are_
 require_path_filter_twice "$LIGHTWORKFLOW" "scripts/selftest_lightweight_workflow_script_coverage.sh"
 require_path_filter_twice "$LIGHTWORKFLOW" "scripts/selftest_selftest_script_baseline.sh"
 require_path_filter_twice "$LIGHTWORKFLOW" "scripts/run_lightweight_selftests.sh"
+require_path_filter_twice "$LIGHTWORKFLOW" "scripts/find_vector_python.sh"
 require_literal "$LIGHTWORKFLOW" "concurrency:"
 require_literal "$LIGHTWORKFLOW" "cancel-in-progress: true"
 require_literal "$LIGHTWORKFLOW" "chmod +x scripts/*.sh"

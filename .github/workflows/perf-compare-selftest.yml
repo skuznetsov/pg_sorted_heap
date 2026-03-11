@@ -26,6 +26,7 @@ on:
       - scripts/selftest_make_help_unnest_ab_startup_script_overrides.sh
       - scripts/selftest_make_help_pg_core_regression_smoke.sh
       - scripts/selftest_make_help_graph_builder.sh
+      - scripts/selftest_find_vector_python_portability.sh
       - scripts/selftest_make_defaults_unnest_ab_startup_sensitivity.sh
       - scripts/selftest_docs_make_sentinel_cold_observe_contract.sh
       - scripts/selftest_docs_policy_safety_quickstart_contract.sh
@@ -105,6 +106,7 @@ on:
       - scripts/selftest_run_lightweight_selftests_success_stream.sh
       - scripts/selftest_run_lightweight_selftests_failure_event.sh
       - scripts/selftest_run_lightweight_selftests_preflight_failure_event.sh
+      - scripts/find_vector_python.sh
       - .github/workflows/workflow-path-filter-sanity.yml
       - scripts/run_lightweight_selftests.sh
       - docs/perf-baselines/unnest_ab_profile_boundary_nightly_baseline.kv
@@ -137,6 +139,7 @@ on:
       - scripts/selftest_make_help_unnest_ab_startup_script_overrides.sh
       - scripts/selftest_make_help_pg_core_regression_smoke.sh
       - scripts/selftest_make_help_graph_builder.sh
+      - scripts/selftest_find_vector_python_portability.sh
       - scripts/selftest_make_defaults_unnest_ab_startup_sensitivity.sh
       - scripts/selftest_docs_make_sentinel_cold_observe_contract.sh
       - scripts/selftest_docs_policy_safety_quickstart_contract.sh
@@ -216,6 +219,7 @@ on:
       - scripts/selftest_run_lightweight_selftests_success_stream.sh
       - scripts/selftest_run_lightweight_selftests_failure_event.sh
       - scripts/selftest_run_lightweight_selftests_preflight_failure_event.sh
+      - scripts/find_vector_python.sh
       - .github/workflows/workflow-path-filter-sanity.yml
       - scripts/run_lightweight_selftests.sh
       - docs/perf-baselines/unnest_ab_profile_boundary_nightly_baseline.kv
