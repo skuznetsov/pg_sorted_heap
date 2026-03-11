@@ -19,16 +19,16 @@ sorted_heap_compact(regclass)
 SELECT ... WHERE pk_col <op> const
     → set_rel_pathlist_hook
     → extract PK bounds from baserestrictinfo
-    → compute block range from zone map
+    → compute disjoint block ranges from zone map
     → CustomPath (SortedHeapScan) with pruned cost
-    → heap_setscanlimits(start, nblocks) — physical I/O skip
+    → serial executor iterates internal scan ranges via heap_setscanlimits()
     → per-block zone map check in ExecCustomScan
 
 Parallel scan (large tables):
     → add_partial_path with parallel_aware=true
     → Gather wraps SortedHeapScan
-    → PG parallel table scan API distributes blocks among workers
-    → each worker applies per-block zone map pruning independently
+    → contiguous/narrow paths use PG parallel table scan API
+    → disjoint sparse paths stay serial to avoid bounding-span blowup
 ```
 
 ## Source Files
@@ -203,8 +203,9 @@ relative throughput under sustained load, not absolute query latency.
 - Online compact/merge (`_online` variants) not supported for UUID/text/varchar
   PKs due to lossy int64 hash key. Use regular compact/merge instead.
 - Single-row INSERT into a covered page updates zone map in-place
-  (preserving scan pruning). INSERT into an uncovered page invalidates
-  scan pruning until next compact.
+  (preserving scan pruning). INSERT into an uncovered page keeps the
+  zone map valid, clears the global sorted flag, and falls back to
+  sorted-prefix + conservative-tail pruning until the next compact/merge.
 - TOAST: sorted_heap delegates TOAST storage entirely to heap. Large
   values (>2KB) survive all rewrite paths (compact, merge, online
   compact, online merge). Tested with 4KB payloads, 25K rows.
@@ -221,9 +222,10 @@ relative throughput under sustained load, not absolute query latency.
   re-probe). PostgreSQL preserves attnums on DROP COLUMN. Table rewrite
   (ALTER TYPE) creates new meta page; compact restores zone map. DROP PK
   disables pruning; re-ADD PK + compact re-enables it. Tested: 33 checks.
-- `heap_setscanlimits()` only supports contiguous block ranges.
-  Non-contiguous pruning handled per-block in ExecCustomScan (still reads
-  pages, but skips tuple processing).
+- `heap_setscanlimits()` only supports contiguous block ranges. Serial
+  SortedHeapScan works around this by iterating an internal range array;
+  parallel scan still only supports contiguous/narrow ranges and will
+  fall back to serial for disjoint sparse predicates.
 
 ### Phase 6 — Production Hardening
 - GUC `sorted_heap.enable_scan_pruning` (default on)
