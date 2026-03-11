@@ -309,6 +309,7 @@ sorted_heap_get_relinfo(Relation rel)
 		info->zm_usable = false;
 		info->zm_loaded = false;
 		info->zm_sorted = false;
+		info->zm_disk_sorted_cleared = false;
 		info->zm_pk_typid = InvalidOid;
 		info->zm_nentries = 0;
 		info->zm_overflow = NULL;
@@ -651,6 +652,7 @@ sorted_heap_zonemap_load(Relation rel, SortedHeapRelInfo *info)
 		info->zm_scan_valid =
 			(meta4->shm_flags & SHM_FLAG_ZONEMAP_VALID) != 0;
 		info->zm_sorted = false;	/* v3/v4 format predates sorted flag */
+		info->zm_disk_sorted_cleared = false;
 
 		if (version >= 4)
 		{
@@ -750,6 +752,7 @@ sorted_heap_zonemap_load(Relation rel, SortedHeapRelInfo *info)
 			(meta->shm_flags & SHM_FLAG_ZONEMAP_VALID) != 0;
 		info->zm_sorted =
 			(meta->shm_flags & SHM_FLAG_ZM_SORTED) != 0;
+		info->zm_disk_sorted_cleared = false;
 
 		info->zm_overflow_npages = meta_ovfl_npages;
 		info->zm_total_entries = n;
@@ -1016,6 +1019,48 @@ sorted_heap_zonemap_flush(Relation rel, SortedHeapRelInfo *info)
 }
 
 /*
+ * Clear SHM_FLAG_ZM_SORTED on the meta page if it's currently set.
+ * Called when monotonicity is lost (overflow update, uncovered insert).
+ *
+ * Uses zm_disk_sorted_cleared to track whether we have already persisted
+ * the flag clear to disk in this session, avoiding redundant buffer reads
+ * on repeat calls (e.g. per-tuple uncovered-page path in multi_insert).
+ */
+static void
+sorted_heap_clear_sorted_flag(Relation rel, SortedHeapRelInfo *info)
+{
+	Buffer				metabuf;
+	Page				metapage;
+	SortedHeapMetaPageData *meta;
+
+	info->zm_sorted = false;
+
+	if (info->zm_disk_sorted_cleared)
+		return;		/* already persisted to disk this session */
+
+	metabuf = ReadBufferExtended(rel, MAIN_FORKNUM, SORTED_HEAP_META_BLOCK,
+								 RBM_NORMAL, NULL);
+	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+	metapage = BufferGetPage(metabuf);
+	meta = (SortedHeapMetaPageData *) PageGetSpecialPointer(metapage);
+
+	if (meta->shm_flags & SHM_FLAG_ZM_SORTED)
+	{
+		GenericXLogState *state = GenericXLogStart(rel);
+
+		metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
+		meta = (SortedHeapMetaPageData *) PageGetSpecialPointer(metapage);
+		meta->shm_flags &= ~SHM_FLAG_ZM_SORTED;
+		GenericXLogFinish(state);
+	}
+
+	info->zm_disk_sorted_cleared = true;
+
+	UnlockReleaseBuffer(metabuf);
+	sorted_heap_bump_zm_generation();
+}
+
+/*
  * Flush a single overflow page from the in-memory cache to disk.
  * page_idx is the 0-based index into info->zm_overflow_blocks[].
  * Only touches one buffer — much cheaper than a full zonemap_flush.
@@ -1101,6 +1146,7 @@ sorted_heap_zonemap_update_entry(SortedHeapRelInfo *info,
 		{
 			e->zme_min = key;
 			changed = true;
+			info->zm_sorted = false;	/* min decreased — monotonicity broken */
 		}
 		if (key > e->zme_max)
 		{
@@ -1784,7 +1830,10 @@ sorted_heap_multi_insert(Relation rel, TupleTableSlot **slots,
 				else
 				{
 					if (key < e->zme_min)
+					{
 						e->zme_min = key;
+						sorted_heap_clear_sorted_flag(rel, info);
+					}
 					if (key > e->zme_max)
 						e->zme_max = key;
 				}
@@ -1842,7 +1891,7 @@ sorted_heap_multi_insert(Relation rel, TupleTableSlot **slots,
 				 * invalidate — the scan path handles uncovered pages
 				 * conservatively (includes them in the scan range).
 				 */
-				info->zm_sorted = false;
+				sorted_heap_clear_sorted_flag(rel, info);
 			}
 		}
 
@@ -1858,6 +1907,13 @@ sorted_heap_multi_insert(Relation rel, TupleTableSlot **slots,
 					sorted_heap_zonemap_flush_overflow_page(rel, info, i);
 			}
 			pfree(ovfl_page_dirty);
+
+			/*
+			 * Persist cleared sorted flag to disk if overflow updates
+			 * broke monotonicity.  (Inline flush already clears the
+			 * on-disk flag unconditionally.)
+			 */
+			sorted_heap_clear_sorted_flag(rel, info);
 		}
 	}
 }
@@ -2168,7 +2224,7 @@ sorted_heap_tuple_insert(Relation rel, TupleTableSlot *slot,
 						sorted_heap_zonemap_flush_overflow_page(
 							rel, info, page_idx);
 				}
-				info->zm_sorted = false;
+				sorted_heap_clear_sorted_flag(rel, info);
 			}
 			/* Zone map stays valid — pruning preserved */
 		}
@@ -2179,7 +2235,7 @@ sorted_heap_tuple_insert(Relation rel, TupleTableSlot *slot,
 			 * the scan path handles uncovered pages conservatively by
 			 * including them in the scan range.
 			 */
-			info->zm_sorted = false;
+			sorted_heap_clear_sorted_flag(rel, info);
 		}
 	}
 }

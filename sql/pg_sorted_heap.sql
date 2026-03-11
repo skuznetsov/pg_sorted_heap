@@ -1788,9 +1788,8 @@ SELECT CASE WHEN sorted_heap_zonemap_stats('sh15_vac'::regclass)
          ELSE 'sh15_zm_FAIL'
     END AS sh15_1_result;
 
--- SH15-2: Single-row INSERTs to overflow onto new page → invalidate zone map
--- After compact, zm_nentries covers all pages. We need INSERTs that spill
--- to a new page (zmidx >= zm_nentries).
+-- SH15-2: Single-row INSERTs beyond coverage → zone map stays valid but
+-- sorted flag cleared (A1: incremental maintenance preserves zone map)
 DO $$
 BEGIN
     FOR i IN 5001..5500 LOOP
@@ -1800,9 +1799,12 @@ END;
 $$;
 
 SELECT CASE WHEN sorted_heap_zonemap_stats('sh15_vac'::regclass)
-                 NOT LIKE '%flags=valid%'
-         THEN 'sh15_zm_invalidated_ok'
-         ELSE 'sh15_zm_still_valid_FAIL'
+                 LIKE '%flags=valid%'
+              AND sorted_heap_zonemap_stats('sh15_vac'::regclass)
+                 NOT LIKE '%flags=valid,sorted%'
+         THEN 'sh15_zm_valid_not_sorted_ok'
+         ELSE 'sh15_zm_FAIL: ' ||
+              sorted_heap_zonemap_stats('sh15_vac'::regclass)
     END AS sh15_2_result;
 
 -- SH15-3: VACUUM should rebuild zone map (zone map becomes valid again)
@@ -1830,8 +1832,8 @@ RESET enable_seqscan;
 RESET enable_indexscan;
 RESET enable_bitmapscan;
 
--- SH15-5: GUC off → VACUUM does NOT rebuild zone map
--- First invalidate again
+-- SH15-5: GUC off → VACUUM does NOT restore sorted flag
+-- Inserts beyond coverage clear sorted flag; vacuum with GUC off should not rebuild
 DO $$
 BEGIN
     FOR i IN 5501..6000 LOOP
@@ -1844,9 +1846,12 @@ SET sorted_heap.vacuum_rebuild_zonemap = off;
 VACUUM sh15_vac;
 
 SELECT CASE WHEN sorted_heap_zonemap_stats('sh15_vac'::regclass)
-                 NOT LIKE '%flags=valid%'
-         THEN 'sh15_guc_off_no_rebuild_ok'
-         ELSE 'sh15_guc_off_FAIL'
+                 LIKE '%flags=valid%'
+              AND sorted_heap_zonemap_stats('sh15_vac'::regclass)
+                 NOT LIKE '%flags=valid,sorted%'
+         THEN 'sh15_guc_off_no_sorted_ok'
+         ELSE 'sh15_guc_off_FAIL: ' ||
+              sorted_heap_zonemap_stats('sh15_vac'::regclass)
     END AS sh15_5_result;
 
 -- SH15-6: Reset GUC, VACUUM → rebuilt

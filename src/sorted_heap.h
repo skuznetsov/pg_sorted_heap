@@ -118,6 +118,7 @@ typedef struct SortedHeapRelInfo
 	bool		zm_loaded;			/* zone map read from meta page */
 	bool		zm_scan_valid;		/* zone map valid for scan pruning */
 	bool		zm_sorted;			/* zone map entries monotonically sorted */
+	bool		zm_disk_sorted_cleared;	/* on-disk SHM_FLAG_ZM_SORTED already cleared */
 	Oid			zm_pk_typid;		/* type of first PK column */
 	bool		zm_col2_usable;		/* second PK col is int2/4/8/timestamp/date */
 	Oid			zm_pk_typid2;		/* type of second PK column */

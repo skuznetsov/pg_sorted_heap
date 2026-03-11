@@ -1178,11 +1178,14 @@ sorted_heap_compute_block_range(SortedHeapRelInfo *info,
 		BlockNumber first_uncovered = (BlockNumber) zm_entries_count + 1;
 
 		/*
-		 * Optimisation for sorted data: if the last covered entry has a
-		 * finite max, and the query's upper bound is at or below that max,
-		 * uncovered pages (which hold higher values) can't match.
+		 * Optimisation for sorted data: if the zone map is monotonic and
+		 * the last covered entry has a finite max, and the query's upper
+		 * bound is at or below that max, uncovered pages (which hold
+		 * higher values) can't match.  Without monotonicity guarantee,
+		 * uncovered pages may contain any values (e.g. inserts that
+		 * landed on new pages with values within the covered range).
 		 */
-		if (bounds->has_hi && zm_entries_count > 0)
+		if (info->zm_sorted && bounds->has_hi && zm_entries_count > 0)
 		{
 			SortedHeapZoneMapEntry *last_e =
 				sorted_heap_get_zm_entry(info, zm_entries_count - 1);
