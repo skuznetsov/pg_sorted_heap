@@ -78,6 +78,14 @@ typedef struct SortedHeapScanState
 	BlockNumber		total_blocks;
 	BlockNumber		scan_start;
 	BlockNumber		scan_nblocks;
+	/* Two-pass scan: sorted prefix + conservative tail */
+	BlockNumber		prefix_pages;		/* sorted prefix length (entries) */
+	BlockNumber		prefix_start;		/* prefix scan range */
+	BlockNumber		prefix_nblocks;
+	BlockNumber		tail_start;			/* tail scan range */
+	BlockNumber		tail_nblocks;
+	bool			in_tail_phase;		/* currently scanning tail */
+	bool			two_pass;			/* prefix + tail mode active */
 	/* Per-scan stats for EXPLAIN ANALYZE */
 	BlockNumber		scanned_blocks;
 	BlockNumber		pruned_blocks;
@@ -127,6 +135,14 @@ static void sorted_heap_compute_block_range(SortedHeapRelInfo *info,
 											BlockNumber total_blocks,
 											BlockNumber *start_block,
 											BlockNumber *nblocks);
+static bool sorted_heap_compute_two_pass_ranges(SortedHeapRelInfo *info,
+												SortedHeapScanBounds *bounds,
+												BlockNumber prefix_pages,
+												BlockNumber total_blocks,
+												BlockNumber *prefix_start,
+												BlockNumber *prefix_nblocks,
+												BlockNumber *tail_start,
+												BlockNumber *tail_nblocks);
 static bool sorted_heap_zone_overlaps(SortedHeapZoneMapEntry *e,
 									  SortedHeapScanBounds *bounds);
 static bool sorted_heap_exprs_need_deferred_runtime_resolve(List *exprs);
@@ -402,8 +418,41 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 		if (runtime_exprs == NIL)
 		{
 			/* Path A: all Const — compute block range now */
-			sorted_heap_compute_block_range(info, &bounds, total_blocks,
-											&start_block, &nblocks);
+			BlockNumber prefix_pages_local;
+			BlockNumber pfx_start = 0, pfx_nblks = 0;
+			BlockNumber tail_start_local = 0, tail_nblks = 0;
+			bool		use_two_pass = false;
+
+			prefix_pages_local = sorted_heap_detect_sorted_prefix(info);
+
+			/*
+			 * Try two-pass scan when we have a sorted prefix but the
+			 * table also has unsorted tail pages (not fully sorted).
+			 */
+			if (prefix_pages_local > 0 &&
+				prefix_pages_local < info->zm_total_entries + 1 &&
+				!info->zm_sorted)
+			{
+				use_two_pass =
+					sorted_heap_compute_two_pass_ranges(info, &bounds,
+														prefix_pages_local,
+														total_blocks,
+														&pfx_start, &pfx_nblks,
+														&tail_start_local,
+														&tail_nblks);
+			}
+
+			if (use_two_pass)
+			{
+				nblocks = pfx_nblks + tail_nblks;
+				start_block = pfx_start;	/* for fallback compat */
+			}
+			else
+			{
+				sorted_heap_compute_block_range(info, &bounds, total_blocks,
+												&start_block, &nblocks);
+				prefix_pages_local = 0;		/* signal: single-pass */
+			}
 
 			if (nblocks >= total_blocks)
 				return;
@@ -419,6 +468,12 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 				cpu_tuple_cost * rel->tuples * sel +
 				cpu_operator_cost * rel->tuples * sel;
 
+			if (use_two_pass)
+			{
+				/* Add small cost for scan restart between passes */
+				cpath->path.total_cost += random_page_cost;
+			}
+
 			/* Pack range + bounds into custom_private */
 			{
 				List *range_list = NIL;
@@ -427,6 +482,12 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 				range_list = lappend_int(range_list, (int32) start_block);
 				range_list = lappend_int(range_list, (int32) nblocks);
 				range_list = lappend_int(range_list, (int32) total_blocks);
+				/* Two-pass fields (4 extra ints) */
+				range_list = lappend_int(range_list, (int32) prefix_pages_local);
+				range_list = lappend_int(range_list, (int32) pfx_start);
+				range_list = lappend_int(range_list, (int32) pfx_nblks);
+				range_list = lappend_int(range_list, (int32) tail_start_local);
+				range_list = lappend_int(range_list, (int32) tail_nblks);
 
 				bounds_list = lappend_int(bounds_list, bounds.has_lo ? 1 : 0);
 				bounds_list = lappend_int(bounds_list, bounds.has_hi ? 1 : 0);
@@ -1229,6 +1290,122 @@ sorted_heap_compute_block_range(SortedHeapRelInfo *info,
 }
 
 /* ----------------------------------------------------------------
+ *  Compute two-pass scan ranges: sorted prefix + conservative tail.
+ *
+ *  When the zone map has a sorted prefix (entries 0..prefix_pages-1
+ *  are monotonically sorted) but the table also has unsorted tail
+ *  pages, we split the scan into two contiguous passes:
+ *    1. prefix pass: binary search on sorted entries → tight range
+ *    2. tail pass: linear scan on remaining entries + uncovered pages
+ *
+ *  Returns true if two-pass mode is beneficial (prefix > 0 and
+ *  tail exists). Returns false if single-pass is sufficient.
+ * ---------------------------------------------------------------- */
+static bool
+sorted_heap_compute_two_pass_ranges(SortedHeapRelInfo *info,
+									SortedHeapScanBounds *bounds,
+									BlockNumber prefix_pages,
+									BlockNumber total_blocks,
+									BlockNumber *prefix_start,
+									BlockNumber *prefix_nblocks,
+									BlockNumber *tail_start,
+									BlockNumber *tail_nblocks)
+{
+	BlockNumber		pfx_first = total_blocks;
+	BlockNumber		pfx_last = 0;
+	BlockNumber		tail_first = total_blocks;
+	BlockNumber		tail_last = 0;
+	uint32			zm_entries_count = info->zm_total_entries;
+	BlockNumber		data_blocks;
+	uint32			i;
+
+	*prefix_start = 1;
+	*prefix_nblocks = 0;
+	*tail_start = 1;
+	*tail_nblocks = 0;
+
+	data_blocks = (total_blocks > 1 + info->zm_overflow_npages) ?
+		total_blocks - 1 - info->zm_overflow_npages : 0;
+
+	/*
+	 * Phase 1: binary search over sorted prefix entries [0..prefix_pages-1].
+	 */
+	{
+		uint32	pfx_limit = Min(prefix_pages, zm_entries_count);
+
+		if (pfx_limit > 0)
+		{
+			uint32	pfx_first_idx = 0;
+			uint32	pfx_last_idx = pfx_limit;
+
+			if (bounds->has_lo)
+				pfx_first_idx = zm_bsearch_first(info, bounds->lo,
+												  bounds->lo_inclusive,
+												  pfx_limit);
+			if (bounds->has_hi)
+				pfx_last_idx = zm_bsearch_last(info, bounds->hi,
+												bounds->hi_inclusive,
+												pfx_limit);
+
+			if (pfx_first_idx < pfx_last_idx)
+			{
+				pfx_first = pfx_first_idx + 1;		/* +1 for meta page */
+				pfx_last = pfx_last_idx;			/* one-past = last block */
+			}
+		}
+	}
+
+	/*
+	 * Phase 2: linear scan over tail entries [prefix_pages..zm_entries_count-1].
+	 */
+	for (i = prefix_pages; i < zm_entries_count; i++)
+	{
+		SortedHeapZoneMapEntry *e = sorted_heap_get_zm_entry(info, i);
+
+		if (e->zme_min == PG_INT64_MAX)
+			continue;
+
+		if (!sorted_heap_zone_overlaps(e, bounds))
+			continue;
+
+		if ((BlockNumber)(i + 1) < tail_first)
+			tail_first = i + 1;
+		tail_last = i + 1;
+	}
+
+	/*
+	 * Phase 3: uncovered pages beyond zone map entries.
+	 * These must go into the tail pass (unknown content).
+	 */
+	if (zm_entries_count < data_blocks)
+	{
+		BlockNumber first_uncovered = (BlockNumber) zm_entries_count + 1;
+		BlockNumber last_block = total_blocks - 1;
+
+		if (first_uncovered < tail_first)
+			tail_first = first_uncovered;
+		if (last_block > tail_last)
+			tail_last = last_block;
+	}
+
+	/* Compute prefix range */
+	if (pfx_first < total_blocks && pfx_last > 0)
+	{
+		*prefix_start = pfx_first;
+		*prefix_nblocks = pfx_last - pfx_first + 1;
+	}
+
+	/* Compute tail range */
+	if (tail_first < total_blocks && tail_last > 0)
+	{
+		*tail_start = tail_first;
+		*tail_nblocks = tail_last - tail_first + 1;
+	}
+
+	return (*prefix_nblocks > 0 && *tail_nblocks > 0);
+}
+
+/* ----------------------------------------------------------------
  *  Check if a zone map entry overlaps with scan bounds
  * ---------------------------------------------------------------- */
 static bool
@@ -1534,6 +1711,26 @@ sorted_heap_begin_custom_scan(CustomScanState *node, EState *estate,
 		shstate->scan_nblocks = (BlockNumber) lsecond_int(range_list);
 		shstate->total_blocks = (BlockNumber) lthird_int(range_list);
 
+		/* Two-pass fields (present when range_list has 8 elements) */
+		if (list_length(range_list) >= 8)
+		{
+			BlockNumber pp = (BlockNumber) list_nth_int(range_list, 3);
+
+			shstate->prefix_pages = pp;
+			shstate->prefix_start = (BlockNumber) list_nth_int(range_list, 4);
+			shstate->prefix_nblocks = (BlockNumber) list_nth_int(range_list, 5);
+			shstate->tail_start = (BlockNumber) list_nth_int(range_list, 6);
+			shstate->tail_nblocks = (BlockNumber) list_nth_int(range_list, 7);
+			shstate->two_pass = (pp > 0 && shstate->prefix_nblocks > 0 &&
+								 shstate->tail_nblocks > 0);
+		}
+		else
+		{
+			shstate->two_pass = false;
+			shstate->prefix_pages = 0;
+		}
+		shstate->in_tail_phase = false;
+
 		/* Extract bounds */
 		shstate->bounds.has_lo = list_nth_int(bounds_list, 0) != 0;
 		shstate->bounds.has_hi = list_nth_int(bounds_list, 1) != 0;
@@ -1618,6 +1815,13 @@ sorted_heap_begin_custom_scan(CustomScanState *node, EState *estate,
 		{
 			/* Full scan for now; first rescan/execution will narrow it. */
 		}
+		else if (shstate->two_pass)
+		{
+			/* Start with prefix pass */
+			heap_setscanlimits(shstate->heap_scan,
+							   shstate->prefix_start,
+							   shstate->prefix_nblocks);
+		}
 		else if (shstate->scan_nblocks > 0)
 			heap_setscanlimits(shstate->heap_scan,
 							   shstate->scan_start,
@@ -1641,24 +1845,30 @@ sorted_heap_scan_next(ScanState *ss)
 	SortedHeapScanState *shstate = (SortedHeapScanState *) node;
 	TupleTableSlot *slot = ss->ss_ScanTupleSlot;
 	SortedHeapRelInfo *info = shstate->relinfo;
+	BlockNumber	current_nblocks;
+	bool		skip_zone_check;
+	bool		pk_prefilter;
 
 	/*
-	 * For narrow scans (<=4 blocks), heap_setscanlimits already restricts
-	 * to the matching blocks.  The per-block zone map check is redundant
-	 * because compute_block_range already verified overlap.
-	 * Exception: IN-list queries need per-block pruning even for narrow
-	 * scans to skip blocks between sparse IN-values.
+	 * Determine the active scan range for skip_zone_check sizing.
+	 * In two-pass mode, use the current phase's block count.
 	 */
-	bool		skip_zone_check = (shstate->scan_nblocks <= 4 &&
-								   shstate->n_in_values == 0);
+	current_nblocks = shstate->two_pass
+		? (shstate->in_tail_phase ? shstate->tail_nblocks
+								  : shstate->prefix_nblocks)
+		: shstate->scan_nblocks;
+
+	skip_zone_check = (current_nblocks <= 4 && shstate->n_in_values == 0);
 
 	/*
-	 * For sorted zone maps (post-compact), tuples within each page are in
-	 * PK order.  We can skip tuples before the lower bound and stop early
-	 * once we pass the upper bound — avoiding both getnextslot and
-	 * ExecScan qual evaluation for non-matching tuples.
+	 * PK-ordered pre-filter: tuples within each page are in PK order
+	 * when the data is sorted.  Active only in the sorted prefix:
+	 * - single-pass fully-sorted: info->zm_sorted
+	 * - two-pass prefix phase: !in_tail_phase
 	 */
-	bool		pk_prefilter = info->zm_sorted;
+	pk_prefilter = shstate->two_pass
+		? !shstate->in_tail_phase
+		: info->zm_sorted;
 
 	if (shstate->runtime_bounds && shstate->runtime_resolve_pending)
 	{
@@ -1680,95 +1890,120 @@ sorted_heap_scan_next(ScanState *ss)
 				heap_setscanlimits(shstate->heap_scan, 1, 0);
 		}
 
-		skip_zone_check = (shstate->scan_nblocks <= 4 &&
+		current_nblocks = shstate->scan_nblocks;
+		skip_zone_check = (current_nblocks <= 4 &&
 						   shstate->n_in_values == 0);
 	}
 
-	while (table_scan_getnextslot(shstate->heap_scan,
-								  ForwardScanDirection, slot))
+	for (;;)
 	{
-		BlockNumber blk = ItemPointerGetBlockNumber(&slot->tts_tid);
-		bool		new_block = (blk != shstate->last_blk);
-		bool		blk_in_prefix;
-
-		/* Track block transitions for EXPLAIN ANALYZE */
-		if (new_block)
+		while (table_scan_getnextslot(shstate->heap_scan,
+									  ForwardScanDirection, slot))
 		{
-			shstate->scanned_blocks++;
-			shstate->last_blk = blk;
+			BlockNumber blk = ItemPointerGetBlockNumber(&slot->tts_tid);
+			bool		new_block = (blk != shstate->last_blk);
+			bool		blk_has_zm;
+
+			/* Track block transitions for EXPLAIN ANALYZE */
+			if (new_block)
+			{
+				shstate->scanned_blocks++;
+				shstate->last_blk = blk;
+
+				if (!shstate->zm_stale &&
+					shstate->zm_gen_at_start != 0)
+				{
+					uint64 cur = sorted_heap_read_zm_generation();
+					if (cur != shstate->zm_gen_at_start)
+						shstate->zm_stale = true;
+				}
+			}
+
+			blk_has_zm = (blk >= 1 &&
+						  (blk - 1) < info->zm_total_entries);
+
+			/* Per-block zone map check for fine-grained pruning */
+			if (!skip_zone_check && !shstate->zm_stale && blk_has_zm)
+			{
+				SortedHeapZoneMapEntry *e =
+					sorted_heap_get_zm_entry(info, blk - 1);
+				bool	overlaps;
+
+				if (shstate->n_in_values > 0)
+					overlaps = zone_overlaps_in_values(e, shstate->in_values,
+													   shstate->n_in_values);
+				else
+					overlaps = sorted_heap_zone_overlaps(e, &shstate->bounds);
+
+				if (!overlaps)
+				{
+					if (new_block)
+						shstate->pruned_blocks++;
+					continue;
+				}
+			}
 
 			/*
-			 * Mid-scan staleness check: if another backend mutated
-			 * the zone map since we started, stop trusting it and let
-			 * the executor quals handle filtering.  One atomic read
-			 * per block transition — negligible cost.
+			 * PK-ordered pre-filter: skip tuples below lower bound,
+			 * stop early once past upper bound.  Only safe when data is
+			 * sorted (full table sorted, or prefix phase of two-pass).
 			 */
-			if (!shstate->zm_stale &&
-				shstate->zm_gen_at_start != 0)
+			if (pk_prefilter && !shstate->zm_stale && blk_has_zm)
 			{
-				uint64 cur = sorted_heap_read_zm_generation();
-				if (cur != shstate->zm_gen_at_start)
-					shstate->zm_stale = true;
+				bool	isnull;
+				Datum	pk_datum;
+				int64	pk_val;
+
+				pk_datum = slot_getattr(slot, info->attNums[0], &isnull);
+				if (!isnull &&
+					sorted_heap_key_to_int64(pk_datum, info->zm_pk_typid,
+											 &pk_val))
+				{
+					if (shstate->bounds.has_lo && pk_val < shstate->bounds.lo)
+						continue;
+
+					if (shstate->bounds.has_hi && pk_val > shstate->bounds.hi)
+					{
+						/*
+						 * Past upper bound in sorted data.  In two-pass
+						 * prefix phase, skip to tail; in single-pass or
+						 * tail phase, we're done.
+						 */
+						if (shstate->two_pass && !shstate->in_tail_phase)
+							goto transition_to_tail;
+						return NULL;
+					}
+				}
 			}
-		}
 
-		blk_in_prefix = (blk >= 1 &&
-						 (blk - 1) < info->zm_total_entries);
-
-		/* Per-block zone map check for fine-grained pruning */
-		if (!skip_zone_check && !shstate->zm_stale && blk_in_prefix)
-		{
-			SortedHeapZoneMapEntry *e =
-				sorted_heap_get_zm_entry(info, blk - 1);
-			bool	overlaps;
-
-			if (shstate->n_in_values > 0)
-				overlaps = zone_overlaps_in_values(e, shstate->in_values,
-												   shstate->n_in_values);
-			else
-				overlaps = sorted_heap_zone_overlaps(e, &shstate->bounds);
-
-			if (!overlaps)
-			{
-				if (new_block)
-					shstate->pruned_blocks++;
-				continue;
-			}
+			return slot;
 		}
 
 		/*
-		 * PK-ordered pre-filter: skip tuples below lower bound, terminate
-		 * scan once past upper bound.  Only safe for pages within the
-		 * sorted prefix (covered by monotonic zone map entries).
+		 * Current phase exhausted.  In two-pass mode, transition from
+		 * prefix to tail phase by resetting the scan with tail limits.
 		 */
-		if (pk_prefilter && !shstate->zm_stale && blk_in_prefix)
+		if (shstate->two_pass && !shstate->in_tail_phase &&
+			shstate->tail_nblocks > 0)
 		{
-			bool	isnull;
-			Datum	pk_datum;
-			int64	pk_val;
+transition_to_tail:
+			shstate->in_tail_phase = true;
+			pk_prefilter = false;
+			shstate->last_blk = InvalidBlockNumber;
 
-			pk_datum = slot_getattr(slot, info->attNums[0], &isnull);
-			if (!isnull &&
-				sorted_heap_key_to_int64(pk_datum, info->zm_pk_typid,
-										 &pk_val))
-			{
-				/* Below lower bound — skip without qual evaluation */
-				if (shstate->bounds.has_lo && pk_val < shstate->bounds.lo)
-					continue;
+			table_rescan(shstate->heap_scan, NULL);
+			heap_setscanlimits(shstate->heap_scan,
+							   shstate->tail_start,
+							   shstate->tail_nblocks);
 
-				/*
-				 * Past upper bound — all remaining tuples are higher,
-				 * so terminate the scan immediately.
-				 */
-				if (shstate->bounds.has_hi && pk_val > shstate->bounds.hi)
-					return NULL;
-			}
+			current_nblocks = shstate->tail_nblocks;
+			skip_zone_check = (current_nblocks <= 4 &&
+							   shstate->n_in_values == 0);
+			continue;
 		}
 
-		return slot;
+		return NULL;
 	}
-
-	return NULL;
 }
 
 /* ----------------------------------------------------------------
@@ -1913,12 +2148,19 @@ sorted_heap_rescan_custom_scan(CustomScanState *node)
 		shstate->last_blk = InvalidBlockNumber;
 	}
 
+	/* Reset two-pass state to prefix phase */
+	shstate->in_tail_phase = false;
+
 	if (shstate->heap_scan)
 	{
 		table_rescan(shstate->heap_scan, NULL);
 
 		/* Re-apply scan limits (rescan resets rs_inited) */
-		if (shstate->scan_nblocks > 0)
+		if (shstate->two_pass)
+			heap_setscanlimits(shstate->heap_scan,
+							   shstate->prefix_start,
+							   shstate->prefix_nblocks);
+		else if (shstate->scan_nblocks > 0)
 			heap_setscanlimits(shstate->heap_scan,
 							   shstate->scan_start,
 							   shstate->scan_nblocks);
@@ -1942,6 +2184,16 @@ sorted_heap_explain_custom_scan(CustomScanState *node, List *ancestors,
 	{
 		appendStringInfo(&buf, "%u total blocks (runtime bounds)",
 						 shstate->total_blocks);
+	}
+	else if (shstate->two_pass)
+	{
+		appendStringInfo(&buf,
+						 "prefix %u + tail %u of %u blocks (pruned %u)",
+						 shstate->prefix_nblocks,
+						 shstate->tail_nblocks,
+						 shstate->total_blocks,
+						 shstate->total_blocks -
+						 shstate->prefix_nblocks - shstate->tail_nblocks);
 	}
 	else
 	{

@@ -6,7 +6,9 @@ DATA = sql/pg_sorted_heap--0.9.13.sql sql/pg_sorted_heap--0.9.12--0.9.13.sql \
        sql/pg_sorted_heap--0.9.12.sql sql/pg_sorted_heap--0.9.11--0.9.12.sql \
        sql/pg_sorted_heap--0.9.11.sql sql/pg_sorted_heap--0.9.10--0.9.11.sql \
        sql/pg_sorted_heap--0.9.10.sql sql/pg_sorted_heap--0.9.9--0.9.10.sql \
-       sql/pg_sorted_heap--0.9.9.sql sql/pg_sorted_heap--0.9.8--0.9.9.sql
+       sql/pg_sorted_heap--0.9.9.sql sql/pg_sorted_heap--0.9.8--0.9.9.sql \
+       sql/pg_sorted_heap--0.9.8.sql sql/pg_sorted_heap--0.9.7--0.9.8.sql \
+       sql/pg_sorted_heap--0.9.7.sql
 DOCS =
 REGRESS = pg_sorted_heap
 

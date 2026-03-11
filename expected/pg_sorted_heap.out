@@ -3474,6 +3474,101 @@ RESET enable_mergejoin;
 RESET max_parallel_workers_per_gather;
 DROP TABLE sh19;
 DROP FUNCTION sh19_plan_contains(text, text);
+-- ================================================================
+-- SH20: Two-pass scan (sorted prefix + conservative tail)
+-- After compact, inserting beyond coverage creates an unsorted tail.
+-- The two-pass scan should still use SortedHeapScan for prefix queries.
+-- ================================================================
+CREATE FUNCTION sh20_plan_contains(query text, pattern text) RETURNS boolean AS $$
+DECLARE r record;
+BEGIN
+    FOR r IN EXECUTE 'EXPLAIN (COSTS OFF) ' || query LOOP
+        IF r."QUERY PLAN" LIKE '%' || pattern || '%' THEN RETURN true; END IF;
+    END LOOP;
+    RETURN false;
+END;
+$$ LANGUAGE plpgsql;
+-- SH20-1: Create table, compact → fully sorted
+CREATE TABLE sh20(id int PRIMARY KEY, val text) USING sorted_heap;
+INSERT INTO sh20 SELECT g, repeat('x', 80) FROM generate_series(1, 5000) g;
+SELECT sorted_heap_compact('sh20'::regclass);
+NOTICE:  sorted_heap_compact acquires AccessExclusiveLock
+HINT:  Schedule during maintenance windows. Concurrent reads and writes are blocked.
+ sorted_heap_compact 
+---------------------
+ 
+(1 row)
+
+ANALYZE sh20;
+-- Verify: SortedHeapScan available on fully sorted table
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SELECT sh20_plan_contains(
+    'SELECT * FROM sh20 WHERE id = 100',
+    'SortedHeapScan') AS sh20_sorted_ok;
+ sh20_sorted_ok 
+----------------
+ t
+(1 row)
+
+-- SH20-2: Insert beyond coverage → unsorted tail created
+DO $$
+BEGIN
+    FOR i IN 5001..6000 LOOP
+        INSERT INTO sh20 VALUES (i, repeat('x', 80));
+    END LOOP;
+END;
+$$;
+-- Zone map should be valid but not sorted
+SELECT CASE WHEN sorted_heap_zonemap_stats('sh20'::regclass)
+                 LIKE '%flags=valid%'
+              AND sorted_heap_zonemap_stats('sh20'::regclass)
+                 NOT LIKE '%flags=valid,sorted%'
+         THEN 'sh20_valid_not_sorted_ok'
+         ELSE 'sh20_FAIL: ' || sorted_heap_zonemap_stats('sh20'::regclass)
+    END AS sh20_2_zm_state;
+     sh20_2_zm_state      
+--------------------------
+ sh20_valid_not_sorted_ok
+(1 row)
+
+-- SH20-3: Two-pass scan: prefix query should still use SortedHeapScan
+-- (Previously this fell back to SeqScan because single-pass bounding box
+-- included all blocks.)
+SELECT sh20_plan_contains(
+    'SELECT * FROM sh20 WHERE id = 100',
+    'SortedHeapScan') AS sh20_two_pass_plan;
+ sh20_two_pass_plan 
+--------------------
+ t
+(1 row)
+
+-- SH20-4: Correctness: prefix query returns correct result
+SELECT id FROM sh20 WHERE id = 100;
+ id  
+-----
+ 100
+(1 row)
+
+-- SH20-5: Tail query also returns correct result
+SELECT id FROM sh20 WHERE id = 5500;
+  id  
+------
+ 5500
+(1 row)
+
+-- SH20-6: Range query spanning prefix and tail
+SELECT count(*) AS sh20_range_count
+    FROM sh20 WHERE id BETWEEN 4990 AND 5010;
+ sh20_range_count 
+------------------
+               21
+(1 row)
+
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+DROP TABLE sh20;
+DROP FUNCTION sh20_plan_contains(text, text);
 -- ====================================================================
 -- ANN regression tests: svec_ann_scan correctness, dimension check,
 -- ann_timing non-crash smoke
