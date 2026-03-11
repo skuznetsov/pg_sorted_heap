@@ -161,15 +161,17 @@ make -C "$ROOT_DIR" clean install PG_CONFIG="$PG18_BIN/pg_config" >/dev/null
 echo "=== Phase 4: pg_upgrade 17→18 ==="
 "$PG18_BIN/initdb" -D "$TMP_DIR/new/data" -A trust --no-locale >/dev/null 2>&1
 
-"$PG18_BIN/pg_upgrade" \
-  --old-datadir "$TMP_DIR/old/data" \
-  --new-datadir "$TMP_DIR/new/data" \
-  --old-bindir  "$PG17_BIN" \
-  --new-bindir  "$PG18_BIN" \
-  --old-port    "$PORT_OLD" \
-  --new-port    "$PORT_NEW" \
-  --socketdir   "$TMP_DIR" \
-  2>&1 | tail -5
+(
+  cd "$TMP_DIR/new"
+  "$PG18_BIN/pg_upgrade" \
+    --old-datadir "$TMP_DIR/old/data" \
+    --new-datadir "$TMP_DIR/new/data" \
+    --old-bindir  "$PG17_BIN" \
+    --new-bindir  "$PG18_BIN" \
+    --old-port    "$PORT_OLD" \
+    --new-port    "$PORT_NEW" \
+    --socketdir   "$TMP_DIR"
+) 2>&1 | tail -5
 
 # ============================================================
 # Phase 5: Post-upgrade verification
