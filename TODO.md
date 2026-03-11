@@ -581,6 +581,43 @@ and `SPI_finish()` becomes a dangling pointer. Fixed by allocating long-lived da
 - PQ: higher recall (100% vs 97%), 30× smaller index, scales better to large datasets
 - At 1M vectors: HNSW ~8 GB vs PQ ~260 MB
 
+### Recent Verified Findings (2026-03)
+
+**Storage / sorted_heap**
+- A1/B1/C1 are landed:
+  - overflow-aware incremental zone map maintenance keeps pruning valid
+  - executor uses sorted-prefix + conservative-tail semantics when global
+    monotonicity is lost
+  - serial SortedHeapScan now executes packed disjoint ranges rather than
+    collapsing sparse predicates into a bounding box
+- Parallel scan remains intentionally limited:
+  - contiguous/narrow paths use PostgreSQL parallel table scan API
+  - disjoint sparse paths stay serial, because a true parallel multi-range
+    scheduler prototype was slower than the serial range-array executor on the
+    local repro (~5.3 ms vs ~1.3 ms)
+- Two write-path CPU experiments were rejected and not merged:
+  - cached sort keys in `sorted_heap_multi_insert()`
+  - single-column fixed-width integer fast-path comparator
+  Both regressed local bulk-insert timing, so the current sort path remains.
+- Point/narrow compacted lookup is already very tight on the local harness
+  (single scanned block, tens of microseconds). Remaining storage work is
+  likely redesign-level, not another cheap local tweak.
+
+**Vector / graph**
+- Reproducible local ANN harness now lives in
+  `scripts/bench_nomic_local_ann.py`; Makefile targets:
+  - `make build-graph-bench-nomic`
+  - `make bench-nomic-ann`
+- Graph-builder tooling is now reproducible and smoke-tested via
+  `make test-graph-builder`.
+- On the local `bench_nomic` synthetic 8K benchmark, graph search currently
+  dominates IVF-PQ on the higher-recall frontier, but reaching near-exact
+  recall still requires large `ef_search`, so the bottleneck is graph quality
+  / search fanout rather than another rerank micro-optimization.
+- Hybrid bridge experiments (`m_bridge=4/8`) and a wider routed pool
+  (`adj=8`) did not produce a clear improvement frontier over the current
+  routed KNN baseline, so they were intentionally not merged.
+
 ### Multi-Hash Filter PoC (Counterproductive)
 
 Tested two-table architecture with multi-hash filter (h1×h2×h3×h4) for
