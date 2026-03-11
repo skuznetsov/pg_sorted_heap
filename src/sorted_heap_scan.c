@@ -333,6 +333,7 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	CustomPath		   *cpath;
 	double				sel;
 	bool				skip_narrow_dml;
+	bool				allow_parallel_partial = true;
 
 	/* Chain to previous hook */
 	if (prev_set_rel_pathlist_hook)
@@ -467,6 +468,7 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 				return;
 
 			nblocks = range_total;
+			allow_parallel_partial = (scan_nranges <= 1);
 
 			if (skip_narrow_dml && nblocks <= 4)
 				return;
@@ -565,6 +567,7 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 			Selectivity		pk_sel;
 			List		   *meta_list = NIL;
 			List		   *const_bounds_list = NIL;
+			ListCell	   *lc;
 
 			pk_sel = clauselist_selectivity(root, pk_clauses,
 											0, JOIN_INNER, NULL);
@@ -587,6 +590,24 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 			meta_list = lappend_int(meta_list, (int32) total_blocks);
 			meta_list = lappend_int(meta_list,
 									list_length(runtime_exprs));
+
+			/*
+			 * Parallel fallback still scans a single contiguous span.
+			 * Avoid partial paths when plan-time evidence already says
+			 * runtime bounds can become disjoint or require prefix+tail.
+			 */
+			if (!info->zm_sorted ||
+				sorted_heap_detect_sorted_prefix(info) < info->zm_total_entries)
+				allow_parallel_partial = false;
+
+			foreach(lc, runtime_meta)
+			{
+				if (lfirst_int(lc) == SH_RUNTIME_IN_ARRAY)
+				{
+					allow_parallel_partial = false;
+					break;
+				}
+			}
 
 			/* Pack Const-only bounds (baseline for mixed Const+Param) */
 			const_bounds_list = lappend_int(const_bounds_list, bounds.has_lo ? 1 : 0);
@@ -629,7 +650,7 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 		/* cpath may be freed here — do NOT dereference it below */
 
 		/* Also offer a parallel partial path if beneficial */
-		if (rel->consider_parallel && nblocks > 0)
+		if (rel->consider_parallel && nblocks > 0 && allow_parallel_partial)
 		{
 			int		pw;
 
