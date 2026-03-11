@@ -2320,6 +2320,15 @@ SELECT id FROM sh20 WHERE id = 5500;
 SELECT count(*) AS sh20_range_count
     FROM sh20 WHERE id BETWEEN 4990 AND 5010;
 
+-- SH20-7: Generic plan (runtime bounds) uses two-pass
+-- Previously, runtime-bound scans bypassed B1 and scanned all blocks.
+SET plan_cache_mode = force_generic_plan;
+PREPARE sh20_q(int) AS SELECT id FROM sh20 WHERE id = $1;
+EXECUTE sh20_q(100);
+EXECUTE sh20_q(5500);
+DEALLOCATE sh20_q;
+RESET plan_cache_mode;
+
 RESET enable_indexscan;
 RESET enable_bitmapscan;
 

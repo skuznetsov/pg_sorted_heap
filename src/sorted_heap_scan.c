@@ -1159,6 +1159,51 @@ sorted_heap_resolve_runtime_bounds(SortedHeapScanState *shstate)
 									shstate->total_blocks,
 									&shstate->scan_start,
 									&shstate->scan_nblocks);
+
+	/*
+	 * Try two-pass scan: sorted prefix (binary search) + conservative tail.
+	 * Same logic as Path A planner, but evaluated at runtime.
+	 */
+	{
+		SortedHeapRelInfo *info = shstate->relinfo;
+		BlockNumber prefix_pages_local;
+
+		prefix_pages_local = sorted_heap_detect_sorted_prefix(info);
+
+		if (prefix_pages_local > 0 &&
+			prefix_pages_local < info->zm_total_entries + 1 &&
+			!info->zm_sorted)
+		{
+			BlockNumber pfx_start = 0, pfx_nblks = 0;
+			BlockNumber tail_start_local = 0, tail_nblks = 0;
+
+			if (sorted_heap_compute_two_pass_ranges(info, &shstate->bounds,
+													prefix_pages_local,
+													shstate->total_blocks,
+													&pfx_start, &pfx_nblks,
+													&tail_start_local,
+													&tail_nblks) &&
+				pfx_nblks + tail_nblks < shstate->scan_nblocks)
+			{
+				shstate->prefix_pages = prefix_pages_local;
+				shstate->prefix_start = pfx_start;
+				shstate->prefix_nblocks = pfx_nblks;
+				shstate->tail_start = tail_start_local;
+				shstate->tail_nblocks = tail_nblks;
+				shstate->two_pass = true;
+				shstate->in_tail_phase = false;
+				/* Update single-pass fields for explain/fallback */
+				shstate->scan_start = pfx_start;
+				shstate->scan_nblocks = pfx_nblks + tail_nblks;
+				return;
+			}
+		}
+
+		/* Single-pass fallback */
+		shstate->two_pass = false;
+		shstate->prefix_pages = 0;
+		shstate->in_tail_phase = false;
+	}
 }
 
 /* ----------------------------------------------------------------
@@ -1882,7 +1927,11 @@ sorted_heap_scan_next(ScanState *ss)
 		{
 			table_rescan(shstate->heap_scan, NULL);
 
-			if (shstate->scan_nblocks > 0)
+			if (shstate->two_pass)
+				heap_setscanlimits(shstate->heap_scan,
+								   shstate->prefix_start,
+								   shstate->prefix_nblocks);
+			else if (shstate->scan_nblocks > 0)
 				heap_setscanlimits(shstate->heap_scan,
 							   shstate->scan_start,
 							   shstate->scan_nblocks);
@@ -1890,7 +1939,13 @@ sorted_heap_scan_next(ScanState *ss)
 				heap_setscanlimits(shstate->heap_scan, 1, 0);
 		}
 
-		current_nblocks = shstate->scan_nblocks;
+		/* Recompute pk_prefilter after runtime resolve */
+		pk_prefilter = shstate->two_pass
+			? !shstate->in_tail_phase
+			: info->zm_sorted;
+		current_nblocks = shstate->two_pass
+			? shstate->prefix_nblocks
+			: shstate->scan_nblocks;
 		skip_zone_check = (current_nblocks <= 4 &&
 						   shstate->n_in_values == 0);
 	}
