@@ -151,7 +151,7 @@ SELECT * FROM events WHERE id BETWEEN 500 AND 600;
 ### Run tests
 
 ```bash
-make installcheck              # regression tests (18 suites)
+make installcheck              # regression tests
 make test-crash-recovery       # crash recovery (4 scenarios)
 make test-concurrent           # concurrent DML + online ops
 make test-toast                # TOAST integrity + concurrent guard

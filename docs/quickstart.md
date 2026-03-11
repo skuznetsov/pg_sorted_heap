@@ -83,7 +83,7 @@ The zone map pruned 1,944 of 1,946 blocks -- only 2 blocks were read.
 ## Run tests
 
 ```bash
-make installcheck              # regression tests (17 suites)
+make installcheck              # regression tests
 make test-crash-recovery       # crash recovery (4 scenarios)
 make test-concurrent           # concurrent DML + online ops
 make test-toast                # TOAST integrity + concurrent guard
