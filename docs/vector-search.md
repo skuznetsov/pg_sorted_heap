@@ -317,7 +317,7 @@ To rebuild the graph sidecar used by `svec_graph_scan`, use
 The committed workflow for the local `bench_nomic` setup is:
 
 ```bash
-/opt/homebrew/Caskroom/miniconda/base/bin/python3 scripts/build_graph.py \
+"$(./scripts/find_vector_python.sh)" scripts/build_graph.py \
   --dsn 'host=/tmp port=65432 dbname=bench_nomic' \
   --table bench_nomic_8k \
   --graph-table bench_nomic_graph \
@@ -334,7 +334,7 @@ The committed workflow for the local `bench_nomic` setup is:
 Then benchmark the rebuilt graph against exact and IVF baselines:
 
 ```bash
-/opt/homebrew/Caskroom/miniconda/base/bin/python3 scripts/bench_nomic_local_ann.py \
+"$(./scripts/find_vector_python.sh)" scripts/bench_nomic_local_ann.py \
   --dsn 'host=/tmp port=65432 dbname=bench_nomic' \
   --graph-table bench_nomic_graph \
   --entry-table bench_nomic_graph_entries \

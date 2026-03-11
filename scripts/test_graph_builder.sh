@@ -33,31 +33,7 @@ else
   PG_BINDIR="/opt/homebrew/Cellar/postgresql@18/18.1_1/bin"
 fi
 
-PYTHON_BIN="${PYTHON_BIN:-}"
-if [ -z "$PYTHON_BIN" ]; then
-  for candidate in \
-    "python3" \
-    "/opt/homebrew/Caskroom/miniconda/base/bin/python3" \
-    "/Users/sergey/miniconda3/bin/python3"
-  do
-    if command -v "$candidate" >/dev/null 2>&1; then
-      if "$candidate" -c 'import numpy, psycopg2' >/dev/null 2>&1; then
-        PYTHON_BIN="$(command -v "$candidate")"
-        break
-      fi
-    elif [ -x "$candidate" ]; then
-      if "$candidate" -c 'import numpy, psycopg2' >/dev/null 2>&1; then
-        PYTHON_BIN="$candidate"
-        break
-      fi
-    fi
-  done
-fi
-
-if [ -z "$PYTHON_BIN" ]; then
-  echo "could not find python with numpy + psycopg2" >&2
-  exit 2
-fi
+PYTHON_BIN="${PYTHON_BIN:-$("$ROOT_DIR/scripts/find_vector_python.sh")}"
 
 make -C "$ROOT_DIR" install >/dev/null 2>&1 || true
 
