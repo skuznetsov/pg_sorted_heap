@@ -62,6 +62,10 @@ if ! rg -n 'find_vector_python\.sh' "$VECTOR_DOC" >/dev/null; then
   echo "expected docs/vector-search.md to mention find_vector_python.sh" >&2
   exit 1
 fi
+if rg -n '/Users/sergey/Projects/C/clustered_pg/' "$VECTOR_DOC" >/dev/null; then
+  echo "unexpected machine-specific absolute workspace path in docs/vector-search.md" >&2
+  exit 1
+fi
 if ! rg -n 'find_vector_python\.sh' "$ROOT_DIR/scripts/build_graph.py" >/dev/null; then
   echo "expected scripts/build_graph.py usage to mention find_vector_python.sh" >&2
   exit 1
