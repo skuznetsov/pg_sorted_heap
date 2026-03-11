@@ -4,8 +4,10 @@ set -euo pipefail
 for candidate in \
   "${PYTHON_BIN:-}" \
   "python3" \
+  "${HOME:-}/miniconda3/bin/python3" \
+  "${HOME:-}/mambaforge/bin/python3" \
   "/opt/homebrew/Caskroom/miniconda/base/bin/python3" \
-  "/Users/sergey/miniconda3/bin/python3"
+  "/opt/homebrew/miniconda3/bin/python3"
 do
   [ -n "$candidate" ] || continue
 
