@@ -54,6 +54,7 @@ jobs:
           make test-alter-table    TMP_SELFTEST_ROOT=/tmp TEST_ALTER_PORT=5442
           make test-dump-restore   TMP_SELFTEST_ROOT=/tmp TEST_DUMP_PORT=5443
           make test-concurrent     TMP_SELFTEST_ROOT=/tmp TEST_CONCURRENT_PORT=5444
+          make test-graph-builder  TMP_SELFTEST_ROOT=/tmp TEST_GRAPH_PORT=5445
 
       - name: Upload regression diffs on failure
         if: failure()
