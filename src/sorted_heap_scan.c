@@ -600,12 +600,19 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 				sorted_heap_detect_sorted_prefix(info) < info->zm_total_entries)
 				allow_parallel_partial = false;
 
-			foreach(lc, runtime_meta)
+			/* Check strategy fields (stride 3: strategy, is_col2, typid) */
 			{
-				if (lfirst_int(lc) == SH_RUNTIME_IN_ARRAY)
+				int		meta_idx = 0;
+
+				foreach(lc, runtime_meta)
 				{
-					allow_parallel_partial = false;
-					break;
+					if (meta_idx % 3 == 0 &&
+						lfirst_int(lc) == SH_RUNTIME_IN_ARRAY)
+					{
+						allow_parallel_partial = false;
+						break;
+					}
+					meta_idx++;
 				}
 			}
 
