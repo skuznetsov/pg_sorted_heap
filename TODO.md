@@ -618,6 +618,10 @@ and `SPI_finish()` becomes a dangling pointer. Fixed by allocating long-lived da
 - Hybrid bridge experiments (`m_bridge=4/8`) and a wider routed pool
   (`adj=8`) did not produce a clear improvement frontier over the current
   routed KNN baseline, so they were intentionally not merged.
+- Rebuilding the graph with full-embedding edge selection (while keeping the
+  same compact runtime sketch) also failed to produce a stable improvement
+  frontier over the current sketch-built graph on `bench_nomic`, so that
+  offline metric upgrade was intentionally not merged.
 
 ### Multi-Hash Filter PoC (Counterproductive)
 
