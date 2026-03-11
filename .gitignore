@@ -16,5 +16,10 @@ tmp_check_iso/
 *.swp
 *~
 
+# Python cache artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
 # Agent tooling
 .agents/
