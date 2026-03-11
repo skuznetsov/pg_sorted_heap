@@ -153,6 +153,7 @@ static bool sorted_heap_zone_overlaps(SortedHeapZoneMapEntry *e,
 static bool zone_overlaps_in_values(SortedHeapZoneMapEntry *e,
 									int64 *values, int nvalues);
 static bool sorted_heap_exprs_need_deferred_runtime_resolve(List *exprs);
+static void sorted_heap_set_parallel_fallback_span(SortedHeapScanState *shstate);
 
 /* CustomPath callback */
 static Plan *sorted_heap_plan_custom_path(PlannerInfo *root,
@@ -1220,14 +1221,31 @@ sorted_heap_resolve_runtime_bounds(SortedHeapScanState *shstate)
 	/* Legacy single-span for parallel fallback / explain */
 	if (shstate->nranges > 0)
 	{
-		shstate->scan_start = shstate->ranges[0].start;
-		shstate->scan_nblocks = shstate->range_total_nblocks;
+		sorted_heap_set_parallel_fallback_span(shstate);
 	}
 	else
 	{
 		shstate->scan_start = 1;
 		shstate->scan_nblocks = 0;
 	}
+}
+
+static void
+sorted_heap_set_parallel_fallback_span(SortedHeapScanState *shstate)
+{
+	BlockNumber	last_end;
+
+	if (shstate->nranges <= 0)
+	{
+		shstate->scan_start = 1;
+		shstate->scan_nblocks = 0;
+		return;
+	}
+
+	shstate->scan_start = shstate->ranges[0].start;
+	last_end = shstate->ranges[shstate->nranges - 1].start +
+		shstate->ranges[shstate->nranges - 1].nblocks;
+	shstate->scan_nblocks = last_end - shstate->scan_start;
 }
 
 /* ----------------------------------------------------------------
@@ -1832,8 +1850,7 @@ sorted_heap_begin_custom_scan(CustomScanState *node, EState *estate,
 		/* Legacy single-span for parallel fallback */
 		if (nr > 0)
 		{
-			shstate->scan_start = shstate->ranges[0].start;
-			shstate->scan_nblocks = shstate->range_total_nblocks;
+			sorted_heap_set_parallel_fallback_span(shstate);
 		}
 		else
 		{
@@ -2188,6 +2205,16 @@ sorted_heap_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 
 	/* Open leader's parallel scan */
 	shstate->heap_scan = table_beginscan_parallel(rel, pscan);
+
+	if (!shstate->runtime_resolve_pending)
+	{
+		if (shstate->scan_nblocks > 0)
+			heap_setscanlimits(shstate->heap_scan,
+							   shstate->scan_start,
+							   shstate->scan_nblocks);
+		else
+			heap_setscanlimits(shstate->heap_scan, 1, 0);
+	}
 }
 
 /* ----------------------------------------------------------------
@@ -2207,6 +2234,16 @@ sorted_heap_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	if (shstate->heap_scan)
 		table_endscan(shstate->heap_scan);
 	shstate->heap_scan = table_beginscan_parallel(rel, pscan);
+
+	if (!shstate->runtime_resolve_pending)
+	{
+		if (shstate->scan_nblocks > 0)
+			heap_setscanlimits(shstate->heap_scan,
+							   shstate->scan_start,
+							   shstate->scan_nblocks);
+		else
+			heap_setscanlimits(shstate->heap_scan, 1, 0);
+	}
 }
 
 /* ----------------------------------------------------------------
@@ -2226,6 +2263,16 @@ sorted_heap_initialize_worker(CustomScanState *node, shm_toc *toc,
 	if (shstate->heap_scan)
 		table_endscan(shstate->heap_scan);
 	shstate->heap_scan = table_beginscan_parallel(rel, pscan);
+
+	if (!shstate->runtime_resolve_pending)
+	{
+		if (shstate->scan_nblocks > 0)
+			heap_setscanlimits(shstate->heap_scan,
+							   shstate->scan_start,
+							   shstate->scan_nblocks);
+		else
+			heap_setscanlimits(shstate->heap_scan, 1, 0);
+	}
 }
 
 /* ----------------------------------------------------------------
