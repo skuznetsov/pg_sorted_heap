@@ -2335,6 +2335,79 @@ RESET enable_bitmapscan;
 DROP TABLE sh20;
 DROP FUNCTION sh20_plan_contains(text, text);
 
+-- ================================================================
+-- SH21: Multi-range scan for sparse predicates (C1)
+-- After compact, sparse IN (...) / = ANY($1) queries should
+-- produce multiple disjoint ranges, not a single bounding box.
+-- ================================================================
+CREATE FUNCTION sh21_plan_contains(query text, pattern text) RETURNS boolean AS $$
+DECLARE r record;
+BEGIN
+    FOR r IN EXECUTE 'EXPLAIN (COSTS OFF) ' || query LOOP
+        IF r."QUERY PLAN" LIKE '%' || pattern || '%' THEN RETURN true; END IF;
+    END LOOP;
+    RETURN false;
+END;
+$$ LANGUAGE plpgsql;
+
+-- SH21-1: Create large compacted table
+CREATE TABLE sh21(id int PRIMARY KEY, val text) USING sorted_heap;
+INSERT INTO sh21 SELECT g, repeat('x', 80) FROM generate_series(1, 10000) g;
+SELECT sorted_heap_compact('sh21'::regclass);
+ANALYZE sh21;
+
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+
+-- SH21-2: Helper to check multi-range in EXPLAIN output
+CREATE FUNCTION sh21_explain_has_ranges(query text) RETURNS boolean AS $$
+DECLARE r record;
+BEGIN
+    FOR r IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF) ' || query LOOP
+        IF r."QUERY PLAN" LIKE '%ranges%' THEN RETURN true; END IF;
+    END LOOP;
+    RETURN false;
+END;
+$$ LANGUAGE plpgsql;
+
+-- SH21-3: Sparse IN with wide gaps → multi-range on sorted table
+SELECT sh21_explain_has_ranges(
+    'SELECT * FROM sh21 WHERE id IN (100, 5000, 9000)')
+    AS sh21_sorted_multi_range;
+
+-- SH21-4: Correctness: sparse IN returns all three rows
+SELECT id FROM sh21 WHERE id IN (100, 5000, 9000) ORDER BY id;
+
+-- SH21-5: Generic plan with = ANY($1) also uses multi-range
+SET plan_cache_mode = force_generic_plan;
+PREPARE sh21_q(int[]) AS SELECT id FROM sh21 WHERE id = ANY($1) ORDER BY id;
+EXECUTE sh21_q('{100, 5000, 9000}');
+DEALLOCATE sh21_q;
+RESET plan_cache_mode;
+
+-- SH21-6: After tail insert, sparse query still works correctly
+DO $$
+BEGIN
+    FOR i IN 10001..11000 LOOP
+        INSERT INTO sh21 VALUES (i, repeat('y', 80));
+    END LOOP;
+END;
+$$;
+-- Sparse query spanning prefix and tail
+SELECT id FROM sh21 WHERE id IN (100, 5000, 10500) ORDER BY id;
+
+-- SH21-7: After tail insert, sparse query shows multi-range (N > 1)
+SELECT sh21_explain_has_ranges(
+    'SELECT * FROM sh21 WHERE id IN (100, 5000, 10500)')
+    AS sh21_multi_range_after_tail;
+
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+
+DROP TABLE sh21;
+DROP FUNCTION sh21_plan_contains(text, text);
+DROP FUNCTION sh21_explain_has_ranges(text);
+
 -- ====================================================================
 -- ANN regression tests: svec_ann_scan correctness, dimension check,
 -- ann_timing non-crash smoke
