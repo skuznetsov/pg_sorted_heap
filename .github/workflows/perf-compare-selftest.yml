@@ -25,10 +25,12 @@ on:
       - scripts/selftest_make_help_unnest_ab_startup_sensitivity_sentinel.sh
       - scripts/selftest_make_help_unnest_ab_startup_script_overrides.sh
       - scripts/selftest_make_help_pg_core_regression_smoke.sh
+      - scripts/selftest_make_help_graph_builder.sh
       - scripts/selftest_make_defaults_unnest_ab_startup_sensitivity.sh
       - scripts/selftest_docs_make_sentinel_cold_observe_contract.sh
       - scripts/selftest_docs_policy_safety_quickstart_contract.sh
       - scripts/selftest_docs_pg_core_regression_smoke_contract.sh
+      - scripts/selftest_docs_graph_builder_contract.sh
       - scripts/selftest_policy_safety_workflow_contract.sh
       - scripts/selftest_policy_safety_target_composition.sh
       - scripts/selftest_policy_safety_workflow_target_sync.sh
@@ -90,6 +92,8 @@ on:
       - scripts/selftest_extract_pg_sorted_heap_define.sh
       - README.md
       - OPERATIONS.md
+      - docs/quickstart.md
+      - docs/vector-search.md
       - scripts/selftest_runtime_profile_export.sh
       - scripts/selftest_workflow_path_filter_coverage.sh
       - scripts/selftest_workflow_files_are_guarded.sh
@@ -132,10 +136,12 @@ on:
       - scripts/selftest_make_help_unnest_ab_startup_sensitivity_sentinel.sh
       - scripts/selftest_make_help_unnest_ab_startup_script_overrides.sh
       - scripts/selftest_make_help_pg_core_regression_smoke.sh
+      - scripts/selftest_make_help_graph_builder.sh
       - scripts/selftest_make_defaults_unnest_ab_startup_sensitivity.sh
       - scripts/selftest_docs_make_sentinel_cold_observe_contract.sh
       - scripts/selftest_docs_policy_safety_quickstart_contract.sh
       - scripts/selftest_docs_pg_core_regression_smoke_contract.sh
+      - scripts/selftest_docs_graph_builder_contract.sh
       - scripts/selftest_policy_safety_workflow_contract.sh
       - scripts/selftest_policy_safety_target_composition.sh
       - scripts/selftest_policy_safety_workflow_target_sync.sh
@@ -197,6 +203,8 @@ on:
       - scripts/selftest_extract_pg_sorted_heap_define.sh
       - README.md
       - OPERATIONS.md
+      - docs/quickstart.md
+      - docs/vector-search.md
       - scripts/selftest_runtime_profile_export.sh
       - scripts/selftest_workflow_path_filter_coverage.sh
       - scripts/selftest_workflow_files_are_guarded.sh
