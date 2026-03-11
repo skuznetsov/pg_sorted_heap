@@ -320,6 +320,11 @@ make bench-nomic-ann \
   VECTOR_BENCH_DSN='host=/tmp port=65432 dbname=bench_nomic'
 ```
 
+Local graph/ANN tooling expects the Python packages listed in
+`scripts/requirements-vector-tools.txt`. CI installs that file directly; for
+local runs, `scripts/find_vector_python.sh` resolves a Python that can import
+the same dependency set.
+
 To rebuild the graph sidecar used by `svec_graph_scan`, use
 `scripts/build_graph.py`. The committed workflow for the local `bench_nomic`
 setup is:

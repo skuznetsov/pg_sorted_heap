@@ -533,4 +533,5 @@ make bench-nomic-ann \
 ```
 
 Both targets use `./scripts/find_vector_python.sh` to locate a Python with
-`numpy` and `psycopg2`.
+the dependency set from `scripts/requirements-vector-tools.txt`
+(`numpy` + `psycopg2-binary`).
