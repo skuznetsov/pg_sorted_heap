@@ -150,8 +150,8 @@ query vector
 ```
 
 Physical clustering by `(partition_id, id)` means the IVF probe translates
-directly to a contiguous block range — sorted_heap's zone map skips all other
-partitions at the I/O level.
+directly to a small set of physical block ranges — sorted_heap's zone map
+skips all other partitions at the I/O level.
 
 ### Residual PQ
 

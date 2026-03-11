@@ -293,8 +293,8 @@ query vector
 ```
 
 Physical clustering by `(partition_id, id)` means IVF probe translates directly
-to a contiguous block range scan — sorted_heap's zone map skips all other
-partitions at the I/O level.
+to a small set of physical block ranges — sorted_heap's zone map skips all
+other partitions at the I/O level.
 
 ### Performance
 
@@ -439,8 +439,8 @@ CREATE INDEX ON t USING btree (key_col);
 - Hooks into `set_rel_pathlist_hook`
 - Extracts PK bounds from `baserestrictinfo` (both `Const` and `Param` nodes)
 - Maps operator OIDs to btree strategies via `get_op_opfamily_strategy()`
-- Computes contiguous block range from zone map overlap
-- Uses `heap_setscanlimits(start, nblocks)` for physical I/O skip
+- Computes one or more block ranges from zone map overlap
+- Uses `heap_setscanlimits(start, nblocks)` for each internal scan range
 - Per-block zone map check in `ExecCustomScan` for fine-grained pruning
 - `IN`/`ANY(array)` pruning: per-block binary search against sorted value list
 - LATERAL/NestLoop: deferred PARAM_EXEC resolution at first rescan/execution
@@ -457,12 +457,15 @@ CREATE INDEX ON t USING btree (key_col);
 - Online compact/merge not supported for UUID/text/varchar PKs (lossy int64
   hash causes collisions in replay). Use offline variants.
 - Single-row INSERT into a covered page updates zone map in-place. INSERT
-  into an uncovered page invalidates scan pruning until next compact (or
-  autovacuum rebuild).
+  into an uncovered page keeps the zone map valid, clears the global sorted
+  flag, and falls back to sorted-prefix + conservative-tail pruning until the
+  next compact/merge.
 - `sorted_heap_compact()` and `sorted_heap_merge()` acquire
   AccessExclusiveLock. Use `_online` variants for non-blocking operation.
-- `heap_setscanlimits()` only supports contiguous block ranges. Non-contiguous
-  pruning handled per-block in ExecCustomScan.
+- `heap_setscanlimits()` only supports contiguous block ranges. Serial
+  SortedHeapScan works around this by iterating an internal range array;
+  parallel scan still only supports contiguous/narrow ranges and falls back
+  to serial for disjoint sparse predicates.
 - UPDATE does not re-sort; use compact/merge periodically for write-heavy
   workloads.
 - pg_dump/restore: data restored via COPY, zone map needs compact after

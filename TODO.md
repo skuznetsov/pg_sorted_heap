@@ -78,9 +78,9 @@ Basic `sorted_heap` AM that delegates everything to heap.
 - `set_rel_pathlist_hook` → `SortedHeapScan` CustomPath
 - Extract PK bounds from WHERE clause (=, <, <=, >, >=, BETWEEN)
 - Map operator OIDs to btree strategies via `get_op_opfamily_strategy()`
-- Compute contiguous block range from zone map overlap
-- `heap_setscanlimits()` for physical I/O skip
-- Per-block zone map check in ExecCustomScan for non-contiguous pruning
+- Compute one or more block ranges from zone map overlap
+- `heap_setscanlimits()` for each internal scan range
+- Per-block zone map check in ExecCustomScan for fine-grained pruning
 - `SHM_FLAG_ZONEMAP_VALID` flag: cleared on first INSERT after compact,
   set during compact/rebuild — prevents stale pruning
 - Uncovered pages (beyond zone map capacity) included in scan unless
@@ -176,7 +176,7 @@ relative throughput under sustained load, not absolute query latency.
 - **EXPLAIN ANALYZE** shows sorted_heap reads fewer blocks than btree
   at every selectivity level. At 10M rows: point query reads 1 block
   (vs 7 for btree, 63,695 for seqscan). At 100M: 1 block vs 8 for btree,
-  519,906 for seqscan. Zone map prunes to exact contiguous block range.
+  519,906 for seqscan. Zone map prunes to exact physical block ranges.
 - **Prepared mode** — runtime parameter resolution enables generic plans for
   sorted_heap. Point query TPS at 10M: 46.5K prepared vs 29.1K simple (+60%).
   At 100M: 32.6K prepared vs 18.7K simple (+74%). Narrow/medium/wide reach
@@ -472,15 +472,15 @@ runtime parameter resolution handles generic plans. No special configuration
 needed.
 
 ### pg_upgrade
-Untested. Expected to work: pg_upgrade copies data files as-is (meta page and
-overflow pages are standard 8KB blocks), and the extension .so is loaded on
-startup via `shared_preload_libraries` (not needed for sorted_heap — it's loaded
-on first use via `CREATE EXTENSION`).
+Tested for PostgreSQL 17 -> 18. `pg_upgrade` copies data files as-is (meta page
+and overflow pages are standard 8KB blocks), and the extension loads normally
+after upgrade.
 
 ### Extension Upgrade Path
-No `pg_sorted_heap--0.1.0--0.2.0.sql` upgrade script exists. Currently requires
-`DROP EXTENSION` + `CREATE EXTENSION` for version changes (data preserved in
-tables, zone map rebuilt on next compact).
+Adjacent extension upgrade scripts exist for the shipped versions
+(`0.9.7 -> ... -> 0.9.13`). Upgrading from a version without a matching
+adjacent script still requires `DROP EXTENSION` + `CREATE EXTENSION`
+(table data preserved, zone map rebuilt on next compact).
 
 ## Vector Search Track
 
