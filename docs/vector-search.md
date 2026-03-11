@@ -307,6 +307,11 @@ JOIN ann_results ar ON gt.qid = ar.qid;
 Note: `lim := 11` and `[2:11]` skip the self-match (position 1) for cross-query
 evaluation. For self-query benchmarks, use `lim := 10` without slicing.
 
+For the local synthetic `bench_nomic` setup used during graph/IVF tuning, use
+[`scripts/bench_nomic_local_ann.py`](/Users/sergey/Projects/C/clustered_pg/scripts/bench_nomic_local_ann.py)
+to reproduce exact ground truth, `svec_graph_scan`, and `svec_ann_scan`
+latency/recall curves from one command.
+
 ---
 
 ## API reference
