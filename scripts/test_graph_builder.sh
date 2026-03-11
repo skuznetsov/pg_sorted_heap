@@ -35,7 +35,7 @@ fi
 
 PYTHON_BIN="${PYTHON_BIN:-$("$ROOT_DIR/scripts/find_vector_python.sh")}"
 
-make -C "$ROOT_DIR" install >/dev/null 2>&1 || true
+make -C "$ROOT_DIR" install >/dev/null
 
 pass=0
 fail=0
