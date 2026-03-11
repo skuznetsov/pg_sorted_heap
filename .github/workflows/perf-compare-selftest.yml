@@ -88,6 +88,10 @@ on:
       - scripts/selftest_runtime_tmpdir_validation.sh
       - scripts/selftest_runtime_output_target_validation.sh
       - scripts/selftest_runtime_port_validation.sh
+      - scripts/find_vector_python.sh
+      - scripts/build_graph.py
+      - scripts/bench_nomic_local_ann.py
+      - scripts/test_graph_builder.sh
       - scripts/extract_pg_sorted_heap_define.sh
       - scripts/selftest_extract_pg_sorted_heap_define.sh
       - README.md
@@ -199,6 +203,10 @@ on:
       - scripts/selftest_runtime_tmpdir_validation.sh
       - scripts/selftest_runtime_output_target_validation.sh
       - scripts/selftest_runtime_port_validation.sh
+      - scripts/find_vector_python.sh
+      - scripts/build_graph.py
+      - scripts/bench_nomic_local_ann.py
+      - scripts/test_graph_builder.sh
       - scripts/extract_pg_sorted_heap_define.sh
       - scripts/selftest_extract_pg_sorted_heap_define.sh
       - README.md
