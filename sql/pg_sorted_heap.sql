@@ -2320,14 +2320,41 @@ SELECT id FROM sh20 WHERE id = 5500;
 SELECT count(*) AS sh20_range_count
     FROM sh20 WHERE id BETWEEN 4990 AND 5010;
 
--- SH20-7: Generic plan (runtime bounds) uses two-pass
--- Previously, runtime-bound scans bypassed B1 and scanned all blocks.
-SET plan_cache_mode = force_generic_plan;
-PREPARE sh20_q(int) AS SELECT id FROM sh20 WHERE id = $1;
-EXECUTE sh20_q(100);
-EXECUTE sh20_q(5500);
-DEALLOCATE sh20_q;
-RESET plan_cache_mode;
+-- SH20-7: Generic plan uses multi-range (not old one-span fallback).
+-- Assert plan shape shows "ranges" or low scanned blocks (< 30).
+CREATE FUNCTION sh20_generic_uses_ranges() RETURNS boolean AS $$
+DECLARE r record;
+BEGIN
+    EXECUTE 'SET plan_cache_mode = force_generic_plan';
+    EXECUTE 'DEALLOCATE ALL';
+    EXECUTE 'PREPARE sh20_q(int) AS SELECT id FROM sh20 WHERE id = $1';
+    FOR r IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF) EXECUTE sh20_q(100)' LOOP
+        IF r."QUERY PLAN" LIKE '%ranges%' THEN
+            EXECUTE 'DEALLOCATE sh20_q';
+            EXECUTE 'RESET plan_cache_mode';
+            RETURN true;
+        END IF;
+        IF r."QUERY PLAN" LIKE '%Scanned Blocks: %' THEN
+            DECLARE
+                blks int;
+            BEGIN
+                blks := regexp_replace(r."QUERY PLAN", '.*Scanned Blocks: (\d+).*', '\1')::int;
+                IF blks < 30 THEN
+                    EXECUTE 'DEALLOCATE sh20_q';
+                    EXECUTE 'RESET plan_cache_mode';
+                    RETURN true;
+                END IF;
+            END;
+        END IF;
+    END LOOP;
+    EXECUTE 'DEALLOCATE sh20_q';
+    EXECUTE 'RESET plan_cache_mode';
+    RETURN false;
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT sh20_generic_uses_ranges() AS sh20_generic_optimized;
+DROP FUNCTION sh20_generic_uses_ranges();
 
 RESET enable_indexscan;
 RESET enable_bitmapscan;
@@ -2378,12 +2405,28 @@ SELECT sh21_explain_has_ranges(
 -- SH21-4: Correctness: sparse IN returns all three rows
 SELECT id FROM sh21 WHERE id IN (100, 5000, 9000) ORDER BY id;
 
--- SH21-5: Generic plan with = ANY($1) also uses multi-range
-SET plan_cache_mode = force_generic_plan;
-PREPARE sh21_q(int[]) AS SELECT id FROM sh21 WHERE id = ANY($1) ORDER BY id;
-EXECUTE sh21_q('{100, 5000, 9000}');
-DEALLOCATE sh21_q;
-RESET plan_cache_mode;
+-- SH21-5: Generic plan with = ANY($1) uses multi-range
+CREATE FUNCTION sh21_generic_any_uses_ranges() RETURNS boolean AS $$
+DECLARE r record;
+BEGIN
+    EXECUTE 'SET plan_cache_mode = force_generic_plan';
+    EXECUTE 'DEALLOCATE ALL';
+    EXECUTE 'PREPARE sh21_q(int[]) AS SELECT id FROM sh21 WHERE id = ANY($1) ORDER BY id';
+    FOR r IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF) EXECUTE sh21_q(''{100, 5000, 9000}'')' LOOP
+        IF r."QUERY PLAN" LIKE '%ranges%' THEN
+            EXECUTE 'DEALLOCATE sh21_q';
+            EXECUTE 'RESET plan_cache_mode';
+            RETURN true;
+        END IF;
+    END LOOP;
+    EXECUTE 'DEALLOCATE sh21_q';
+    EXECUTE 'RESET plan_cache_mode';
+    RETURN false;
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT sh21_generic_any_uses_ranges() AS sh21_generic_multi_range;
+DROP FUNCTION sh21_generic_any_uses_ranges();
 
 -- SH21-6: After tail insert, sparse query still works correctly
 DO $$
