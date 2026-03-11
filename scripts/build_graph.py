@@ -16,7 +16,8 @@ Algorithm:
   9. Write graph_nodes and graph_entries tables.
 
 Usage:
-  python3 scripts/build_graph.py [--dsn DSN] [--table TABLE] [--M 16] [--seed 42]
+  "$(./scripts/find_vector_python.sh)" scripts/build_graph.py \
+    [--dsn DSN] [--table TABLE] [--M 16] [--seed 42]
 
 Metrics guarantee: uses cosine distance on float16 sketches, same as runtime.
 """

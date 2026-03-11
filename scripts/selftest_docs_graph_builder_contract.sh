@@ -62,5 +62,17 @@ if ! rg -n 'find_vector_python\.sh' "$VECTOR_DOC" >/dev/null; then
   echo "expected docs/vector-search.md to mention find_vector_python.sh" >&2
   exit 1
 fi
+if ! rg -n 'find_vector_python\.sh' "$ROOT_DIR/scripts/build_graph.py" >/dev/null; then
+  echo "expected scripts/build_graph.py usage to mention find_vector_python.sh" >&2
+  exit 1
+fi
+if rg -n 'python3 scripts/build_graph\.py' "$ROOT_DIR/scripts/build_graph.py" >/dev/null; then
+  echo "unexpected hardcoded python3 usage in scripts/build_graph.py" >&2
+  exit 1
+fi
+if ! rg -n 'find_vector_python\.sh' "$ROOT_DIR/scripts/bench_nomic_local_ann.py" >/dev/null; then
+  echo "expected scripts/bench_nomic_local_ann.py usage to mention find_vector_python.sh" >&2
+  exit 1
+fi
 
 echo "selftest_docs_graph_builder_contract status=ok"

@@ -8,6 +8,10 @@ Measures exact ground truth vs:
 
 The goal is reproducibility for local optimization work, not a generic
 benchmark framework.
+
+Usage:
+  "$(./scripts/find_vector_python.sh)" scripts/bench_nomic_local_ann.py \
+    [--dsn DSN] [--query-limit 20]
 """
 
 from __future__ import annotations
