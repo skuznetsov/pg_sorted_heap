@@ -513,3 +513,24 @@ Optional: set `LIGHTWEIGHT_SELFTEST_RUN_LABEL=<id>` for a human-readable per-run
 JSONL events include `schema_version=1`, stable per-run `run_id`, optional/custom `run_label`, `runner_pid`, monotonic `event_seq`, and `event_ts` (UTC RFC3339, second precision).
 
 CI note: workflow `perf-compare-selftest` stores the JSONL stream as an artifact (`clustered-pg-lightweight-selftest-<run_id>-<run_attempt>`) for post-run diagnostics.
+
+## Vector tooling quick commands
+
+Graph-sidecar tooling now has a dedicated lifecycle smoke:
+
+```bash
+make test-graph-builder TMP_SELFTEST_ROOT=/private/tmp TEST_GRAPH_PORT=65489
+```
+
+For the local `bench_nomic` synthetic ANN setup:
+
+```bash
+make build-graph-bench-nomic \
+  VECTOR_BENCH_DSN='host=/tmp port=65432 dbname=bench_nomic'
+
+make bench-nomic-ann \
+  VECTOR_BENCH_DSN='host=/tmp port=65432 dbname=bench_nomic'
+```
+
+Both targets use `./scripts/find_vector_python.sh` to locate a Python with
+`numpy` and `psycopg2`.
