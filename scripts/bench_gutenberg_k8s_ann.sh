@@ -69,6 +69,13 @@ HNSW_PREFIX="${HNSW_PREFIX:-public.gutenberg_gptoss_sh_hnsw}"
 HNSW_CACHED_EF_LATENCY="${HNSW_CACHED_EF_LATENCY:-64}"
 HNSW_CACHED_EF_QUALITY="${HNSW_CACHED_EF_QUALITY:-96}"
 
+# Ground truth mode (applies to ALL methods including cached-HNSW section)
+#   halfvec  — brute-force seqscan on the pgvector table (fast, 16-bit distances)
+#   svec     — exhaustive IVF svec_ann_scan with full nprobe (slower, float32 exact)
+GT_MODE="${GT_MODE:-halfvec}"
+GT_SVEC_NPROBE="${GT_SVEC_NPROBE:-256}"         # svec mode: scan all IVF partitions
+GT_SVEC_RERANK_TOPK="${GT_SVEC_RERANK_TOPK:-5000}"  # svec mode: rerank window (>> K)
+
 if ! [[ "$QUERY_LIMIT" =~ ^[0-9]+$ ]] || [ "$QUERY_LIMIT" -lt 1 ]; then
   echo "QUERY_LIMIT must be >= 1" >&2
   exit 2
@@ -165,7 +172,27 @@ SQL
 
 sql_ground_truth_ids() {
   local qvec="$1"
-  cat <<SQL
+  if [ "$GT_MODE" = "svec" ]; then
+    # Near-exact svec GT: exhaustive IVF scan (nprobe=all partitions) + float32 rerank.
+    # GT_SVEC_RERANK_TOPK must be >> K to ensure true top-K are not dropped by PQ scoring.
+    cat <<SQL
+PREPARE q(${EXT_SCHEMA}.svec) AS
+SELECT string_agg(id, ',' ORDER BY ord)
+FROM (
+  SELECT id, row_number() OVER () AS ord
+  FROM ${EXT_SCHEMA}.svec_ann_scan(
+    '${SH_TABLE}'::regclass,
+    \$1,
+    ${GT_SVEC_NPROBE}, ${K}, ${GT_SVEC_RERANK_TOPK},
+    ${CB_ID}, ${IVF_CB_ID},
+    '${PQ_COLUMN}'
+  )
+) x;
+EXECUTE q('${qvec}'::${EXT_SCHEMA}.svec);
+DEALLOCATE q;
+SQL
+  else
+    cat <<SQL
 BEGIN;
 SET LOCAL enable_indexscan = off;
 SET LOCAL enable_bitmapscan = off;
@@ -185,6 +212,7 @@ EXECUTE q('${qvec}'::halfvec);
 DEALLOCATE q;
 COMMIT;
 SQL
+  fi
 }
 
 sql_ivfpq_ids() {
@@ -342,6 +370,11 @@ echo "IVF-PQ:  nprobe=${NPROBE}, rerank_topk=${RERANK_TOPK}, cb_id=${CB_ID}, ivf
 echo "Sketch:  table=${SKETCH_TABLE}, sketch_topk=${SKETCH_TOPK}"
 echo "Graph:   table=${GRAPH_TABLE}, entry=${GRAPH_ENTRY_TABLE}, ef=${GRAPH_EF_SEARCH}, rerank=${GRAPH_RERANK_TOPK}, skip=${GRAPH_SKIP}"
 echo "HNSWcache: prefix=${HNSW_PREFIX}, ef_latency=${HNSW_CACHED_EF_LATENCY}, ef_quality=${HNSW_CACHED_EF_QUALITY}, skip=${HNSW_CACHED_SKIP}"
+if [ "$GT_MODE" = "svec" ]; then
+  echo "GT:      mode=svec (exhaustive IVF nprobe=${GT_SVEC_NPROBE}, rerank_topk=${GT_SVEC_RERANK_TOPK})"
+else
+  echo "GT:      mode=halfvec (brute-force seqscan on ${HNSW_TABLE})"
+fi
 echo ""
 
 POD_PSQL -c "SELECT extname, extversion FROM pg_extension WHERE extname IN ('pg_sorted_heap','vector') ORDER BY 1;"
@@ -441,10 +474,41 @@ if [ "$HNSW_CACHED_SKIP" != "1" ]; then
   echo ""
   echo "Cached HNSW (hierarchical, session-warm L0+upper cache)"
   echo "------------------------------------------------------------"
-  echo "NOTE: recall% here is against the same brute-force halfvec GT used by all"
-  echo "      methods in this harness (seqscan on ${HNSW_TABLE}).  It is NOT against"
-  echo "      full-svec exact GT.  Results are directly comparable across methods"
-  echo "      within this script, but do not conflate with full-vector exact recall."
+  if [ "$GT_MODE" = "svec" ]; then
+    echo "GT:    near-exact svec (exhaustive IVF nprobe=${GT_SVEC_NPROBE}, rerank_topk=${GT_SVEC_RERANK_TOPK})"
+    # Build the GT subquery block for svec mode (PL/pgSQL statements, no index hints needed)
+    hnsw_gt_sql="        -- Near-exact svec GT: exhaustive IVF scan + float32 rerank.
+        SELECT array_agg(id ORDER BY ord) INTO truth_ids
+        FROM (
+            SELECT id, row_number() OVER () AS ord
+            FROM ${EXT_SCHEMA}.svec_ann_scan(
+                '${SH_TABLE}'::regclass, qrec.qvec,
+                ${GT_SVEC_NPROBE}, ${K}, ${GT_SVEC_RERANK_TOPK},
+                ${CB_ID}, ${IVF_CB_ID}, '${PQ_COLUMN}'
+            )
+        ) s;"
+  else
+    echo "GT:    halfvec brute-force seqscan on ${HNSW_TABLE} (same as all other methods)"
+    echo "       recall% is cross-method comparable but NOT full-svec exact recall."
+    echo "       Use GT_MODE=svec for float32 exact GT (slower, requires IVF codebook)."
+    # Build the GT subquery block for halfvec mode
+    hnsw_gt_sql="        -- Halfvec brute-force GT (same GT as all other harness methods).
+        PERFORM set_config('enable_indexscan',     'off', true);
+        PERFORM set_config('enable_bitmapscan',    'off', true);
+        PERFORM set_config('enable_indexonlyscan', 'off', true);
+
+        SELECT array_agg(id ORDER BY rn) INTO truth_ids
+        FROM (
+            SELECT id,
+                   row_number() OVER (ORDER BY embedding <=> qrec.qvec::text::halfvec) AS rn
+            FROM ${HNSW_TABLE}
+            LIMIT ${K}
+        ) s;
+
+        PERFORM set_config('enable_indexscan',     'on', true);
+        PERFORM set_config('enable_bitmapscan',    'on', true);
+        PERFORM set_config('enable_indexonlyscan', 'on', true);"
+  fi
   # All statements run in one psql session so the backend-local L0/upper caches
   # built during warmup persist for the entire benchmark loop.
   kubectl exec -i -n "$NAMESPACE" "$POD" -- \
@@ -476,26 +540,7 @@ BEGIN
         ORDER BY ${QUERY_ID_COL}
         LIMIT ${QUERY_LIMIT}
     LOOP
-        -- Ground truth: brute-force halfvec seqscan on the pgvector table.
-        -- Same GT used by all methods in this harness (hnsw, ivfpq, graph).
-        -- Recall is therefore directly comparable across methods but is NOT
-        -- full-svec exact recall (halfvec is 16-bit quantised; distances may
-        -- differ from svec float32 by a small rounding error).
-        PERFORM set_config('enable_indexscan',     'off', true);
-        PERFORM set_config('enable_bitmapscan',    'off', true);
-        PERFORM set_config('enable_indexonlyscan', 'off', true);
-
-        SELECT array_agg(id ORDER BY rn) INTO truth_ids
-        FROM (
-            SELECT id,
-                   row_number() OVER (ORDER BY embedding <=> qrec.qvec::text::halfvec) AS rn
-            FROM ${HNSW_TABLE}
-            LIMIT ${K}
-        ) s;
-
-        PERFORM set_config('enable_indexscan',     'on', true);
-        PERFORM set_config('enable_bitmapscan',    'on', true);
-        PERFORM set_config('enable_indexonlyscan', 'on', true);
+${hnsw_gt_sql}
 
         -- Latency-first operating point (ef=${HNSW_CACHED_EF_LATENCY})
         t0 := clock_timestamp();
