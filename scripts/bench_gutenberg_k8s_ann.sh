@@ -12,6 +12,9 @@ set -euo pipefail
 #   3. sorted_heap IVF-PQ + sketch sidecar
 #   4. sorted_heap graph scan (svec_graph_scan) — skipped if GRAPH_SKIP=1
 #      or if the graph table does not exist
+#   5. sorted_heap hierarchical HNSW with session-warm L0+upper cache
+#      (svec_hnsw_scan) — skipped if HNSW_CACHED_SKIP=1 or tables absent
+#      Reports two operating points: ef_latency (default 64) and ef_quality (96)
 #
 # Prerequisite for graph: build_graph.py must have been run against the pod:
 #   "$(./scripts/find_vector_python.sh)" scripts/build_graph.py \
@@ -60,6 +63,11 @@ GRAPH_ENTRY_TABLE="${GRAPH_ENTRY_TABLE:-public.gutenberg_gptoss_sh_graph_entries
 GRAPH_EF_SEARCH="${GRAPH_EF_SEARCH:-256}"
 GRAPH_RERANK_TOPK="${GRAPH_RERANK_TOPK:-0}"
 GRAPH_SKIP="${GRAPH_SKIP:-0}"
+
+HNSW_CACHED_SKIP="${HNSW_CACHED_SKIP:-0}"
+HNSW_PREFIX="${HNSW_PREFIX:-public.gutenberg_gptoss_sh_hnsw}"
+HNSW_CACHED_EF_LATENCY="${HNSW_CACHED_EF_LATENCY:-64}"
+HNSW_CACHED_EF_QUALITY="${HNSW_CACHED_EF_QUALITY:-96}"
 
 if ! [[ "$QUERY_LIMIT" =~ ^[0-9]+$ ]] || [ "$QUERY_LIMIT" -lt 1 ]; then
   echo "QUERY_LIMIT must be >= 1" >&2
@@ -333,6 +341,7 @@ echo "HNSW ef: ${HNSW_EF_SEARCH}"
 echo "IVF-PQ:  nprobe=${NPROBE}, rerank_topk=${RERANK_TOPK}, cb_id=${CB_ID}, ivf_cb_id=${IVF_CB_ID}"
 echo "Sketch:  table=${SKETCH_TABLE}, sketch_topk=${SKETCH_TOPK}"
 echo "Graph:   table=${GRAPH_TABLE}, entry=${GRAPH_ENTRY_TABLE}, ef=${GRAPH_EF_SEARCH}, rerank=${GRAPH_RERANK_TOPK}, skip=${GRAPH_SKIP}"
+echo "HNSWcache: prefix=${HNSW_PREFIX}, ef_latency=${HNSW_CACHED_EF_LATENCY}, ef_quality=${HNSW_CACHED_EF_QUALITY}, skip=${HNSW_CACHED_SKIP}"
 echo ""
 
 POD_PSQL -c "SELECT extname, extversion FROM pg_extension WHERE extname IN ('pg_sorted_heap','vector') ORDER BY 1;"
@@ -350,6 +359,15 @@ if [ "$GRAPH_SKIP" != "1" ]; then
     echo "Graph table '${GRAPH_TABLE}' not found — skipping graph scan." >&2
     echo "(Run build_graph.py against the pod first; see script header for the command.)" >&2
     GRAPH_SKIP=1
+  fi
+fi
+
+if [ "$HNSW_CACHED_SKIP" != "1" ]; then
+  hnsw_cached_exists="$(POD_PSQL -c "SELECT to_regclass('${HNSW_PREFIX}_meta') IS NOT NULL;" | tr -d ' \r\n')"
+  if [ "$hnsw_cached_exists" != "t" ]; then
+    echo "Cached HNSW prefix '${HNSW_PREFIX}' not found — skipping." >&2
+    echo "(Run svec_hnsw_build against the pod first to populate the sidecar tables.)" >&2
+    HNSW_CACHED_SKIP=1
   fi
 fi
 
@@ -418,6 +436,112 @@ echo "------------------------------------------------------------"
   summarize_method "ivfpq_sketch"
   [ "$GRAPH_SKIP" != "1" ] && summarize_method "graph"
 } | column -t -s $'\t'
+
+if [ "$HNSW_CACHED_SKIP" != "1" ]; then
+  echo ""
+  echo "Cached HNSW (hierarchical, session-warm L0+upper cache)"
+  echo "------------------------------------------------------------"
+  echo "NOTE: recall% here is against the same brute-force halfvec GT used by all"
+  echo "      methods in this harness (seqscan on ${HNSW_TABLE}).  It is NOT against"
+  echo "      full-svec exact GT.  Results are directly comparable across methods"
+  echo "      within this script, but do not conflate with full-vector exact recall."
+  # All statements run in one psql session so the backend-local L0/upper caches
+  # built during warmup persist for the entire benchmark loop.
+  kubectl exec -i -n "$NAMESPACE" "$POD" -- \
+    psql -U "$DBUSER" -d "$DATABASE" -v ON_ERROR_STOP=1 <<SQL
+
+SET sorted_heap.hnsw_cache_l0 = on;
+CREATE TEMP TABLE _hnsw_bench (method text, latency_ms float8, recall int);
+
+-- Warmup: prime L0 and upper-level caches before timing
+SELECT id
+FROM ${EXT_SCHEMA}.svec_hnsw_scan(
+    '${SH_TABLE}'::regclass,
+    (SELECT ${QUERY_VEC_COL} FROM ${QUERY_TABLE} ORDER BY ${QUERY_ID_COL} LIMIT 1),
+    '${HNSW_PREFIX}', ${HNSW_CACHED_EF_LATENCY}, ${K}, 0)
+LIMIT 1;
+
+DO \$\$
+DECLARE
+    qrec       RECORD;
+    t0         timestamptz;
+    elapsed_ms float8;
+    result_ids text[];
+    truth_ids  text[];
+    hits       int;
+BEGIN
+    FOR qrec IN
+        SELECT ${QUERY_ID_COL} AS qid, ${QUERY_VEC_COL} AS qvec
+        FROM ${QUERY_TABLE}
+        ORDER BY ${QUERY_ID_COL}
+        LIMIT ${QUERY_LIMIT}
+    LOOP
+        -- Ground truth: brute-force halfvec seqscan on the pgvector table.
+        -- Same GT used by all methods in this harness (hnsw, ivfpq, graph).
+        -- Recall is therefore directly comparable across methods but is NOT
+        -- full-svec exact recall (halfvec is 16-bit quantised; distances may
+        -- differ from svec float32 by a small rounding error).
+        PERFORM set_config('enable_indexscan',     'off', true);
+        PERFORM set_config('enable_bitmapscan',    'off', true);
+        PERFORM set_config('enable_indexonlyscan', 'off', true);
+
+        SELECT array_agg(id ORDER BY rn) INTO truth_ids
+        FROM (
+            SELECT id,
+                   row_number() OVER (ORDER BY embedding <=> qrec.qvec::text::halfvec) AS rn
+            FROM ${HNSW_TABLE}
+            LIMIT ${K}
+        ) s;
+
+        PERFORM set_config('enable_indexscan',     'on', true);
+        PERFORM set_config('enable_bitmapscan',    'on', true);
+        PERFORM set_config('enable_indexonlyscan', 'on', true);
+
+        -- Latency-first operating point (ef=${HNSW_CACHED_EF_LATENCY})
+        t0 := clock_timestamp();
+        SELECT array_agg(id) INTO result_ids
+        FROM ${EXT_SCHEMA}.svec_hnsw_scan(
+            '${SH_TABLE}'::regclass, qrec.qvec,
+            '${HNSW_PREFIX}', ${HNSW_CACHED_EF_LATENCY}, ${K}, 0);
+        elapsed_ms := extract(epoch from (clock_timestamp() - t0)) * 1000.0;
+
+        SELECT count(*) INTO hits
+        FROM unnest(result_ids) r(id)
+        WHERE r.id = ANY(truth_ids);
+
+        INSERT INTO _hnsw_bench VALUES
+            ('hnsw_cached_ef${HNSW_CACHED_EF_LATENCY}', elapsed_ms, hits);
+
+        -- Quality-first operating point (ef=${HNSW_CACHED_EF_QUALITY})
+        t0 := clock_timestamp();
+        SELECT array_agg(id) INTO result_ids
+        FROM ${EXT_SCHEMA}.svec_hnsw_scan(
+            '${SH_TABLE}'::regclass, qrec.qvec,
+            '${HNSW_PREFIX}', ${HNSW_CACHED_EF_QUALITY}, ${K}, 0);
+        elapsed_ms := extract(epoch from (clock_timestamp() - t0)) * 1000.0;
+
+        SELECT count(*) INTO hits
+        FROM unnest(result_ids) r(id)
+        WHERE r.id = ANY(truth_ids);
+
+        INSERT INTO _hnsw_bench VALUES
+            ('hnsw_cached_ef${HNSW_CACHED_EF_QUALITY}', elapsed_ms, hits);
+    END LOOP;
+END;
+\$\$ LANGUAGE plpgsql;
+
+SELECT
+    method,
+    round(percentile_cont(0.50) WITHIN GROUP (ORDER BY latency_ms)::numeric, 2) AS p50_ms,
+    round(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)::numeric, 2) AS p95_ms,
+    round(avg(latency_ms)::numeric, 2)                                           AS avg_ms,
+    round(avg(recall)::numeric * 100.0 / ${K}, 1)                               AS "recall%",
+    count(*)                                                                     AS n
+FROM _hnsw_bench
+GROUP BY method
+ORDER BY method;
+SQL
+fi
 
 echo ""
 echo "Storage"
