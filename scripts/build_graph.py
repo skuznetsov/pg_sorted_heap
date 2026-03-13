@@ -516,6 +516,11 @@ def main():
 
     print(f"\n[8/8] Writing to database...")
 
+    # csv_input mode: conn was never opened during data read
+    if args.csv_input and not args.csv_output:
+        conn = psycopg2.connect(args.dsn)
+        cur = conn.cursor()
+
     conn.set_session(autocommit=False)
 
     # Drop and recreate graph table
@@ -552,9 +557,10 @@ def main():
 
     print(f"\n  Nodes written: {n}")
 
-    # Create covering index
+    # Create covering index (strip schema from index name)
+    graph_table_name = args.graph_table.split('.')[-1]
     cur.execute(f"""
-        CREATE UNIQUE INDEX {args.graph_table}_cover
+        CREATE UNIQUE INDEX {graph_table_name}_cover
         ON {args.graph_table} (nid) INCLUDE (sketch, neighbors, src_tid)
     """)
     print("  Covering index created")

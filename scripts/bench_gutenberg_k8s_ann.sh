@@ -1,0 +1,491 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================
+# Live k8s Gutenberg ANN benchmark
+# ============================================================
+#
+# Reproducible benchmark for the live Gutenberg corpus on a Kubernetes
+# PostgreSQL pod. It compares:
+#   1. pgvector HNSW on halfvec
+#   2. sorted_heap IVF-PQ baseline
+#   3. sorted_heap IVF-PQ + sketch sidecar
+#   4. sorted_heap graph scan (svec_graph_scan) — skipped if GRAPH_SKIP=1
+#      or if the graph table does not exist
+#
+# Prerequisite for graph: build_graph.py must have been run against the pod:
+#   "$(./scripts/find_vector_python.sh)" scripts/build_graph.py \
+#     --dsn 'host=localhost port=PORT dbname=DATABASE' \
+#     --table gutenberg_gptoss_sh \
+#     --graph-table gutenberg_gptoss_sh_graph \
+#     --entry-table gutenberg_gptoss_sh_graph_entries \
+#     --bootstrap --sketch-dim 384 --M 32 --M-max 64 --n-adjacent 4 --no-prune --seed 42
+#
+# Methodology:
+#   - fixed query set from a query table
+#   - fresh brute-force ground truth for those exact queries
+#   - latency from server-side EXPLAIN Execution Time
+#   - recall@K from overlap with the fresh ground truth
+#   - normalized storage report that accounts for duplicate HNSW indexes
+#
+# Usage:
+#   ./scripts/bench_gutenberg_k8s_ann.sh [namespace] [pod] [database]
+
+NAMESPACE="${1:-default}"
+POD="${2:-pgvector-dev-1}"
+DATABASE="${3:-cogniformerus}"
+DBUSER="${DBUSER:-postgres}"
+
+EXT_SCHEMA="${EXT_SCHEMA:-public}"
+HNSW_TABLE="${HNSW_TABLE:-public.gutenberg_gptoss}"
+SH_TABLE="${SH_TABLE:-public.gutenberg_gptoss_sh}"
+SKETCH_TABLE="${SKETCH_TABLE:-public.gutenberg_gptoss_sh_sketch}"
+QUERY_TABLE="${QUERY_TABLE:-public.bench_gptoss_queries}"
+QUERY_ID_COL="${QUERY_ID_COL:-qid}"
+QUERY_VEC_COL="${QUERY_VEC_COL:-qvec}"
+
+QUERY_LIMIT="${QUERY_LIMIT:-10}"
+K="${K:-10}"
+WARMUP_RUNS="${WARMUP_RUNS:-1}"
+HNSW_EF_SEARCH="${HNSW_EF_SEARCH:-100}"
+NPROBE="${NPROBE:-10}"
+RERANK_TOPK="${RERANK_TOPK:-2000}"
+SKETCH_TOPK="${SKETCH_TOPK:-128}"
+CB_ID="${CB_ID:-7}"
+IVF_CB_ID="${IVF_CB_ID:-1}"
+PQ_COLUMN="${PQ_COLUMN:-pq_code}"
+
+GRAPH_TABLE="${GRAPH_TABLE:-public.gutenberg_gptoss_sh_graph}"
+GRAPH_ENTRY_TABLE="${GRAPH_ENTRY_TABLE:-public.gutenberg_gptoss_sh_graph_entries}"
+GRAPH_EF_SEARCH="${GRAPH_EF_SEARCH:-256}"
+GRAPH_RERANK_TOPK="${GRAPH_RERANK_TOPK:-0}"
+GRAPH_SKIP="${GRAPH_SKIP:-0}"
+
+if ! [[ "$QUERY_LIMIT" =~ ^[0-9]+$ ]] || [ "$QUERY_LIMIT" -lt 1 ]; then
+  echo "QUERY_LIMIT must be >= 1" >&2
+  exit 2
+fi
+if ! [[ "$K" =~ ^[0-9]+$ ]] || [ "$K" -lt 1 ]; then
+  echo "K must be >= 1" >&2
+  exit 2
+fi
+if ! [[ "$WARMUP_RUNS" =~ ^[0-9]+$ ]]; then
+  echo "WARMUP_RUNS must be >= 0" >&2
+  exit 2
+fi
+
+if ! command -v kubectl >/dev/null 2>&1; then
+  echo "kubectl not found" >&2
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bench_gutenberg_k8s_ann.XXXXXX")"
+RESULTS_TSV="$TMP_DIR/results.tsv"
+QUERY_TSV="$TMP_DIR/queries.tsv"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+POD_PSQL() {
+  kubectl exec -i -n "$NAMESPACE" "$POD" -- \
+    psql -U "$DBUSER" -d "$DATABASE" -v ON_ERROR_STOP=1 -Atq "$@"
+}
+
+extract_exec_ms() {
+  sed -n 's/^Execution Time: \([0-9.][0-9.]*\) ms$/\1/p' | tail -1
+}
+
+compute_recall() {
+  local truth_csv="$1"
+  local got_csv="$2"
+  local count=0
+  local id
+  declare -A truth=()
+
+  IFS=',' read -r -a truth_ids <<< "$truth_csv"
+  for id in "${truth_ids[@]}"; do
+    [ -n "$id" ] && truth["$id"]=1
+  done
+
+  IFS=',' read -r -a got_ids <<< "$got_csv"
+  for id in "${got_ids[@]}"; do
+    if [ -n "${truth[$id]:-}" ]; then
+      count=$((count + 1))
+    fi
+  done
+  echo "$count"
+}
+
+sql_hnsw_ids() {
+  local qvec="$1"
+  cat <<SQL
+BEGIN;
+SET LOCAL hnsw.ef_search = ${HNSW_EF_SEARCH};
+PREPARE q(halfvec) AS
+SELECT string_agg(id, ',' ORDER BY ord)
+FROM (
+  SELECT id, row_number() OVER () AS ord
+  FROM (
+    SELECT id
+    FROM ${HNSW_TABLE}
+    ORDER BY embedding <=> \$1
+    LIMIT ${K}
+  ) s
+) x;
+EXECUTE q('${qvec}'::halfvec);
+DEALLOCATE q;
+COMMIT;
+SQL
+}
+
+sql_hnsw_explain() {
+  local qvec="$1"
+  cat <<SQL
+BEGIN;
+SET LOCAL hnsw.ef_search = ${HNSW_EF_SEARCH};
+PREPARE q(halfvec) AS
+SELECT id
+FROM ${HNSW_TABLE}
+ORDER BY embedding <=> \$1
+LIMIT ${K};
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF) EXECUTE q('${qvec}'::halfvec);
+DEALLOCATE q;
+COMMIT;
+SQL
+}
+
+sql_ground_truth_ids() {
+  local qvec="$1"
+  cat <<SQL
+BEGIN;
+SET LOCAL enable_indexscan = off;
+SET LOCAL enable_bitmapscan = off;
+SET LOCAL enable_indexonlyscan = off;
+PREPARE q(halfvec) AS
+SELECT string_agg(id, ',' ORDER BY ord)
+FROM (
+  SELECT id, row_number() OVER () AS ord
+  FROM (
+    SELECT id
+    FROM ${HNSW_TABLE}
+    ORDER BY embedding <=> \$1
+    LIMIT ${K}
+  ) s
+) x;
+EXECUTE q('${qvec}'::halfvec);
+DEALLOCATE q;
+COMMIT;
+SQL
+}
+
+sql_ivfpq_ids() {
+  local qvec="$1"
+  cat <<SQL
+PREPARE q(${EXT_SCHEMA}.svec) AS
+SELECT string_agg(id, ',' ORDER BY ord)
+FROM (
+  SELECT id, row_number() OVER () AS ord
+  FROM ${EXT_SCHEMA}.svec_ann_scan(
+    '${SH_TABLE}'::regclass,
+    \$1,
+    ${NPROBE}, ${K}, ${RERANK_TOPK},
+    ${CB_ID}, ${IVF_CB_ID},
+    '${PQ_COLUMN}'
+  )
+) x;
+EXECUTE q('${qvec}'::${EXT_SCHEMA}.svec);
+DEALLOCATE q;
+SQL
+}
+
+sql_ivfpq_explain() {
+  local qvec="$1"
+  cat <<SQL
+PREPARE q(${EXT_SCHEMA}.svec) AS
+SELECT id
+FROM ${EXT_SCHEMA}.svec_ann_scan(
+  '${SH_TABLE}'::regclass,
+  \$1,
+  ${NPROBE}, ${K}, ${RERANK_TOPK},
+  ${CB_ID}, ${IVF_CB_ID},
+  '${PQ_COLUMN}'
+);
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF) EXECUTE q('${qvec}'::${EXT_SCHEMA}.svec);
+DEALLOCATE q;
+SQL
+}
+
+sql_ivfpq_sketch_ids() {
+  local qvec="$1"
+  cat <<SQL
+PREPARE q(${EXT_SCHEMA}.svec) AS
+SELECT string_agg(id, ',' ORDER BY ord)
+FROM (
+  SELECT id, row_number() OVER () AS ord
+  FROM ${EXT_SCHEMA}.svec_ann_scan(
+    '${SH_TABLE}'::regclass,
+    \$1,
+    ${NPROBE}, ${K}, ${RERANK_TOPK},
+    ${CB_ID}, ${IVF_CB_ID},
+    '${PQ_COLUMN}',
+    '${SKETCH_TABLE}',
+    ${SKETCH_TOPK}
+  )
+) x;
+EXECUTE q('${qvec}'::${EXT_SCHEMA}.svec);
+DEALLOCATE q;
+SQL
+}
+
+sql_ivfpq_sketch_explain() {
+  local qvec="$1"
+  cat <<SQL
+PREPARE q(${EXT_SCHEMA}.svec) AS
+SELECT id
+FROM ${EXT_SCHEMA}.svec_ann_scan(
+  '${SH_TABLE}'::regclass,
+  \$1,
+  ${NPROBE}, ${K}, ${RERANK_TOPK},
+  ${CB_ID}, ${IVF_CB_ID},
+  '${PQ_COLUMN}',
+  '${SKETCH_TABLE}',
+  ${SKETCH_TOPK}
+);
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF) EXECUTE q('${qvec}'::${EXT_SCHEMA}.svec);
+DEALLOCATE q;
+SQL
+}
+
+sql_graph_ids() {
+  local qvec="$1"
+  cat <<SQL
+PREPARE q(${EXT_SCHEMA}.svec) AS
+SELECT string_agg(id, ',' ORDER BY ord)
+FROM (
+  SELECT id, row_number() OVER () AS ord
+  FROM ${EXT_SCHEMA}.svec_graph_scan(
+    '${SH_TABLE}'::regclass,
+    \$1,
+    '${GRAPH_TABLE}',
+    ${GRAPH_EF_SEARCH}, ${K}, ${GRAPH_RERANK_TOPK},
+    '${GRAPH_ENTRY_TABLE}'
+  )
+) x;
+EXECUTE q('${qvec}'::${EXT_SCHEMA}.svec);
+DEALLOCATE q;
+SQL
+}
+
+sql_graph_explain() {
+  local qvec="$1"
+  cat <<SQL
+PREPARE q(${EXT_SCHEMA}.svec) AS
+SELECT id
+FROM ${EXT_SCHEMA}.svec_graph_scan(
+  '${SH_TABLE}'::regclass,
+  \$1,
+  '${GRAPH_TABLE}',
+  ${GRAPH_EF_SEARCH}, ${K}, ${GRAPH_RERANK_TOPK},
+  '${GRAPH_ENTRY_TABLE}'
+);
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF) EXECUTE q('${qvec}'::${EXT_SCHEMA}.svec);
+DEALLOCATE q;
+SQL
+}
+
+summarize_method() {
+  local method="$1"
+  awk -F'\t' -v m="$method" '
+    $1 == m {
+      cnt++
+      sum_ms += $3
+      sum_rec += $4
+      if (cnt == 1 || $3 < min_ms) min_ms = $3
+      if (cnt == 1 || $3 > max_ms) max_ms = $3
+    }
+    END {
+      if (cnt == 0) exit 1
+      printf "%s\t%.2f\t%.2f\t%.2f\t%.2f\n", m, sum_ms/cnt, min_ms, max_ms, sum_rec/cnt
+    }
+  ' "$RESULTS_TSV"
+}
+
+warm_method() {
+  local sql="$1"
+  local i
+
+  for ((i = 0; i < WARMUP_RUNS; i++)); do
+    printf '%s\n' "$sql" | POD_PSQL -f - >/dev/null
+  done
+}
+
+echo "============================================================"
+echo "Live Gutenberg ANN benchmark"
+echo "============================================================"
+echo "Context: $(kubectl config current-context)"
+echo "Pod:     ${NAMESPACE}/${POD}"
+echo "DB:      ${DATABASE}"
+echo "Queries: ${QUERY_LIMIT} fixed queries from ${QUERY_TABLE}"
+echo "K:       ${K}"
+echo "Warmups: ${WARMUP_RUNS} per method/query before timed run"
+echo "HNSW ef: ${HNSW_EF_SEARCH}"
+echo "IVF-PQ:  nprobe=${NPROBE}, rerank_topk=${RERANK_TOPK}, cb_id=${CB_ID}, ivf_cb_id=${IVF_CB_ID}"
+echo "Sketch:  table=${SKETCH_TABLE}, sketch_topk=${SKETCH_TOPK}"
+echo "Graph:   table=${GRAPH_TABLE}, entry=${GRAPH_ENTRY_TABLE}, ef=${GRAPH_EF_SEARCH}, rerank=${GRAPH_RERANK_TOPK}, skip=${GRAPH_SKIP}"
+echo ""
+
+POD_PSQL -c "SELECT extname, extversion FROM pg_extension WHERE extname IN ('pg_sorted_heap','vector') ORDER BY 1;"
+echo ""
+
+# Check whether graph table exists; auto-skip if absent
+if [ "$GRAPH_SKIP" != "1" ]; then
+  graph_exists="$(POD_PSQL -c "
+    SELECT count(*) FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname || '.' || c.relname = '${GRAPH_TABLE}'
+      OR c.relname = '${GRAPH_TABLE}';
+  " | tr -d ' \r\n')"
+  if [ "$graph_exists" = "0" ]; then
+    echo "Graph table '${GRAPH_TABLE}' not found — skipping graph scan." >&2
+    echo "(Run build_graph.py against the pod first; see script header for the command.)" >&2
+    GRAPH_SKIP=1
+  fi
+fi
+
+POD_PSQL -F $'\t' -c "
+SELECT ${QUERY_ID_COL}, ${QUERY_VEC_COL}::text
+FROM ${QUERY_TABLE}
+ORDER BY ${QUERY_ID_COL}
+LIMIT ${QUERY_LIMIT};
+" > "$QUERY_TSV"
+
+if [ ! -s "$QUERY_TSV" ]; then
+  echo "No queries returned from ${QUERY_TABLE}" >&2
+  exit 1
+fi
+
+echo -e "method\tqid\tlatency_ms\trecall10" > "$RESULTS_TSV"
+
+while IFS=$'\t' read -r qid qvec; do
+  echo "[query] ${qid}" >&2
+
+  truth_ids="$(sql_ground_truth_ids "$qvec" | POD_PSQL -f - | tr -d '\r')"
+  if [ -z "$truth_ids" ]; then
+    echo "Ground truth query returned no rows for ${qid}" >&2
+    exit 1
+  fi
+
+  warm_method "$(sql_hnsw_ids "$qvec")"
+  hnsw_ms="$(sql_hnsw_explain "$qvec" | POD_PSQL -f - | extract_exec_ms)"
+  hnsw_ids="$(sql_hnsw_ids "$qvec" | POD_PSQL -f - | tr -d '\r')"
+  hnsw_recall="$(compute_recall "$truth_ids" "$hnsw_ids")"
+  echo -e "hnsw\t${qid}\t${hnsw_ms}\t${hnsw_recall}" >> "$RESULTS_TSV"
+
+  warm_method "$(sql_ivfpq_ids "$qvec")"
+  ivfpq_ms="$(sql_ivfpq_explain "$qvec" | POD_PSQL -f - | extract_exec_ms)"
+  ivfpq_ids="$(sql_ivfpq_ids "$qvec" | POD_PSQL -f - | tr -d '\r')"
+  ivfpq_recall="$(compute_recall "$truth_ids" "$ivfpq_ids")"
+  echo -e "ivfpq\t${qid}\t${ivfpq_ms}\t${ivfpq_recall}" >> "$RESULTS_TSV"
+
+  warm_method "$(sql_ivfpq_sketch_ids "$qvec")"
+  ivfpq_sketch_ms="$(sql_ivfpq_sketch_explain "$qvec" | POD_PSQL -f - | extract_exec_ms)"
+  ivfpq_sketch_ids="$(sql_ivfpq_sketch_ids "$qvec" | POD_PSQL -f - | tr -d '\r')"
+  ivfpq_sketch_recall="$(compute_recall "$truth_ids" "$ivfpq_sketch_ids")"
+  echo -e "ivfpq_sketch\t${qid}\t${ivfpq_sketch_ms}\t${ivfpq_sketch_recall}" >> "$RESULTS_TSV"
+
+  if [ "$GRAPH_SKIP" != "1" ]; then
+    warm_method "$(sql_graph_ids "$qvec")"
+    graph_ms="$(sql_graph_explain "$qvec" | POD_PSQL -f - | extract_exec_ms)"
+    graph_ids="$(sql_graph_ids "$qvec" | POD_PSQL -f - | tr -d '\r')"
+    graph_recall="$(compute_recall "$truth_ids" "$graph_ids")"
+    echo -e "graph\t${qid}\t${graph_ms}\t${graph_recall}" >> "$RESULTS_TSV"
+  fi
+done < "$QUERY_TSV"
+
+echo ""
+echo "Per-query results"
+echo "------------------------------------------------------------"
+column -t -s $'\t' "$RESULTS_TSV"
+
+echo ""
+echo "Summary"
+echo "------------------------------------------------------------"
+{
+  echo -e "method\tavg_ms\tmin_ms\tmax_ms\tavg_recall10"
+  summarize_method "hnsw"
+  summarize_method "ivfpq"
+  summarize_method "ivfpq_sketch"
+  [ "$GRAPH_SKIP" != "1" ] && summarize_method "graph"
+} | column -t -s $'\t'
+
+echo ""
+echo "Storage"
+echo "------------------------------------------------------------"
+POD_PSQL -F $'\t' -c "
+WITH rels AS (
+  SELECT '${HNSW_TABLE}'::regclass AS hnsw_tbl,
+         '${SH_TABLE}'::regclass AS sh_tbl,
+         '${SKETCH_TABLE}'::regclass AS sketch_tbl,
+         to_regclass('${GRAPH_TABLE}') AS graph_tbl,
+         to_regclass('${GRAPH_ENTRY_TABLE}') AS graph_entry_tbl
+),
+hnsw_indexes AS (
+  SELECT i.indexrelid::regclass::text AS index_name,
+         pg_relation_size(i.indexrelid) AS index_bytes
+  FROM pg_index i
+  JOIN pg_class c ON c.oid = i.indexrelid
+  JOIN pg_am am ON am.oid = c.relam
+  JOIN rels r ON i.indrelid = r.hnsw_tbl
+  WHERE am.amname = 'hnsw'
+),
+pick_one_hnsw AS (
+  SELECT index_name, index_bytes
+  FROM hnsw_indexes
+  ORDER BY index_name
+  LIMIT 1
+),
+pk_index AS (
+  SELECT pg_relation_size(i.indexrelid) AS pk_bytes
+  FROM pg_index i
+  JOIN rels r ON i.indrelid = r.hnsw_tbl
+  WHERE i.indisprimary
+),
+base AS (
+  SELECT
+    pg_total_relation_size(hnsw_tbl) AS hnsw_total,
+    pg_relation_size(hnsw_tbl) AS hnsw_heap,
+    pg_indexes_size(hnsw_tbl) AS hnsw_indexes_total,
+    pg_total_relation_size(hnsw_tbl)
+      - pg_relation_size(hnsw_tbl)
+      - pg_indexes_size(hnsw_tbl) AS hnsw_toast,
+    pg_total_relation_size(sh_tbl) + pg_total_relation_size(sketch_tbl) AS sh_total,
+    CASE WHEN graph_tbl IS NOT NULL
+         THEN pg_total_relation_size(graph_tbl)
+              + COALESCE(pg_total_relation_size(graph_entry_tbl), 0)
+         ELSE NULL END AS graph_total
+  FROM rels
+)
+SELECT 'pgvector_total_current', pg_size_pretty(hnsw_total) FROM base
+UNION ALL
+SELECT 'pgvector_heap', pg_size_pretty(hnsw_heap) FROM base
+UNION ALL
+SELECT 'pgvector_toast', pg_size_pretty(hnsw_toast) FROM base
+UNION ALL
+SELECT 'pgvector_indexes_current', pg_size_pretty(hnsw_indexes_total) FROM base
+UNION ALL
+SELECT 'pgvector_hnsw_index_count', count(*)::text FROM hnsw_indexes
+UNION ALL
+SELECT 'pgvector_one_hnsw_index', pg_size_pretty(index_bytes) FROM pick_one_hnsw
+UNION ALL
+SELECT 'pgvector_total_normalized_one_hnsw',
+       pg_size_pretty((SELECT hnsw_heap + hnsw_toast FROM base)
+                      + COALESCE((SELECT pk_bytes FROM pk_index), 0)
+                      + COALESCE((SELECT index_bytes FROM pick_one_hnsw), 0))
+FROM base
+UNION ALL
+SELECT 'sorted_heap_plus_sketch_total', pg_size_pretty(sh_total) FROM base
+UNION ALL
+SELECT 'graph_total', pg_size_pretty(graph_total) FROM base WHERE graph_total IS NOT NULL
+ORDER BY 1;
+"
