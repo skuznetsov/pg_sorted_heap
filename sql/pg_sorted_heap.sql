@@ -2796,6 +2796,78 @@ SELECT svec_graph_scan('ann_test', '[5,3,6,7,1,2,4,2]'::svec,
 
 DROP TABLE ann_bad_graph, ann_no_sketch, ann_no_pk;
 
+-- ANN-15: svec_hnsw_scan with session-local L0 cache (sorted_heap.hnsw_cache_l0)
+-- Build minimal 2-level HNSW sidecar (L1 + L0) over ann_test.
+-- L0: 300 nodes, ring neighbors ±1/±2 mod 300, ctid for exact rerank.
+-- L1: 10 nodes (every 30th), ring neighbors among themselves.
+-- meta: entry_nid=0, max_level=1.
+
+CREATE TABLE ann_hnsw_meta (entry_nid int4, max_level int2);
+
+CREATE TABLE ann_hnsw_l0 (
+    nid       int4 PRIMARY KEY,
+    sketch    hsvec(8) NOT NULL,
+    neighbors int4[] NOT NULL,
+    src_id    text NOT NULL,
+    src_tid   tid NOT NULL
+);
+
+CREATE TABLE ann_hnsw_l1 (
+    nid       int4 PRIMARY KEY,
+    sketch    hsvec(8) NOT NULL,
+    neighbors int4[] NOT NULL
+);
+
+WITH numbered AS (
+    SELECT (row_number() OVER (ORDER BY id) - 1)::int4 AS nid,
+           id AS src_id, ctid AS src_tid,
+           embedding::hsvec AS sketch
+    FROM ann_test ORDER BY id
+)
+INSERT INTO ann_hnsw_l0
+SELECT nid, sketch,
+       ARRAY[((nid+1)%300), ((nid+2)%300),
+             ((nid-1+300)%300), ((nid-2+300)%300)],
+       src_id, src_tid
+FROM numbered;
+
+-- L1: 10 evenly-spaced nodes (nids 0, 30, ..., 270)
+INSERT INTO ann_hnsw_l1
+SELECT nid, sketch,
+       ARRAY[((nid/30+1)%10)*30, ((nid/30-1+10)%10)*30]
+FROM ann_hnsw_l0
+WHERE nid % 30 = 0;
+
+INSERT INTO ann_hnsw_meta VALUES (0, 1);
+
+VACUUM ann_hnsw_l0, ann_hnsw_l1;
+
+-- cache off: basic sanity check
+SET sorted_heap.hnsw_cache_l0 = off;
+SELECT count(*) AS ann15_count,
+       bool_and(distance >= 0) AS ann15_nonneg
+FROM svec_hnsw_scan('ann_test'::regclass,
+                    '[5,3,6,7,1,2,4,2]'::svec,
+                    'ann_hnsw', 16, 5, 0);
+
+-- cache on, cold (builds cache): must return identical count/nonneg
+SET sorted_heap.hnsw_cache_l0 = on;
+SELECT count(*) AS ann15_count,
+       bool_and(distance >= 0) AS ann15_nonneg
+FROM svec_hnsw_scan('ann_test'::regclass,
+                    '[5,3,6,7,1,2,4,2]'::svec,
+                    'ann_hnsw', 16, 5, 0);
+
+-- warm call (cache already resident): must return identical count/nonneg
+SELECT count(*) AS ann15_count,
+       bool_and(distance >= 0) AS ann15_nonneg
+FROM svec_hnsw_scan('ann_test'::regclass,
+                    '[5,3,6,7,1,2,4,2]'::svec,
+                    'ann_hnsw', 16, 5, 0);
+
+SET sorted_heap.hnsw_cache_l0 = off;
+DROP TABLE ann_hnsw_meta, ann_hnsw_l0, ann_hnsw_l1;
+
 -- Cleanup: drop codebook tables (have svec columns) before extension
 DROP TABLE ann_test;
 DROP TABLE IF EXISTS _ivf_centroids, _pq_codebooks, _ivf_meta, _pq_codebook_meta;
