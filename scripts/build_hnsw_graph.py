@@ -23,7 +23,8 @@ Usage:
     --dsn 'host=localhost port=15432 dbname=cogniformerus user=postgres password=postgres' \
     --source-table gutenberg_gptoss_sh_graph \
     --prefix gutenberg_gptoss_hnsw \
-    --M 16 --ef-construction 200
+    --M 16 --ef-construction 200 \
+    --sketch-dim 384
 """
 from __future__ import annotations
 
@@ -36,7 +37,7 @@ import numpy as np
 import psycopg2
 import psycopg2.extras
 
-SKETCH_DIM = 384
+DEFAULT_SKETCH_DIM = 384
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +73,8 @@ def build_faiss_hnsw(sketches: np.ndarray, M: int, ef_construction: int) -> fais
     norms = np.linalg.norm(sketches, axis=1, keepdims=True)
     vecs  = sketches / np.maximum(norms, 1e-10)
 
-    index = faiss.IndexHNSWFlat(SKETCH_DIM, M, faiss.METRIC_INNER_PRODUCT)
+    dim = sketches.shape[1]
+    index = faiss.IndexHNSWFlat(dim, M, faiss.METRIC_INNER_PRODUCT)
     index.hnsw.efConstruction = ef_construction
     index.add(vecs)
 
@@ -141,7 +143,7 @@ def extract_adjacency(index: faiss.IndexHNSWFlat, nids: list[int]) \
 # Write to PostgreSQL
 # ---------------------------------------------------------------------------
 
-def create_tables(cur, prefix: str, max_level: int) -> None:
+def create_tables(cur, prefix: str, max_level: int, sketch_dim: int = DEFAULT_SKETCH_DIM) -> None:
     cur.execute(f"DROP TABLE IF EXISTS {prefix}_meta CASCADE")
     cur.execute(f"""
         CREATE TABLE {prefix}_meta (
@@ -155,7 +157,7 @@ def create_tables(cur, prefix: str, max_level: int) -> None:
     cur.execute(f"""
         CREATE TABLE {prefix}_l0 (
             nid        int4    PRIMARY KEY,
-            sketch     hsvec({SKETCH_DIM}),
+            sketch     hsvec({sketch_dim}),
             neighbors  int4[],
             src_id     text,
             src_tid    tid
@@ -171,7 +173,7 @@ def create_tables(cur, prefix: str, max_level: int) -> None:
         cur.execute(f"""
             CREATE TABLE {prefix}_l{l} (
                 nid       int4    PRIMARY KEY,
-                sketch    hsvec({SKETCH_DIM}),
+                sketch    hsvec({sketch_dim}),
                 neighbors int4[]
             )
         """)
@@ -263,6 +265,8 @@ def main() -> None:
     parser.add_argument("--prefix",          default="public.gutenberg_gptoss_hnsw")
     parser.add_argument("--M",               type=int, default=16)
     parser.add_argument("--ef-construction", type=int, default=200)
+    parser.add_argument("--sketch-dim",      type=int, default=0,
+                        help="Expected sketch dimension (0 = infer from data)")
     args = parser.parse_args()
 
     conn = psycopg2.connect(args.dsn)
@@ -270,6 +274,11 @@ def main() -> None:
     cur  = conn.cursor()
 
     sketches, nids, src_ids, src_tids = load_source(cur, args.source_table)
+
+    sketch_dim = args.sketch_dim if args.sketch_dim > 0 else sketches.shape[1]
+    if sketches.shape[1] != sketch_dim:
+        parser.error(f"--sketch-dim={args.sketch_dim} but data has {sketches.shape[1]} dims")
+
     index = build_faiss_hnsw(sketches, args.M, args.ef_construction)
     entry_nid, max_level, adj = extract_adjacency(index, nids)
 
@@ -281,7 +290,7 @@ def main() -> None:
     src_ids_by_nid  = {nids[i]: src_ids[i]  for i in range(len(nids))}
     src_tids_by_nid = {nids[i]: src_tids[i] for i in range(len(nids))}
 
-    create_tables(cur, args.prefix, max_level)
+    create_tables(cur, args.prefix, max_level, sketch_dim)
     conn.commit()
 
     write_tables(

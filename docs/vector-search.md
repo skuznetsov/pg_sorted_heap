@@ -398,7 +398,11 @@ python scripts/build_hnsw_graph.py \
   --source-table my_table \
   --prefix my_table_hnsw \
   --M 16 \
-  --ef-construction 200
+  --ef-construction 200 \
+  --sketch-dim 384
+
+# Or via Make (uses bench_nomic defaults):
+make build-hnsw-bench-nomic VECTOR_BENCH_DSN='host=... dbname=...'
 ```
 
 ### Calling the function

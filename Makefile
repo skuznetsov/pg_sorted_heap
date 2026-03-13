@@ -65,6 +65,11 @@ VECTOR_GRAPH_M_MAX ?= 64
 VECTOR_GRAPH_N_ADJACENT ?= 4
 VECTOR_GRAPH_PRUNE ?= off
 VECTOR_GRAPH_SEED ?= 42
+HNSW_SOURCE_TABLE ?= $(VECTOR_GRAPH_TABLE)
+HNSW_PREFIX ?= $(VECTOR_GRAPH_MAIN_TABLE)_hnsw
+HNSW_M ?= 16
+HNSW_EF_CONSTRUCTION ?= 200
+HNSW_SKETCH_DIM ?= $(VECTOR_GRAPH_SKETCH_DIM)
 TMP_CLEAN_MIN_AGE_S ?= 0
 PLANNER_PROBE_ROWS ?= 1000,10000,50000
 PLANNER_PROBE_PORT ?= 65496
@@ -480,6 +485,16 @@ build-graph-bench-nomic:
 	  $$prune_flag \
 	  --seed $(VECTOR_GRAPH_SEED)
 
+build-hnsw-bench-nomic:
+	@PYTHON_BIN="$$(./scripts/find_vector_python.sh)" && \
+	"$$PYTHON_BIN" ./scripts/build_hnsw_graph.py \
+	  --dsn '$(VECTOR_BENCH_DSN)' \
+	  --source-table $(HNSW_SOURCE_TABLE) \
+	  --prefix $(HNSW_PREFIX) \
+	  --M $(HNSW_M) \
+	  --ef-construction $(HNSW_EF_CONSTRUCTION) \
+	  --sketch-dim $(HNSW_SKETCH_DIM)
+
 bench-nomic-ann:
 	@PYTHON_BIN="$$(./scripts/find_vector_python.sh)" && \
 	"$$PYTHON_BIN" ./scripts/bench_nomic_local_ann.py \
@@ -578,6 +593,7 @@ help:
 	@echo "  make test-alter-table TEST_ALTER_PORT=<port>"
 	@echo "  make test-graph-builder TEST_GRAPH_PORT=<port>"
 	@echo "  make build-graph-bench-nomic VECTOR_BENCH_DSN='<dsn>' VECTOR_GRAPH_TABLE=<graph_table> VECTOR_ENTRY_TABLE=<entry_table>"
+	@echo "  make build-hnsw-bench-nomic VECTOR_BENCH_DSN='<dsn>' HNSW_SOURCE_TABLE=<graph_table> HNSW_PREFIX=<prefix>"
 	@echo "  make bench-nomic-ann VECTOR_BENCH_DSN='<dsn>' VECTOR_GRAPH_TABLE=<graph_table> VECTOR_ENTRY_TABLE=<entry_table>"
 	@echo "  make bench BENCH_PORT=<port> BENCH_SCALES=<comma-separated>"
 	@echo "  make policy-lint-strict"
