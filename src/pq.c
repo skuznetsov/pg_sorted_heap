@@ -104,6 +104,10 @@ typedef struct
 
 static HnswL0Cache *hnsw_l0_cache = NULL;
 
+/* Upper-level caches: index i holds L{i+1} (0=L1, 1=L2, ...) */
+#define HNSW_MAX_UPPER_LEVELS 8
+static HnswL0Cache *hnsw_upper_caches[HNSW_MAX_UPPER_LEVELS];
+
 static void
 evict_hnsw_l0_cache(void)
 {
@@ -115,16 +119,28 @@ evict_hnsw_l0_cache(void)
 
 /*
  * sorted_heap_hnsw_relcache_invalidate — called from the relcache callback.
- * Evicts the L0 cache if the invalidated relation matches the cached OID
- * or if relid is InvalidOid (global flush).
+ * Evicts L0 and upper-level caches whose l0_rel_oid matches relid,
+ * or all caches on InvalidOid (global flush).
  */
 void
 sorted_heap_hnsw_relcache_invalidate(Oid relid)
 {
-	if (hnsw_l0_cache == NULL)
-		return;
-	if (!OidIsValid(relid) || relid == hnsw_l0_cache->l0_rel_oid)
+	int	i;
+
+	if (hnsw_l0_cache != NULL &&
+		(!OidIsValid(relid) || relid == hnsw_l0_cache->l0_rel_oid))
 		evict_hnsw_l0_cache();
+
+	for (i = 0; i < HNSW_MAX_UPPER_LEVELS; i++)
+	{
+		if (hnsw_upper_caches[i] != NULL &&
+			(!OidIsValid(relid) ||
+			 relid == hnsw_upper_caches[i]->l0_rel_oid))
+		{
+			MemoryContextDelete(hnsw_upper_caches[i]->mctx);
+			hnsw_upper_caches[i] = NULL;
+		}
+	}
 }
 
 static HnswL0Cache *
@@ -5517,9 +5533,34 @@ svec_hnsw_scan(PG_FUNCTION_ARGS)
 		tblname = psprintf("%s_l%d", prefix, l);
 		hnsw_open_level(&ul, tblname, snapshot);
 
-		ep_arr[0] = ep;
-		res_sz = hnsw_search_level(&ul, query->x, query->dim,
-								   ep_arr, 1, 1, ul_res, &n_vis, NULL);
+		/* Upper-level cache: slot index = l-1 (L1→0, L2→1, …) */
+		{
+			const HnswL0Cache *ul_cache = NULL;
+			int	cidx = l - 1;
+
+			if (sorted_heap_hnsw_cache_l0 && cidx < HNSW_MAX_UPPER_LEVELS)
+			{
+				Oid ul_oid = RelationGetRelid(ul.rel);
+
+				if (hnsw_upper_caches[cidx] == NULL ||
+					hnsw_upper_caches[cidx]->l0_rel_oid != ul_oid)
+				{
+					if (hnsw_upper_caches[cidx] != NULL)
+					{
+						MemoryContextDelete(hnsw_upper_caches[cidx]->mctx);
+						hnsw_upper_caches[cidx] = NULL;
+					}
+					hnsw_upper_caches[cidx] =
+						build_hnsw_l0_cache(ul.rel, ul_oid, snapshot);
+				}
+				ul_cache = hnsw_upper_caches[cidx];
+			}
+
+			ep_arr[0] = ep;
+			res_sz = hnsw_search_level(&ul, query->x, query->dim,
+									   ep_arr, 1, 1, ul_res, &n_vis,
+									   ul_cache);
+		}
 		n_visited_upper += n_vis;
 
 		if (res_sz > 0)
