@@ -2867,6 +2867,31 @@ FROM svec_hnsw_scan('ann_test'::regclass,
 
 SET sorted_heap.hnsw_cache_l0 = off;
 
+-- ANN-15b: bit-identical distance proof across cache states.
+-- Three queries (off / on-cold / on-warm) must produce identical sorted distances.
+SET sorted_heap.hnsw_cache_l0 = off;
+SELECT round(distance::numeric, 6) AS ann15b_dist
+FROM svec_hnsw_scan('ann_test'::regclass,
+                    '[5,3,6,7,1,2,4,2]'::svec,
+                    'ann_hnsw', 16, 5, 0)
+ORDER BY distance;
+
+SET sorted_heap.hnsw_cache_l0 = on;
+SELECT round(distance::numeric, 6) AS ann15b_dist
+FROM svec_hnsw_scan('ann_test'::regclass,
+                    '[5,3,6,7,1,2,4,2]'::svec,
+                    'ann_hnsw', 16, 5, 0)
+ORDER BY distance;
+
+-- warm (cache resident):
+SELECT round(distance::numeric, 6) AS ann15b_dist
+FROM svec_hnsw_scan('ann_test'::regclass,
+                    '[5,3,6,7,1,2,4,2]'::svec,
+                    'ann_hnsw', 16, 5, 0)
+ORDER BY distance;
+
+SET sorted_heap.hnsw_cache_l0 = off;
+
 -- ANN-16: svec_hnsw_scan with _r1 dense rerank sidecar (rerank1_topk > 0)
 -- Reuses the ann_hnsw_* tables from ANN-15 (still in scope here).
 -- _r1 carries hsvec(8) rerank vectors (same dim as ann_test embeddings).
@@ -2904,6 +2929,46 @@ SELECT count(*) AS ann17_count,
 FROM svec_hnsw_scan('ann_test'::regclass,
                     '[5,3,6,7,1,2,4,2]'::svec,
                     'ann_hnsw', 16, 5, 0, 5);
+
+-- ANN-18: relcache invalidation — cache must not serve stale data after DDL.
+-- Warm the L0 cache, then DROP+recreate ann_hnsw_l0 with identical data.
+-- The OID-mismatch path must evict the stale cache and rebuild cleanly.
+SET sorted_heap.hnsw_cache_l0 = on;
+SELECT count(*) AS ann18_warmup
+FROM svec_hnsw_scan('ann_test'::regclass,
+                    '[5,3,6,7,1,2,4,2]'::svec,
+                    'ann_hnsw', 16, 5, 0);
+
+DROP TABLE ann_hnsw_l0;
+CREATE TABLE ann_hnsw_l0 (
+    nid       int4 PRIMARY KEY,
+    sketch    hsvec(8) NOT NULL,
+    neighbors int4[] NOT NULL,
+    src_id    text NOT NULL,
+    src_tid   tid NOT NULL
+);
+WITH numbered AS (
+    SELECT (row_number() OVER (ORDER BY id) - 1)::int4 AS nid,
+           id AS src_id, ctid AS src_tid,
+           embedding::hsvec AS sketch
+    FROM ann_test ORDER BY id
+)
+INSERT INTO ann_hnsw_l0
+SELECT nid, sketch,
+       ARRAY[((nid+1)%300), ((nid+2)%300),
+             ((nid-1+300)%300), ((nid-2+300)%300)],
+       src_id, src_tid
+FROM numbered;
+VACUUM ann_hnsw_l0;
+
+-- Scan must rebuild cache for the new OID: no crash, correct results.
+SELECT count(*) AS ann18_count,
+       bool_and(distance >= 0) AS ann18_nonneg
+FROM svec_hnsw_scan('ann_test'::regclass,
+                    '[5,3,6,7,1,2,4,2]'::svec,
+                    'ann_hnsw', 16, 5, 0);
+
+SET sorted_heap.hnsw_cache_l0 = off;
 
 DROP TABLE ann_hnsw_meta, ann_hnsw_l0, ann_hnsw_l1;
 
