@@ -187,5 +187,6 @@ typedef struct SortedHeapSharedStats
 extern bool sorted_heap_enable_scan_pruning;
 extern bool sorted_heap_vacuum_rebuild_zonemap;
 extern bool sorted_heap_ann_timing;
+extern bool sorted_heap_hnsw_cache_l0;
 
 #endif							/* SORTED_HEAP_H */

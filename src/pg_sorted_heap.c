@@ -1549,6 +1549,18 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("sorted_heap.hnsw_cache_l0",
+							 "Cache HNSW L0 nodes in session memory to "
+							 "eliminate per-node btree overhead. "
+							 "Uses ~908 bytes per node (86 MB for 103K nodes). "
+							 "Immutable sidecar tables only; no in-place update detection.",
+							 NULL,
+							 &sorted_heap_hnsw_cache_l0,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("sorted_heap");
 
 	CacheRegisterRelcacheCallback(pg_sorted_heap_relcache_callback, (Datum) 0);

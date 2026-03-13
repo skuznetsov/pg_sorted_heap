@@ -62,6 +62,194 @@
 /* GUC: log svec_ann_scan phase timing via DEBUG1 */
 bool sorted_heap_ann_timing = false;
 
+/* GUC: session-local L0 node cache for svec_hnsw_scan */
+bool sorted_heap_hnsw_cache_l0 = false;
+
+/* ----------------------------------------------------------------
+ *  HNSW L0 backend-local node cache
+ *
+ *  Eliminates per-node btree index_rescan overhead during L0 beam
+ *  search by loading all L0 nodes into a palloc'd array in a
+ *  dedicated MemoryContext.  One cache slot per backend; keyed by
+ *  l0 relation OID.  Opt-in via sorted_heap.hnsw_cache_l0 = on.
+ *
+ *  HNSW_CACHE_SKETCH_DIM must match build_hnsw_graph.py SKETCH_DIM.
+ *  HNSW_CACHE_MAX_NBRS   must be >= faiss Mmax0 (= 2*M for L0).
+ * ---------------------------------------------------------------- */
+#define HNSW_CACHE_SKETCH_DIM  384
+#define HNSW_CACHE_MAX_NBRS     32
+
+typedef struct
+{
+	int16			sketch[HNSW_CACHE_SKETCH_DIM]; /* hsvec float16  768 B */
+	int32			nbrs[HNSW_CACHE_MAX_NBRS];	   /* neighbors       128 B */
+	int8			nbr_count;					   /* actual count      1 B */
+	int8			_pad[5];					   /* alignment pad     5 B */
+	ItemPointerData src_tid;					   /* heap TID          6 B */
+	/* total: 908 bytes */
+} HnswL0CacheNode;
+
+typedef struct
+{
+	MemoryContext	 mctx;			/* child of TopMemoryContext */
+	Oid				 l0_rel_oid;	/* relation OID — invalidation key */
+	int32			 n_nodes;		/* node count loaded */
+	int32			 alloc_nids;	/* allocated slots (nodes[0..alloc-1]) */
+	int32			 max_nid;		/* maximum nid seen during build */
+	HnswL0CacheNode *nodes;			/* direct-indexed by nid */
+	int64			 cache_bytes;
+	double			 build_ms;		/* wall-clock build time */
+	int64			 use_count;		/* warm queries served */
+} HnswL0Cache;
+
+static HnswL0Cache *hnsw_l0_cache = NULL;
+
+static void
+evict_hnsw_l0_cache(void)
+{
+	if (hnsw_l0_cache == NULL)
+		return;
+	MemoryContextDelete(hnsw_l0_cache->mctx);	/* frees cache + nodes */
+	hnsw_l0_cache = NULL;
+}
+
+static HnswL0Cache *
+build_hnsw_l0_cache(Relation l0_rel, Oid l0_oid, Snapshot snap)
+{
+	instr_time		 t0, t1;
+	MemoryContext	 mctx, old_ctx;
+	HnswL0Cache		*cache;
+	HnswL0CacheNode *nodes;
+	TableScanDesc	 scan;
+	TupleTableSlot	*slot;
+	AttrNumber		 att_nid, att_sketch, att_nbrs, att_src_tid;
+	int32			 alloc_nids;
+	int32			 max_nid = -1;
+
+	INSTR_TIME_SET_CURRENT(t0);
+
+	/* Allocate cache + nodes array in a dedicated long-lived context */
+	mctx = AllocSetContextCreate(TopMemoryContext,
+								 "HnswL0Cache",
+								 ALLOCSET_DEFAULT_SIZES);
+	old_ctx = MemoryContextSwitchTo(mctx);
+
+	cache = (HnswL0Cache *) palloc0(sizeof(HnswL0Cache));
+	cache->mctx		  = mctx;
+	cache->l0_rel_oid = l0_oid;
+
+	alloc_nids = (int32)(l0_rel->rd_rel->reltuples * 1.05) + 2048;
+	if (alloc_nids < 65536)
+		alloc_nids = 65536;
+	nodes			  = (HnswL0CacheNode *)
+		palloc0((Size) alloc_nids * sizeof(HnswL0CacheNode));
+	cache->nodes	  = nodes;
+	cache->alloc_nids = alloc_nids;
+	cache->cache_bytes = (int64) alloc_nids * sizeof(HnswL0CacheNode);
+
+	MemoryContextSwitchTo(old_ctx);	/* temp datum allocs in caller ctx */
+
+	att_nid		= get_attnum(l0_oid, "nid");
+	att_sketch	= get_attnum(l0_oid, "sketch");
+	att_nbrs	= get_attnum(l0_oid, "neighbors");
+	att_src_tid = get_attnum(l0_oid, "src_tid");	/* InvalidAttrNumber if absent */
+
+	slot = table_slot_create(l0_rel, NULL);
+	scan = table_beginscan(l0_rel, snap, 0, NULL);
+
+	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+	{
+		bool			 isnull;
+		int32			 nid;
+		HnswL0CacheNode *cn;
+
+		nid = DatumGetInt32(slot_getattr(slot, att_nid, &isnull));
+		if (isnull || nid < 0)
+		{
+			ExecClearTuple(slot);
+			continue;
+		}
+
+		/* Expand nodes array if nid exceeds current allocation */
+		if (nid >= cache->alloc_nids)
+		{
+			int32		 new_alloc = Max(nid + 2048, cache->alloc_nids * 2);
+			MemoryContext save = MemoryContextSwitchTo(mctx);
+
+			nodes = (HnswL0CacheNode *)
+				repalloc(cache->nodes,
+						 (Size) new_alloc * sizeof(HnswL0CacheNode));
+			memset(nodes + cache->alloc_nids, 0,
+				   (Size)(new_alloc - cache->alloc_nids) *
+				   sizeof(HnswL0CacheNode));
+			MemoryContextSwitchTo(save);
+			cache->nodes	   = nodes;
+			cache->alloc_nids  = new_alloc;
+			cache->cache_bytes = (int64) new_alloc * sizeof(HnswL0CacheNode);
+		}
+
+		cn = &cache->nodes[nid];
+		if (nid > max_nid)
+			max_nid = nid;
+		cache->n_nodes++;
+
+		/* sketch */
+		{
+			Datum  sk_d = slot_getattr(slot, att_sketch, &isnull);
+
+			if (!isnull)
+			{
+				Hsvec  *sk	 = (Hsvec *) PG_DETOAST_DATUM(sk_d);
+				int		cdim = Min(sk->dim, HNSW_CACHE_SKETCH_DIM);
+
+				memcpy(cn->sketch, sk->x, (Size) cdim * sizeof(int16));
+				if (sk != (Hsvec *) DatumGetPointer(sk_d))
+					pfree(sk);
+			}
+		}
+
+		/* neighbors */
+		{
+			Datum	   nbrs_d = slot_getattr(slot, att_nbrs, &isnull);
+
+			if (!isnull)
+			{
+				ArrayType *arr  = DatumGetArrayTypeP(nbrs_d);
+				int32	  *nbrs = (int32 *) ARR_DATA_PTR(arr);
+				int		   cnt  = Min(
+					ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr)),
+					HNSW_CACHE_MAX_NBRS);
+
+				memcpy(cn->nbrs, nbrs, (Size) cnt * sizeof(int32));
+				cn->nbr_count = (int8) cnt;
+				if (arr != (ArrayType *) DatumGetPointer(nbrs_d))
+					pfree(arr);
+			}
+		}
+
+		/* src_tid (L0 only; InvalidAttrNumber for upper levels) */
+		if (att_src_tid != InvalidAttrNumber)
+		{
+			Datum tid_d = slot_getattr(slot, att_src_tid, &isnull);
+
+			if (!isnull)
+				ItemPointerCopy(DatumGetItemPointer(tid_d), &cn->src_tid);
+		}
+
+		ExecClearTuple(slot);
+	}
+
+	table_endscan(scan);
+	ExecDropSingleTupleTableSlot(slot);
+
+	cache->max_nid = max_nid;
+	INSTR_TIME_SET_CURRENT(t1);
+	cache->build_ms = INSTR_TIME_GET_MILLISEC(t1) -
+		INSTR_TIME_GET_MILLISEC(t0);
+
+	return cache;
+}
+
 /* ----------------------------------------------------------------
  *  Return the quoted schema name of the pg_sorted_heap extension.
  *  Used to schema-qualify internal metadata tables (_pq_*, _ivf_*).
@@ -4616,6 +4804,1068 @@ svec_graph_scan(PG_FUNCTION_ARGS)
 			 INSTR_TIME_GET_MILLISEC(t_start),
 			 n_visited, n_explored, res_size, sketch_dim,
 			 n_point_probes, n_range_runs, n_range_nodes);
+	}
+
+	return (Datum) 0;
+}
+
+/* ================================================================
+ *  svec_hnsw_scan: hierarchical HNSW search via PG sidecar tables
+ *
+ *  svec_hnsw_scan(tbl regclass, query svec, prefix text,
+ *                 ef_search int4 DEFAULT 64,
+ *                 lim int4 DEFAULT 10,
+ *                 rerank_topk int4 DEFAULT 0)
+ *  RETURNS TABLE(id text, distance float8)
+ *
+ *  Top-down HNSW search on sidecar tables built by build_hnsw_graph.py:
+ *    {prefix}_meta   (entry_nid int4, max_level int2)
+ *    {prefix}_l0     (nid int4 PK, sketch hsvec, neighbors int4[],
+ *                    src_id text, src_tid tid)
+ *    {prefix}_l1..lN (nid int4 PK, sketch hsvec, neighbors int4[])
+ *
+ *  Algorithm:
+ *    1. Read entry_nid, max_level from {prefix}_meta
+ *    2. For l = max_level..1: greedy ef=1 descent
+ *    3. At L0: beam search with ef_search candidates
+ *    4. Exact rerank via main table (same pattern as svec_graph_scan)
+ * ================================================================ */
+
+/* One open HNSW level table + its covering index + reusable scan state */
+typedef struct HnswLevelTag
+{
+	Relation		rel;
+	Relation		idx;		/* covering (IOS) or PK */
+	bool			use_ios;
+	TupleTableSlot *slot;
+	Snapshot		snap;
+	Oid				pk_oid;		/* original PK oid (for rerank after IOS) */
+	AttrNumber		att_nid;
+	AttrNumber		att_sketch;
+	AttrNumber		att_nbrs;
+	AttrNumber		att_src_id;		/* InvalidAttrNumber for L1+ */
+	AttrNumber		att_src_tid;	/* InvalidAttrNumber for L1+ */
+	/* 1-based index attribute positions (0 = not present) */
+	int				ios_att_sketch;
+	int				ios_att_nbrs;
+	int				ios_att_src_tid;
+	RegProcedure	eq_op;
+	IndexScanDesc	iscan;
+	ScanKeyData		skey[1];
+} HnswLevel;
+
+/*
+ * Like find_covering_graph_index but accepts non-unique indexes.
+ * Needed because build_hnsw_graph.py creates non-unique covering indexes.
+ */
+static Oid
+find_covering_hnsw_index(Relation rel, AttrNumber pk_att,
+						 AttrNumber att_sketch, AttrNumber att_nbrs)
+{
+	List	   *indexlist;
+	ListCell   *lc;
+
+	indexlist = RelationGetIndexList(rel);
+
+	foreach(lc, indexlist)
+	{
+		Oid			idx_oid = lfirst_oid(lc);
+		Relation	idx;
+		Form_pg_index idx_form;
+		int			nkeyatts, natts;
+
+		idx      = index_open(idx_oid, AccessShareLock);
+		idx_form = idx->rd_index;
+
+		/* Must be btree, valid, ready */
+		if (idx->rd_rel->relam != BTREE_AM_OID ||
+			!idx_form->indisvalid ||
+			!idx_form->indisready)
+		{
+			index_close(idx, AccessShareLock);
+			continue;
+		}
+
+		nkeyatts = idx_form->indnkeyatts;
+		natts    = idx_form->indnatts;
+
+		/* 1 key column = pk_att, + at least 2 INCLUDE columns */
+		if (nkeyatts != 1 || natts < 3 ||
+			idx_form->indkey.values[0] != pk_att)
+		{
+			index_close(idx, AccessShareLock);
+			continue;
+		}
+
+		{
+			bool	has_sketch = false;
+			bool	has_nbrs   = false;
+			int		i;
+
+			for (i = nkeyatts; i < natts; i++)
+			{
+				AttrNumber a = idx_form->indkey.values[i];
+
+				if (a == att_sketch)
+					has_sketch = true;
+				else if (a == att_nbrs)
+					has_nbrs = true;
+			}
+
+			if (has_sketch && has_nbrs)
+			{
+				Oid result = idx_oid;
+
+				index_close(idx, AccessShareLock);
+				list_free(indexlist);
+				return result;
+			}
+		}
+
+		index_close(idx, AccessShareLock);
+	}
+
+	list_free(indexlist);
+	return InvalidOid;
+}
+
+static void
+hnsw_open_level(HnswLevel *h, const char *tblname, Snapshot snap)
+{
+	Oid			tbl_oid;
+	TupleDesc	td;
+	AttrNumber	pk_att;
+	Oid			pk_typid, oc, of;
+	Relation	pk_tmp;
+	Oid			cover_oid;
+
+	tbl_oid = DatumGetObjectId(
+		DirectFunctionCall1(regclassin, CStringGetDatum(tblname)));
+
+	h->rel    = table_open(tbl_oid, AccessShareLock);
+	td        = RelationGetDescr(h->rel);
+	h->slot   = table_slot_create(h->rel, NULL);
+	h->snap   = snap;
+	h->use_ios         = false;
+	h->ios_att_sketch  = 0;
+	h->ios_att_nbrs    = 0;
+	h->ios_att_src_tid = 0;
+
+	h->att_nid    = get_attnum(tbl_oid, "nid");
+	h->att_sketch = get_attnum(tbl_oid, "sketch");
+	h->att_nbrs   = get_attnum(tbl_oid, "neighbors");
+	h->att_src_id  = get_attnum(tbl_oid, "src_id");
+	h->att_src_tid = get_attnum(tbl_oid, "src_tid");
+
+	if (h->att_sketch == InvalidAttrNumber ||
+		h->att_nbrs == InvalidAttrNumber)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("svec_hnsw_scan: table \"%s\" must have "
+						"\"sketch\" (hsvec) and \"neighbors\" (int4[]) "
+						"columns", tblname)));
+
+	if (!h->rel->rd_indexvalid)
+		RelationGetIndexList(h->rel);
+	h->pk_oid = h->rel->rd_pkindex;
+	if (!OidIsValid(h->pk_oid))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("svec_hnsw_scan: table \"%s\" has no primary key",
+						tblname)));
+
+	pk_tmp   = index_open(h->pk_oid, AccessShareLock);
+	pk_att   = pk_tmp->rd_index->indkey.values[0];
+	pk_typid = TupleDescAttr(td, pk_att - 1)->atttypid;
+	oc = GetDefaultOpClass(pk_typid, BTREE_AM_OID);
+	of = get_opclass_family(oc);
+	h->eq_op = get_opcode(
+		get_opfamily_member(of, pk_typid, pk_typid,
+							BTEqualStrategyNumber));
+
+	cover_oid = find_covering_hnsw_index(h->rel, pk_att,
+										 h->att_sketch, h->att_nbrs);
+	if (OidIsValid(cover_oid))
+	{
+		Form_pg_index	ci;
+		int				i;
+
+		index_close(pk_tmp, AccessShareLock);
+		h->idx     = index_open(cover_oid, AccessShareLock);
+		h->use_ios = true;
+		ci = h->idx->rd_index;
+		for (i = 0; i < ci->indnatts; i++)
+		{
+			AttrNumber a = ci->indkey.values[i];
+
+			if (a == h->att_sketch)
+				h->ios_att_sketch = i + 1;
+			else if (a == h->att_nbrs)
+				h->ios_att_nbrs = i + 1;
+			else if (h->att_src_tid != InvalidAttrNumber &&
+					 a == h->att_src_tid)
+				h->ios_att_src_tid = i + 1;
+		}
+	}
+	else
+		h->idx = pk_tmp;
+
+#if PG_VERSION_NUM < 180000
+	h->iscan = index_beginscan(h->rel, h->idx, snap, 1, 0);
+#else
+	h->iscan = index_beginscan(h->rel, h->idx, snap, NULL, 1, 0);
+#endif
+	if (h->use_ios)
+		h->iscan->xs_want_itup = true;
+}
+
+static void
+hnsw_close_level(HnswLevel *h)
+{
+	index_endscan(h->iscan);
+	ExecDropSingleTupleTableSlot(h->slot);
+	index_close(h->idx, AccessShareLock);
+	table_close(h->rel, AccessShareLock);
+}
+
+/*
+ * Beam search on one HNSW level.
+ *
+ * entry_nids[0..n_entries-1]: starting nodes.
+ * ef: beam width (1 for greedy upper-level descent, ef_search for L0).
+ * res_out: pre-allocated array of size ef+1.
+ *
+ * Returns number of results in res_out, sorted ascending by distance.
+ */
+static int
+hnsw_search_level(HnswLevel *h,
+				  const float *qx, int qdim,
+				  int32 *entry_nids, int n_entries, int ef,
+				  GraphEntry *res_out,
+				  int *n_visited_out,
+				  const HnswL0Cache *l0_cache)	/* NULL for upper levels */
+{
+	GraphEntry *candidates;
+	int			cand_size = 0;
+	int			cand_cap;
+	int			res_size  = 0;
+	bool	   *visited;
+	int			visited_cap;
+	int			n_visited = 0;
+	int			i;
+
+	cand_cap    = Max(ef * 32, 4096);
+	candidates  = palloc(sizeof(GraphEntry) * cand_cap);
+	visited_cap = Max((int) h->rel->rd_rel->reltuples + 1024, 65536);
+	visited     = palloc0(sizeof(bool) * visited_cap);
+
+	/* ---- Seed from entry points ---- */
+	for (i = 0; i < n_entries; i++)
+	{
+		int32		ep = entry_nids[i];
+		float8		d;
+
+		if (ep < 0)
+			continue;
+
+		if (ep >= visited_cap)
+		{
+			int	new_cap = Max(visited_cap * 2, ep + 1024);
+
+			visited = repalloc(visited, sizeof(bool) * new_cap);
+			memset(visited + visited_cap, 0,
+				   sizeof(bool) * (new_cap - visited_cap));
+			visited_cap = new_cap;
+		}
+		if (visited[ep])
+			continue;
+		visited[ep] = true;
+		n_visited++;
+
+		if (l0_cache != NULL && ep <= l0_cache->max_nid)
+		{
+			/* Cache fast path: no btree probe */
+			const HnswL0CacheNode *cn = &l0_cache->nodes[ep];
+
+			d = cosine_distance_f32_f16(qx, (const half *) cn->sketch,
+										Min(HNSW_CACHE_SKETCH_DIM, qdim));
+		}
+		else
+		{
+			/* Btree index path */
+			bool	isnull;
+			Datum	sk_d;
+			Hsvec  *sk;
+
+			ScanKeyInit(&h->skey[0], 1, BTEqualStrategyNumber,
+						h->eq_op, Int32GetDatum(ep));
+			index_rescan(h->iscan, h->skey, 1, NULL, 0);
+
+			if (h->use_ios)
+			{
+				ItemPointer tid = index_getnext_tid(h->iscan,
+													ForwardScanDirection);
+
+				if (tid == NULL)
+					continue;
+				sk_d = index_getattr(h->iscan->xs_itup,
+									 h->ios_att_sketch,
+									 h->iscan->xs_itupdesc, &isnull);
+			}
+			else
+			{
+				if (!index_getnext_slot(h->iscan, ForwardScanDirection,
+										h->slot))
+					continue;
+				sk_d = slot_getattr(h->slot, h->att_sketch, &isnull);
+			}
+
+			if (isnull)
+			{
+				if (!h->use_ios) ExecClearTuple(h->slot);
+				continue;
+			}
+			sk = (Hsvec *) PG_DETOAST_DATUM(sk_d);
+			d  = cosine_distance_f32_f16(qx, sk->x, Min(sk->dim, qdim));
+			if (!h->use_ios) ExecClearTuple(h->slot);
+		}
+
+		candidates[cand_size].dist = d;
+		candidates[cand_size].nid  = ep;
+		cand_size++;
+		graph_minheap_siftup(candidates, cand_size - 1);
+
+		if (res_size < ef)
+		{
+			res_out[res_size].dist = d;
+			res_out[res_size].nid  = ep;
+			res_size++;
+			graph_maxheap_siftup(res_out, res_size - 1);
+		}
+		else if (d < res_out[0].dist)
+		{
+			res_out[0].dist = d;
+			res_out[0].nid  = ep;
+			graph_maxheap_siftdown(res_out, res_size, 0);
+		}
+	}
+
+	/* ---- Main beam search loop ---- */
+	while (cand_size > 0)
+	{
+		float8		c_dist;
+		int32		c_nid;
+		float8		f_dist;
+		int			k;
+
+		c_dist = candidates[0].dist;
+		c_nid  = candidates[0].nid;
+		cand_size--;
+		if (cand_size > 0)
+		{
+			candidates[0] = candidates[cand_size];
+			graph_minheap_siftdown(candidates, cand_size, 0);
+		}
+
+		f_dist = (res_size >= ef) ? res_out[0].dist : DBL_MAX;
+		if (res_size >= ef && c_dist > f_dist)
+			break;
+
+		if (l0_cache != NULL && c_nid >= 0 && c_nid <= l0_cache->max_nid)
+		{
+			/* ---- Cache fast path: no btree probes ---- */
+			const HnswL0CacheNode *cn = &l0_cache->nodes[c_nid];
+			const int32			  *nbrs_c = cn->nbrs;
+			int					   n_nbrs_c = (int) cn->nbr_count;
+
+			for (k = 0; k < n_nbrs_c; k++)
+			{
+				int32	n_nid = nbrs_c[k];
+				float8	n_dist;
+				const HnswL0CacheNode *nn;
+
+				if (n_nid < 0)
+					continue;
+
+				if (n_nid >= visited_cap)
+				{
+					int	new_cap = Max(visited_cap * 2, n_nid + 1024);
+
+					visited = repalloc(visited, sizeof(bool) * new_cap);
+					memset(visited + visited_cap, 0,
+						   sizeof(bool) * (new_cap - visited_cap));
+					visited_cap = new_cap;
+				}
+				if (visited[n_nid])
+					continue;
+				visited[n_nid] = true;
+				n_visited++;
+
+				if (n_nid > l0_cache->max_nid)
+					continue;	/* safety: nid beyond cache */
+
+				nn	   = &l0_cache->nodes[n_nid];
+				n_dist = cosine_distance_f32_f16(qx,
+												 (const half *) nn->sketch,
+												 Min(HNSW_CACHE_SKETCH_DIM,
+													 qdim));
+
+				f_dist = (res_size >= ef) ? res_out[0].dist : DBL_MAX;
+				if (n_dist < f_dist || res_size < ef)
+				{
+					if (cand_size >= cand_cap)
+					{
+						cand_cap  *= 2;
+						candidates = repalloc(candidates,
+											  sizeof(GraphEntry) * cand_cap);
+					}
+					candidates[cand_size].dist = n_dist;
+					candidates[cand_size].nid  = n_nid;
+					cand_size++;
+					graph_minheap_siftup(candidates, cand_size - 1);
+
+					if (res_size < ef)
+					{
+						res_out[res_size].dist = n_dist;
+						res_out[res_size].nid  = n_nid;
+						res_size++;
+						graph_maxheap_siftup(res_out, res_size - 1);
+					}
+					else if (n_dist < res_out[0].dist)
+					{
+						res_out[0].dist = n_dist;
+						res_out[0].nid  = n_nid;
+						graph_maxheap_siftdown(res_out, res_size, 0);
+					}
+				}
+			}
+		}
+		else
+		{
+			/* ---- Btree index path ---- */
+			bool		isnull;
+			Datum		nbrs_d;
+			ArrayType  *nbrs_arr;
+			int32	   *nbrs;
+			int			n_nbrs;
+			int32	   *nbrs_copy;
+
+			ScanKeyInit(&h->skey[0], 1, BTEqualStrategyNumber,
+						h->eq_op, Int32GetDatum(c_nid));
+			index_rescan(h->iscan, h->skey, 1, NULL, 0);
+
+			if (h->use_ios)
+			{
+				ItemPointer tid = index_getnext_tid(h->iscan,
+													ForwardScanDirection);
+
+				if (tid == NULL)
+					continue;
+				nbrs_d = index_getattr(h->iscan->xs_itup,
+									   h->ios_att_nbrs,
+									   h->iscan->xs_itupdesc, &isnull);
+			}
+			else
+			{
+				if (!index_getnext_slot(h->iscan, ForwardScanDirection,
+										h->slot))
+					continue;
+				nbrs_d = slot_getattr(h->slot, h->att_nbrs, &isnull);
+			}
+
+			if (isnull)
+			{
+				if (!h->use_ios) ExecClearTuple(h->slot);
+				continue;
+			}
+
+			nbrs_arr  = DatumGetArrayTypeP(nbrs_d);
+			nbrs      = (int32 *) ARR_DATA_PTR(nbrs_arr);
+			n_nbrs    = ArrayGetNItems(ARR_NDIM(nbrs_arr), ARR_DIMS(nbrs_arr));
+			nbrs_copy = palloc(sizeof(int32) * n_nbrs);
+			memcpy(nbrs_copy, nbrs, sizeof(int32) * n_nbrs);
+			if (!h->use_ios) ExecClearTuple(h->slot);
+
+			for (k = 0; k < n_nbrs; k++)
+			{
+				int32	n_nid = nbrs_copy[k];
+				bool	nisnull;
+				Datum	nsk_d;
+				Hsvec  *nsk;
+				float8	n_dist;
+
+				if (n_nid < 0)
+					continue;
+
+				if (n_nid >= visited_cap)
+				{
+					int	new_cap = Max(visited_cap * 2, n_nid + 1024);
+
+					visited = repalloc(visited, sizeof(bool) * new_cap);
+					memset(visited + visited_cap, 0,
+						   sizeof(bool) * (new_cap - visited_cap));
+					visited_cap = new_cap;
+				}
+				if (visited[n_nid])
+					continue;
+				visited[n_nid] = true;
+				n_visited++;
+
+				ScanKeyInit(&h->skey[0], 1, BTEqualStrategyNumber,
+							h->eq_op, Int32GetDatum(n_nid));
+				index_rescan(h->iscan, h->skey, 1, NULL, 0);
+
+				if (h->use_ios)
+				{
+					ItemPointer tid = index_getnext_tid(h->iscan,
+														ForwardScanDirection);
+
+					if (tid == NULL)
+						continue;
+					nsk_d = index_getattr(h->iscan->xs_itup,
+										  h->ios_att_sketch,
+										  h->iscan->xs_itupdesc, &nisnull);
+				}
+				else
+				{
+					if (!index_getnext_slot(h->iscan, ForwardScanDirection,
+											h->slot))
+						continue;
+					nsk_d = slot_getattr(h->slot, h->att_sketch, &nisnull);
+				}
+
+				if (nisnull)
+				{
+					if (!h->use_ios) ExecClearTuple(h->slot);
+					continue;
+				}
+				nsk    = (Hsvec *) PG_DETOAST_DATUM(nsk_d);
+				n_dist = cosine_distance_f32_f16(qx, nsk->x,
+												 Min(nsk->dim, qdim));
+				if (!h->use_ios) ExecClearTuple(h->slot);
+
+				f_dist = (res_size >= ef) ? res_out[0].dist : DBL_MAX;
+				if (n_dist < f_dist || res_size < ef)
+				{
+					if (cand_size >= cand_cap)
+					{
+						cand_cap  *= 2;
+						candidates = repalloc(candidates,
+											  sizeof(GraphEntry) * cand_cap);
+					}
+					candidates[cand_size].dist = n_dist;
+					candidates[cand_size].nid  = n_nid;
+					cand_size++;
+					graph_minheap_siftup(candidates, cand_size - 1);
+
+					if (res_size < ef)
+					{
+						res_out[res_size].dist = n_dist;
+						res_out[res_size].nid  = n_nid;
+						res_size++;
+						graph_maxheap_siftup(res_out, res_size - 1);
+					}
+					else if (n_dist < res_out[0].dist)
+					{
+						res_out[0].dist = n_dist;
+						res_out[0].nid  = n_nid;
+						graph_maxheap_siftdown(res_out, res_size, 0);
+					}
+				}
+			}
+			pfree(nbrs_copy);
+		}
+	}
+
+	pfree(candidates);
+	pfree(visited);
+
+	/* Sort results ascending by distance */
+	qsort(res_out, res_size, sizeof(GraphEntry), cmp_graph_entry);
+
+	*n_visited_out = n_visited;
+	return res_size;
+}
+
+PG_FUNCTION_INFO_V1(svec_hnsw_scan);
+Datum
+svec_hnsw_scan(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo  *rsinfo    = (ReturnSetInfo *) fcinfo->resultinfo;
+	Oid				tbl_oid   = PG_GETARG_OID(0);
+	Svec		   *query     = PG_GETARG_SVEC_P(1);
+	char		   *prefix    = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	int				ef_search = PG_GETARG_INT32(3);
+	int				lim       = PG_GETARG_INT32(4);
+	int				rerank_topk = PG_GETARG_INT32(5);
+
+	char		   *tblname;
+	Snapshot		snapshot;
+	int32			entry_nid = 0;
+	int				max_level = 0;
+	int32			ep;
+	int				l;
+	HnswLevel		l0;
+	GraphEntry	   *l0_res;
+	int				l0_res_size = 0;
+	int				n_visited_upper = 0;
+	int				n_visited_l0 = 0;
+	int				j;
+	instr_time		t_start, t_upper, t_l0, t_rerank, t_out;
+	const HnswL0Cache *active_cache = NULL;	/* set below if GUC on */
+	double			cache_build_ms = 0.0;
+
+	/* ---- Setup ---- */
+	if (sorted_heap_ann_timing)
+		INSTR_TIME_SET_CURRENT(t_start);
+
+	if (ef_search < 1) ef_search = 1;
+	if (lim < 1) lim = 1;
+	if (ef_search < lim) ef_search = lim;
+
+	snapshot = GetActiveSnapshot();
+
+	/* ---- Read meta table ---- */
+	tblname = psprintf("%s_meta", prefix);
+	{
+		Oid				meta_oid;
+		Relation		meta_rel;
+		TableScanDesc	meta_scan;
+		TupleTableSlot *meta_slot;
+		AttrNumber		att_entry, att_maxlev;
+
+		meta_oid  = DatumGetObjectId(
+			DirectFunctionCall1(regclassin, CStringGetDatum(tblname)));
+		meta_rel  = table_open(meta_oid, AccessShareLock);
+		meta_slot = table_slot_create(meta_rel, NULL);
+		meta_scan = table_beginscan(meta_rel, snapshot, 0, NULL);
+
+		att_entry  = get_attnum(meta_oid, "entry_nid");
+		att_maxlev = get_attnum(meta_oid, "max_level");
+
+		if (table_scan_getnextslot(meta_scan, ForwardScanDirection,
+								   meta_slot))
+		{
+			bool	isnull;
+
+			entry_nid = DatumGetInt32(
+				slot_getattr(meta_slot, att_entry, &isnull));
+			max_level = (int) DatumGetInt16(
+				slot_getattr(meta_slot, att_maxlev, &isnull));
+			ExecClearTuple(meta_slot);
+		}
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_NO_DATA_FOUND),
+					 errmsg("svec_hnsw_scan: \"%s\" is empty", tblname)));
+
+		table_endscan(meta_scan);
+		ExecDropSingleTupleTableSlot(meta_slot);
+		table_close(meta_rel, AccessShareLock);
+	}
+
+	/* ---- Validation passed — init SRF and open L0 ---- */
+	InitMaterializedSRF(fcinfo, 0);
+
+	tblname = psprintf("%s_l0", prefix);
+	hnsw_open_level(&l0, tblname, snapshot);
+
+	/* ---- Session-local L0 cache (opt-in via sorted_heap.hnsw_cache_l0) ---- */
+	if (sorted_heap_hnsw_cache_l0)
+	{
+		Oid l0_oid = RelationGetRelid(l0.rel);
+
+		if (hnsw_l0_cache == NULL ||
+			hnsw_l0_cache->l0_rel_oid != l0_oid)
+		{
+			/* Cache miss or stale: evict old, build fresh */
+			evict_hnsw_l0_cache();
+			hnsw_l0_cache = build_hnsw_l0_cache(l0.rel, l0_oid, snapshot);
+		}
+		active_cache  = hnsw_l0_cache;
+		cache_build_ms = (hnsw_l0_cache->use_count == 0)
+			? hnsw_l0_cache->build_ms : 0.0;
+		hnsw_l0_cache->use_count++;
+	}
+
+	l0_res = palloc(sizeof(GraphEntry) * (ef_search + 1));
+
+	/* ---- Greedy ef=1 descent through upper levels (L_max..L1) ---- */
+	ep = entry_nid;
+	for (l = max_level; l >= 1; l--)
+	{
+		HnswLevel	ul;
+		GraphEntry	ul_res[2];	/* ef=1 → at most 1 result */
+		int32		ep_arr[1];
+		int			n_vis = 0;
+		int			res_sz;
+
+		tblname = psprintf("%s_l%d", prefix, l);
+		hnsw_open_level(&ul, tblname, snapshot);
+
+		ep_arr[0] = ep;
+		res_sz = hnsw_search_level(&ul, query->x, query->dim,
+								   ep_arr, 1, 1, ul_res, &n_vis, NULL);
+		n_visited_upper += n_vis;
+
+		if (res_sz > 0)
+			ep = ul_res[0].nid;
+
+		hnsw_close_level(&ul);
+	}
+
+	if (sorted_heap_ann_timing)
+		INSTR_TIME_SET_CURRENT(t_upper);
+
+	/* ---- Beam search at L0 ---- */
+	{
+		int32	ep_arr[1];
+		int		n_vis = 0;
+
+		ep_arr[0]   = ep;
+		l0_res_size = hnsw_search_level(&l0, query->x, query->dim,
+										ep_arr, 1, ef_search,
+										l0_res, &n_vis, active_cache);
+		n_visited_l0 = n_vis;
+	}
+
+	if (sorted_heap_ann_timing)
+		INSTR_TIME_SET_CURRENT(t_l0);
+
+	/* ---- Rerank phase ---- */
+	{
+		GraphResult	   *gresults;
+		bool			do_exact_rerank;
+		int				n_out;
+
+		gresults = palloc(sizeof(GraphResult) * l0_res_size);
+		for (j = 0; j < l0_res_size; j++)
+		{
+			gresults[j].nid      = l0_res[j].nid;
+			gresults[j].distance = l0_res[j].dist;
+			gresults[j].src_id   = NULL;
+			ItemPointerSetInvalid(&gresults[j].src_tid);
+		}
+
+		do_exact_rerank = (l0.att_src_tid != InvalidAttrNumber);
+
+		/* Sketch pre-filter: l0_res already sorted ascending */
+		if (do_exact_rerank && rerank_topk > 0 &&
+			rerank_topk < l0_res_size)
+		{
+			int	effective = Max(rerank_topk, lim);
+
+			l0_res_size = Min(effective, l0_res_size);
+		}
+
+		/* Read src_tid for all candidates */
+		if (do_exact_rerank && active_cache != NULL)
+		{
+			/* Cache fast path: src_tid already loaded in HnswL0CacheNode */
+			for (j = 0; j < l0_res_size; j++)
+			{
+				int32 nid = gresults[j].nid;
+
+				if (nid >= 0 && nid <= active_cache->max_nid &&
+					ItemPointerIsValid(&active_cache->nodes[nid].src_tid))
+					ItemPointerCopy(&active_cache->nodes[nid].src_tid,
+									&gresults[j].src_tid);
+			}
+		}
+		else if (do_exact_rerank)
+		{
+			IndexScanDesc	src_iscan;
+			ScanKeyData		src_skey[1];
+
+			if (l0.use_ios && l0.ios_att_src_tid != 0)
+			{
+				/* IOS path: src_tid is in the covering index */
+#if PG_VERSION_NUM < 180000
+				src_iscan = index_beginscan(l0.rel, l0.idx,
+											snapshot, 1, 0);
+#else
+				src_iscan = index_beginscan(l0.rel, l0.idx,
+											snapshot, NULL, 1, 0);
+#endif
+				src_iscan->xs_want_itup = true;
+
+				for (j = 0; j < l0_res_size; j++)
+				{
+					bool		isnull;
+					ItemPointer tid;
+					Datum		tid_d;
+
+					ScanKeyInit(&src_skey[0], 1, BTEqualStrategyNumber,
+								l0.eq_op,
+								Int32GetDatum(gresults[j].nid));
+					index_rescan(src_iscan, src_skey, 1, NULL, 0);
+
+					tid = index_getnext_tid(src_iscan,
+											ForwardScanDirection);
+					if (tid == NULL)
+						continue;
+
+					tid_d = index_getattr(src_iscan->xs_itup,
+										  l0.ios_att_src_tid,
+										  src_iscan->xs_itupdesc,
+										  &isnull);
+					if (!isnull)
+						ItemPointerCopy(DatumGetItemPointer(tid_d),
+										&gresults[j].src_tid);
+				}
+				index_endscan(src_iscan);
+			}
+			else
+			{
+				/* Heap path: PK lookup → heap fetch for src_tid */
+				Relation	src_idx;
+				bool		src_pk = false;
+
+				if (l0.use_ios)
+				{
+					src_idx = index_open(l0.pk_oid, AccessShareLock);
+					src_pk  = true;
+				}
+				else
+					src_idx = l0.idx;
+
+#if PG_VERSION_NUM < 180000
+				src_iscan = index_beginscan(l0.rel, src_idx,
+											snapshot, 1, 0);
+#else
+				src_iscan = index_beginscan(l0.rel, src_idx,
+											snapshot, NULL, 1, 0);
+#endif
+				for (j = 0; j < l0_res_size; j++)
+				{
+					bool	isnull;
+
+					ScanKeyInit(&src_skey[0], 1, BTEqualStrategyNumber,
+								l0.eq_op,
+								Int32GetDatum(gresults[j].nid));
+					index_rescan(src_iscan, src_skey, 1, NULL, 0);
+
+					if (!index_getnext_slot(src_iscan,
+											ForwardScanDirection,
+											l0.slot))
+						continue;
+
+					{
+						Datum	td = slot_getattr(l0.slot,
+												   l0.att_src_tid,
+												   &isnull);
+
+						if (!isnull)
+							ItemPointerCopy(DatumGetItemPointer(td),
+											&gresults[j].src_tid);
+					}
+					ExecClearTuple(l0.slot);
+				}
+				index_endscan(src_iscan);
+				if (src_pk)
+					index_close(src_idx, AccessShareLock);
+			}
+		}
+
+		/* Exact rerank via main table */
+		if (do_exact_rerank)
+		{
+			Relation		main_rel;
+			TupleTableSlot *main_slot;
+			TupleDesc		main_td;
+			AttrNumber		emb_attno, id_attno;
+			Oid				id_typid, typoutput;
+			bool			typisvarlena;
+
+			main_rel  = table_open(tbl_oid, AccessShareLock);
+			main_td   = RelationGetDescr(main_rel);
+			main_slot = table_slot_create(main_rel, NULL);
+
+			emb_attno = get_attnum(tbl_oid, "embedding");
+			id_attno  = get_attnum(tbl_oid, "id");
+			id_typid  = TupleDescAttr(main_td, id_attno - 1)->atttypid;
+			getTypeOutputInfo(id_typid, &typoutput, &typisvarlena);
+
+			/* Sort by block for sequential I/O */
+			qsort(gresults, l0_res_size, sizeof(GraphResult),
+				  cmp_graph_result_by_blk);
+
+			/* Prefetch initial batch */
+			for (j = 0; j < Min(RERANK_PREFETCH_DISTANCE,
+								 l0_res_size); j++)
+			{
+				if (ItemPointerIsValid(&gresults[j].src_tid))
+					PrefetchBuffer(main_rel, MAIN_FORKNUM,
+								   ItemPointerGetBlockNumber(
+									   &gresults[j].src_tid));
+			}
+
+			for (j = 0; j < l0_res_size; j++)
+			{
+				bool	isnull;
+				Datum	emb_d;
+				Svec   *candidate;
+
+				if (!ItemPointerIsValid(&gresults[j].src_tid))
+				{
+					gresults[j].distance = DBL_MAX;
+					continue;
+				}
+
+				if (j + RERANK_PREFETCH_DISTANCE < l0_res_size &&
+					ItemPointerIsValid(
+						&gresults[j + RERANK_PREFETCH_DISTANCE].src_tid))
+					PrefetchBuffer(main_rel, MAIN_FORKNUM,
+								   ItemPointerGetBlockNumber(
+									   &gresults[j + RERANK_PREFETCH_DISTANCE].src_tid));
+
+				if (!table_tuple_fetch_row_version(main_rel,
+												   &gresults[j].src_tid,
+												   snapshot, main_slot))
+				{
+					gresults[j].distance = DBL_MAX;
+					continue;
+				}
+
+				emb_d = slot_getattr(main_slot, emb_attno, &isnull);
+				if (!isnull)
+				{
+					candidate = DatumGetSvecP(emb_d);
+					if (candidate->dim != query->dim)
+						ereport(ERROR,
+								(errcode(ERRCODE_DATA_EXCEPTION),
+								 errmsg("svec_hnsw_scan: embedding dim "
+										"%d != query dim %d",
+										candidate->dim, query->dim)));
+					gresults[j].distance =
+						svec_cosine_distance_internal(query, candidate);
+				}
+
+				{
+					Datum	mid = slot_getattr(main_slot, id_attno,
+											   &isnull);
+
+					if (!isnull)
+						gresults[j].src_id = pstrdup(
+							OidOutputFunctionCall(typoutput, mid));
+				}
+				ExecClearTuple(main_slot);
+			}
+
+			ExecDropSingleTupleTableSlot(main_slot);
+			table_close(main_rel, AccessShareLock);
+		}
+
+		if (sorted_heap_ann_timing)
+			INSTR_TIME_SET_CURRENT(t_rerank);
+
+		/* Sort final results by distance, keep top lim */
+		qsort(gresults, l0_res_size, sizeof(GraphResult),
+			  cmp_graph_result);
+		n_out = Min(l0_res_size, lim);
+
+		/* Deferred src_id when no exact rerank */
+		if (!do_exact_rerank && l0.att_src_id != InvalidAttrNumber)
+		{
+			IndexScanDesc	srcid_iscan;
+			Relation		srcid_idx;
+			bool			srcid_pk = false;
+			ScanKeyData		srcid_skey[1];
+			TupleDesc		g_td = RelationGetDescr(l0.rel);
+			Oid				g_typid, g_typout;
+			bool			g_typisvar;
+
+			g_typid = TupleDescAttr(g_td,
+									l0.att_src_id - 1)->atttypid;
+			getTypeOutputInfo(g_typid, &g_typout, &g_typisvar);
+
+			if (l0.use_ios)
+			{
+				srcid_idx = index_open(l0.pk_oid, AccessShareLock);
+				srcid_pk  = true;
+			}
+			else
+				srcid_idx = l0.idx;
+
+#if PG_VERSION_NUM < 180000
+			srcid_iscan = index_beginscan(l0.rel, srcid_idx,
+										  snapshot, 1, 0);
+#else
+			srcid_iscan = index_beginscan(l0.rel, srcid_idx,
+										  snapshot, NULL, 1, 0);
+#endif
+			for (j = 0; j < n_out; j++)
+			{
+				bool	isnull;
+
+				ScanKeyInit(&srcid_skey[0], 1, BTEqualStrategyNumber,
+							l0.eq_op,
+							Int32GetDatum(gresults[j].nid));
+				index_rescan(srcid_iscan, srcid_skey, 1, NULL, 0);
+
+				if (!index_getnext_slot(srcid_iscan,
+										ForwardScanDirection,
+										l0.slot))
+					continue;
+
+				{
+					Datum	id_d = slot_getattr(l0.slot,
+												 l0.att_src_id, &isnull);
+
+					if (!isnull)
+						gresults[j].src_id = pstrdup(
+							OidOutputFunctionCall(g_typout, id_d));
+				}
+				ExecClearTuple(l0.slot);
+			}
+			index_endscan(srcid_iscan);
+			if (srcid_pk)
+				index_close(srcid_idx, AccessShareLock);
+		}
+
+		/* ---- Output tuples ---- */
+		for (j = 0; j < n_out; j++)
+		{
+			Datum	values[2];
+			bool	nulls[2] = {false, false};
+
+			values[0] = CStringGetTextDatum(
+				gresults[j].src_id ? gresults[j].src_id : "");
+			values[1] = Float8GetDatum(gresults[j].distance);
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+								 values, nulls);
+		}
+
+		pfree(gresults);
+	}
+
+	/* ---- Cleanup ---- */
+	hnsw_close_level(&l0);
+	pfree(l0_res);
+
+	if (sorted_heap_ann_timing)
+	{
+		INSTR_TIME_SET_CURRENT(t_out);
+		elog(DEBUG1,
+			 "svec_hnsw_scan: upper=%.3fms l0=%.3fms rerank=%.3fms "
+			 "out=%.3fms total=%.3fms "
+			 "(visited_upper=%d visited_l0=%d results=%d max_level=%d "
+			 "cache=%s build_ms=%.1f use=%lld bytes=%lld)",
+			 INSTR_TIME_GET_MILLISEC(t_upper) -
+			 INSTR_TIME_GET_MILLISEC(t_start),
+			 INSTR_TIME_GET_MILLISEC(t_l0) -
+			 INSTR_TIME_GET_MILLISEC(t_upper),
+			 INSTR_TIME_GET_MILLISEC(t_rerank) -
+			 INSTR_TIME_GET_MILLISEC(t_l0),
+			 INSTR_TIME_GET_MILLISEC(t_out) -
+			 INSTR_TIME_GET_MILLISEC(t_rerank),
+			 INSTR_TIME_GET_MILLISEC(t_out) -
+			 INSTR_TIME_GET_MILLISEC(t_start),
+			 n_visited_upper, n_visited_l0, l0_res_size, max_level,
+			 active_cache ? "hit" : "off",
+			 cache_build_ms,
+			 active_cache ? (long long) active_cache->use_count : 0LL,
+			 active_cache ? (long long) active_cache->cache_bytes : 0LL);
 	}
 
 	return (Datum) 0;
