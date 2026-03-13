@@ -1,5 +1,17 @@
 # S1: Storage Redesign — Persisted Sorted Prefix
 
+> **Status: S2 IMPLEMENTED (2026-03-13)**
+>
+> - Meta page v7 with `shm_sorted_prefix_pages` — committed in `3ebb252`
+> - `tuple_update` override with conservative prefix shrink
+> - Max-overlap detection in `zonemap_update_entry` (both min-decrease and max-increase paths)
+> - SH22-1..5 regression tests covering full lifecycle including update path
+> - S2 characterization (`scripts/bench_s2_prefix.sql`): prefix survives 100% for
+>   append-only workloads; collapses under low-fillfactor HOT updates and recycle
+>   inserts (accepted tradeoff); merge always restores
+> - **S2+ (PK-comparing tuple_update) deferred** — no product need for low-fillfactor
+>   update-heavy sorted_heap tables currently
+
 ## Problem Statement
 
 After compaction (`sorted_heap_merge` / `sorted_heap_merge_online`), the entire
