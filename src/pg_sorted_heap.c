@@ -429,6 +429,9 @@ pg_sorted_heap_zone_map_invalidate(Oid relid)
 static void
 pg_sorted_heap_relcache_callback(Datum arg, Oid relid)
 {
+	/* Evict session-local HNSW L0 cache if its relation was invalidated */
+	sorted_heap_hnsw_relcache_invalidate(relid);
+
 	if (pg_sorted_heap_zone_map_rels == NULL)
 		return;
 

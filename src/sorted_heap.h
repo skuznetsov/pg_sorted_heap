@@ -188,5 +188,6 @@ extern bool sorted_heap_enable_scan_pruning;
 extern bool sorted_heap_vacuum_rebuild_zonemap;
 extern bool sorted_heap_ann_timing;
 extern bool sorted_heap_hnsw_cache_l0;
+extern void sorted_heap_hnsw_relcache_invalidate(Oid relid);
 
 #endif							/* SORTED_HEAP_H */

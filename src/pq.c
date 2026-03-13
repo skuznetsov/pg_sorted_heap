@@ -113,6 +113,20 @@ evict_hnsw_l0_cache(void)
 	hnsw_l0_cache = NULL;
 }
 
+/*
+ * sorted_heap_hnsw_relcache_invalidate — called from the relcache callback.
+ * Evicts the L0 cache if the invalidated relation matches the cached OID
+ * or if relid is InvalidOid (global flush).
+ */
+void
+sorted_heap_hnsw_relcache_invalidate(Oid relid)
+{
+	if (hnsw_l0_cache == NULL)
+		return;
+	if (!OidIsValid(relid) || relid == hnsw_l0_cache->l0_rel_oid)
+		evict_hnsw_l0_cache();
+}
+
 static HnswL0Cache *
 build_hnsw_l0_cache(Relation l0_rel, Oid l0_oid, Snapshot snap)
 {
