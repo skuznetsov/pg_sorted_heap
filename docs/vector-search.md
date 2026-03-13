@@ -259,9 +259,11 @@ Same dataset (103K × 2880-dim), same k8s pod (warm buffer pool).
 `sorted_heap.hnsw_cache_l0 = on` for the sub-2ms operating points (session-local
 cache built on first query, ~100 MB per session).
 
-`svec_hnsw_scan` is 3–4× faster than pgvector at comparable recall because
-navigation uses compact hsvec(384) sketches (no TOAST) and the cache eliminates
-repeated btree lookups. See [HNSW search](#hnsw-search-svec_hnsw_scan) below.
+`svec_hnsw_scan` at ef=96/rk=48 is 3.6× faster than pgvector HNSW ef=64 at
+2.3 points lower recall (96.8% vs 99.8%). The quality-first point (rk=0,
+98.4%) is 2× faster at 1.4 points lower recall. Navigation uses compact
+hsvec(384) sketches (no TOAST) and the session-local cache eliminates repeated
+btree lookups. See [HNSW search](#hnsw-search-svec_hnsw_scan) below.
 
 ### Self-query vs cross-query
 
@@ -388,14 +390,15 @@ candidates.
 {prefix}_l1..lN — nid int4 PK, sketch hsvec(N), neighbors int4[]
 ```
 
-Build these with `scripts/build_hnsw_graph.py`. Example for a table with
-`(partition_id int2, id text)` primary key:
+Build these with `scripts/build_hnsw_graph.py`:
 
 ```bash
 python scripts/build_hnsw_graph.py \
   --dsn 'host=... dbname=...' \
-  --table my_table --prefix my_table_hnsw \
-  --sketch-dim 384 --M 16 --bootstrap
+  --source-table my_table \
+  --prefix my_table_hnsw \
+  --M 16 \
+  --ef-construction 200
 ```
 
 ### Calling the function
