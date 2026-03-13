@@ -95,6 +95,15 @@ static void sorted_heap_relinfo_invalidate(Oid relid);
 static void sorted_heap_zonemap_flush(Relation rel, SortedHeapRelInfo *info);
 /* sorted_heap_rebuild_zonemap_internal is declared in sorted_heap.h (non-static) */
 
+static void sorted_heap_shrink_prefix(Relation rel, SortedHeapRelInfo *info,
+									  uint32 boundary);
+static TM_Result sorted_heap_tuple_update(Relation rel, ItemPointer otid,
+										  TupleTableSlot *slot, CommandId cid,
+										  Snapshot snapshot, Snapshot crosscheck,
+										  bool wait, TM_FailureData *tmfd,
+										  LockTupleMode *lockmode,
+										  TU_UpdateIndexes *update_indexes);
+
 static void sorted_heap_relation_set_new_filelocator(Relation rel,
 													 const RelFileLocator *rlocator,
 													 char persistence,
@@ -179,8 +188,11 @@ sorted_heap_init_routine(void)
 	sorted_heap_am_routine.relation_copy_for_cluster =
 		sorted_heap_relation_copy_for_cluster;
 
-	/* Single-row insert — invalidates zone map valid flag */
+	/* Single-row insert — incremental zone map update */
 	sorted_heap_am_routine.tuple_insert = sorted_heap_tuple_insert;
+
+	/* Update — conservative prefix shrink + zone map update */
+	sorted_heap_am_routine.tuple_update = sorted_heap_tuple_update;
 
 	/* Bulk insert — sort batch by PK + update zone map */
 	sorted_heap_am_routine.multi_insert = sorted_heap_multi_insert;
@@ -622,6 +634,7 @@ sorted_heap_zonemap_load(Relation rel, SortedHeapRelInfo *info)
 		info->zm_overflow_alloc = 0;
 		info->zm_total_entries = 0;
 		info->zm_overflow_npages = 0;
+		info->sorted_prefix_pages = 0;
 		info->zm_loaded = true;
 		info->zm_gen = sorted_heap_read_zm_generation();
 		UnlockReleaseBuffer(metabuf);
@@ -653,6 +666,7 @@ sorted_heap_zonemap_load(Relation rel, SortedHeapRelInfo *info)
 			(meta4->shm_flags & SHM_FLAG_ZONEMAP_VALID) != 0;
 		info->zm_sorted = false;	/* v3/v4 format predates sorted flag */
 		info->zm_disk_sorted_cleared = false;
+		info->sorted_prefix_pages = 0;	/* v3/v4 predates prefix tracking */
 
 		if (version >= 4)
 		{
@@ -753,6 +767,8 @@ sorted_heap_zonemap_load(Relation rel, SortedHeapRelInfo *info)
 		info->zm_sorted =
 			(meta->shm_flags & SHM_FLAG_ZM_SORTED) != 0;
 		info->zm_disk_sorted_cleared = false;
+		info->sorted_prefix_pages = (version >= 7) ?
+			meta->shm_sorted_prefix_pages : 0;
 
 		info->zm_overflow_npages = meta_ovfl_npages;
 		info->zm_total_entries = n;
@@ -989,6 +1005,8 @@ sorted_heap_zonemap_flush(Relation rel, SortedHeapRelInfo *info)
 		meta->shm_zonemap_pk_typid = info->zm_pk_typid;
 		meta->shm_zonemap_pk_typid2 = info->zm_pk_typid2;
 		meta->shm_flags &= ~SHM_FLAG_ZM_SORTED;	/* INSERT may break monotonicity */
+		if (meta->shm_version >= 7)
+			meta->shm_sorted_prefix_pages = info->sorted_prefix_pages;
 		memcpy(meta->shm_zonemap, info->zm_entries,
 			   n * sizeof(SortedHeapZoneMapEntry));
 	}
@@ -1107,12 +1125,54 @@ sorted_heap_zonemap_flush_overflow_page(Relation rel,
 }
 
 /*
+ * Shrink the persisted sorted prefix to the given boundary.
+ * No-op if boundary >= current prefix (not actually shrinking).
+ * Persists to disk via GenericXLog on v7+ meta pages.
+ */
+static void
+sorted_heap_shrink_prefix(Relation rel, SortedHeapRelInfo *info,
+						  uint32 boundary)
+{
+	Buffer				metabuf;
+	Page				metapage;
+	SortedHeapMetaPageData *meta;
+
+	if (boundary >= info->sorted_prefix_pages)
+		return;		/* not actually shrinking */
+
+	info->sorted_prefix_pages = (uint16) boundary;
+
+	metabuf = ReadBufferExtended(rel, MAIN_FORKNUM, SORTED_HEAP_META_BLOCK,
+								 RBM_NORMAL, NULL);
+	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+	metapage = BufferGetPage(metabuf);
+	meta = (SortedHeapMetaPageData *) PageGetSpecialPointer(metapage);
+
+	if (meta->shm_version >= 7 &&
+		meta->shm_sorted_prefix_pages != info->sorted_prefix_pages)
+	{
+		GenericXLogState *state = GenericXLogStart(rel);
+
+		metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
+		meta = (SortedHeapMetaPageData *) PageGetSpecialPointer(metapage);
+		meta->shm_sorted_prefix_pages = info->sorted_prefix_pages;
+		GenericXLogFinish(state);
+	}
+
+	UnlockReleaseBuffer(metabuf);
+}
+
+/*
  * Update a zone map entry for the given block, creating or widening
  * min/max as needed.  Returns true if the entry was modified.
  * Works for both inline (zmidx < zm_nentries) and overflow entries.
+ *
+ * Also detects prefix monotonicity breaks: when a min decreases or a
+ * max increases past the next entry's min within the sorted prefix,
+ * shrinks the persisted prefix via sorted_heap_shrink_prefix().
  */
 static bool
-sorted_heap_zonemap_update_entry(SortedHeapRelInfo *info,
+sorted_heap_zonemap_update_entry(Relation rel, SortedHeapRelInfo *info,
 								 uint32 zmidx,
 								 TupleTableSlot *slot)
 {
@@ -1147,11 +1207,28 @@ sorted_heap_zonemap_update_entry(SortedHeapRelInfo *info,
 			e->zme_min = key;
 			changed = true;
 			info->zm_sorted = false;	/* min decreased — monotonicity broken */
+
+			/* Overlap left: prefix broken at this page */
+			if (zmidx < info->sorted_prefix_pages)
+				sorted_heap_shrink_prefix(rel, info, zmidx);
 		}
 		if (key > e->zme_max)
 		{
 			e->zme_max = key;
 			changed = true;
+
+			/* Overlap right: check if max now exceeds next page's min */
+			if (zmidx + 1 < info->sorted_prefix_pages)
+			{
+				SortedHeapZoneMapEntry *next =
+					sorted_heap_get_zm_entry(info, zmidx + 1);
+
+				if (next->zme_min != PG_INT64_MAX && key > next->zme_min)
+				{
+					info->zm_sorted = false;
+					sorted_heap_shrink_prefix(rel, info, zmidx + 1);
+				}
+			}
 		}
 	}
 
@@ -1473,23 +1550,33 @@ sorted_heap_rebuild_zonemap_internal(Relation rel, Oid pk_typid,
 	meta->shm_zonemap_pk_typid2 = pk_typid2;
 	meta->shm_flags |= SHM_FLAG_ZONEMAP_VALID;
 
-	/* Check if entries are monotonically sorted (enables binary search) */
+	/* Check monotonicity and compute sorted prefix */
 	{
 		bool	is_sorted = true;
 		int64	prev_max = PG_INT64_MIN;
+		uint32	prefix = nentries;		/* assume fully sorted */
 
-		for (uint32 j = 0; j < nentries && is_sorted; j++)
+		for (uint32 j = 0; j < nentries; j++)
 		{
 			if (entries[j].zme_min == PG_INT64_MAX)
 				continue;			/* skip empty pages */
 			if (entries[j].zme_min < prev_max)
-				is_sorted = false;
+			{
+				if (is_sorted)
+				{
+					is_sorted = false;
+					prefix = j;		/* first overlap = end of prefix */
+				}
+			}
 			prev_max = entries[j].zme_max;
 		}
 		if (is_sorted)
 			meta->shm_flags |= SHM_FLAG_ZM_SORTED;
 		else
 			meta->shm_flags &= ~SHM_FLAG_ZM_SORTED;
+
+		meta->shm_sorted_prefix_pages =
+			(uint16) Min(prefix, PG_UINT16_MAX);
 	}
 
 	memcpy(meta->shm_zonemap, entries,
@@ -1546,6 +1633,7 @@ sorted_heap_init_meta_page_smgr(const RelFileLocator *rlocator,
 	meta->shm_overflow_npages = 0;
 	meta->shm_zonemap_pk_typid = InvalidOid;
 	meta->shm_zonemap_pk_typid2 = InvalidOid;
+	meta->shm_sorted_prefix_pages = 0;
 	meta->shm_padding = 0;
 
 	/* Initialize zone map entries to sentinel */
@@ -1833,9 +1921,28 @@ sorted_heap_multi_insert(Relation rel, TupleTableSlot **slots,
 					{
 						e->zme_min = key;
 						sorted_heap_clear_sorted_flag(rel, info);
+
+						if (zmidx < info->sorted_prefix_pages)
+							sorted_heap_shrink_prefix(rel, info, zmidx);
 					}
 					if (key > e->zme_max)
+					{
 						e->zme_max = key;
+
+						if (zmidx + 1 < info->sorted_prefix_pages)
+						{
+							SortedHeapZoneMapEntry *next_e =
+								sorted_heap_get_zm_entry(info, zmidx + 1);
+
+							if (next_e->zme_min != PG_INT64_MAX &&
+								key > next_e->zme_min)
+							{
+								sorted_heap_clear_sorted_flag(rel, info);
+								sorted_heap_shrink_prefix(rel, info,
+														  zmidx + 1);
+							}
+						}
+					}
 				}
 
 				if (info->zm_col2_usable)
@@ -1874,7 +1981,7 @@ sorted_heap_multi_insert(Relation rel, TupleTableSlot **slots,
 				 * Overflow entry within loaded coverage.
 				 * Update in-place and mark the overflow page dirty.
 				 */
-				if (sorted_heap_zonemap_update_entry(info, zmidx, slots[i]))
+				if (sorted_heap_zonemap_update_entry(rel, info, zmidx, slots[i]))
 				{
 					uint32 ovfl_idx = zmidx - info->zm_nentries;
 					uint32 page_idx = ovfl_idx /
@@ -1978,6 +2085,10 @@ sorted_heap_zonemap_stats(PG_FUNCTION_ARGS)
 							 (unsigned) meta->shm_zonemap_pk_typid2,
 							 flags_str,
 							 (unsigned) meta->shm_overflow_npages);
+
+			if (meta->shm_version >= 7)
+				appendStringInfo(&buf, " sorted_prefix=%u",
+								 (unsigned) meta->shm_sorted_prefix_pages);
 		}
 
 		/* Save first entries and last overflow block for after release */
@@ -2208,7 +2319,7 @@ sorted_heap_tuple_insert(Relation rel, TupleTableSlot *slot,
 			 * Block within zone map coverage (inline or overflow).
 			 * Update entry in-place.
 			 */
-			if (sorted_heap_zonemap_update_entry(info, zmidx, slot))
+			if (sorted_heap_zonemap_update_entry(rel, info, zmidx, slot))
 			{
 				if (zmidx < info->zm_nentries)
 				{
@@ -2238,6 +2349,78 @@ sorted_heap_tuple_insert(Relation rel, TupleTableSlot *slot,
 			sorted_heap_clear_sorted_flag(rel, info);
 		}
 	}
+}
+
+/* ----------------------------------------------------------------
+ *  tuple_update — conservative prefix shrink + zone map update
+ *
+ *  Delegates to heap's tuple_update, then:
+ *  1. If the new tuple landed on a prefix page, conservatively
+ *     shrinks the persisted prefix to that page boundary.
+ *  2. Updates the zone map for the new tuple's page (same as
+ *     tuple_insert logic).
+ * ---------------------------------------------------------------- */
+static TM_Result
+sorted_heap_tuple_update(Relation rel, ItemPointer otid,
+						 TupleTableSlot *slot, CommandId cid,
+						 Snapshot snapshot, Snapshot crosscheck,
+						 bool wait, TM_FailureData *tmfd,
+						 LockTupleMode *lockmode,
+						 TU_UpdateIndexes *update_indexes)
+{
+	const TableAmRoutine *heap = GetHeapamTableAmRoutine();
+	TM_Result	result;
+
+	result = heap->tuple_update(rel, otid, slot, cid, snapshot,
+								crosscheck, wait, tmfd,
+								lockmode, update_indexes);
+
+	if (result == TM_Ok)
+	{
+		SortedHeapRelInfo *info = sorted_heap_get_relinfo(rel);
+		BlockNumber		new_blk = ItemPointerGetBlockNumber(&slot->tts_tid);
+
+		/* Conservative prefix shrink: any update landing on a prefix page */
+		if (info->sorted_prefix_pages > 0 && new_blk >= 1)
+		{
+			uint32	zmidx = new_blk - 1;
+
+			if (zmidx < info->sorted_prefix_pages)
+				sorted_heap_shrink_prefix(rel, info, zmidx);
+		}
+
+		/* Zone map update for the new tuple's page */
+		if (info->zm_scan_valid && info->zm_usable && new_blk >= 1)
+		{
+			uint32	zmidx = new_blk - 1;
+
+			slot_getallattrs(slot);
+
+			if (zmidx < info->zm_total_entries)
+			{
+				if (sorted_heap_zonemap_update_entry(rel, info, zmidx, slot))
+				{
+					if (zmidx < info->zm_nentries)
+						sorted_heap_zonemap_flush(rel, info);
+					else
+					{
+						uint32 ovfl_idx = zmidx - info->zm_nentries;
+						uint32 page_idx = ovfl_idx /
+							SORTED_HEAP_OVERFLOW_ENTRIES_PER_PAGE;
+
+						if (page_idx < info->zm_overflow_npages)
+							sorted_heap_zonemap_flush_overflow_page(
+								rel, info, page_idx);
+					}
+					sorted_heap_clear_sorted_flag(rel, info);
+				}
+			}
+			else
+				sorted_heap_clear_sorted_flag(rel, info);
+		}
+	}
+
+	return result;
 }
 
 /* ----------------------------------------------------------------
@@ -2343,13 +2526,10 @@ sorted_heap_rebuild_zonemap_sql(PG_FUNCTION_ARGS)
 /* ----------------------------------------------------------------
  *  sorted_heap_detect_sorted_prefix
  *
- *  Scan zone map entries from the start. The longest initial sequence
- *  where entry[i+1].min >= entry[i].max (no overlap) is the sorted
- *  prefix. Zone map must be valid. If invalid, returns 0 (entire
- *  table goes through tuplesort).
- *
- *  Returns the number of data pages in the sorted prefix (0-based
- *  entry index corresponds to data page = block entry_index + 1).
+ *  Returns the number of data pages in the sorted prefix.
+ *  Fast path: if sorted_prefix_pages > 0 (persisted by compaction),
+ *  returns it in O(1) without scanning zone map entries.
+ *  Fallback: scans zone map entries from the start (O(n)).
  * ---------------------------------------------------------------- */
 BlockNumber
 sorted_heap_detect_sorted_prefix(SortedHeapRelInfo *info)
@@ -2358,7 +2538,12 @@ sorted_heap_detect_sorted_prefix(SortedHeapRelInfo *info)
 	int64		prev_max;
 	SortedHeapZoneMapEntry *entry;
 
+	/* O(1) fast path: persisted prefix from last compaction */
+	if (info->sorted_prefix_pages > 0)
+		return info->sorted_prefix_pages;
+
 	/*
+	 * Fallback: scan zone map entries (pre-v7 tables, or no compaction yet).
 	 * We use zone map entries to detect monotonicity regardless of the
 	 * zm_scan_valid flag. The entries for compacted pages are accurate
 	 * even after subsequent INSERTs clear the flag. If the zone map
@@ -2496,6 +2681,33 @@ sorted_heap_merge(PG_FUNCTION_ARGS)
 	 */
 	if (prefix_pages >= total_data_pages)
 	{
+		/* Update persisted prefix if stale (e.g. shrunk by INSERT then
+		 * full-scan re-detected as sorted) */
+		if (info->sorted_prefix_pages < (uint16) Min(total_data_pages,
+													  PG_UINT16_MAX))
+		{
+			Buffer				metabuf;
+			Page				metapage;
+			SortedHeapMetaPageData *meta;
+			GenericXLogState   *state;
+
+			info->sorted_prefix_pages =
+				(uint16) Min(total_data_pages, PG_UINT16_MAX);
+
+			metabuf = ReadBufferExtended(rel, MAIN_FORKNUM,
+										 SORTED_HEAP_META_BLOCK,
+										 RBM_NORMAL, NULL);
+			LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+			state = GenericXLogStart(rel);
+			metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
+			meta = (SortedHeapMetaPageData *)
+				PageGetSpecialPointer(metapage);
+			if (meta->shm_version >= 7)
+				meta->shm_sorted_prefix_pages = info->sorted_prefix_pages;
+			GenericXLogFinish(state);
+			UnlockReleaseBuffer(metabuf);
+		}
+
 		ereport(NOTICE,
 				(errmsg("sorted_heap_merge: table is already sorted (%u pages)",
 						(unsigned) total_data_pages)));

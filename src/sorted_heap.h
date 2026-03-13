@@ -9,7 +9,7 @@
 #include "storage/block.h"
 
 #define SORTED_HEAP_MAGIC		0x534F5254	/* 'SORT' */
-#define SORTED_HEAP_VERSION		6
+#define SORTED_HEAP_VERSION		7
 #define SORTED_HEAP_META_BLOCK	0
 #define SORTED_HEAP_MAX_KEYS	INDEX_MAX_KEYS
 #define SORTED_HEAP_ZONEMAP_MAX	250		/* v5/v6 on-disk meta page entries */
@@ -65,7 +65,8 @@ typedef struct SortedHeapMetaPageData
 	uint16		shm_overflow_npages;	/* number of overflow pages */
 	Oid			shm_zonemap_pk_typid;	/* type of first PK column */
 	Oid			shm_zonemap_pk_typid2;	/* type of second PK column (v5+) */
-	uint32		shm_padding;			/* align entries to 8 bytes */
+	uint16		shm_sorted_prefix_pages;	/* v7: persisted sorted prefix count */
+	uint16		shm_padding;			/* align entries to 8 bytes */
 	/* 32 bytes of header above */
 	SortedHeapZoneMapEntry shm_zonemap[SORTED_HEAP_ZONEMAP_MAX];
 	/* overflow page block numbers (128 bytes) */
@@ -133,6 +134,9 @@ typedef struct SortedHeapRelInfo
 	uint32		zm_overflow_npages;			/* number of overflow pages */
 	BlockNumber *zm_overflow_blocks;		/* palloc'd, or NULL; one per overflow page */
 	uint64		zm_gen;						/* generation when zone map was loaded */
+
+	/* Persisted sorted prefix (v7+) */
+	uint16		sorted_prefix_pages;		/* pages 1..N known sorted */
 } SortedHeapRelInfo;
 
 /*

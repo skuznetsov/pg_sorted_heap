@@ -1244,7 +1244,7 @@ INSERT INTO sh8_intint
 SELECT sorted_heap_compact('sh8_intint'::regclass);
 SELECT
     CASE WHEN sorted_heap_zonemap_stats('sh8_intint'::regclass)
-              LIKE 'version=6%pk_typid=23 pk_typid2=23%flags=valid%'
+              LIKE 'version=%pk_typid=23 pk_typid2=23%flags=valid%'
          THEN 'sh8_intint_zonemap_ok'
          ELSE 'sh8_intint_zonemap_FAIL: ' || sorted_heap_zonemap_stats('sh8_intint'::regclass)
     END AS sh8_1_result;
@@ -1280,7 +1280,7 @@ INSERT INTO sh8_ts
 SELECT sorted_heap_compact('sh8_ts'::regclass);
 SELECT
     CASE WHEN sorted_heap_zonemap_stats('sh8_ts'::regclass)
-              LIKE 'version=6%pk_typid=23 pk_typid2=1114%flags=valid%'
+              LIKE 'version=%pk_typid=23 pk_typid2=1114%flags=valid%'
          THEN 'sh8_ts_zonemap_ok'
          ELSE 'sh8_ts_zonemap_FAIL: ' || sorted_heap_zonemap_stats('sh8_ts'::regclass)
     END AS sh8_4_result;
@@ -1294,7 +1294,7 @@ SELECT sorted_heap_compact('sh8_text'::regclass);
 -- pk_typid2 should be 0 (InvalidOid) — text not supported
 SELECT
     CASE WHEN sorted_heap_zonemap_stats('sh8_text'::regclass)
-              LIKE 'version=6%pk_typid=23 pk_typid2=0%flags=valid%'
+              LIKE 'version=%pk_typid=23 pk_typid2=0%flags=valid%'
          THEN 'sh8_text_degradation_ok'
          ELSE 'sh8_text_degradation_FAIL: ' || sorted_heap_zonemap_stats('sh8_text'::regclass)
     END AS sh8_5_result;
@@ -1307,7 +1307,7 @@ INSERT INTO sh8_single SELECT g, repeat('w', 40) FROM generate_series(1, 300) g;
 SELECT sorted_heap_compact('sh8_single'::regclass);
 SELECT
     CASE WHEN sorted_heap_zonemap_stats('sh8_single'::regclass)
-              LIKE 'version=6%pk_typid=23 pk_typid2=0%flags=valid%'
+              LIKE 'version=%pk_typid=23 pk_typid2=0%flags=valid%'
          THEN 'sh8_single_ok'
          ELSE 'sh8_single_FAIL: ' || sorted_heap_zonemap_stats('sh8_single'::regclass)
     END AS sh8_6_result;
@@ -2971,6 +2971,106 @@ FROM svec_hnsw_scan('ann_test'::regclass,
 SET sorted_heap.hnsw_cache_l0 = off;
 
 DROP TABLE ann_hnsw_meta, ann_hnsw_l0, ann_hnsw_l1;
+
+-- ================================================================
+-- SH22: Persisted sorted prefix (S2)
+-- ================================================================
+
+-- SH22-1: compact → prefix > 0, INSERT beyond → prefix unchanged
+CREATE TABLE sh22_prefix (id int PRIMARY KEY, pad text) USING sorted_heap;
+INSERT INTO sh22_prefix SELECT g, repeat('x', 200) FROM generate_series(1, 2000) g;
+SELECT sorted_heap_compact('sh22_prefix'::regclass);
+
+-- Verify prefix exists after compact
+SELECT CASE WHEN (regexp_match(sorted_heap_zonemap_stats('sh22_prefix'::regclass),
+                               'sorted_prefix=(\d+)'))[1]::int > 0
+            THEN 'sh22_has_prefix'
+            ELSE 'sh22_NO_PREFIX'
+       END AS sh22_1a;
+
+-- Remember prefix after compact
+CREATE TEMP TABLE sh22_state AS
+SELECT (regexp_match(sorted_heap_zonemap_stats('sh22_prefix'::regclass),
+                     'sorted_prefix=(\d+)'))[1]::int AS prefix_val;
+
+-- INSERT beyond existing pages — prefix should NOT shrink
+INSERT INTO sh22_prefix SELECT g, repeat('y', 200)
+    FROM generate_series(2001, 2010) g;
+
+SELECT CASE WHEN (regexp_match(sorted_heap_zonemap_stats('sh22_prefix'::regclass),
+                               'sorted_prefix=(\d+)'))[1]::int
+                 >= (SELECT prefix_val FROM sh22_state)
+            THEN 'sh22_append_preserved'
+            ELSE 'sh22_append_SHRUNK'
+       END AS sh22_1b;
+
+-- SH22-2: INSERT that recycles a prefix page → prefix shrank
+DELETE FROM sh22_prefix WHERE id <= 1000;
+VACUUM sh22_prefix;
+
+-- Insert a very low value that may land on a recycled prefix page
+INSERT INTO sh22_prefix VALUES (-999, 'recycle');
+
+SELECT CASE WHEN (regexp_match(sorted_heap_zonemap_stats('sh22_prefix'::regclass),
+                               'sorted_prefix=(\d+)'))[1]::int
+                 < (SELECT prefix_val FROM sh22_state)
+            THEN 'sh22_recycle_shrunk'
+            ELSE 'sh22_recycle_no_change'
+       END AS sh22_2_result;
+
+-- SH22-3: merge → prefix restored
+SELECT sorted_heap_merge('sh22_prefix'::regclass);
+
+SELECT CASE WHEN (regexp_match(sorted_heap_zonemap_stats('sh22_prefix'::regclass),
+                               'sorted_prefix=(\d+)'))[1]::int > 0
+            THEN 'sh22_merge_restored'
+            ELSE 'sh22_merge_ZERO'
+       END AS sh22_3_result;
+
+-- SH22-4: verify merge produced valid,sorted with prefix
+SELECT CASE WHEN sorted_heap_zonemap_stats('sh22_prefix'::regclass)
+                 LIKE '%flags=valid,sorted%sorted_prefix=%'
+            THEN 'sh22_merge_sorted'
+            ELSE 'sh22_merge_FAIL'
+       END AS sh22_4_result;
+
+DROP TABLE sh22_state;
+
+-- SH22-5: UPDATE on a prefix page → prefix shrinks (tuple_update override)
+-- After compact, pages are packed full — need to free space for HOT update
+SELECT sorted_heap_compact('sh22_prefix'::regclass);
+
+CREATE TEMP TABLE sh22_upd_state AS
+SELECT (regexp_match(sorted_heap_zonemap_stats('sh22_prefix'::regclass),
+                     'sorted_prefix=(\d+)'))[1]::int AS prefix_val;
+
+-- Free space on page 1 so UPDATE can do HOT (stay on same prefix page)
+-- After SH22-2/3: table has ids -999, 1001..2010; page 1 starts with -999, 1001, 1002, ...
+DELETE FROM sh22_prefix WHERE id = 1002;
+VACUUM sh22_prefix;
+
+-- UPDATE a row on page 1: new tuple stays on page 1 (HOT), triggers prefix shrink
+UPDATE sh22_prefix SET pad = 'updated' WHERE id = 1001;
+
+SELECT CASE WHEN (regexp_match(sorted_heap_zonemap_stats('sh22_prefix'::regclass),
+                               'sorted_prefix=(\d+)'))[1]::int
+                 < (SELECT prefix_val FROM sh22_upd_state)
+            THEN 'sh22_update_shrunk'
+            ELSE 'sh22_update_NO_SHRINK'
+       END AS sh22_5_result;
+
+-- Merge restores prefix after update-induced shrink
+SELECT sorted_heap_merge('sh22_prefix'::regclass);
+
+SELECT CASE WHEN (regexp_match(sorted_heap_zonemap_stats('sh22_prefix'::regclass),
+                               'sorted_prefix=(\d+)'))[1]::int > 0
+            THEN 'sh22_update_merge_ok'
+            ELSE 'sh22_update_merge_ZERO'
+       END AS sh22_5_merge;
+
+DROP TABLE sh22_upd_state;
+
+DROP TABLE sh22_prefix;
 
 -- Cleanup: drop codebook tables (have svec columns) before extension
 DROP TABLE ann_test;
