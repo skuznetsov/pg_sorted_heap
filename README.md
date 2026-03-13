@@ -274,6 +274,21 @@ SELECT * FROM pg_sorted_heap.svec_ann_scan(
 SELECT * FROM pg_sorted_heap.svec_ann_scan(
     'vectors', query_vec, nprobe := 10, lim := 10,
     rerank_topk := 50, cb_id := 2, ivf_cb_id := 1);
+
+-- 5e. Hierarchical HNSW via sidecar tables (sub-ms with cache)
+--     Build sidecars first: scripts/build_hnsw_graph.py
+SET sorted_heap.hnsw_cache_l0 = on;  -- session-local cache, ~100 MB
+
+-- Balanced (96.8% recall@10, ~1 ms):
+SELECT * FROM pg_sorted_heap.svec_hnsw_scan(
+    'vectors', query_vec, 'vectors_hnsw',
+    ef_search := 96, lim := 10, rerank_topk := 48);
+
+-- Quality-first (98.4% recall@10, ~1.8 ms):
+SELECT * FROM pg_sorted_heap.svec_hnsw_scan(
+    'vectors', query_vec, 'vectors_hnsw',
+    ef_search := 96, lim := 10, rerank_topk := 0);
+-- NOTE: rerank_topk=0 means rerank ALL ef_search candidates, not skip rerank.
 ```
 
 ### How IVF-PQ works
@@ -332,11 +347,19 @@ This confirms hsvec is a safe storage choice for ANN workloads.
 
 #### Comparison with pgvector HNSW
 
-| Method | R@1 | Avg latency | Index size |
+103K × 2880-dim, same k8s pod, warm buffer pool.
+
+| Method | Recall@10 | p50 latency | Index size |
 |---|---|---|---|
 | Exact brute-force | 100% | 996 ms | — |
-| pgvector HNSW ef=100 | 97% | 14 ms | 806 MB |
-| IVF-PQ nprobe=10, rerank=200 | 97–99% | 22 ms | 27 MB |
+| pgvector HNSW ef=64 | 99.8% | 3.6 ms | 806 MB |
+| IVF-PQ nprobe=10, rerank=2000 | 99.0% | 64 ms | 27 MB |
+| **svec_hnsw_scan ef=96, rk=48** | **96.8%** | **0.98 ms** | **~100 MB†** |
+| svec_hnsw_scan ef=96, rk=0 | 98.4% | 1.83 ms | ~100 MB† |
+
+†Sidecar tables (hsvec(384) sketches, hierarchical). Requires
+`sorted_heap.hnsw_cache_l0 = on` (session-local cache, ~100 MB, first-query
+build). See [HNSW search docs](docs/vector-search.md#hnsw-search-svec_hnsw_scan).
 
 ## SQL API
 

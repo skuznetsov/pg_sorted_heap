@@ -2896,6 +2896,15 @@ FROM svec_hnsw_scan('ann_test'::regclass,
                     'ann_hnsw', 16, 5, 0, 5);
 
 DROP TABLE ann_hnsw_r1;
+
+-- ANN-17: _r1 absent → graceful skip. rerank1_topk>0 with no sidecar table
+-- must return the same shape as rerank1_topk=0 (no error, no fewer rows).
+SELECT count(*) AS ann17_count,
+       bool_and(distance >= 0) AS ann17_nonneg
+FROM svec_hnsw_scan('ann_test'::regclass,
+                    '[5,3,6,7,1,2,4,2]'::svec,
+                    'ann_hnsw', 16, 5, 0, 5);
+
 DROP TABLE ann_hnsw_meta, ann_hnsw_l0, ann_hnsw_l1;
 
 -- Cleanup: drop codebook tables (have svec columns) before extension

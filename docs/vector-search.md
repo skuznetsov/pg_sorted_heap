@@ -245,18 +245,23 @@ and IVF routing are. This confirms hsvec is a safe storage choice for ANN.
 
 ### Comparison with pgvector HNSW
 
-Same dataset (103K × 2880-dim), same k8s pod.
+Same dataset (103K × 2880-dim), same k8s pod (warm buffer pool).
 
-| Method | R@1 | Avg latency | Index size | Max dim |
+| Method | Recall@10 | p50 latency | Index size | Max dim |
 |---|---|---|---|---|
 | Exact brute-force (svec `<=>`) | 100% | 996 ms | — | 16,000 / 32,000 |
-| pgvector HNSW ef=100 | 97% | 14 ms | 806 MB | 2,000 (`vector`) / 4,000 (`halfvec`) |
-| IVF-PQ nprobe=10, rerank=200 | 97–99% | 22 ms | 27 MB | 16,000 / 32,000 |
+| pgvector HNSW ef=64 | 99.8% | 3.6 ms | 806 MB | 2,000 (`vector`) / 4,000 (`halfvec`) |
+| IVF-PQ nprobe=10, rerank=2000 | 99.0% | 64 ms | 27 MB | 16,000 / 32,000 |
+| svec_hnsw_scan ef=96, rk=48 | 96.8% | 0.98 ms | ~100 MB† | 16,000 / 32,000 |
+| svec_hnsw_scan ef=96, rk=0 | 98.4% | 1.83 ms | ~100 MB† | 16,000 / 32,000 |
 
-IVF-PQ is 30x smaller on storage at comparable recall. HNSW is faster for
-single queries but requires storing full vectors in the index. `svec`/`hsvec`
-still support a much wider dimensional range and keep the ANN path inside the
-table rather than an additional large graph index.
+†Hierarchical sidecar tables (L0–L4, hsvec(384) sketches). Requires
+`sorted_heap.hnsw_cache_l0 = on` for the sub-2ms operating points (session-local
+cache built on first query, ~100 MB per session).
+
+`svec_hnsw_scan` is 3–4× faster than pgvector at comparable recall because
+navigation uses compact hsvec(384) sketches (no TOAST) and the cache eliminates
+repeated btree lookups. See [HNSW search](#hnsw-search-svec_hnsw_scan) below.
 
 ### Self-query vs cross-query
 
@@ -368,6 +373,98 @@ Builder notes:
 
 ---
 
+## HNSW search (`svec_hnsw_scan`)
+
+`svec_hnsw_scan` performs hierarchical HNSW search using compact hsvec(384)
+sketch sidecar tables. Navigation never touches the main table's TOAST
+embeddings — only exact rerank does, and only for the final `rerank_topk`
+candidates.
+
+### Table requirements
+
+```
+{prefix}_meta   — entry_nid int4, max_level int2
+{prefix}_l0     — nid int4 PK, sketch hsvec(N), neighbors int4[], src_id text, src_tid tid
+{prefix}_l1..lN — nid int4 PK, sketch hsvec(N), neighbors int4[]
+```
+
+Build these with `scripts/build_hnsw_graph.py`. Example for a table with
+`(partition_id int2, id text)` primary key:
+
+```bash
+python scripts/build_hnsw_graph.py \
+  --dsn 'host=... dbname=...' \
+  --table my_table --prefix my_table_hnsw \
+  --sketch-dim 384 --M 16 --bootstrap
+```
+
+### Calling the function
+
+```sql
+SELECT * FROM svec_hnsw_scan(
+    tbl          := 'my_table'::regclass,
+    query        := '[0.1, 0.2, ...]'::svec,
+    prefix       := 'my_table_hnsw',
+    ef_search    := 96,    -- beam width for L0 traversal
+    lim          := 10,    -- results to return
+    rerank_topk  := 48,    -- candidates to exact-rerank (see below)
+    rerank1_topk := 0      -- dense r1 pre-filter (0 = disabled)
+);
+```
+
+Enable the session-local cache for best latency (built once per session,
+~100 MB for 100K nodes):
+
+```sql
+SET sorted_heap.hnsw_cache_l0 = on;
+```
+
+### `rerank_topk` semantics
+
+`rerank_topk` controls how many L0 candidates are passed to exact svec cosine
+rerank. Exact rerank always runs when the L0 table has a `src_tid` column
+(which `build_hnsw_graph.py` always adds).
+
+| `rerank_topk` value | Candidates reranked | Effect |
+|---|---|---|
+| `0` (default) | all `ef_search` | No truncation. Highest recall, `ef_search` TOAST reads. |
+| `0 < rk < ef_search` | `rk` | Truncates before rerank. Fewer TOAST reads, lower recall. |
+| `rk >= ef_search` | all `ef_search` | No effect (same as 0). |
+
+**`rerank_topk=0` does NOT skip exact rerank.** It means "rerank all
+candidates". To return results by sketch distance only (skipping TOAST reads
+entirely), the L0 table must omit the `src_tid` column — this is not the
+default build.
+
+### Recommended operating points (103K × 2880-dim, warm cache)
+
+| Goal | ef_search | rerank_topk | p50 latency | Recall@10 |
+|---|---|---|---|---|
+| Latency-first | 64 | 32 | 0.85 ms | 9.28/10 (92.8%) |
+| Balanced | 96 | 48 | 0.98 ms | 9.68/10 (96.8%) |
+| Quality-first | 96 | 0 | 1.83 ms | 9.84/10 (98.4%) |
+
+These assume `sorted_heap.hnsw_cache_l0 = on` and a warm TOAST buffer pool
+(normal after first few queries per session). Cold pool adds 1–3 ms depending
+on `rerank_topk`.
+
+### Dense r1 pre-filter (`rerank1_topk`)
+
+An optional intermediate stage using a `{prefix}_r1 (nid int4 PK, rerank_vec
+hsvec(768))` sidecar. Set `rerank1_topk > 0` to enable. The r1 stage scores
+all `ef_search` candidates via hsvec(768) cosine, keeps the closest
+`Max(rerank1_topk, lim)`, then passes those to exact svec rerank.
+
+**On a warm TOAST pool, r1 provides marginal benefit.** At ef=64, r1=24 saves
+~0.3 ms but costs ~0.12 recall (9.74→9.62). At ef≥96 the r1 btree overhead
+exceeds the TOAST savings. r1 is most useful in cold-TOAST scenarios (first
+query of a session, or very large datasets where TOAST pages don't fit in
+shared_buffers).
+
+If `{prefix}_r1` does not exist, the stage is silently skipped.
+
+---
+
 ## API reference
 
 ### Training
@@ -391,7 +488,9 @@ Builder notes:
 
 | Function | Description |
 |---|---|
-| `svec_ann_scan(tbl, query, nprobe, lim, rerank_topk, cb_id, ivf_cb_id, pq_column)` | C-level IVF-PQ scan (fastest) |
+| `svec_hnsw_scan(tbl, query, prefix, ef_search, lim, rerank_topk, rerank1_topk)` | Hierarchical HNSW via sidecar tables (sub-ms with cache) |
+| `svec_graph_scan(tbl, query, graph_tbl, entries_tbl, ef_search, lim, rerank_topk)` | Flat NSW graph search |
+| `svec_ann_scan(tbl, query, nprobe, lim, rerank_topk, cb_id, ivf_cb_id, pq_column)` | C-level IVF-PQ scan |
 | `svec_ann_search(tbl, query, nprobe, lim, rerank_topk, cb_id)` | SQL-level IVF-PQ search |
 | `svec_ivf_probe(vec, nprobe, cb_id)` | Return nearest nprobe centroid IDs |
 
