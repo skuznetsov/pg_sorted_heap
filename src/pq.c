@@ -30,6 +30,7 @@
 #include "fmgr.h"
 #include "funcapi.h"
 #include "catalog/pg_type_d.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_namespace.h"
 #include "commands/extension.h"
 #include "executor/spi.h"
@@ -5427,7 +5428,8 @@ svec_hnsw_scan(PG_FUNCTION_ARGS)
 	char		   *prefix    = text_to_cstring(PG_GETARG_TEXT_PP(2));
 	int				ef_search = PG_GETARG_INT32(3);
 	int				lim       = PG_GETARG_INT32(4);
-	int				rerank_topk = PG_GETARG_INT32(5);
+	int				rerank_topk  = PG_GETARG_INT32(5);
+	int				rerank1_topk = (PG_NARGS() > 6) ? PG_GETARG_INT32(6) : 0;
 
 	char		   *tblname;
 	Snapshot		snapshot;
@@ -5441,7 +5443,7 @@ svec_hnsw_scan(PG_FUNCTION_ARGS)
 	int				n_visited_upper = 0;
 	int				n_visited_l0 = 0;
 	int				j;
-	instr_time		t_start, t_upper, t_l0, t_rerank, t_out;
+	instr_time		t_start, t_upper, t_l0, t_r1, t_rerank, t_out;
 	const HnswL0Cache *active_cache = NULL;	/* set below if GUC on */
 	double			cache_build_ms = 0.0;
 
@@ -5612,6 +5614,134 @@ svec_hnsw_scan(PG_FUNCTION_ARGS)
 
 			l0_res_size = Min(effective, l0_res_size);
 		}
+
+		/* ---- Dense r1 rerank via _r1 sidecar (e.g. hsvec(768)) ---- *
+		 * If rerank1_topk > 0 and the _r1 table exists, compute an
+		 * intermediate hsvec cosine distance for every L0 candidate and
+		 * keep only the closest rerank1_topk before expensive full-svec
+		 * TOAST reads.  Gracefully skipped when _r1 is absent.
+		 */
+		if (rerank1_topk > 0 && l0_res_size > 0)
+		{
+			const char *dot;
+			char	   *r1_tblname;
+			Oid			r1_oid = InvalidOid;
+
+			r1_tblname = psprintf("%s_r1", prefix);
+			dot = strchr(prefix, '.');
+			if (dot)
+			{
+				/* schema-qualified prefix: split at first '.' */
+				char	   *schemaname = pnstrdup(prefix, dot - prefix);
+				const char *relname    = psprintf("%s_r1", dot + 1);
+				Oid			nsoid = LookupExplicitNamespace(schemaname,
+															true /* missing_ok */);
+
+				if (OidIsValid(nsoid))
+					r1_oid = get_relname_relid(relname, nsoid);
+			}
+			else
+				r1_oid = RelnameGetRelid(psprintf("%s_r1", prefix));
+
+			if (OidIsValid(r1_oid))
+			{
+				Relation		r1_rel;
+				TupleDesc		r1_td;
+				TupleTableSlot *r1_slot;
+				AttrNumber		r1_vec_attno;
+				Relation		r1_pk;
+				AttrNumber		r1_pk_att;
+				Oid				r1_pk_typid, r1_oc, r1_of;
+				RegProcedure	r1_eq_op;
+				IndexScanDesc	r1_iscan;
+				ScanKeyData		r1_skey[1];
+				int				r1_effective;
+
+				r1_rel       = table_open(r1_oid, AccessShareLock);
+				r1_td        = RelationGetDescr(r1_rel);
+				r1_slot      = table_slot_create(r1_rel, NULL);
+				r1_vec_attno = get_attnum(r1_oid, "rerank_vec");
+
+				if (r1_vec_attno == InvalidAttrNumber)
+					ereport(ERROR,
+							(errcode(ERRCODE_UNDEFINED_COLUMN),
+							 errmsg("svec_hnsw_scan: \"%s\" must have "
+									"\"rerank_vec\" (hsvec) column",
+									r1_tblname)));
+
+				if (!r1_rel->rd_indexvalid)
+					RelationGetIndexList(r1_rel);
+				if (!OidIsValid(r1_rel->rd_pkindex))
+					ereport(ERROR,
+							(errcode(ERRCODE_UNDEFINED_OBJECT),
+							 errmsg("svec_hnsw_scan: \"%s\" has no "
+									"primary key", r1_tblname)));
+
+				r1_pk       = index_open(r1_rel->rd_pkindex, AccessShareLock);
+				r1_pk_att   = r1_pk->rd_index->indkey.values[0];
+				r1_pk_typid = TupleDescAttr(r1_td, r1_pk_att - 1)->atttypid;
+				r1_oc       = GetDefaultOpClass(r1_pk_typid, BTREE_AM_OID);
+				r1_of       = get_opclass_family(r1_oc);
+				r1_eq_op    = get_opcode(
+					get_opfamily_member(r1_of, r1_pk_typid, r1_pk_typid,
+										BTEqualStrategyNumber));
+
+#if PG_VERSION_NUM < 180000
+				r1_iscan = index_beginscan(r1_rel, r1_pk, snapshot, 1, 0);
+#else
+				r1_iscan = index_beginscan(r1_rel, r1_pk, snapshot, NULL, 1, 0);
+#endif
+
+				for (j = 0; j < l0_res_size; j++)
+				{
+					bool	isnull;
+					Datum	vec_d;
+					Hsvec  *rvec;
+
+					ScanKeyInit(&r1_skey[0], 1, BTEqualStrategyNumber,
+								r1_eq_op,
+								Int32GetDatum(gresults[j].nid));
+					index_rescan(r1_iscan, r1_skey, 1, NULL, 0);
+
+					if (!index_getnext_slot(r1_iscan, ForwardScanDirection,
+											r1_slot))
+					{
+						/* nid absent from _r1: sort to end */
+						gresults[j].distance = DBL_MAX;
+						continue;
+					}
+
+					vec_d = slot_getattr(r1_slot, r1_vec_attno, &isnull);
+					if (!isnull)
+					{
+						rvec = (Hsvec *) PG_DETOAST_DATUM(vec_d);
+						gresults[j].distance =
+							cosine_distance_f32_f16(query->x, rvec->x,
+													Min(rvec->dim,
+														query->dim));
+					}
+					else
+						gresults[j].distance = DBL_MAX;
+
+					ExecClearTuple(r1_slot);
+				}
+
+				index_endscan(r1_iscan);
+				ExecDropSingleTupleTableSlot(r1_slot);
+				index_close(r1_pk, AccessShareLock);
+				table_close(r1_rel, AccessShareLock);
+
+				/* Sort by r1 distance, truncate to rerank1_effective */
+				r1_effective = Max(rerank1_topk, lim);
+				qsort(gresults, l0_res_size, sizeof(GraphResult),
+					  cmp_graph_result);
+				if (l0_res_size > r1_effective)
+					l0_res_size = r1_effective;
+			}
+		}
+
+		if (sorted_heap_ann_timing)
+			INSTR_TIME_SET_CURRENT(t_r1);
 
 		/* Read src_tid for all candidates */
 		if (do_exact_rerank && active_cache != NULL)
@@ -5902,16 +6032,18 @@ svec_hnsw_scan(PG_FUNCTION_ARGS)
 	{
 		INSTR_TIME_SET_CURRENT(t_out);
 		elog(DEBUG1,
-			 "svec_hnsw_scan: upper=%.3fms l0=%.3fms rerank=%.3fms "
-			 "out=%.3fms total=%.3fms "
+			 "svec_hnsw_scan: upper=%.3fms l0=%.3fms r1=%.3fms "
+			 "rerank=%.3fms out=%.3fms total=%.3fms "
 			 "(visited_upper=%d visited_l0=%d results=%d max_level=%d "
 			 "cache=%s build_ms=%.1f use=%lld bytes=%lld)",
 			 INSTR_TIME_GET_MILLISEC(t_upper) -
 			 INSTR_TIME_GET_MILLISEC(t_start),
 			 INSTR_TIME_GET_MILLISEC(t_l0) -
 			 INSTR_TIME_GET_MILLISEC(t_upper),
-			 INSTR_TIME_GET_MILLISEC(t_rerank) -
+			 INSTR_TIME_GET_MILLISEC(t_r1) -
 			 INSTR_TIME_GET_MILLISEC(t_l0),
+			 INSTR_TIME_GET_MILLISEC(t_rerank) -
+			 INSTR_TIME_GET_MILLISEC(t_r1),
 			 INSTR_TIME_GET_MILLISEC(t_out) -
 			 INSTR_TIME_GET_MILLISEC(t_rerank),
 			 INSTR_TIME_GET_MILLISEC(t_out) -

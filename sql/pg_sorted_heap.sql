@@ -2866,6 +2866,36 @@ FROM svec_hnsw_scan('ann_test'::regclass,
                     'ann_hnsw', 16, 5, 0);
 
 SET sorted_heap.hnsw_cache_l0 = off;
+
+-- ANN-16: svec_hnsw_scan with _r1 dense rerank sidecar (rerank1_topk > 0)
+-- Reuses the ann_hnsw_* tables from ANN-15 (still in scope here).
+-- _r1 carries hsvec(8) rerank vectors (same dim as ann_test embeddings).
+
+CREATE TABLE ann_hnsw_r1 (
+    nid        int4 PRIMARY KEY,
+    rerank_vec hsvec(8) NOT NULL
+);
+
+-- Populate _r1 from the same sketch values used in _l0
+INSERT INTO ann_hnsw_r1 SELECT nid, sketch FROM ann_hnsw_l0;
+VACUUM ann_hnsw_r1;
+
+-- rerank1_topk=3 (< lim=5): r1 stage cuts ef candidates to 3, exact rerank
+-- then returns top lim. Count must equal lim, distances must be non-negative.
+SELECT count(*) AS ann16_count,
+       bool_and(distance >= 0) AS ann16_nonneg
+FROM svec_hnsw_scan('ann_test'::regclass,
+                    '[5,3,6,7,1,2,4,2]'::svec,
+                    'ann_hnsw', 16, 5, 0, 3);
+
+-- rerank1_topk=5 (= lim): should behave identically to rerank1_topk=0
+SELECT count(*) AS ann16_count,
+       bool_and(distance >= 0) AS ann16_nonneg
+FROM svec_hnsw_scan('ann_test'::regclass,
+                    '[5,3,6,7,1,2,4,2]'::svec,
+                    'ann_hnsw', 16, 5, 0, 5);
+
+DROP TABLE ann_hnsw_r1;
 DROP TABLE ann_hnsw_meta, ann_hnsw_l0, ann_hnsw_l1;
 
 -- Cleanup: drop codebook tables (have svec columns) before extension

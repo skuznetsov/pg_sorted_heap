@@ -1,5 +1,5 @@
 comment = 'Sorted heap table AM with zone map scan pruning for PostgreSQL'
-default_version = '0.9.14'
+default_version = '0.9.15'
 relocatable = false
 superuser = false
 module_pathname = '$libdir/pg_sorted_heap'
