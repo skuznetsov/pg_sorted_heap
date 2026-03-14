@@ -3109,6 +3109,74 @@ EXPLAIN (COSTS OFF) EXECUTE scan1_q(2500);
 DEALLOCATE scan1_q;
 DROP TABLE scan1_cliff;
 
+-- ============================================================
+-- SCAN-2: lazy update maintenance (U1)
+--
+-- Verifies:
+-- 1. After SET sorted_heap.lazy_update = on, UPDATE invalidates zone map
+-- 2. Planner falls back to Index Scan (no Custom Scan)
+-- 3. SELECT still returns correct data
+-- 4. Compact restores zone map and Custom Scan pruning
+-- ============================================================
+CREATE TABLE scan2_lazy(id bigint PRIMARY KEY, val text) USING sorted_heap;
+INSERT INTO scan2_lazy SELECT g, 'row-' || g FROM generate_series(1, 5000) g;
+SELECT sorted_heap_compact('scan2_lazy'::regclass);
+ANALYZE scan2_lazy;
+
+-- Before lazy update: Custom Scan with pruning
+EXPLAIN (COSTS OFF) SELECT val FROM scan2_lazy WHERE id = 2500;
+
+-- Enable lazy update mode and do some updates
+SET sorted_heap.lazy_update = on;
+UPDATE scan2_lazy SET val = 'lazy-' || id WHERE id BETWEEN 1 AND 100;
+
+-- After lazy updates: planner must use Index Scan (zone map invalidated)
+EXPLAIN (COSTS OFF) SELECT val FROM scan2_lazy WHERE id = 2500;
+
+-- Correctness: updated and non-updated rows still accessible
+SELECT val FROM scan2_lazy WHERE id = 50;
+SELECT val FROM scan2_lazy WHERE id = 2500;
+
+-- Compact restores zone map
+SET sorted_heap.lazy_update = off;
+SELECT sorted_heap_compact('scan2_lazy'::regclass);
+ANALYZE scan2_lazy;
+
+-- After compact: Custom Scan with pruning is back
+EXPLAIN (COSTS OFF) SELECT val FROM scan2_lazy WHERE id = 2500;
+
+-- Same-backend re-invalidation: second lazy cycle must re-clear on disk
+-- (tests zm_lazy_invalidated reset after compact)
+SET sorted_heap.lazy_update = on;
+UPDATE scan2_lazy SET val = 'lazy2-' || id WHERE id BETWEEN 200 AND 250;
+-- Must be Index Scan again (re-invalidated, not stale from first cycle)
+EXPLAIN (COSTS OFF) SELECT val FROM scan2_lazy WHERE id = 2500;
+SELECT val FROM scan2_lazy WHERE id = 225;
+
+-- Restore and compact again
+SET sorted_heap.lazy_update = off;
+SELECT sorted_heap_compact('scan2_lazy'::regclass);
+ANALYZE scan2_lazy;
+
+-- Pruning restored after second cycle
+EXPLAIN (COSTS OFF) SELECT val FROM scan2_lazy WHERE id = 2500;
+
+-- Merge after lazy updates on EARLY pages: must not trust stale fallback prefix
+-- (This falsifies the scenario where detect_sorted_prefix scans stale entries)
+SET sorted_heap.lazy_update = on;
+UPDATE scan2_lazy SET val = 'lazy3-' || id WHERE id BETWEEN 1 AND 200;
+SET sorted_heap.lazy_update = off;
+-- Merge should treat prefix as 0 (full tuplesort), not infer from stale entries
+SELECT sorted_heap_merge('scan2_lazy'::regclass);
+ANALYZE scan2_lazy;
+
+-- After merge: pruning restored and all rows correct
+EXPLAIN (COSTS OFF) SELECT val FROM scan2_lazy WHERE id = 2500;
+SELECT val FROM scan2_lazy WHERE id = 100;
+SELECT count(*) FROM scan2_lazy;
+
+DROP TABLE scan2_lazy;
+
 -- Cleanup: drop codebook tables (have svec columns) before extension
 DROP TABLE ann_test;
 DROP TABLE IF EXISTS _ivf_centroids, _pq_codebooks, _ivf_meta, _pq_codebook_meta;

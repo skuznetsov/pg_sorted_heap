@@ -1564,6 +1564,18 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("sorted_heap.lazy_update",
+							 "Skip zone map maintenance on UPDATE. "
+							 "First UPDATE invalidates zone map pruning; "
+							 "planner falls back to Index Scan. "
+							 "Compact or merge restores zone map.",
+							 NULL,
+							 &sorted_heap_lazy_update,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("sorted_heap");
 
 	CacheRegisterRelcacheCallback(pg_sorted_heap_relcache_callback, (Datum) 0);

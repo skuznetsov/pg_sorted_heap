@@ -22,24 +22,30 @@
   columns including wide svec vectors on every UPDATE/INSERT. Removing it
   eliminates ~530 bytes of needless deform per tuple for svec(128) tables.
   UPDATE vec col: 74% → 102% (parity). Mixed OLTP: 42% → 83%.
+- **Lazy update maintenance** (`sorted_heap.lazy_update = on`): opt-in mode
+  that skips per-UPDATE zone map maintenance. First UPDATE on a covered page
+  clears `SHM_FLAG_ZONEMAP_VALID` on disk; planner falls back to Index Scan.
+  INSERT keeps eager maintenance. Compact/merge restores zone map pruning.
+  UPDATE non-vec: 46% → 100%. Mixed OLTP: 83% → 97%.
+- **SCAN-2 regression test**: verifies lazy mode invalidation → Index Scan
+  fallback → correct data → compact restores Custom Scan pruning.
 
 ### CRUD performance contract (500K rows, svec(128), prepared mode)
 
-| Operation | sorted_heap / heap | Notes |
-|-----------|-------------------|-------|
-| SELECT PK | 85% | Index Scan via btree |
-| SELECT range 1000 | 97% | Sequential I/O advantage |
-| Bulk INSERT | 100% | Parity (+ compact cost amortized) |
-| DELETE + INSERT | 63% | Zone map maintenance on INSERT |
-| UPDATE non-vec | 46% | Zone map flush (GenericXLog FPI) per update |
-| UPDATE vec col | 102% | Parity — random_vector_text dominates |
-| Mixed OLTP | 83% | Dominated by UPDATE share |
+| Operation | eager / heap | lazy / heap | Notes |
+|-----------|-------------|-------------|-------|
+| SELECT PK | 85% | 85% | Index Scan via btree |
+| SELECT range 1000 | 97% | — | Custom Scan pruning (eager only) |
+| Bulk INSERT | 100% | 100% | Always eager |
+| DELETE + INSERT | 63% | 63% | INSERT always eager |
+| UPDATE non-vec | 46% | **100%** | Lazy skips zone map flush |
+| UPDATE vec col | 102% | **100%** | Parity both modes |
+| Mixed OLTP | 83% | **97%** | Near-parity with lazy |
 
-Remaining UPDATE non-vec gap is per-update zone map flush cost
-(`zonemap_flush` via GenericXLog FPI writes 8KB meta page to WAL).
-Batching falsifier negative — commit-time batching won't help single-stmt
-transactions. Next option: opt-in lazy zone map mode (skip maintenance,
-planner falls back to Index Scan, rebuild on compact).
+Eager mode (default) maintains zone maps on every UPDATE for scan pruning.
+Lazy mode (`sorted_heap.lazy_update = on`) trades scan pruning for UPDATE
+parity with heap. Compact/merge restores pruning. Recommended for
+write-heavy workloads where point lookups use Index Scan anyway.
 
 ### HNSW sidecar search (`svec_hnsw_scan`)
 

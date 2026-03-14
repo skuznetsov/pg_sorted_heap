@@ -137,6 +137,9 @@ typedef struct SortedHeapRelInfo
 
 	/* Persisted sorted prefix (v7+) */
 	uint16		sorted_prefix_pages;		/* pages 1..N known sorted */
+
+	/* Lazy update maintenance (U1) */
+	bool		zm_lazy_invalidated;	/* VALID flag already cleared on disk */
 } SortedHeapRelInfo;
 
 /*
@@ -192,6 +195,7 @@ extern bool sorted_heap_enable_scan_pruning;
 extern bool sorted_heap_vacuum_rebuild_zonemap;
 extern bool sorted_heap_ann_timing;
 extern bool sorted_heap_hnsw_cache_l0;
+extern bool sorted_heap_lazy_update;
 extern void sorted_heap_hnsw_relcache_invalidate(Oid relid);
 
 #endif							/* SORTED_HEAP_H */

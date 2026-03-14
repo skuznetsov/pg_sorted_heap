@@ -158,6 +158,9 @@ static HTAB *sorted_heap_relinfo_hash = NULL;
 /* GUC: rebuild zone map during VACUUM when invalid */
 bool sorted_heap_vacuum_rebuild_zonemap = true;
 
+/* GUC: lazy update maintenance — skip zone map upkeep on UPDATE */
+bool sorted_heap_lazy_update = false;
+
 /* ----------------------------------------------------------------
  *  Handler + initialization
  * ---------------------------------------------------------------- */
@@ -333,6 +336,7 @@ sorted_heap_get_relinfo(Relation rel)
 		info->zm_col2_usable = false;
 		info->zm_pk_typid2 = InvalidOid;
 		info->zm_gen = 0;
+		info->zm_lazy_invalidated = false;
 	}
 	else
 	{
@@ -344,7 +348,11 @@ sorted_heap_get_relinfo(Relation rel)
 		uint64	current_gen = sorted_heap_read_zm_generation();
 
 		if (current_gen != 0 && info->zm_gen != current_gen)
+		{
 			info->zm_loaded = false;
+			info->zm_lazy_invalidated = false;
+			info->zm_disk_sorted_cleared = false;
+		}
 	}
 
 	if (!info->pk_probed)
@@ -525,6 +533,8 @@ sorted_heap_relcache_callback(Datum arg, Oid relid)
 		{
 			info->pk_probed = false;
 			info->zm_loaded = false;
+			info->zm_lazy_invalidated = false;
+			info->zm_disk_sorted_cleared = false;
 			if (info->zm_overflow)
 			{
 				pfree(info->zm_overflow);
@@ -551,6 +561,8 @@ sorted_heap_relcache_callback(Datum arg, Oid relid)
 		{
 			info->pk_probed = false;
 			info->zm_loaded = false;
+			info->zm_lazy_invalidated = false;
+			info->zm_disk_sorted_cleared = false;
 			if (info->zm_overflow)
 			{
 				pfree(info->zm_overflow);
@@ -1072,6 +1084,65 @@ sorted_heap_clear_sorted_flag(Relation rel, SortedHeapRelInfo *info)
 		GenericXLogFinish(state);
 	}
 
+	info->zm_disk_sorted_cleared = true;
+
+	UnlockReleaseBuffer(metabuf);
+	sorted_heap_bump_zm_generation();
+}
+
+/*
+ * Invalidate zone map for scan pruning on disk.
+ * Called once per relation when lazy update mode encounters a covered-page
+ * UPDATE.  Clears SHM_FLAG_ZONEMAP_VALID and sorted_prefix_pages so other
+ * backends stop trusting the zone map for pruning (they fall back to Index
+ * Scan) and merge/compact don't rely on a stale sorted prefix.
+ * Uses zm_lazy_invalidated to avoid redundant disk writes.
+ */
+static void
+sorted_heap_lazy_invalidate_zonemap(Relation rel, SortedHeapRelInfo *info)
+{
+	Buffer				metabuf;
+	Page				metapage;
+	SortedHeapMetaPageData *meta;
+
+	info->zm_scan_valid = false;
+	info->zm_sorted = false;
+	info->sorted_prefix_pages = 0;
+
+	if (info->zm_lazy_invalidated)
+		return;		/* already cleared on disk this session */
+
+	metabuf = ReadBufferExtended(rel, MAIN_FORKNUM, SORTED_HEAP_META_BLOCK,
+								 RBM_NORMAL, NULL);
+	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+	metapage = BufferGetPage(metabuf);
+	meta = (SortedHeapMetaPageData *) PageGetSpecialPointer(metapage);
+
+	{
+		bool need_write = false;
+		GenericXLogState *state;
+
+		if (meta->shm_flags & SHM_FLAG_ZONEMAP_VALID)
+			need_write = true;
+		if (meta->shm_version >= 7 && meta->shm_sorted_prefix_pages != 0)
+			need_write = true;
+		if (meta->shm_flags & SHM_FLAG_ZM_SORTED)
+			need_write = true;
+
+		if (need_write)
+		{
+			state = GenericXLogStart(rel);
+			metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
+			meta = (SortedHeapMetaPageData *) PageGetSpecialPointer(metapage);
+			meta->shm_flags &= ~SHM_FLAG_ZONEMAP_VALID;
+			meta->shm_flags &= ~SHM_FLAG_ZM_SORTED;
+			if (meta->shm_version >= 7)
+				meta->shm_sorted_prefix_pages = 0;
+			GenericXLogFinish(state);
+		}
+	}
+
+	info->zm_lazy_invalidated = true;
 	info->zm_disk_sorted_cleared = true;
 
 	UnlockReleaseBuffer(metabuf);
@@ -2378,41 +2449,58 @@ sorted_heap_tuple_update(Relation rel, ItemPointer otid,
 		SortedHeapRelInfo *info = sorted_heap_get_relinfo(rel);
 		BlockNumber		new_blk = ItemPointerGetBlockNumber(&slot->tts_tid);
 
-		/* Conservative prefix shrink: any update landing on a prefix page */
-		if (info->sorted_prefix_pages > 0 && new_blk >= 1)
+		if (sorted_heap_lazy_update && info->zm_usable)
 		{
-			uint32	zmidx = new_blk - 1;
-
-			if (zmidx < info->sorted_prefix_pages)
-				sorted_heap_shrink_prefix(rel, info, zmidx);
+			/*
+			 * Lazy update maintenance: invalidate zone map on first
+			 * covered-page UPDATE, then skip all per-update zone map
+			 * work.  Planner falls back to Index Scan when
+			 * zm_scan_valid is false.  Compact/merge restores it.
+			 */
+			if (info->zm_scan_valid)
+				sorted_heap_lazy_invalidate_zonemap(rel, info);
 		}
-
-		/* Zone map update for the new tuple's page */
-		if (info->zm_scan_valid && info->zm_usable && new_blk >= 1)
+		else
 		{
-			uint32	zmidx = new_blk - 1;
+			/* Eager mode: maintain zone map and prefix on every UPDATE */
 
-			if (zmidx < info->zm_total_entries)
+			/* Conservative prefix shrink: update on a prefix page */
+			if (info->sorted_prefix_pages > 0 && new_blk >= 1)
 			{
-				if (sorted_heap_zonemap_update_entry(rel, info, zmidx, slot))
-				{
-					if (zmidx < info->zm_nentries)
-						sorted_heap_zonemap_flush(rel, info);
-					else
-					{
-						uint32 ovfl_idx = zmidx - info->zm_nentries;
-						uint32 page_idx = ovfl_idx /
-							SORTED_HEAP_OVERFLOW_ENTRIES_PER_PAGE;
+				uint32	zmidx = new_blk - 1;
 
-						if (page_idx < info->zm_overflow_npages)
-							sorted_heap_zonemap_flush_overflow_page(
-								rel, info, page_idx);
-					}
-					sorted_heap_clear_sorted_flag(rel, info);
-				}
+				if (zmidx < info->sorted_prefix_pages)
+					sorted_heap_shrink_prefix(rel, info, zmidx);
 			}
-			else
-				sorted_heap_clear_sorted_flag(rel, info);
+
+			/* Zone map update for the new tuple's page */
+			if (info->zm_scan_valid && info->zm_usable && new_blk >= 1)
+			{
+				uint32	zmidx = new_blk - 1;
+
+				if (zmidx < info->zm_total_entries)
+				{
+					if (sorted_heap_zonemap_update_entry(rel, info,
+														 zmidx, slot))
+					{
+						if (zmidx < info->zm_nentries)
+							sorted_heap_zonemap_flush(rel, info);
+						else
+						{
+							uint32 ovfl_idx = zmidx - info->zm_nentries;
+							uint32 page_idx = ovfl_idx /
+								SORTED_HEAP_OVERFLOW_ENTRIES_PER_PAGE;
+
+							if (page_idx < info->zm_overflow_npages)
+								sorted_heap_zonemap_flush_overflow_page(
+									rel, info, page_idx);
+						}
+						sorted_heap_clear_sorted_flag(rel, info);
+					}
+				}
+				else
+					sorted_heap_clear_sorted_flag(rel, info);
+			}
 		}
 	}
 
@@ -2540,11 +2628,18 @@ sorted_heap_detect_sorted_prefix(SortedHeapRelInfo *info)
 
 	/*
 	 * Fallback: scan zone map entries (pre-v7 tables, or no compaction yet).
-	 * We use zone map entries to detect monotonicity regardless of the
-	 * zm_scan_valid flag. The entries for compacted pages are accurate
-	 * even after subsequent INSERTs clear the flag. If the zone map
-	 * hasn't been populated at all, prefix is 0 (full tuplesort fallback).
+	 *
+	 * Only safe when zm_scan_valid is true — meaning zone map entries have
+	 * been eagerly maintained.  When the zone map has been invalidated
+	 * (e.g. by lazy update mode), entries may be stale and must not be
+	 * trusted for prefix detection.  Return 0 to force full tuplesort.
+	 *
+	 * When zm_scan_valid is true, entries for compacted pages are accurate
+	 * even after subsequent INSERTs (INSERTs always maintain eagerly).
 	 */
+	if (!info->zm_scan_valid)
+		return 0;
+
 	if (info->zm_total_entries == 0)
 		return 0;
 
@@ -2654,6 +2749,8 @@ sorted_heap_merge(PG_FUNCTION_ARGS)
 
 	/* Force zone map reload under exclusive lock */
 	info->zm_loaded = false;
+	info->zm_lazy_invalidated = false;
+	info->zm_disk_sorted_cleared = false;
 	sorted_heap_zonemap_load(rel, info);
 
 	total_blocks = RelationGetNumberOfBlocks(rel);
