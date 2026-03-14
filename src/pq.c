@@ -55,6 +55,10 @@
 #include <math.h>
 #include <string.h>
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 #include "svec.h"
 #include "hsvec.h"
 #include "pq.h"
@@ -2576,11 +2580,56 @@ svec_pq_adc(PG_FUNCTION_ARGS)
 static float8
 cosine_distance_f32_f16(const float *a, const half *b, int dim)
 {
-	double		dot = 0.0,
-				norm_a = 0.0,
-				norm_b = 0.0;
+	double		dot;
+	double		norm_a;
+	double		norm_b;
 	double		similarity;
 	int			i;
+
+#if defined(__aarch64__) && defined(__ARM_NEON) && HSVEC_NATIVE_FP16
+	{
+		float32x4_t vdot = vdupq_n_f32(0.0f);
+		float32x4_t vna  = vdupq_n_f32(0.0f);
+		float32x4_t vnb  = vdupq_n_f32(0.0f);
+
+		for (i = 0; i + 7 < dim; i += 8)
+		{
+			/* Load 8 × f16 from sketch, convert to 2 × f32x4 */
+			float16x8_t vh    = vld1q_f16((const float16_t *) &b[i]);
+			float32x4_t vb_lo = vcvt_f32_f16(vget_low_f16(vh));
+			float32x4_t vb_hi = vcvt_f32_f16(vget_high_f16(vh));
+
+			/* Load 8 × f32 from query */
+			float32x4_t va_lo = vld1q_f32(&a[i]);
+			float32x4_t va_hi = vld1q_f32(&a[i + 4]);
+
+			vdot = vfmaq_f32(vdot, va_lo, vb_lo);
+			vdot = vfmaq_f32(vdot, va_hi, vb_hi);
+			vna  = vfmaq_f32(vna, va_lo, va_lo);
+			vna  = vfmaq_f32(vna, va_hi, va_hi);
+			vnb  = vfmaq_f32(vnb, vb_lo, vb_lo);
+			vnb  = vfmaq_f32(vnb, vb_hi, vb_hi);
+		}
+
+		dot    = (double) vaddvq_f32(vdot);
+		norm_a = (double) vaddvq_f32(vna);
+		norm_b = (double) vaddvq_f32(vnb);
+
+		/* Scalar tail for non-multiple-of-8 */
+		for (; i < dim; i++)
+		{
+			double	ai = (double) a[i];
+			double	bi = (double) (float) b[i];
+
+			dot    += ai * bi;
+			norm_a += ai * ai;
+			norm_b += bi * bi;
+		}
+	}
+#else
+	dot = 0.0;
+	norm_a = 0.0;
+	norm_b = 0.0;
 
 	for (i = 0; i < dim; i++)
 	{
@@ -2591,6 +2640,7 @@ cosine_distance_f32_f16(const float *a, const half *b, int dim)
 		norm_a += ai * ai;
 		norm_b += bi * bi;
 	}
+#endif
 
 	if (norm_a == 0.0 || norm_b == 0.0)
 		return get_float8_nan();
@@ -2602,6 +2652,103 @@ cosine_distance_f32_f16(const float *a, const half *b, int dim)
 		similarity = -1.0;
 
 	return 1.0 - similarity;
+}
+
+/* --- f32×f16 cosine distance with precomputed query norm (beam search) --- */
+
+static float8
+cosine_distance_f32_f16_prenorm(const float *a, const half *b, int dim,
+								double norm_a)
+{
+	double		dot;
+	double		norm_b;
+	double		similarity;
+	int			i;
+
+#if defined(__aarch64__) && defined(__ARM_NEON) && HSVEC_NATIVE_FP16
+	{
+		float32x4_t vdot = vdupq_n_f32(0.0f);
+		float32x4_t vnb  = vdupq_n_f32(0.0f);
+
+		for (i = 0; i + 7 < dim; i += 8)
+		{
+			float16x8_t vh    = vld1q_f16((const float16_t *) &b[i]);
+			float32x4_t vb_lo = vcvt_f32_f16(vget_low_f16(vh));
+			float32x4_t vb_hi = vcvt_f32_f16(vget_high_f16(vh));
+
+			float32x4_t va_lo = vld1q_f32(&a[i]);
+			float32x4_t va_hi = vld1q_f32(&a[i + 4]);
+
+			vdot = vfmaq_f32(vdot, va_lo, vb_lo);
+			vdot = vfmaq_f32(vdot, va_hi, vb_hi);
+			vnb  = vfmaq_f32(vnb, vb_lo, vb_lo);
+			vnb  = vfmaq_f32(vnb, vb_hi, vb_hi);
+		}
+
+		dot    = (double) vaddvq_f32(vdot);
+		norm_b = (double) vaddvq_f32(vnb);
+
+		for (; i < dim; i++)
+		{
+			double	bi = (double) (float) b[i];
+
+			dot    += (double) a[i] * bi;
+			norm_b += bi * bi;
+		}
+	}
+#else
+	dot = 0.0;
+	norm_b = 0.0;
+
+	for (i = 0; i < dim; i++)
+	{
+		double	bi = (double) HalfToFloat4(b[i]);
+
+		dot    += (double) a[i] * bi;
+		norm_b += bi * bi;
+	}
+#endif
+
+	if (norm_a == 0.0 || norm_b == 0.0)
+		return get_float8_nan();
+
+	similarity = dot / (sqrt(norm_a) * sqrt(norm_b));
+	if (similarity > 1.0)
+		similarity = 1.0;
+	else if (similarity < -1.0)
+		similarity = -1.0;
+
+	return 1.0 - similarity;
+}
+
+/* --- Precompute query self-norm for prenorm variants --- */
+
+static double
+query_self_norm(const float *q, int dim)
+{
+	double	norm = 0.0;
+	int		i;
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+	{
+		float32x4_t vn = vdupq_n_f32(0.0f);
+
+		for (i = 0; i + 3 < dim; i += 4)
+		{
+			float32x4_t va = vld1q_f32(&q[i]);
+
+			vn = vfmaq_f32(vn, va, va);
+		}
+		norm = (double) vaddvq_f32(vn);
+		for (; i < dim; i++)
+			norm += (double) q[i] * (double) q[i];
+	}
+#else
+	for (i = 0; i < dim; i++)
+		norm += (double) q[i] * (double) q[i];
+#endif
+
+	return norm;
 }
 
 /* --- Max-heap for top-K selection --- */
@@ -5078,7 +5225,8 @@ hnsw_search_level(HnswLevel *h,
 				  GraphEntry *res_out,
 				  int *n_visited_out,
 				  const HnswL0Cache *l0_cache,	/* NULL for upper levels */
-				  int patience)					/* 0 = disabled */
+				  int patience,					/* 0 = disabled */
+				  double qnorm)					/* precomputed ||query||² */
 {
 	GraphEntry *candidates;
 	int			cand_size = 0;
@@ -5121,11 +5269,12 @@ hnsw_search_level(HnswLevel *h,
 
 		if (l0_cache != NULL && ep <= l0_cache->max_nid)
 		{
-			/* Cache fast path: no btree probe */
+			/* Cache fast path: f32 sketches, precomputed query norm */
 			const HnswL0CacheNode *cn = &l0_cache->nodes[ep];
 
-			d = cosine_distance_f32_f16(qx, (const half *) cn->sketch,
-										Min(HNSW_CACHE_SKETCH_DIM, qdim));
+			d = cosine_distance_f32_f16_prenorm(qx, (const half *) cn->sketch,
+												Min(HNSW_CACHE_SKETCH_DIM, qdim),
+												qnorm);
 		}
 		else
 		{
@@ -5243,10 +5392,9 @@ hnsw_search_level(HnswLevel *h,
 					continue;	/* safety: nid beyond cache */
 
 				nn	   = &l0_cache->nodes[n_nid];
-				n_dist = cosine_distance_f32_f16(qx,
-												 (const half *) nn->sketch,
-												 Min(HNSW_CACHE_SKETCH_DIM,
-													 qdim));
+				n_dist = cosine_distance_f32_f16_prenorm(qx, (const half *) nn->sketch,
+														 Min(HNSW_CACHE_SKETCH_DIM,
+															 qdim), qnorm);
 
 				f_dist = (res_size >= ef) ? res_out[0].dist : DBL_MAX;
 				if (n_dist < f_dist || res_size < ef)
@@ -5466,6 +5614,7 @@ svec_hnsw_scan(PG_FUNCTION_ARGS)
 	instr_time		t_start, t_upper, t_l0, t_r1, t_rerank, t_out;
 	const HnswL0Cache *active_cache = NULL;	/* set below if GUC on */
 	double			cache_build_ms = 0.0;
+	double			qnorm;			/* precomputed ||query||² */
 
 	/* ---- Setup ---- */
 	if (sorted_heap_ann_timing)
@@ -5474,6 +5623,8 @@ svec_hnsw_scan(PG_FUNCTION_ARGS)
 	if (ef_search < 1) ef_search = 1;
 	if (lim < 1) lim = 1;
 	if (ef_search < lim) ef_search = lim;
+
+	qnorm = query_self_norm(query->x, query->dim);
 
 	snapshot = GetActiveSnapshot();
 
@@ -5581,7 +5732,7 @@ svec_hnsw_scan(PG_FUNCTION_ARGS)
 			ep_arr[0] = ep;
 			res_sz = hnsw_search_level(&ul, query->x, query->dim,
 									   ep_arr, 1, 1, ul_res, &n_vis,
-									   ul_cache, 0);
+									   ul_cache, 0, qnorm);
 		}
 		n_visited_upper += n_vis;
 
@@ -5603,7 +5754,8 @@ svec_hnsw_scan(PG_FUNCTION_ARGS)
 		l0_res_size = hnsw_search_level(&l0, query->x, query->dim,
 										ep_arr, 1, ef_search,
 										l0_res, &n_vis, active_cache,
-										sorted_heap_hnsw_ef_patience);
+										sorted_heap_hnsw_ef_patience,
+										qnorm);
 		n_visited_l0 = n_vis;
 	}
 

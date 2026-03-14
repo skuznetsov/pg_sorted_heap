@@ -55,10 +55,16 @@ write-heavy workloads where point lookups use Index Scan anyway.
 - **Session-local L0 cache** (`sorted_heap.hnsw_cache_l0 = on`): seqscans L0
   once per session (~95ms build, ~100MB for 103K nodes). Upper levels (L1–L4)
   cached separately (~6MB). OID-based invalidation on DDL.
+- **ARM NEON SIMD** for `cosine_distance_f32_f16`: vectorized mixed-precision
+  distance with `vld1q_f16` → `vcvt_f32_f16` → `vfmaq_f32`, processing 8 f16
+  elements per iteration. Precomputed query self-norm (`cosine_distance_f32_f16_prenorm`)
+  eliminates redundant norm_a accumulation in beam search (4 FMAs/iter vs 6).
+  Compile-time guard: `__aarch64__ && __ARM_NEON && HSVEC_NATIVE_FP16`.
+  Scalar fallback on x86. 27–36% speedup across all operating points.
 - **Recommended operating points** (103K x 2880-dim, warm pool, hsvec(384) sketch):
-  - Balanced: ef=128 rk=48 patience=8 → 1.14ms p50, 96.8% recall@10
-  - Quality: ef=96 rk=0 → 1.77ms p50, 98.4% recall@10
-  - Latency: ef=64 rk=32 → 0.85ms p50, 92.8% recall@10
+  - Balanced: ef=128 rk=48 patience=8 → 0.85ms p50, 96.8% recall@10
+  - Quality: ef=96 rk=0 → 1.40ms p50, 98.4% recall@10
+  - Latency: ef=64 rk=32 → 0.60ms p50, 92.8% recall@10
 - **r1 verdict**: marginal on warm pools. At ef>=96 the btree overhead exceeds
   TOAST savings. Useful only in cold-TOAST scenarios.
 - **Tests**: ANN-15 (basic HNSW), ANN-15b (bit-identical distances across cache
