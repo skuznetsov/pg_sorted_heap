@@ -332,7 +332,6 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	BlockNumber			nblocks, total_blocks;
 	CustomPath		   *cpath;
 	double				sel;
-	bool				skip_narrow_dml;
 	bool				allow_parallel_partial = true;
 
 	/* Chain to previous hook */
@@ -349,6 +348,16 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	if (rte->rtekind != RTE_RELATION)
 		return;
 	if (rel->baserestrictinfo == NIL)
+		return;
+
+	/*
+	 * Skip CustomScan entirely for UPDATE/DELETE targeting this relation.
+	 * Index scan's direct TID access always beats custom scan for DML,
+	 * and the bounds extraction + range computation add measurable
+	 * planning overhead on every DML statement (~11% at high TPS).
+	 */
+	if (root->parse->commandType != CMD_SELECT &&
+		(int) rti == root->parse->resultRelation)
 		return;
 
 	/* Check if this is a sorted_heap table */
@@ -400,15 +409,6 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 
 		if (total_blocks <= 1)
 			return;
-
-		/*
-		 * For UPDATE/DELETE targeting this relation, skip CustomScan when the
-		 * block range is narrow (<=4 blocks).  IndexScan's direct TID access
-		 * beats CustomScan's per-block filtering for point DML, while
-		 * CustomScan's sequential I/O pattern still wins for wider ranges.
-		 */
-		skip_narrow_dml = (root->parse->commandType != CMD_SELECT &&
-						   (int) rti == root->parse->resultRelation);
 
 		/* Create CustomPath */
 		cpath = makeNode(CustomPath);
@@ -469,9 +469,6 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 
 			nblocks = range_total;
 			allow_parallel_partial = (scan_nranges <= 1);
-
-			if (skip_narrow_dml && nblocks <= 4)
-				return;
 
 			sel = (double) nblocks / (double) total_blocks;
 			cpath->path.rows = rel->rows;
@@ -593,9 +590,6 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 			nblocks += uncovered_blocks;
 
 			if (nblocks >= total_blocks)
-				return;
-
-			if (skip_narrow_dml && nblocks <= 4)
 				return;
 
 			sel = (double) nblocks / (double) total_blocks;
