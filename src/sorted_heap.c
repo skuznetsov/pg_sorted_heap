@@ -2311,8 +2311,6 @@ sorted_heap_tuple_insert(Relation rel, TupleTableSlot *slot,
 		if (blk < 1)
 			return;		/* meta page, nothing to track */
 
-		slot_getallattrs(slot);
-
 		if (zmidx < info->zm_total_entries)
 		{
 			/*
@@ -2393,8 +2391,6 @@ sorted_heap_tuple_update(Relation rel, ItemPointer otid,
 		if (info->zm_scan_valid && info->zm_usable && new_blk >= 1)
 		{
 			uint32	zmidx = new_blk - 1;
-
-			slot_getallattrs(slot);
 
 			if (zmidx < info->zm_total_entries)
 			{

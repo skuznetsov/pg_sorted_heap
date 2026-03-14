@@ -14,23 +14,32 @@
 - **SCAN-1 regression test**: verifies prepared statement generic plan uses
   Index Scan (not Custom Scan) after UPDATEs create uncovered tail pages.
 
+### UPDATE path optimization
+
+- **Remove `slot_getallattrs` from UPDATE/INSERT zone map path**:
+  `zonemap_update_entry` only reads PK columns via `slot_getattr` (lazy
+  deform). The prior `slot_getallattrs` call unnecessarily materialized all
+  columns including wide svec vectors on every UPDATE/INSERT. Removing it
+  eliminates ~530 bytes of needless deform per tuple for svec(128) tables.
+  UPDATE vec col: 74% → 102% (parity). Mixed OLTP: 42% → 83%.
+
 ### CRUD performance contract (500K rows, svec(128), prepared mode)
 
 | Operation | sorted_heap / heap | Notes |
 |-----------|-------------------|-------|
-| SELECT PK | 98% | Zone map pruning matches btree |
-| SELECT range 1000 | 92% | Sequential I/O advantage |
+| SELECT PK | 85% | Index Scan via btree |
+| SELECT range 1000 | 97% | Sequential I/O advantage |
 | Bulk INSERT | 100% | Parity (+ compact cost amortized) |
-| DELETE + INSERT | 100% | Full parity |
-| UPDATE non-vec | 58% | Zone map maintenance overhead |
-| UPDATE vec col | 74% | Wider tuples = tighter zone maps |
-| Mixed OLTP | 42% | Dominated by UPDATE share |
+| DELETE + INSERT | 63% | Zone map maintenance on INSERT |
+| UPDATE non-vec | 46% | Zone map flush (GenericXLog FPI) per update |
+| UPDATE vec col | 102% | Parity — random_vector_text dominates |
+| Mixed OLTP | 83% | Dominated by UPDATE share |
 
-Remaining UPDATE gap is per-update zone map maintenance cost
-(`zonemap_update_entry` + conditional `zonemap_flush` via GenericXLog FPI).
+Remaining UPDATE non-vec gap is per-update zone map flush cost
+(`zonemap_flush` via GenericXLog FPI writes 8KB meta page to WAL).
 Batching falsifier negative — commit-time batching won't help single-stmt
-transactions. Future option: opt-in lazy zone map mode (skip maintenance,
-rebuild on compact).
+transactions. Next option: opt-in lazy zone map mode (skip maintenance,
+planner falls back to Index Scan, rebuild on compact).
 
 ### HNSW sidecar search (`svec_hnsw_scan`)
 
