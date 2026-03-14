@@ -2,6 +2,36 @@
 
 ## 0.9.15 (2026-03-13)
 
+### Scan planner fixes
+
+- **Prepared-mode OLTP cliff fix**: Path B cost estimator now includes
+  uncovered tail pages (pages beyond zone map entries created by UPDATEs).
+  Previously the generic plan estimated 1 block but scanned 90+, keeping
+  Custom Scan over Index Scan. Mixed OLTP: 56 → 28K tps.
+- **DML planning skip**: `set_rel_pathlist` hook bails out immediately for
+  UPDATE/DELETE on the result relation, avoiding bounds extraction and range
+  computation overhead. UPDATE +10%, DELETE+INSERT reaches heap parity.
+- **SCAN-1 regression test**: verifies prepared statement generic plan uses
+  Index Scan (not Custom Scan) after UPDATEs create uncovered tail pages.
+
+### CRUD performance contract (500K rows, svec(128), prepared mode)
+
+| Operation | sorted_heap / heap | Notes |
+|-----------|-------------------|-------|
+| SELECT PK | 98% | Zone map pruning matches btree |
+| SELECT range 1000 | 92% | Sequential I/O advantage |
+| Bulk INSERT | 100% | Parity (+ compact cost amortized) |
+| DELETE + INSERT | 100% | Full parity |
+| UPDATE non-vec | 58% | Zone map maintenance overhead |
+| UPDATE vec col | 74% | Wider tuples = tighter zone maps |
+| Mixed OLTP | 42% | Dominated by UPDATE share |
+
+Remaining UPDATE gap is per-update zone map maintenance cost
+(`zonemap_update_entry` + conditional `zonemap_flush` via GenericXLog FPI).
+Batching falsifier negative — commit-time batching won't help single-stmt
+transactions. Future option: opt-in lazy zone map mode (skip maintenance,
+rebuild on compact).
+
 ### HNSW sidecar search (`svec_hnsw_scan`)
 
 - **7-arg interface**: added `rerank1_topk` parameter for optional dense r1
