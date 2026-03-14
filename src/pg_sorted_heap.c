@@ -1564,6 +1564,19 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	DefineCustomIntVariable("sorted_heap.hnsw_ef_patience",
+						 "Adaptive ef: stop L0 beam search after N consecutive "
+						 "node expansions with no result set improvement. "
+						 "0 disables (use fixed ef). Typical: 16-32.",
+						 NULL,
+						 &sorted_heap_hnsw_ef_patience,
+						 0,		/* default: disabled */
+						 0,		/* min */
+						 1000,	/* max */
+						 PGC_USERSET,
+						 0,
+						 NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("sorted_heap.lazy_update",
 							 "Skip zone map maintenance on UPDATE. "
 							 "First UPDATE invalidates zone map pruning; "

@@ -56,14 +56,20 @@ write-heavy workloads where point lookups use Index Scan anyway.
   once per session (~95ms build, ~100MB for 103K nodes). Upper levels (L1–L4)
   cached separately (~6MB). OID-based invalidation on DDL.
 - **Recommended operating points** (103K x 2880-dim, warm pool, hsvec(384) sketch):
-  - Balanced: ef=96 rk=48 → 0.98ms p50, 96.8% recall@10
-  - Quality: ef=96 rk=0 → 1.83ms p50, 98.4% recall@10
+  - Balanced: ef=128 rk=48 patience=8 → 1.14ms p50, 96.8% recall@10
+  - Quality: ef=96 rk=0 → 1.77ms p50, 98.4% recall@10
   - Latency: ef=64 rk=32 → 0.85ms p50, 92.8% recall@10
 - **r1 verdict**: marginal on warm pools. At ef>=96 the btree overhead exceeds
   TOAST savings. Useful only in cold-TOAST scenarios.
 - **Tests**: ANN-15 (basic HNSW), ANN-15b (bit-identical distances across cache
   states), ANN-16 (r1 sidecar), ANN-17 (r1 absent graceful skip), ANN-18
   (relcache invalidation).
+- **Adaptive ef** (`sorted_heap.hnsw_ef_patience`): patience-based early
+  termination for L0 beam search. When set to N > 0, the search stops after N
+  consecutive node expansions that don't improve the result set. `ef` becomes
+  the maximum budget; easy queries converge sooner. Recommended: ef=128 rk=48
+  patience=8 → 1.14ms p50 (–12% vs fixed ef=96) at identical 96.8% recall.
+  Not beneficial for rk=0 (quality mode) where TOAST reads scale with ef.
 - **Sketch dimension sweep** (103K x 2880-dim Nomic, hsvec 384/512/768):
   recall@10 identical (98.2% at ef=96/rk=48, 93.6% at ef=64/rk=32) across all
   three dimensions; latency within noise (~1.2ms/q). First 384 dims via MRL

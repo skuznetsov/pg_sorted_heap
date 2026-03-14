@@ -66,6 +66,9 @@ bool sorted_heap_ann_timing = false;
 /* GUC: session-local L0 node cache for svec_hnsw_scan */
 bool sorted_heap_hnsw_cache_l0 = false;
 
+/* GUC: adaptive ef — early termination after N stale expansions (0 = off) */
+int sorted_heap_hnsw_ef_patience = 0;
+
 /* ----------------------------------------------------------------
  *  HNSW L0 backend-local node cache
  *
@@ -5074,7 +5077,8 @@ hnsw_search_level(HnswLevel *h,
 				  int32 *entry_nids, int n_entries, int ef,
 				  GraphEntry *res_out,
 				  int *n_visited_out,
-				  const HnswL0Cache *l0_cache)	/* NULL for upper levels */
+				  const HnswL0Cache *l0_cache,	/* NULL for upper levels */
+				  int patience)					/* 0 = disabled */
 {
 	GraphEntry *candidates;
 	int			cand_size = 0;
@@ -5084,6 +5088,8 @@ hnsw_search_level(HnswLevel *h,
 	int			visited_cap;
 	int			n_visited = 0;
 	int			i;
+
+	int			stale_steps = 0;	/* adaptive ef: consecutive no-improvement expansions */
 
 	cand_cap    = Max(ef * 32, 4096);
 	candidates  = palloc(sizeof(GraphEntry) * cand_cap);
@@ -5188,6 +5194,7 @@ hnsw_search_level(HnswLevel *h,
 		int32		c_nid;
 		float8		f_dist;
 		int			k;
+		bool		improved = false;
 
 		c_dist = candidates[0].dist;
 		c_nid  = candidates[0].nid;
@@ -5261,12 +5268,14 @@ hnsw_search_level(HnswLevel *h,
 						res_out[res_size].nid  = n_nid;
 						res_size++;
 						graph_maxheap_siftup(res_out, res_size - 1);
+						improved = true;
 					}
 					else if (n_dist < res_out[0].dist)
 					{
 						res_out[0].dist = n_dist;
 						res_out[0].nid  = n_nid;
 						graph_maxheap_siftdown(res_out, res_size, 0);
+						improved = true;
 					}
 				}
 			}
@@ -5395,16 +5404,27 @@ hnsw_search_level(HnswLevel *h,
 						res_out[res_size].nid  = n_nid;
 						res_size++;
 						graph_maxheap_siftup(res_out, res_size - 1);
+						improved = true;
 					}
 					else if (n_dist < res_out[0].dist)
 					{
 						res_out[0].dist = n_dist;
 						res_out[0].nid  = n_nid;
 						graph_maxheap_siftdown(res_out, res_size, 0);
+						improved = true;
 					}
 				}
 			}
 			pfree(nbrs_copy);
+		}
+
+		/* ---- Adaptive ef: patience-based early termination ---- */
+		if (patience > 0 && res_size >= ef)
+		{
+			if (improved)
+				stale_steps = 0;
+			else if (++stale_steps >= patience)
+				break;
 		}
 	}
 
@@ -5561,7 +5581,7 @@ svec_hnsw_scan(PG_FUNCTION_ARGS)
 			ep_arr[0] = ep;
 			res_sz = hnsw_search_level(&ul, query->x, query->dim,
 									   ep_arr, 1, 1, ul_res, &n_vis,
-									   ul_cache);
+									   ul_cache, 0);
 		}
 		n_visited_upper += n_vis;
 
@@ -5582,7 +5602,8 @@ svec_hnsw_scan(PG_FUNCTION_ARGS)
 		ep_arr[0]   = ep;
 		l0_res_size = hnsw_search_level(&l0, query->x, query->dim,
 										ep_arr, 1, ef_search,
-										l0_res, &n_vis, active_cache);
+										l0_res, &n_vis, active_cache,
+										sorted_heap_hnsw_ef_patience);
 		n_visited_l0 = n_vis;
 	}
 
