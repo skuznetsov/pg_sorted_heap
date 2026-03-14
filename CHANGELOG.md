@@ -61,10 +61,20 @@ write-heavy workloads where point lookups use Index Scan anyway.
   eliminates redundant norm_a accumulation in beam search (4 FMAs/iter vs 6).
   Compile-time guard: `__aarch64__ && __ARM_NEON && HSVEC_NATIVE_FP16`.
   Scalar fallback on x86. 27–36% speedup across all operating points.
+- **Beam search micro-optimizations** (22–29% additional speedup on cache paths):
+  - Visited bitset: replaced `bool[]` (1 byte/node, 103KB) with `uint64[]`
+    bitset (1 bit/node, 12.9KB). Fits in L1 cache; faster membership tests.
+  - Neighbor prefetch: `__builtin_prefetch` on next unvisited neighbor's cache
+    node before computing distance on current. Hides L2/L3 latency for the
+    908-byte cache nodes scattered across the 96MB cache array.
+  - Cache-only upper search: `hnsw_search_cached()` bypasses
+    `hnsw_open_level`/`hnsw_close_level` for warm upper-level caches. Eliminates
+    `table_open` + `index_open` + `index_beginscan` overhead per level.
+    Upper traversal: 0.17ms → 0.04ms (−74%).
 - **Recommended operating points** (103K x 2880-dim, warm pool, hsvec(384) sketch):
-  - Balanced: ef=128 rk=48 patience=8 → 0.85ms p50, 96.8% recall@10
+  - Balanced: ef=128 rk=48 patience=8 → 0.60ms p50, 96.8% recall@10
   - Quality: ef=96 rk=0 → 1.40ms p50, 98.4% recall@10
-  - Latency: ef=64 rk=32 → 0.60ms p50, 92.8% recall@10
+  - Latency: ef=64 rk=32 → 0.43ms p50, 92.8% recall@10
 - **r1 verdict**: marginal on warm pools. At ef>=96 the btree overhead exceeds
   TOAST savings. Useful only in cold-TOAST scenarios.
 - **Tests**: ANN-15 (basic HNSW), ANN-15b (bit-identical distances across cache

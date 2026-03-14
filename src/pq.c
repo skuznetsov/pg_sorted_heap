@@ -5209,6 +5209,180 @@ hnsw_close_level(HnswLevel *h)
 	table_close(h->rel, AccessShareLock);
 }
 
+/* ---- Visited bitset macros (1 bit per nid) ---- */
+#define VISITED_TEST(bits, nwords, nid) \
+	((nid) >= 0 && (nid) / 64 < (nwords) && \
+	 ((bits)[(nid) / 64] & ((uint64) 1 << ((nid) % 64))) != 0)
+
+#define VISITED_SET(bits, nwords, nid) \
+	do { \
+		int _w = (nid) / 64; \
+		if (_w < (nwords)) \
+			(bits)[_w] |= ((uint64) 1 << ((nid) % 64)); \
+	} while (0)
+
+/*
+ * Cache-only beam search (no HnswLevel / no catalog access).
+ *
+ * Used for upper-level greedy descent when cache is already built.
+ * Avoids hnsw_open_level / hnsw_close_level overhead entirely.
+ */
+static int
+hnsw_search_cached(const HnswL0Cache *cache,
+				   const float *qx, int qdim,
+				   int32 *entry_nids, int n_entries, int ef,
+				   GraphEntry *res_out,
+				   int *n_visited_out,
+				   double qnorm)
+{
+	GraphEntry *candidates;
+	int			cand_size = 0;
+	int			cand_cap;
+	int			res_size  = 0;
+	uint64	   *visited_bits;
+	int			visited_nwords;
+	int			n_visited = 0;
+	int			i;
+
+	cand_cap       = Max(ef * 32, 4096);
+	candidates     = palloc(sizeof(GraphEntry) * cand_cap);
+	visited_nwords = cache->max_nid / 64 + 2;
+	visited_bits   = palloc0(sizeof(uint64) * visited_nwords);
+
+	for (i = 0; i < n_entries; i++)
+	{
+		int32		ep = entry_nids[i];
+		float8		d;
+		const HnswL0CacheNode *cn;
+
+		if (ep < 0 || ep > cache->max_nid)
+			continue;
+		if (VISITED_TEST(visited_bits, visited_nwords, ep))
+			continue;
+		VISITED_SET(visited_bits, visited_nwords, ep);
+		n_visited++;
+
+		cn = &cache->nodes[ep];
+		d = cosine_distance_f32_f16_prenorm(qx, (const half *) cn->sketch,
+											Min(HNSW_CACHE_SKETCH_DIM, qdim),
+											qnorm);
+
+		candidates[cand_size].dist = d;
+		candidates[cand_size].nid  = ep;
+		cand_size++;
+		graph_minheap_siftup(candidates, cand_size - 1);
+
+		if (res_size < ef)
+		{
+			res_out[res_size].dist = d;
+			res_out[res_size].nid  = ep;
+			res_size++;
+			graph_maxheap_siftup(res_out, res_size - 1);
+		}
+		else if (d < res_out[0].dist)
+		{
+			res_out[0].dist = d;
+			res_out[0].nid  = ep;
+			graph_maxheap_siftdown(res_out, res_size, 0);
+		}
+	}
+
+	while (cand_size > 0)
+	{
+		float8		c_dist;
+		int32		c_nid;
+		float8		f_dist;
+		int			k;
+		const HnswL0CacheNode *cn;
+
+		c_dist = candidates[0].dist;
+		c_nid  = candidates[0].nid;
+		cand_size--;
+		if (cand_size > 0)
+		{
+			candidates[0] = candidates[cand_size];
+			graph_minheap_siftdown(candidates, cand_size, 0);
+		}
+
+		f_dist = (res_size >= ef) ? res_out[0].dist : DBL_MAX;
+		if (res_size >= ef && c_dist > f_dist)
+			break;
+
+		if (c_nid < 0 || c_nid > cache->max_nid)
+			continue;
+		cn = &cache->nodes[c_nid];
+
+		for (k = 0; k < (int) cn->nbr_count; k++)
+		{
+			int32	n_nid = cn->nbrs[k];
+			float8	n_dist;
+			const HnswL0CacheNode *nn;
+
+			if (n_nid < 0 || n_nid > cache->max_nid)
+				continue;
+			if (VISITED_TEST(visited_bits, visited_nwords, n_nid))
+				continue;
+			VISITED_SET(visited_bits, visited_nwords, n_nid);
+			n_visited++;
+
+			nn = &cache->nodes[n_nid];
+
+			/* Prefetch next unvisited neighbor */
+			for (int pk = k + 1; pk < (int) cn->nbr_count; pk++)
+			{
+				int32 pnid = cn->nbrs[pk];
+
+				if (pnid >= 0 && pnid <= cache->max_nid &&
+					!VISITED_TEST(visited_bits, visited_nwords, pnid))
+				{
+					__builtin_prefetch(&cache->nodes[pnid], 0, 1);
+					break;
+				}
+			}
+
+			n_dist = cosine_distance_f32_f16_prenorm(qx, (const half *) nn->sketch,
+													 Min(HNSW_CACHE_SKETCH_DIM,
+														 qdim), qnorm);
+
+			f_dist = (res_size >= ef) ? res_out[0].dist : DBL_MAX;
+			if (n_dist < f_dist || res_size < ef)
+			{
+				if (cand_size >= cand_cap)
+				{
+					cand_cap  *= 2;
+					candidates = repalloc(candidates,
+										  sizeof(GraphEntry) * cand_cap);
+				}
+				candidates[cand_size].dist = n_dist;
+				candidates[cand_size].nid  = n_nid;
+				cand_size++;
+				graph_minheap_siftup(candidates, cand_size - 1);
+
+				if (res_size < ef)
+				{
+					res_out[res_size].dist = n_dist;
+					res_out[res_size].nid  = n_nid;
+					res_size++;
+					graph_maxheap_siftup(res_out, res_size - 1);
+				}
+				else if (n_dist < res_out[0].dist)
+				{
+					res_out[0].dist = n_dist;
+					res_out[0].nid  = n_nid;
+					graph_maxheap_siftdown(res_out, res_size, 0);
+				}
+			}
+		}
+	}
+
+	pfree(candidates);
+	pfree(visited_bits);
+
+	qsort(res_out, res_size, sizeof(GraphEntry), cmp_graph_entry);
+	*n_visited_out = n_visited;
+	return res_size;
+}
+
 /*
  * Beam search on one HNSW level.
  *
@@ -5232,17 +5406,19 @@ hnsw_search_level(HnswLevel *h,
 	int			cand_size = 0;
 	int			cand_cap;
 	int			res_size  = 0;
-	bool	   *visited;
-	int			visited_cap;
+	uint64	   *visited_bits;		/* bitset: 1 bit per nid */
+	int			visited_nwords;		/* number of uint64 words */
 	int			n_visited = 0;
 	int			i;
 
 	int			stale_steps = 0;	/* adaptive ef: consecutive no-improvement expansions */
 
-	cand_cap    = Max(ef * 32, 4096);
-	candidates  = palloc(sizeof(GraphEntry) * cand_cap);
-	visited_cap = Max((int) h->rel->rd_rel->reltuples + 1024, 65536);
-	visited     = palloc0(sizeof(bool) * visited_cap);
+	cand_cap       = Max(ef * 32, 4096);
+	candidates     = palloc(sizeof(GraphEntry) * cand_cap);
+	visited_nwords = (l0_cache != NULL)
+		? (l0_cache->max_nid / 64 + 2)
+		: Max((int) h->rel->rd_rel->reltuples / 64 + 16, 1024);
+	visited_bits   = palloc0(sizeof(uint64) * visited_nwords);
 
 	/* ---- Seed from entry points ---- */
 	for (i = 0; i < n_entries; i++)
@@ -5253,18 +5429,9 @@ hnsw_search_level(HnswLevel *h,
 		if (ep < 0)
 			continue;
 
-		if (ep >= visited_cap)
-		{
-			int	new_cap = Max(visited_cap * 2, ep + 1024);
-
-			visited = repalloc(visited, sizeof(bool) * new_cap);
-			memset(visited + visited_cap, 0,
-				   sizeof(bool) * (new_cap - visited_cap));
-			visited_cap = new_cap;
-		}
-		if (visited[ep])
+		if (VISITED_TEST(visited_bits, visited_nwords, ep))
 			continue;
-		visited[ep] = true;
+		VISITED_SET(visited_bits, visited_nwords, ep);
 		n_visited++;
 
 		if (l0_cache != NULL && ep <= l0_cache->max_nid)
@@ -5371,27 +5538,29 @@ hnsw_search_level(HnswLevel *h,
 				float8	n_dist;
 				const HnswL0CacheNode *nn;
 
-				if (n_nid < 0)
+				if (n_nid < 0 || n_nid > l0_cache->max_nid)
 					continue;
 
-				if (n_nid >= visited_cap)
-				{
-					int	new_cap = Max(visited_cap * 2, n_nid + 1024);
-
-					visited = repalloc(visited, sizeof(bool) * new_cap);
-					memset(visited + visited_cap, 0,
-						   sizeof(bool) * (new_cap - visited_cap));
-					visited_cap = new_cap;
-				}
-				if (visited[n_nid])
+				if (VISITED_TEST(visited_bits, visited_nwords, n_nid))
 					continue;
-				visited[n_nid] = true;
+				VISITED_SET(visited_bits, visited_nwords, n_nid);
 				n_visited++;
 
-				if (n_nid > l0_cache->max_nid)
-					continue;	/* safety: nid beyond cache */
+				nn = &l0_cache->nodes[n_nid];
 
-				nn	   = &l0_cache->nodes[n_nid];
+				/* Prefetch next unvisited neighbor's cache node */
+				for (int pk = k + 1; pk < n_nbrs_c; pk++)
+				{
+					int32 pnid = nbrs_c[pk];
+
+					if (pnid >= 0 && pnid <= l0_cache->max_nid &&
+						!VISITED_TEST(visited_bits, visited_nwords, pnid))
+					{
+						__builtin_prefetch(&l0_cache->nodes[pnid], 0, 1);
+						break;
+					}
+				}
+
 				n_dist = cosine_distance_f32_f16_prenorm(qx, (const half *) nn->sketch,
 														 Min(HNSW_CACHE_SKETCH_DIM,
 															 qdim), qnorm);
@@ -5485,18 +5654,9 @@ hnsw_search_level(HnswLevel *h,
 				if (n_nid < 0)
 					continue;
 
-				if (n_nid >= visited_cap)
-				{
-					int	new_cap = Max(visited_cap * 2, n_nid + 1024);
-
-					visited = repalloc(visited, sizeof(bool) * new_cap);
-					memset(visited + visited_cap, 0,
-						   sizeof(bool) * (new_cap - visited_cap));
-					visited_cap = new_cap;
-				}
-				if (visited[n_nid])
+				if (VISITED_TEST(visited_bits, visited_nwords, n_nid))
 					continue;
-				visited[n_nid] = true;
+				VISITED_SET(visited_bits, visited_nwords, n_nid);
 				n_visited++;
 
 				ScanKeyInit(&h->skey[0], 1, BTEqualStrategyNumber,
@@ -5577,7 +5737,7 @@ hnsw_search_level(HnswLevel *h,
 	}
 
 	pfree(candidates);
-	pfree(visited);
+	pfree(visited_bits);
 
 	/* Sort results ascending by distance */
 	qsort(res_out, res_size, sizeof(GraphEntry), cmp_graph_entry);
@@ -5697,49 +5857,53 @@ svec_hnsw_scan(PG_FUNCTION_ARGS)
 	ep = entry_nid;
 	for (l = max_level; l >= 1; l--)
 	{
-		HnswLevel	ul;
 		GraphEntry	ul_res[2];	/* ef=1 → at most 1 result */
 		int32		ep_arr[1];
 		int			n_vis = 0;
 		int			res_sz;
+		int			cidx = l - 1;
 
-		tblname = psprintf("%s_l%d", prefix, l);
-		hnsw_open_level(&ul, tblname, snapshot);
+		ep_arr[0] = ep;
 
-		/* Upper-level cache: slot index = l-1 (L1→0, L2→1, …) */
+		/*
+		 * Fast path: if upper cache already built, search from cache
+		 * without opening/closing the relation at all.
+		 */
+		if (sorted_heap_hnsw_cache_l0 && cidx < HNSW_MAX_UPPER_LEVELS &&
+			hnsw_upper_caches[cidx] != NULL)
 		{
+			res_sz = hnsw_search_cached(hnsw_upper_caches[cidx],
+										query->x, query->dim,
+										ep_arr, 1, 1, ul_res, &n_vis,
+										qnorm);
+		}
+		else
+		{
+			/* Cold path: open relation, build cache if GUC on, search */
+			HnswLevel	ul;
 			const HnswL0Cache *ul_cache = NULL;
-			int	cidx = l - 1;
+
+			tblname = psprintf("%s_l%d", prefix, l);
+			hnsw_open_level(&ul, tblname, snapshot);
 
 			if (sorted_heap_hnsw_cache_l0 && cidx < HNSW_MAX_UPPER_LEVELS)
 			{
 				Oid ul_oid = RelationGetRelid(ul.rel);
 
-				if (hnsw_upper_caches[cidx] == NULL ||
-					hnsw_upper_caches[cidx]->l0_rel_oid != ul_oid)
-				{
-					if (hnsw_upper_caches[cidx] != NULL)
-					{
-						MemoryContextDelete(hnsw_upper_caches[cidx]->mctx);
-						hnsw_upper_caches[cidx] = NULL;
-					}
-					hnsw_upper_caches[cidx] =
-						build_hnsw_l0_cache(ul.rel, ul_oid, snapshot);
-				}
+				hnsw_upper_caches[cidx] =
+					build_hnsw_l0_cache(ul.rel, ul_oid, snapshot);
 				ul_cache = hnsw_upper_caches[cidx];
 			}
 
-			ep_arr[0] = ep;
 			res_sz = hnsw_search_level(&ul, query->x, query->dim,
 									   ep_arr, 1, 1, ul_res, &n_vis,
 									   ul_cache, 0, qnorm);
+			hnsw_close_level(&ul);
 		}
 		n_visited_upper += n_vis;
 
 		if (res_sz > 0)
 			ep = ul_res[0].nid;
-
-		hnsw_close_level(&ul);
 	}
 
 	if (sorted_heap_ann_timing)
