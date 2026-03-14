@@ -64,6 +64,12 @@ write-heavy workloads where point lookups use Index Scan anyway.
 - **Tests**: ANN-15 (basic HNSW), ANN-15b (bit-identical distances across cache
   states), ANN-16 (r1 sidecar), ANN-17 (r1 absent graceful skip), ANN-18
   (relcache invalidation).
+- **Sketch dimension sweep** (103K x 2880-dim Nomic, hsvec 384/512/768):
+  recall@10 identical (98.2% at ef=96/rk=48, 93.6% at ef=64/rk=32) across all
+  three dimensions; latency within noise (~1.2ms/q). First 384 dims via MRL
+  prefix truncation already capture all discriminative power for this model.
+  Recall ceiling is in navigation (graph quality / ef budget), not sketch
+  fidelity. **384-dim is the correct sketch size.**
 - **Builder**: `build_hnsw_graph.py` now accepts `--sketch-dim` (infers from
   data by default). Make target: `make build-hnsw-bench-nomic`.
 
