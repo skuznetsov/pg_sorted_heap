@@ -72,14 +72,14 @@ write-heavy workloads where point lookups use Index Scan anyway.
     `table_open` + `index_open` + `index_beginscan` overhead per level.
     Upper traversal: 0.17ms → 0.04ms (−74%).
 - **Recommended operating points** (103K x 2880-dim, hsvec(384) sketch):
-  - Balanced: ef=96 rk=48 → 96.8% recall@10
-  - Quality: ef=96 rk=0 → 98.4% recall@10
-  - Latency: ef=64 rk=32 → 92.8% recall@10
-  Absolute latency depends heavily on TOAST pool state. Isolated single-config
-  measurement (independent retest): ~2.0ms p50 balanced, ~1.7ms latency,
-  ~3.1ms quality. Relative speedups from NEON SIMD + beam search
-  micro-optimizations are ~40–50% vs pre-optimization baseline measured with
-  the same methodology.
+  - Balanced: ef=96 rk=48 → 0.70ms p50, 96.8% recall@10
+  - Quality: ef=96 rk=0 → 1.15ms p50, 98.4% recall@10
+  - Latency: ef=64 rk=32 → 0.50ms p50, 92.8% recall@10
+  Measured with `shared_buffers=512MB` (pod 2Gi), isolated per-config protocol
+  (warmup pass + measure pass, no cross-config TOAST sharing). pgvector HNSW
+  under same conditions: 1.70ms p50 (ef=64). Cold first-call latency is 2–3×
+  higher due to TOAST page faults; `shared_buffers` must be sized to hold the
+  rerank working set (~27MB for 50 queries at rk=48).
 - **r1 verdict**: marginal on warm pools. At ef>=96 the btree overhead exceeds
   TOAST savings. Useful only in cold-TOAST scenarios.
 - **Tests**: ANN-15 (basic HNSW), ANN-15b (bit-identical distances across cache
