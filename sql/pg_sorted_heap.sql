@@ -3072,6 +3072,43 @@ DROP TABLE sh22_upd_state;
 
 DROP TABLE sh22_prefix;
 
+-- ================================================================
+-- SCAN-1: prepared-mode plan cliff regression (Path B cost estimate)
+--
+-- After UPDATEs, non-HOT tuples create uncovered tail pages beyond
+-- zone map entries.  The Path B cost estimator must include these
+-- pages so the generic plan correctly prefers Index Scan over a
+-- Custom Scan that would read the entire uncovered tail.
+-- ================================================================
+CREATE TABLE scan1_cliff(id bigint PRIMARY KEY, val text) USING sorted_heap;
+INSERT INTO scan1_cliff SELECT g, 'row-' || g FROM generate_series(1, 5000) g;
+SELECT sorted_heap_compact('scan1_cliff'::regclass);
+ANALYZE scan1_cliff;
+
+-- Before UPDATEs: Custom Scan is optimal (zone map prunes to 1 block)
+EXPLAIN (COSTS OFF) SELECT val FROM scan1_cliff WHERE id = 2500;
+
+-- Create uncovered tail pages via UPDATEs
+UPDATE scan1_cliff SET val = 'upd-' || id WHERE id BETWEEN 1 AND 2000;
+ANALYZE scan1_cliff;
+
+-- After UPDATEs: planner must switch to Index Scan (not Custom Scan)
+EXPLAIN (COSTS OFF) SELECT val FROM scan1_cliff WHERE id = 2500;
+
+-- Verify prepared statement generic plan also uses Index Scan
+PREPARE scan1_q(bigint) AS SELECT val FROM scan1_cliff WHERE id = $1;
+-- Execute 6 times to trigger generic plan
+EXECUTE scan1_q(100);
+EXECUTE scan1_q(200);
+EXECUTE scan1_q(300);
+EXECUTE scan1_q(400);
+EXECUTE scan1_q(500);
+EXECUTE scan1_q(600);
+-- 7th execution uses generic plan; verify it is Index Scan, not Custom Scan
+EXPLAIN (COSTS OFF) EXECUTE scan1_q(2500);
+DEALLOCATE scan1_q;
+DROP TABLE scan1_cliff;
+
 -- Cleanup: drop codebook tables (have svec columns) before extension
 DROP TABLE ann_test;
 DROP TABLE IF EXISTS _ivf_centroids, _pq_codebooks, _ivf_meta, _pq_codebook_meta;
