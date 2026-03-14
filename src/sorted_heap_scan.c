@@ -568,12 +568,32 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 			List		   *meta_list = NIL;
 			List		   *const_bounds_list = NIL;
 			ListCell	   *lc;
+			BlockNumber		uncovered_blocks;
+			BlockNumber		data_blocks;
 
 			pk_sel = clauselist_selectivity(root, pk_clauses,
 											0, JOIN_INNER, NULL);
 			nblocks = (BlockNumber) clamp_row_est(total_blocks * pk_sel);
 			if (nblocks < 1)
 				nblocks = 1;
+
+			/*
+			 * Account for uncovered pages beyond zone map entries.
+			 * After UPDATEs, non-HOT tuples land on pages without zone
+			 * map coverage.  The executor must scan these unconditionally,
+			 * so include them in the cost estimate.  Without this, the
+			 * generic plan looks artificially cheap and the planner
+			 * keeps a Custom Scan that actually reads many more blocks
+			 * than estimated (the "prepared-mode OLTP cliff").
+			 */
+			data_blocks = (total_blocks > 1 + info->zm_overflow_npages) ?
+				total_blocks - 1 - info->zm_overflow_npages : 0;
+			uncovered_blocks = (data_blocks > info->zm_total_entries) ?
+				data_blocks - info->zm_total_entries : 0;
+			nblocks += uncovered_blocks;
+
+			if (nblocks >= total_blocks)
+				return;
 
 			if (skip_narrow_dml && nblocks <= 4)
 				return;
