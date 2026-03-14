@@ -71,10 +71,15 @@ write-heavy workloads where point lookups use Index Scan anyway.
     `hnsw_open_level`/`hnsw_close_level` for warm upper-level caches. Eliminates
     `table_open` + `index_open` + `index_beginscan` overhead per level.
     Upper traversal: 0.17ms → 0.04ms (−74%).
-- **Recommended operating points** (103K x 2880-dim, warm pool, hsvec(384) sketch):
-  - Balanced: ef=128 rk=48 patience=8 → 0.60ms p50, 96.8% recall@10
-  - Quality: ef=96 rk=0 → 1.40ms p50, 98.4% recall@10
-  - Latency: ef=64 rk=32 → 0.43ms p50, 92.8% recall@10
+- **Recommended operating points** (103K x 2880-dim, hsvec(384) sketch):
+  - Balanced: ef=96 rk=48 → 96.8% recall@10
+  - Quality: ef=96 rk=0 → 98.4% recall@10
+  - Latency: ef=64 rk=32 → 92.8% recall@10
+  Absolute latency depends heavily on TOAST pool state. Isolated single-config
+  measurement (independent retest): ~2.0ms p50 balanced, ~1.7ms latency,
+  ~3.1ms quality. Relative speedups from NEON SIMD + beam search
+  micro-optimizations are ~40–50% vs pre-optimization baseline measured with
+  the same methodology.
 - **r1 verdict**: marginal on warm pools. At ef>=96 the btree overhead exceeds
   TOAST savings. Useful only in cold-TOAST scenarios.
 - **Tests**: ANN-15 (basic HNSW), ANN-15b (bit-identical distances across cache
@@ -83,8 +88,7 @@ write-heavy workloads where point lookups use Index Scan anyway.
 - **Adaptive ef** (`sorted_heap.hnsw_ef_patience`): patience-based early
   termination for L0 beam search. When set to N > 0, the search stops after N
   consecutive node expansions that don't improve the result set. `ef` becomes
-  the maximum budget; easy queries converge sooner. Recommended: ef=128 rk=48
-  patience=8 → 1.14ms p50 (–12% vs fixed ef=96) at identical 96.8% recall.
+  the maximum budget; easy queries converge sooner.
   Not beneficial for rk=0 (quality mode) where TOAST reads scale with ef.
 - **Sketch dimension sweep** (103K x 2880-dim Nomic, hsvec 384/512/768):
   recall@10 identical (98.2% at ef=96/rk=48, 93.6% at ef=64/rk=32) across all
