@@ -5209,17 +5209,34 @@ hnsw_close_level(HnswLevel *h)
 	table_close(h->rel, AccessShareLock);
 }
 
-/* ---- Visited bitset macros (1 bit per nid) ---- */
-#define VISITED_TEST(bits, nwords, nid) \
-	((nid) >= 0 && (nid) / 64 < (nwords) && \
-	 ((bits)[(nid) / 64] & ((uint64) 1 << ((nid) % 64))) != 0)
+/* ---- Visited bitset helpers (1 bit per nid, growable) ---- */
 
-#define VISITED_SET(bits, nwords, nid) \
-	do { \
-		int _w = (nid) / 64; \
-		if (_w < (nwords)) \
-			(bits)[_w] |= ((uint64) 1 << ((nid) % 64)); \
-	} while (0)
+static inline bool
+visited_test(const uint64 *bits, int nwords, int32 nid)
+{
+	int w = nid / 64;
+
+	if (nid < 0 || w >= nwords)
+		return false;
+	return (bits[w] & ((uint64) 1 << (nid % 64))) != 0;
+}
+
+static inline void
+visited_set(uint64 **bits_p, int *nwords_p, int32 nid)
+{
+	int w = nid / 64;
+
+	if (w >= *nwords_p)
+	{
+		int new_nwords = Max(*nwords_p * 2, w + 64);
+
+		*bits_p = repalloc(*bits_p, sizeof(uint64) * new_nwords);
+		memset(*bits_p + *nwords_p, 0,
+			   sizeof(uint64) * (new_nwords - *nwords_p));
+		*nwords_p = new_nwords;
+	}
+	(*bits_p)[w] |= ((uint64) 1 << (nid % 64));
+}
 
 /*
  * Cache-only beam search (no HnswLevel / no catalog access).
@@ -5257,9 +5274,9 @@ hnsw_search_cached(const HnswL0Cache *cache,
 
 		if (ep < 0 || ep > cache->max_nid)
 			continue;
-		if (VISITED_TEST(visited_bits, visited_nwords, ep))
+		if (visited_test(visited_bits, visited_nwords, ep))
 			continue;
-		VISITED_SET(visited_bits, visited_nwords, ep);
+		visited_set(&visited_bits, &visited_nwords, ep);
 		n_visited++;
 
 		cn = &cache->nodes[ep];
@@ -5320,9 +5337,9 @@ hnsw_search_cached(const HnswL0Cache *cache,
 
 			if (n_nid < 0 || n_nid > cache->max_nid)
 				continue;
-			if (VISITED_TEST(visited_bits, visited_nwords, n_nid))
+			if (visited_test(visited_bits, visited_nwords, n_nid))
 				continue;
-			VISITED_SET(visited_bits, visited_nwords, n_nid);
+			visited_set(&visited_bits, &visited_nwords, n_nid);
 			n_visited++;
 
 			nn = &cache->nodes[n_nid];
@@ -5333,7 +5350,7 @@ hnsw_search_cached(const HnswL0Cache *cache,
 				int32 pnid = cn->nbrs[pk];
 
 				if (pnid >= 0 && pnid <= cache->max_nid &&
-					!VISITED_TEST(visited_bits, visited_nwords, pnid))
+					!visited_test(visited_bits, visited_nwords, pnid))
 				{
 					__builtin_prefetch(&cache->nodes[pnid], 0, 1);
 					break;
@@ -5429,9 +5446,9 @@ hnsw_search_level(HnswLevel *h,
 		if (ep < 0)
 			continue;
 
-		if (VISITED_TEST(visited_bits, visited_nwords, ep))
+		if (visited_test(visited_bits, visited_nwords, ep))
 			continue;
-		VISITED_SET(visited_bits, visited_nwords, ep);
+		visited_set(&visited_bits, &visited_nwords, ep);
 		n_visited++;
 
 		if (l0_cache != NULL && ep <= l0_cache->max_nid)
@@ -5541,9 +5558,9 @@ hnsw_search_level(HnswLevel *h,
 				if (n_nid < 0 || n_nid > l0_cache->max_nid)
 					continue;
 
-				if (VISITED_TEST(visited_bits, visited_nwords, n_nid))
+				if (visited_test(visited_bits, visited_nwords, n_nid))
 					continue;
-				VISITED_SET(visited_bits, visited_nwords, n_nid);
+				visited_set(&visited_bits, &visited_nwords, n_nid);
 				n_visited++;
 
 				nn = &l0_cache->nodes[n_nid];
@@ -5554,7 +5571,7 @@ hnsw_search_level(HnswLevel *h,
 					int32 pnid = nbrs_c[pk];
 
 					if (pnid >= 0 && pnid <= l0_cache->max_nid &&
-						!VISITED_TEST(visited_bits, visited_nwords, pnid))
+						!visited_test(visited_bits, visited_nwords, pnid))
 					{
 						__builtin_prefetch(&l0_cache->nodes[pnid], 0, 1);
 						break;
@@ -5654,9 +5671,9 @@ hnsw_search_level(HnswLevel *h,
 				if (n_nid < 0)
 					continue;
 
-				if (VISITED_TEST(visited_bits, visited_nwords, n_nid))
+				if (visited_test(visited_bits, visited_nwords, n_nid))
 					continue;
-				VISITED_SET(visited_bits, visited_nwords, n_nid);
+				visited_set(&visited_bits, &visited_nwords, n_nid);
 				n_visited++;
 
 				ScanKeyInit(&h->skey[0], 1, BTEqualStrategyNumber,
@@ -5864,26 +5881,54 @@ svec_hnsw_scan(PG_FUNCTION_ARGS)
 		int			cidx = l - 1;
 
 		ep_arr[0] = ep;
+		tblname = psprintf("%s_l%d", prefix, l);
 
 		/*
-		 * Fast path: if upper cache already built, search from cache
-		 * without opening/closing the relation at all.
+		 * Fast path: if upper cache already built AND matches the
+		 * current prefix's table OID, search from cache without
+		 * opening/closing the relation.  OID check prevents cross-prefix
+		 * cache reuse when different HNSW graphs share a backend.
 		 */
 		if (sorted_heap_hnsw_cache_l0 && cidx < HNSW_MAX_UPPER_LEVELS &&
 			hnsw_upper_caches[cidx] != NULL)
 		{
-			res_sz = hnsw_search_cached(hnsw_upper_caches[cidx],
-										query->x, query->dim,
-										ep_arr, 1, 1, ul_res, &n_vis,
-										qnorm);
+			Oid expected_oid;
+			const char *dot = strchr(tblname, '.');
+
+			if (dot)
+			{
+				char *schemaname = pnstrdup(tblname, dot - tblname);
+				Oid   nsoid = LookupExplicitNamespace(schemaname, true);
+
+				expected_oid = OidIsValid(nsoid)
+					? get_relname_relid(dot + 1, nsoid)
+					: InvalidOid;
+			}
+			else
+				expected_oid = RelnameGetRelid(tblname);
+
+			if (OidIsValid(expected_oid) &&
+				hnsw_upper_caches[cidx]->l0_rel_oid == expected_oid)
+			{
+				res_sz = hnsw_search_cached(hnsw_upper_caches[cidx],
+											query->x, query->dim,
+											ep_arr, 1, 1, ul_res, &n_vis,
+											qnorm);
+				goto upper_done;
+			}
+			else
+			{
+				/* OID mismatch: evict stale cache */
+				MemoryContextDelete(hnsw_upper_caches[cidx]->mctx);
+				hnsw_upper_caches[cidx] = NULL;
+			}
 		}
-		else
+
 		{
 			/* Cold path: open relation, build cache if GUC on, search */
 			HnswLevel	ul;
 			const HnswL0Cache *ul_cache = NULL;
 
-			tblname = psprintf("%s_l%d", prefix, l);
 			hnsw_open_level(&ul, tblname, snapshot);
 
 			if (sorted_heap_hnsw_cache_l0 && cidx < HNSW_MAX_UPPER_LEVELS)
@@ -5900,6 +5945,7 @@ svec_hnsw_scan(PG_FUNCTION_ARGS)
 									   ul_cache, 0, qnorm);
 			hnsw_close_level(&ul);
 		}
+upper_done:
 		n_visited_upper += n_vis;
 
 		if (res_sz > 0)
