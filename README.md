@@ -339,6 +339,9 @@ make pg-core-regression-smoke  # PG core regression smoke test
 make selftest-lightweight      # lightweight selftest suite
 ```
 
+Command selection quick map: see [OPERATIONS.md](OPERATIONS.md) for the full
+list of available make targets and their descriptions.
+
 ## SQL API
 
 ### Compaction
