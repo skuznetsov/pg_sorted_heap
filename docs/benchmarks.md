@@ -142,17 +142,37 @@ This confirms hsvec is a safe storage choice for ANN workloads.
 
 ### Comparison with pgvector HNSW
 
-Same dataset (103K × 2880-dim), same k8s pod.
+Same dataset (103K × 2880-dim), 2 Gi k8s pod, `shared_buffers=512MB`,
+isolated per-config protocol (warmup + measure pass per config).
 
-| Method | R@1 | Avg latency | Index size | Max dim |
+| Method | Recall@10 | p50 latency | Index size | Max dim |
 |---|---|---|---|---|
 | Exact brute-force (svec `<=>`) | 100% | 996 ms | — | 16,000 / 32,000 |
-| pgvector HNSW ef=100 | 97% | 14 ms | 806 MB | 2,000 |
-| IVF-PQ nprobe=10, rerank=200 | 97–99% | 22 ms | 27 MB | 16,000 / 32,000 |
+| pgvector HNSW ef=64 | 99.8% | 1.70 ms | 806 MB | 2,000 / 4,000 |
+| IVF-PQ nprobe=10, rerank=2000 | 99.0% | 64 ms | 27 MB | 16,000 / 32,000 |
+| **svec_hnsw_scan ef=96, rk=48** | **96.8%** | **0.98 ms** | ~100 MB | 16,000 / 32,000 |
+| svec_hnsw_scan ef=96, rk=0 | 98.4% | 1.83 ms | ~100 MB | 16,000 / 32,000 |
+| svec_hnsw_scan ef=64, rk=32 | 92.8% | 0.85 ms | ~100 MB | 16,000 / 32,000 |
 
-pgvector's HNSW/IVFFlat indexes are limited to 2,000 dimensions. For
-dim=2880, pgvector must truncate or quantize. svec+IVF-PQ works natively at
-full float32 precision up to 16,000 dims; hsvec extends to 32,000 dims.
+`svec_hnsw_scan` at ef=96/rk=48 is 1.7x faster than pgvector HNSW at 3 points
+lower recall. Requires `sorted_heap.hnsw_cache_l0 = on` (session-local cache,
+~100 MB, built on first query). Navigation uses hsvec(384) sketches (no TOAST).
+
+### CRUD performance (500K rows, svec(128), prepared mode)
+
+| Operation | eager / heap | lazy / heap | Notes |
+|-----------|:-----------:|:-----------:|-------|
+| SELECT PK | 85% | 85% | Index Scan via btree |
+| SELECT range 1K | 97% | -- | Custom Scan pruning (eager only) |
+| Bulk INSERT | 100% | 100% | Always eager |
+| DELETE + INSERT | 63% | 63% | INSERT always eager |
+| UPDATE non-vec | 46% | **100%** | Lazy skips zone map flush |
+| UPDATE vec col | 102% | **100%** | Parity both modes |
+| Mixed OLTP | 83% | **97%** | Near-parity with lazy |
+
+Eager mode (default) maintains zone maps on every UPDATE for scan pruning.
+Lazy mode (`sorted_heap.lazy_update = on`) trades scan pruning for UPDATE
+parity with heap. Compact/merge restores pruning.
 
 ### Self-query vs cross-query
 

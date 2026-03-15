@@ -38,10 +38,14 @@ btree-competitive query performance without a separate index structure.
   runtime parameters.
 
 - **Vector search** -- Built-in `svec` (float32, up to 16K dim) and `hsvec`
-  (float16, up to 32K dim) vector types with cosine distance and IVF-PQ
-  approximate nearest neighbor search. 30x smaller index than HNSW, no
-  pgvector dependency, no 2,000-dim index limit.
+  (float16, up to 32K dim) vector types with cosine distance, IVF-PQ ANN
+  search (30x smaller than HNSW), and hierarchical HNSW via sidecar tables
+  (sub-ms with cache). No pgvector dependency, no 2,000-dim index limit.
   See [Vector Search](vector-search).
+
+- **Lazy update mode** -- `sorted_heap.lazy_update = on` skips per-UPDATE zone
+  map maintenance, reaching heap-parity UPDATE throughput. Compact/merge
+  restores zone map pruning. Recommended for write-heavy workloads.
 
 - **PG 17 and PG 18** -- Builds and runs on both versions with zero warnings.
   pg_upgrade from 17 to 18 tested and verified.

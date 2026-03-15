@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.0 (2026-03-14)
+
+Documentation release: comprehensive rewrite of README with use-case examples,
+updated benchmarks, and usage guides. No SQL or C changes from 0.9.15.
+
 ## 0.9.15 (2026-03-13)
 
 ### Scan planner fixes

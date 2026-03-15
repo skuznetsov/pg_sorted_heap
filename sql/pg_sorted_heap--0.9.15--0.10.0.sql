@@ -1,0 +1,5 @@
+-- Upgrade 0.9.15 -> 0.10.0
+-- Documentation-only release: no SQL object changes.
+-- All C-level improvements (NEON SIMD, visited bitset, neighbor prefetch,
+-- cache-only upper search, adaptive ef, lazy update mode, persisted sorted
+-- prefix) were delivered in 0.9.15 and do not require SQL migration.

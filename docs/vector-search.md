@@ -451,9 +451,10 @@ default build.
 | Balanced | 96 | 48 | 0.98 ms | 9.68/10 (96.8%) |
 | Quality-first | 96 | 0 | 1.83 ms | 9.84/10 (98.4%) |
 
-These assume `sorted_heap.hnsw_cache_l0 = on` and a warm TOAST buffer pool
-(normal after first few queries per session). Cold pool adds 1–3 ms depending
-on `rerank_topk`.
+Measured with `shared_buffers=512MB` (2 Gi pod), isolated per-config protocol
+(warmup pass + measure pass, no cross-config TOAST sharing). Requires
+`sorted_heap.hnsw_cache_l0 = on`. Cold first-call latency is 2--3x higher
+due to TOAST page faults.
 
 ### Dense r1 pre-filter (`rerank1_topk`)
 

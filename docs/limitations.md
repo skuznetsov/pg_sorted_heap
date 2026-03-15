@@ -39,6 +39,20 @@ UPDATE does not re-sort tuples. After many updates, the physical order may
 drift from PK order. Run `sorted_heap_compact` or `sorted_heap_merge`
 periodically on write-heavy tables.
 
+### Eager vs lazy mode
+
+By default (eager mode), every UPDATE that widens a zone map entry flushes the
+meta page to disk. This keeps scan pruning accurate but adds per-UPDATE WAL
+overhead (~46% of heap throughput for small-column updates).
+
+Set `sorted_heap.lazy_update = on` to skip per-UPDATE zone map maintenance.
+The first UPDATE invalidates the zone map on disk; the planner falls back to
+Index Scan. Compact or merge restores zone map pruning. INSERT always uses
+eager maintenance regardless of this setting.
+
+The mode is never activated automatically -- choose it based on your workload.
+See the README "UPDATE modes" section for a decision guide.
+
 ---
 
 ## Zone map validity

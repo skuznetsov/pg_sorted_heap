@@ -46,9 +46,11 @@ matching rows.
 
 ### Storage layout
 
-**Block 0** of every sorted_heap table is the **meta page**. It contains:
+**Block 0** of every sorted_heap table is the **meta page** (v7 format). It
+contains:
 
-- A 32-byte header (magic, version, flags, PK metadata)
+- A 32-byte header (magic, version, flags, PK metadata, persisted sorted
+  prefix count)
 - Up to **250 zone map entries** (32 bytes each, two columns)
 - Up to **32 overflow page references**
 
@@ -247,3 +249,18 @@ with the unsorted tail instead of doing a full rewrite.
 When `sorted_heap.vacuum_rebuild_zonemap` is enabled (default), VACUUM
 automatically rebuilds the zone map if it has been invalidated. This
 re-enables scan pruning without a manual compact step.
+
+---
+
+## Lazy update mode
+
+`sorted_heap.lazy_update = on` (PGC_USERSET) skips per-UPDATE zone map
+maintenance. The first UPDATE on a covered page clears `SHM_FLAG_ZONEMAP_VALID`
+on disk; subsequent UPDATEs do no zone map work. The planner falls back to
+Index Scan when the validity flag is cleared.
+
+INSERT always uses eager maintenance regardless of this setting. Compact
+or merge restores the zone map.
+
+This is a manual choice, not automatically activated. See the README
+"UPDATE modes" section for a decision guide.

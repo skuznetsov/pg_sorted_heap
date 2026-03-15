@@ -184,6 +184,80 @@ scan pruning without a manual compact step.
 SET sorted_heap.vacuum_rebuild_zonemap = off;
 ```
 
+### `sorted_heap.lazy_update`
+
+| Property | Value |
+|----------|-------|
+| Type | boolean |
+| Default | `off` |
+| Context | user (SET, SET LOCAL, ALTER SYSTEM) |
+
+When enabled, the first UPDATE on a covered page invalidates the zone map on
+disk. All subsequent UPDATEs skip zone map maintenance entirely. The planner
+falls back to Index Scan. INSERT always uses eager maintenance regardless.
+Compact or merge restores zone map pruning.
+
+```sql
+-- Per session
+SET sorted_heap.lazy_update = on;
+
+-- Per transaction
+SET LOCAL sorted_heap.lazy_update = on;
+
+-- Globally
+ALTER SYSTEM SET sorted_heap.lazy_update = on;
+SELECT pg_reload_conf();
+```
+
+### `sorted_heap.hnsw_cache_l0`
+
+| Property | Value |
+|----------|-------|
+| Type | boolean |
+| Default | `off` |
+| Context | user (SET) |
+
+Enables session-local cache for HNSW sidecar tables. On first
+`svec_hnsw_scan` call, L0 is loaded via sequential scan (~95ms build,
+~100 MB for 100K nodes). Upper levels (L1--L4) cached separately (~6 MB).
+Cache is evicted on DDL (relcache invalidation).
+
+```sql
+SET sorted_heap.hnsw_cache_l0 = on;
+```
+
+### `sorted_heap.hnsw_ef_patience`
+
+| Property | Value |
+|----------|-------|
+| Type | integer |
+| Default | `0` (disabled) |
+| Context | user (SET) |
+
+Patience-based early termination for L0 beam search. When set to N > 0, the
+search stops after N consecutive expansions that don't improve the result set.
+`ef_search` becomes the maximum budget.
+
+```sql
+SET sorted_heap.hnsw_ef_patience = 20;
+```
+
+### `sorted_heap.ann_timing`
+
+| Property | Value |
+|----------|-------|
+| Type | boolean |
+| Default | `off` |
+| Context | user (SET) |
+
+Enables per-query timing breakdown for `svec_ann_scan`, `svec_graph_scan`,
+and `svec_hnsw_scan`. Output is emitted at `DEBUG1` log level.
+
+```sql
+SET sorted_heap.ann_timing = on;
+SET client_min_messages = debug1;
+```
+
 ---
 
 ## Vector search
