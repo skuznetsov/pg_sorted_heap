@@ -275,14 +275,19 @@ write-heavy workloads.
 
 ### Vector search comparison
 
-103K x 2880-dim vectors, 2 Gi k8s pod, `shared_buffers=512MB`, warm cache.
+103K x 2880-dim vectors, Apple M-series, warm cache.
 
 | Method | Recall@10 | p50 latency | Index size |
 |--------|:---------:|:-----------:|:----------:|
+| **svec_hnsw_scan ef=96, rk=48** | **96.8%** | **0.70ms** | ~100 MB |
+| zvec HNSW M=32, ef=100 | 100% | 1.04ms | 1,173 MB |
 | pgvector HNSW ef=64 | 99.8% | 1.70ms | 806 MB |
-| **svec_hnsw_scan ef=96, rk=48** | **96.8%** | **0.98ms** | ~100 MB |
-| svec_hnsw_scan ef=96, rk=0 | 98.4% | 1.83ms | ~100 MB |
-| IVF-PQ nprobe=10, rr=2000 | 99.0% | 64ms | 27 MB |
+| IVF-PQ nprobe=10, rr=200 | 99.0% | 10.7ms | 27 MB |
+| Qdrant HNSW M=32, ef=100 | 100% | 23.2ms | 2,626 MB |
+
+zvec: in-process embedded C++ (Alibaba Proxima). Qdrant: Rust server via
+Docker. pgvector / pg_sorted_heap: PostgreSQL extensions via unix socket.
+Qdrant server-side latency ~19ms (rest is Docker VM overhead).
 
 ## Quick start
 
