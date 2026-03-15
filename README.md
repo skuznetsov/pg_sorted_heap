@@ -332,7 +332,11 @@ make test-concurrent           # concurrent DML + online ops
 make test-toast                # TOAST integrity
 make test-alter-table          # ALTER TABLE DDL (36 checks)
 make test-dump-restore         # pg_dump/restore lifecycle
+make test-graph-builder        # graph sidecar bootstrap + rebuild smoke
 make test-pg-upgrade           # pg_upgrade 17->18
+make policy-safety-selftest    # policy + doc contract checks
+make pg-core-regression-smoke  # PG core regression smoke test
+make selftest-lightweight      # lightweight selftest suite
 ```
 
 ## SQL API

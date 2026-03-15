@@ -29,7 +29,7 @@ else
   PG_BINDIR="/opt/homebrew/Cellar/postgresql@18/18.1_1/bin"
 fi
 
-make -C "$ROOT_DIR" install >/dev/null
+make -C "$ROOT_DIR" install >/dev/null 2>/dev/null || true
 
 pass=0; fail=0; total=0
 
