@@ -488,17 +488,27 @@ default build.
 
 **svec(D) hybrid L0 (SQ8 cache, default):**
 
-| Goal | ef_search | rerank_topk | p50 latency | Recall@10 |
-|---|---|---|---|---|
-| Balanced | 96 | 48 | 1.70ms | 99.8% |
-| Quality-first | 96 | 0 | 6.35ms | 99.8% |
+| Goal | ef_search | lim | rerank_topk | p50 latency | Recall@10 |
+|---|---|---|---|---|---|
+| Fastest top-1 | 32 | 1 | 1 | 0.51ms | — |
+| Fast top-5 | 64 | 5 | 5 | 1.00ms | — |
+| Fast top-10 | 96 | 10 | 10 | 1.19ms | 98.6% |
+| Balanced top-10 | 96 | 10 | 20 | 1.52ms | 99.8% |
+| Safe top-10 | 96 | 10 | 48 | 1.70ms | 99.8% |
+| Rerank-all | 96 | 10 | 0 | 6.35ms | 99.8% |
 
 **svec(D) hybrid L0 (f32 cache, sq8=off):**
 
 | Goal | ef_search | rerank_topk | p50 latency | Recall@10 |
 |---|---|---|---|---|
-| Quality-first | 96 | 48 | 5.53ms | 99.8% |
-| Max quality | 96 | 0 | 3.87ms | 99.8% |
+| Balanced | 96 | 48 | 5.53ms | 99.8% |
+| Rerank-all | 96 | 0 | 3.87ms | 99.8% |
+
+**Tuning `rerank_topk` for lowest latency:** set `rerank_topk = max(lim, 20)`
+for 99.8% recall with minimal TOAST reads. Each TOAST read fetches one full
+svec(D) row (~11.5 KB for 2880-dim), so fewer reads = lower latency. The SQ8
+cache navigates accurately enough that reranking just 20 candidates already
+achieves 99.8% recall — no need for 48 or more.
 
 SQ8 quantizes float32 → uint8 per dimension in the session-local cache (4x
 memory savings). With `rerank_topk > 0`, SQ8 is faster than f32 because the
@@ -506,9 +516,9 @@ smaller cache (283 MB vs 1.1 GB) leaves more room for buffer pool and OS
 page cache. Set `sorted_heap.hnsw_cache_sq8 = off` only when memory is
 abundant and you need zero-rerank operation.
 
-Measured with `shared_buffers=512MB`, warm cache, 50 queries. Requires
-`sorted_heap.hnsw_cache_l0 = on`. Cold first-call latency is 2–3x higher
-due to TOAST page faults and cache build.
+Measured with `shared_buffers=512MB` (4 Gi pod), warm cache, 50 queries.
+Requires `sorted_heap.hnsw_cache_l0 = on`. Cold first-call latency is 2–3x
+higher due to TOAST page faults and cache build.
 
 ### Dense r1 pre-filter (`rerank1_topk`)
 

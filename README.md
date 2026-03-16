@@ -98,29 +98,30 @@ SELECT * FROM svec_ann_scan(
 Hierarchical HNSW via compact sidecar tables. Three cache modes let you
 trade memory for recall:
 
-| L0 cache mode | Cache size | Latency (ef=96) | Recall@10 |
-|---------------|:----------:|:---------------:|:---------:|
-| hsvec(384) sketch | ~75 MB | 0.7ms | 97% |
-| svec full + SQ8 (default) | ~283 MB | 1.3ms | 98.4% |
-| svec full + f32 | ~1.1 GB | 1.5ms | 99.6% |
+| L0 cache mode | Cache size | p50 (ef=96, rk=20) | Recall@10 |
+|---------------|:----------:|:------------------:|:---------:|
+| hsvec(384) sketch | ~75 MB | 1.02ms | 96.8% |
+| svec + SQ8 (default) | ~283 MB | 1.52ms | 99.8% |
+| svec + f32 | ~1.1 GB | 5.53ms | 99.8% |
 
 ```sql
 -- Enable session-local cache (built on first query)
 SET sorted_heap.hnsw_cache_l0 = on;
 
--- Fast mode: hsvec(384) sketches in L0, 0.7ms, 97% recall
+-- Fastest top-1: 0.51ms (SQ8 cache, 1 TOAST read)
 SELECT * FROM svec_hnsw_scan(
     'documents', query_vec, 'documents_hnsw',
-    ef_search := 96, lim := 10, rerank_topk := 48);
+    ef_search := 32, lim := 1, rerank_topk := 1);
 
--- SQ8 mode (default for svec L0): 1.3ms, 98.4% recall, 4x less memory
--- Automatically quantizes float32 vectors to uint8 in cache
+-- Fast top-10: 1.19ms, 98.6% recall (10 TOAST reads)
 SELECT * FROM svec_hnsw_scan(
     'documents', query_vec, 'documents_hnsw',
-    ef_search := 96, lim := 10, rerank_topk := 0);
+    ef_search := 96, lim := 10, rerank_topk := 10);
 
--- Full precision: disable SQ8 for maximum recall without rerank
-SET sorted_heap.hnsw_cache_sq8 = off;
+-- Balanced top-10: 1.52ms, 99.8% recall (20 TOAST reads)
+SELECT * FROM svec_hnsw_scan(
+    'documents', query_vec, 'documents_hnsw',
+    ef_search := 96, lim := 10, rerank_topk := 20);
 ```
 
 ### Large-table analytics with range predicates
@@ -425,17 +426,17 @@ SELECT * FROM svec_ann_scan('tbl', query, nprobe:=10, lim:=10, rerank_topk:=200,
 ```sql
 SET sorted_heap.hnsw_cache_l0 = on;  -- session-local cache
 
--- Balanced: 1.3ms, 98.4% recall@10 (SQ8 cache, default)
+-- Fastest top-1: 0.51ms (SQ8 cache, 1 TOAST read)
 SELECT * FROM svec_hnsw_scan('tbl', query, 'tbl_hnsw',
-    ef_search:=96, lim:=10, rerank_topk:=0);
+    ef_search:=32, lim:=1, rerank_topk:=1);
 
--- Fast: 0.7ms, 96.8% recall@10 (hsvec sketch L0, with rerank)
+-- Fast top-10: 1.19ms, 98.6% recall (rerank = lim)
 SELECT * FROM svec_hnsw_scan('tbl', query, 'tbl_hnsw',
-    ef_search:=96, lim:=10, rerank_topk:=48);
+    ef_search:=96, lim:=10, rerank_topk:=10);
 
--- High-recall: ef=300 + exact rerank
+-- Balanced top-10: 1.52ms, 99.8% recall (rerank = 2x lim)
 SELECT * FROM svec_hnsw_scan('tbl', query, 'tbl_hnsw',
-    ef_search:=300, lim:=10, rerank_topk:=48);
+    ef_search:=96, lim:=10, rerank_topk:=20);
 ```
 
 ### Configuration

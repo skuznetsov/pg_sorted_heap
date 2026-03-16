@@ -158,14 +158,30 @@ warm cache, top-10, 50 queries.
 †zvec and Qdrant measured locally (in-process / Docker); all others on the
 same k8s pod. psh = pg_sorted_heap.
 
-**psh HNSW detailed results (k8s, svec L0 + SQ8 cache):**
+**psh HNSW SQ8 topK latency sweep (k8s, svec L0):**
+
+| ef | lim | rerank_topk | p50 latency | Recall@10 |
+|:--:|:---:|:-----------:|:-----------:|:---------:|
+| 32 | 1 | 1 | 0.51ms | — |
+| 64 | 1 | 1 | 0.90ms | — |
+| 64 | 5 | 5 | 1.00ms | — |
+| 96 | 10 | 10 | 1.19ms | 98.6% |
+| 96 | 10 | 20 | 1.52ms | 99.8% |
+| 96 | 10 | 48 | 1.70ms | 99.8% |
+| 64 | 10 | 10 | 3.40ms | 98.4% |
+| 64 | 10 | 20 | 3.56ms | 99.6% |
+| 96 | 10 | 0 | 6.35ms | 99.8% |
+| 64 | 10 | 48 | 7.30ms | 99.6% |
+
+Rule of thumb: set `rerank_topk = max(lim, 20)` for 99.8% recall with
+minimal TOAST I/O. Each TOAST read fetches one full svec row, so fewer
+reads = lower latency. ef=96 navigates more accurately than ef=64,
+producing better candidates that need less over-fetching.
+
+**Other cache modes (k8s, ef=96):**
 
 | Config | p50 latency | Recall@10 |
 |--------|:-----------:|:---------:|
-| SQ8 ef=64, rk=0 | 11.31ms | 99.6% |
-| SQ8 ef=96, rk=48 | 1.70ms | 99.8% |
-| SQ8 ef=96, rk=0 | 6.35ms | 99.8% |
-| SQ8 ef=200, rk=0 | 13.48ms | 99.8% |
 | f32 ef=96, rk=48 | 5.53ms | 99.8% |
 | f32 ef=96, rk=0 | 3.87ms | 99.8% |
 
