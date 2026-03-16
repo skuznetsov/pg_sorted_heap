@@ -284,27 +284,25 @@ write-heavy workloads.
 
 ### Vector search comparison
 
-103K x 2880-dim vectors, Apple M-series, warm cache, top-10.
+103K x 2880-dim vectors, k8s (4 Gi pod, shared_buffers=512MB), warm cache, top-10.
 
 | Method | Recall@10 | p50 latency | Memory/Index |
 |--------|:---------:|:-----------:|:------------:|
-| **psh HNSW SQ8** ef=96 | **98.4%** | **1.3ms** | **283 MB** |
-| **psh HNSW sketch** ef=96, rk=48 | **96.8%** | **0.7ms** | **75 MB** |
-| **psh HNSW f32** ef=96 | **99.6%** | **1.5ms** | **1.1 GB** |
-| zvec HNSW M=32, ef=100 | 100% | 1.04ms | 1,173 MB |
-| pgvector HNSW ef=64 | 99.8% | 1.70ms | 806 MB |
-| **psh IVF-PQ** np=10, rr=200 | **99.0%** | **10.7ms** | **27 MB** |
-| Qdrant HNSW M=32, ef=100 | 100% | 23.2ms | 2,626 MB |
+| **psh HNSW sketch** ef=96, rk=48 | **96.8%** | **1.02ms** | **75 MB** |
+| pgvector HNSW ef=64 | 99.8% | 1.29ms | 806 MB |
+| **psh HNSW SQ8** ef=96, rk=48 | **99.8%** | **1.70ms** | **283 MB** |
+| pgvector HNSW ef=100 | 99.8% | 1.75ms | 806 MB |
+| zvec HNSW M=32, ef=100 | 100% | 1.04ms* | 1,173 MB |
+| **psh IVF-PQ** np=10, rr=200 | **99.0%** | **16.96ms** | **27 MB** |
+| Qdrant HNSW M=32, ef=100 | 100% | 23.2ms* | 2,626 MB |
 
-psh = pg_sorted_heap. zvec: in-process embedded C++ (Alibaba Proxima).
-Qdrant: Rust server via Docker. pgvector / pg_sorted_heap: PostgreSQL
-extensions via unix socket. Qdrant server-side latency ~19ms (rest is
-Docker VM overhead).
+*zvec and Qdrant measured locally; all others on the same k8s pod.
+psh = pg_sorted_heap.
 
 **Key tradeoffs:**
-- psh HNSW SQ8: best balance -- 98.4% recall, 1.3ms, 283 MB (4x less than f32)
-- psh HNSW sketch: fastest -- 0.7ms, but capped at ~97% recall
-- psh IVF-PQ: smallest index -- 27 MB, good for disk-constrained setups
+- psh HNSW sketch: fastest at 1.02ms, 75 MB cache, capped at ~97% recall
+- psh HNSW SQ8: 99.8% recall at 1.70ms, 3x less memory than pgvector
+- psh IVF-PQ: smallest index (27 MB), good for disk-constrained setups
 - For 16K-dim vectors: SQ8 cache = 1.6 GB (vs 6.3 GB f32, vs 75 MB sketch)
 
 ## Quick start

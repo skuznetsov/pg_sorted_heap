@@ -142,26 +142,36 @@ This confirms hsvec is a safe storage choice for ANN workloads.
 
 ### Comparison with other vector search engines
 
-Same dataset (103K × 2880-dim), warm cache, top-10.
+Same dataset (103K × 2880-dim), k8s (4 Gi pod, shared_buffers=512MB),
+warm cache, top-10, 50 queries.
 
 | Method | Recall@10 | p50 latency | Memory/Index |
 |--------|:---------:|:-----------:|:------------:|
-| **psh HNSW SQ8** ef=96 | **98.4%** | **1.3ms** | **283 MB** |
-| **psh HNSW sketch** ef=96, rk=48 | **96.8%** | **0.7ms** | **75 MB** |
-| **psh HNSW f32** ef=96 | **99.6%** | **1.5ms** | **1.1 GB** |
-| zvec HNSW M=32, ef=100 | 100% | 1.04ms | 1,173 MB |
-| pgvector HNSW ef=64 | 99.8% | 1.70ms | 806 MB |
-| **psh IVF-PQ** np=10, rr=200 | **99.0%** | **10.7ms** | **27 MB** |
-| Qdrant HNSW M=32, ef=100 | 100% | 23.2ms | 2,626 MB |
+| **psh HNSW sketch** ef=96, rk=48 | **96.8%** | **1.02ms** | **75 MB** |
+| pgvector HNSW ef=64 | 99.8% | 1.29ms | 806 MB |
+| **psh HNSW SQ8** ef=96, rk=48 | **99.8%** | **1.70ms** | **283 MB** |
+| pgvector HNSW ef=100 | 99.8% | 1.75ms | 806 MB |
+| zvec HNSW M=32, ef=100 | 100% | 1.04ms† | 1,173 MB |
+| **psh IVF-PQ** np=10, rr=200 | **99.0%** | **16.96ms** | **27 MB** |
+| Qdrant HNSW M=32, ef=100 | 100% | 23.2ms† | 2,626 MB |
 
-psh = pg_sorted_heap. zvec: in-process embedded C++ (Alibaba Proxima).
-Qdrant: Rust server via Docker (server-side ~19ms). pgvector / pg_sorted_heap:
-PostgreSQL extensions via unix socket.
+†zvec and Qdrant measured locally (in-process / Docker); all others on the
+same k8s pod. psh = pg_sorted_heap.
 
-psh HNSW requires `sorted_heap.hnsw_cache_l0 = on` (session-local cache, built
-on first query). Three L0 cache modes: hsvec(384) sketch (75 MB), SQ8 quantized
-svec (283 MB, default), or full float32 svec (1.1 GB). SQ8 is controlled by
-`sorted_heap.hnsw_cache_sq8` GUC (default on).
+**psh HNSW detailed results (k8s, svec L0 + SQ8 cache):**
+
+| Config | p50 latency | Recall@10 |
+|--------|:-----------:|:---------:|
+| SQ8 ef=64, rk=0 | 11.31ms | 99.6% |
+| SQ8 ef=96, rk=48 | 1.70ms | 99.8% |
+| SQ8 ef=96, rk=0 | 6.35ms | 99.8% |
+| SQ8 ef=200, rk=0 | 13.48ms | 99.8% |
+| f32 ef=96, rk=48 | 5.53ms | 99.8% |
+| f32 ef=96, rk=0 | 3.87ms | 99.8% |
+
+SQ8 with rk=48 is the best operating point: rk limits TOAST reads to 48
+candidates while the 283 MB cache leaves room for buffer pool. f32 cache
+(1.1 GB) causes memory pressure on pods with ≤4 Gi.
 
 ### CRUD performance (500K rows, svec(128), prepared mode)
 
