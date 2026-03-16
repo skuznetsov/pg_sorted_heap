@@ -253,6 +253,228 @@ build_hnsw_l0_cache(Relation l0_rel, Oid l0_oid, Snapshot snap)
 
 	MemoryContextSwitchTo(old_ctx);
 
+	/*
+	 * Streaming SQ8 path: when the L0 column is svec (float32) and SQ8 is
+	 * enabled, we avoid allocating a huge f32 buffer.  Instead we do two
+	 * table scans:
+	 *   Pass 1: load neighbors + src_tid, compute per-dim min/max
+	 *   Pass 2: re-scan, quantize each detoasted svec directly into uint8
+	 *
+	 * Peak memory: sq8 buffer (N × dim bytes) + nodes array.
+	 * This avoids the N × dim × 4 float32 buffer that caused OOM on
+	 * memory-constrained pods (e.g. 2 Gi with 103K × 2880-dim vectors).
+	 */
+	if (is_f32 && sorted_heap_hnsw_cache_sq8)
+	{
+		float	   *sq8_mins = NULL;
+		float	   *sq8_maxs = NULL;
+		float	   *sq8_scales = NULL;
+		int32		sq8_dim = 0;
+
+		/* ---- Pass 1: neighbors + src_tid + min/max ---- */
+		slot = table_slot_create(l0_rel, NULL);
+		scan = table_beginscan(l0_rel, snap, 0, NULL);
+
+		while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+		{
+			bool			 isnull;
+			int32			 nid;
+			HnswL0CacheNode *cn;
+
+			nid = DatumGetInt32(slot_getattr(slot, att_nid, &isnull));
+			if (isnull || nid < 0)
+			{
+				ExecClearTuple(slot);
+				continue;
+			}
+
+			/* Expand nodes array if needed */
+			if (nid >= cache->alloc_nids)
+			{
+				int32		 new_alloc = Max(nid + 2048, cache->alloc_nids * 2);
+				MemoryContext save = MemoryContextSwitchTo(mctx);
+
+				nodes = (HnswL0CacheNode *)
+					repalloc(cache->nodes,
+							 (Size) new_alloc * sizeof(HnswL0CacheNode));
+				memset(nodes + cache->alloc_nids, 0,
+					   (Size)(new_alloc - cache->alloc_nids) *
+					   sizeof(HnswL0CacheNode));
+
+				MemoryContextSwitchTo(save);
+				cache->nodes	   = nodes;
+				cache->alloc_nids  = new_alloc;
+			}
+
+			cn = &cache->nodes[nid];
+			if (nid > max_nid)
+				max_nid = nid;
+			cache->n_nodes++;
+
+			/* Detoast svec just for min/max, don't store f32 data */
+			{
+				Datum  sk_d = slot_getattr(slot, att_sketch, &isnull);
+
+				if (!isnull)
+				{
+					Svec   *sv = (Svec *) PG_DETOAST_DATUM(sk_d);
+					int32	d;
+
+					if (sq8_dim == 0)
+					{
+						MemoryContext save = MemoryContextSwitchTo(mctx);
+
+						sq8_dim = sv->dim;
+						sq8_mins  = palloc(sizeof(float) * sq8_dim);
+						sq8_maxs  = palloc(sizeof(float) * sq8_dim);
+						sq8_scales = palloc(sizeof(float) * sq8_dim);
+						for (d = 0; d < sq8_dim; d++)
+						{
+							sq8_mins[d] = FLT_MAX;
+							sq8_maxs[d] = -FLT_MAX;
+						}
+						MemoryContextSwitchTo(save);
+					}
+
+					for (d = 0; d < Min(sv->dim, sq8_dim); d++)
+					{
+						if (sv->x[d] < sq8_mins[d]) sq8_mins[d] = sv->x[d];
+						if (sv->x[d] > sq8_maxs[d]) sq8_maxs[d] = sv->x[d];
+					}
+
+					if (sv != (Svec *) DatumGetPointer(sk_d))
+						pfree(sv);
+				}
+			}
+
+			/* neighbors */
+			{
+				Datum	   nbrs_d = slot_getattr(slot, att_nbrs, &isnull);
+
+				if (!isnull)
+				{
+					ArrayType *arr  = DatumGetArrayTypeP(nbrs_d);
+					int32	  *nbrs = (int32 *) ARR_DATA_PTR(arr);
+					int		   cnt  = Min(
+						ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr)),
+						HNSW_CACHE_MAX_NBRS);
+
+					memcpy(cn->nbrs, nbrs, (Size) cnt * sizeof(int32));
+					cn->nbr_count = (int8) cnt;
+					if (arr != (ArrayType *) DatumGetPointer(nbrs_d))
+						pfree(arr);
+				}
+			}
+
+			/* src_tid */
+			if (att_src_tid != InvalidAttrNumber)
+			{
+				Datum tid_d = slot_getattr(slot, att_src_tid, &isnull);
+
+				if (!isnull)
+					ItemPointerCopy(DatumGetItemPointer(tid_d), &cn->src_tid);
+			}
+
+			ExecClearTuple(slot);
+		}
+
+		table_endscan(scan);
+		ExecDropSingleTupleTableSlot(slot);
+
+		cache->max_nid = max_nid;
+
+		/* Compute scales from min/max */
+		if (sq8_dim > 0)
+		{
+			int32	d;
+
+			for (d = 0; d < sq8_dim; d++)
+			{
+				float range = sq8_maxs[d] - sq8_mins[d];
+
+				sq8_scales[d] = (range > 0.0f) ? (range / 255.0f) : 0.0f;
+			}
+			pfree(sq8_maxs);
+
+			/* Allocate SQ8 buffer (the only big allocation) */
+			{
+				MemoryContext save = MemoryContextSwitchTo(mctx);
+				Size sq8_size = (Size)(max_nid + 1) * sq8_dim;
+
+				cache->vec_data = (char *)
+					MemoryContextAllocHuge(mctx, sq8_size);
+				memset(cache->vec_data, 0, sq8_size);
+				MemoryContextSwitchTo(save);
+			}
+
+			cache->vec_dim    = sq8_dim;
+			cache->vec_stride = sq8_dim;	/* 1 byte per component */
+			cache->vec_is_f32 = false;
+			cache->vec_is_sq8 = true;
+			cache->sq8_mins   = sq8_mins;
+			cache->sq8_scales = sq8_scales;
+
+			/* ---- Pass 2: re-scan, quantize directly into uint8 ---- */
+			slot = table_slot_create(l0_rel, NULL);
+			scan = table_beginscan(l0_rel, snap, 0, NULL);
+
+			while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+			{
+				bool	 isnull;
+				int32	 nid;
+
+				nid = DatumGetInt32(slot_getattr(slot, att_nid, &isnull));
+				if (isnull || nid < 0 || nid > max_nid)
+				{
+					ExecClearTuple(slot);
+					continue;
+				}
+
+				{
+					Datum sk_d = slot_getattr(slot, att_sketch, &isnull);
+
+					if (!isnull)
+					{
+						Svec   *sv = (Svec *) PG_DETOAST_DATUM(sk_d);
+						uint8  *dst = (uint8 *) cache->vec_data +
+							(Size) nid * sq8_dim;
+						int32	d;
+
+						for (d = 0; d < Min(sv->dim, sq8_dim); d++)
+						{
+							float val;
+
+							if (sq8_scales[d] > 0.0f)
+								val = (sv->x[d] - sq8_mins[d]) /
+									sq8_scales[d];
+							else
+								val = 0.0f;
+
+							if (val < 0.0f) val = 0.0f;
+							else if (val > 255.0f) val = 255.0f;
+							dst[d] = (uint8) (val + 0.5f);
+						}
+
+						if (sv != (Svec *) DatumGetPointer(sk_d))
+							pfree(sv);
+					}
+				}
+
+				ExecClearTuple(slot);
+			}
+
+			table_endscan(scan);
+			ExecDropSingleTupleTableSlot(slot);
+
+			elog(DEBUG1, "hnsw_l0_cache: streaming SQ8 %d-dim vectors "
+				 "(%lld uint8 bytes, no f32 intermediate)",
+				 sq8_dim,
+				 (long long)((Size)(max_nid + 1) * sq8_dim));
+		}
+	}
+	else
+	{
+	/* ---- Standard single-pass: load vectors into f32/f16 buffer ---- */
 	slot = table_slot_create(l0_rel, NULL);
 	scan = table_beginscan(l0_rel, snap, 0, NULL);
 
@@ -399,113 +621,7 @@ build_hnsw_l0_cache(Relation l0_rel, Oid l0_oid, Snapshot snap)
 	ExecDropSingleTupleTableSlot(slot);
 
 	cache->max_nid = max_nid;
-
-	/* ---- SQ8 quantization: convert f32 vec_data to uint8 ---- */
-	if (sorted_heap_hnsw_cache_sq8 && cache->vec_is_f32 &&
-		cache->vec_dim > 0 && cache->vec_data != NULL)
-	{
-		MemoryContext save;
-		int32		dim = cache->vec_dim;
-		int32		f32_stride = cache->vec_stride;
-		float	   *mins;
-		float	   *maxs;
-		float	   *scales;
-		uint8	   *sq8_data;
-		Size		sq8_size;
-		int32		d, nid_i;
-
-		save = MemoryContextSwitchTo(mctx);
-
-		mins  = palloc(sizeof(float) * dim);
-		maxs  = palloc(sizeof(float) * dim);
-		scales = palloc(sizeof(float) * dim);
-
-		/* Init min/max */
-		for (d = 0; d < dim; d++)
-		{
-			mins[d] = FLT_MAX;
-			maxs[d] = -FLT_MAX;
-		}
-
-		/* Pass 1: compute per-dimension min/max */
-		for (nid_i = 0; nid_i <= max_nid; nid_i++)
-		{
-			const float *src;
-
-			if (cache->nodes[nid_i].nbr_count == 0 && nid_i != 0)
-				continue;	/* skip unused slots */
-
-			src = (const float *)(cache->vec_data +
-								  (Size) nid_i * f32_stride);
-
-			for (d = 0; d < dim; d++)
-			{
-				if (src[d] < mins[d]) mins[d] = src[d];
-				if (src[d] > maxs[d]) maxs[d] = src[d];
-			}
-		}
-
-		/* Compute scales */
-		for (d = 0; d < dim; d++)
-		{
-			float range = maxs[d] - mins[d];
-
-			scales[d] = (range > 0.0f) ? (range / 255.0f) : 0.0f;
-		}
-
-		/* Allocate SQ8 buffer */
-		sq8_size = (Size)(max_nid + 1) * dim;
-		sq8_data = (uint8 *) MemoryContextAllocHuge(mctx, sq8_size);
-		memset(sq8_data, 0, sq8_size);
-
-		/* Pass 2: quantize */
-		for (nid_i = 0; nid_i <= max_nid; nid_i++)
-		{
-			const float *src;
-			uint8	   *dst;
-
-			if (cache->nodes[nid_i].nbr_count == 0 && nid_i != 0)
-				continue;
-
-			src = (const float *)(cache->vec_data +
-								  (Size) nid_i * f32_stride);
-			dst = sq8_data + (Size) nid_i * dim;
-
-			for (d = 0; d < dim; d++)
-			{
-				float val;
-
-				if (scales[d] > 0.0f)
-					val = (src[d] - mins[d]) / scales[d];
-				else
-					val = 0.0f;
-
-				if (val < 0.0f) val = 0.0f;
-				else if (val > 255.0f) val = 255.0f;
-				dst[d] = (uint8) (val + 0.5f);		/* round */
-			}
-		}
-
-		MemoryContextSwitchTo(save);
-
-		/* Replace f32 vec_data with SQ8 */
-		pfree(cache->vec_data);
-		cache->vec_data   = (char *) sq8_data;
-		cache->vec_stride = dim;			/* 1 byte per component */
-		cache->vec_is_f32 = false;
-		cache->vec_is_sq8 = true;
-		cache->sq8_mins   = mins;
-		cache->sq8_scales = scales;
-
-		pfree(maxs);
-
-		elog(DEBUG1, "hnsw_l0_cache: SQ8 quantized %d-dim vectors "
-			 "(%lld bytes -> %lld bytes, %.1fx compression)",
-			 dim,
-			 (long long)((Size)(max_nid + 1) * f32_stride),
-			 (long long) sq8_size,
-			 (double)((Size)(max_nid + 1) * f32_stride) / (double) sq8_size);
-	}
+	} /* end standard single-pass */
 
 	vec_stride = cache->vec_stride;
 	cache->cache_bytes = (int64) cache->alloc_nids * sizeof(HnswL0CacheNode)
