@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """
-Build hierarchical HNSW graph on Gutenberg hsvec(384) sketches (faiss).
+Build hierarchical HNSW graph on sketches (faiss), with optional full-vector L0.
 
 Extracts adjacency lists per level from a faiss IndexHNSWFlat and writes to
 PostgreSQL sidecar tables for the hierarchical PG prototype.
 
 Tables created:
   <prefix>_meta   (entry_nid int4, max_level int2)
-  <prefix>_l0     (nid int4 PK, sketch hsvec(384), neighbors int4[],
+  <prefix>_l0     (nid int4 PK, sketch hsvec(D)|svec(D), neighbors int4[],
                    src_id text, src_tid tid)
-  <prefix>_l1     (nid int4 PK, sketch hsvec(384), neighbors int4[])
+  <prefix>_l1     (nid int4 PK, sketch hsvec(D), neighbors int4[])
   <prefix>_l2 ... same for each upper level present
 
-Search (to be implemented in svec_hnsw_scan_v2):
-  1. Start at entry_point (max_level)
-  2. For level = max_level down to 1: greedy 1-NN in upper table
-  3. Level 0: beam search with ef_search candidates in l0 table
-  4. Exact rerank top-k from main sorted_heap table
+With --full-vectors, L0 stores full svec(D) from the main sorted_heap table
+instead of reduced hsvec sketches. This enables exact distance computation
+during L0 traversal for 100% recall at the cost of larger L0 cache (~1.2 GB
+for 103K x 2880-dim vs ~93 MB with sketches).
 
 Usage:
   python3 scripts/build_hnsw_graph.py \
@@ -25,6 +24,13 @@ Usage:
     --prefix gutenberg_gptoss_hnsw \
     --M 16 --ef-construction 200 \
     --sketch-dim 384
+
+  # Hybrid L0: full vectors for L0, sketches for upper levels
+  python3 scripts/build_hnsw_graph.py \
+    --dsn '...' --source-table gutenberg_gptoss_sh_graph \
+    --prefix gutenberg_gptoss_hnsw \
+    --M 16 --ef-construction 200 \
+    --full-vectors --main-table gutenberg_gptoss_sh
 """
 from __future__ import annotations
 
@@ -58,6 +64,32 @@ def load_source(cur, source_table: str) -> tuple[np.ndarray, list[int], list[str
     src_tids = [r[3] for r in rows]  # tid as text, e.g. "(123,4)"
     print(f"      {len(nids):,} rows, shape {sketches.shape}")
     return sketches, nids, src_ids, src_tids
+
+
+def load_full_vectors(cur, main_table: str, nids: list[int],
+                      src_ids_by_nid: dict[int, str]) -> dict[int, str]:
+    """Load full svec embeddings from the main sorted_heap table.
+
+    Returns nid → "[f,f,...,f]" literal for svec INSERT.
+    """
+    print(f"      Loading full vectors from {main_table}...", flush=True)
+    # Build id→nid mapping
+    id_to_nid = {sid: nid for nid, sid in src_ids_by_nid.items()}
+
+    cur.execute(f"SELECT id, embedding::text FROM {main_table}")
+    full_vecs: dict[int, str] = {}
+    n_loaded = 0
+    for row_id, emb_text in cur:
+        nid = id_to_nid.get(row_id)
+        if nid is None:
+            continue
+        full_vecs[nid] = emb_text  # already "[f,f,...,f]" from svec::text
+        n_loaded += 1
+        if n_loaded % 20000 == 0:
+            print(f"        {n_loaded:,}/{len(nids):,}", end="\r", flush=True)
+
+    print(f"      Loaded {n_loaded:,} full vectors ({len(full_vecs):,} matched)")
+    return full_vecs
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +175,13 @@ def extract_adjacency(index: faiss.IndexHNSWFlat, nids: list[int]) \
 # Write to PostgreSQL
 # ---------------------------------------------------------------------------
 
-def create_tables(cur, prefix: str, max_level: int, sketch_dim: int = DEFAULT_SKETCH_DIM) -> None:
+def create_tables(cur, prefix: str, max_level: int,
+                  sketch_dim: int = DEFAULT_SKETCH_DIM,
+                  l0_full_dim: int = 0) -> None:
+    """Create sidecar tables.
+
+    l0_full_dim > 0: L0 uses svec(l0_full_dim) instead of hsvec(sketch_dim).
+    """
     cur.execute(f"DROP TABLE IF EXISTS {prefix}_meta CASCADE")
     cur.execute(f"""
         CREATE TABLE {prefix}_meta (
@@ -153,20 +191,24 @@ def create_tables(cur, prefix: str, max_level: int, sketch_dim: int = DEFAULT_SK
     """)
 
     # Level 0: includes src_id + src_tid for final rerank
+    l0_type = f"svec({l0_full_dim})" if l0_full_dim > 0 else f"hsvec({sketch_dim})"
     cur.execute(f"DROP TABLE IF EXISTS {prefix}_l0 CASCADE")
     cur.execute(f"""
         CREATE TABLE {prefix}_l0 (
             nid        int4    PRIMARY KEY,
-            sketch     hsvec({sketch_dim}),
+            sketch     {l0_type},
             neighbors  int4[],
             src_id     text,
             src_tid    tid
         )
     """)
-    cur.execute(f"""
-        CREATE INDEX {prefix.split('.')[-1]}_l0_cover
-        ON {prefix}_l0 (nid) INCLUDE (sketch, neighbors, src_tid)
-    """)
+    # Covering index only for hsvec (small sketches); svec(2880) exceeds btree
+    # page size limit (8KB).  Full vectors are TOAST'd so we just use the PK.
+    if l0_full_dim == 0:
+        cur.execute(f"""
+            CREATE INDEX {prefix.split('.')[-1]}_l0_cover
+            ON {prefix}_l0 (nid) INCLUDE (sketch, neighbors, src_tid)
+        """)
 
     for l in range(1, max_level + 1):
         cur.execute(f"DROP TABLE IF EXISTS {prefix}_l{l} CASCADE")
@@ -193,6 +235,7 @@ def write_tables(
     sketches_by_nid: dict[int, str],   # nid → "[f,f,...]" literal
     src_ids_by_nid: dict[int, str],
     src_tids_by_nid: dict[int, str],
+    l0_vecs_by_nid: dict[int, str] | None = None,  # nid → full svec literal
     batch: int = 2000,
 ) -> None:
     print(f"[4/4] Writing to PostgreSQL...", flush=True)
@@ -204,14 +247,17 @@ def write_tables(
         return "{" + ",".join(str(x) for x in lst) + "}"
 
     # Level 0
+    use_full = l0_vecs_by_nid is not None
+    l0_cast = "svec" if use_full else "hsvec"
     t0 = time.time()
     rows_l0 = []
     for nid, level_nbrs in adj.items():
         if 0 not in level_nbrs:
             continue
+        vec_literal = l0_vecs_by_nid[nid] if use_full else sketches_by_nid[nid]
         rows_l0.append((
             nid,
-            sketches_by_nid[nid],
+            vec_literal,
             pg_int4_array(level_nbrs[0]),
             src_ids_by_nid[nid],
             src_tids_by_nid[nid],
@@ -223,10 +269,11 @@ def write_tables(
             f"INSERT INTO {prefix}_l0 (nid, sketch, neighbors, src_id, src_tid) "
             f"VALUES %s",
             rows_l0[i:i+batch],
-            template=f"(%s, %s::hsvec, %s::int4[], %s, %s::tid)",
+            template=f"(%s, %s::{l0_cast}, %s::int4[], %s, %s::tid)",
         )
         conn.commit()
-    print(f"      L0: {len(rows_l0):,} rows  ({time.time()-t0:.1f}s)")
+    label = f"L0 ({'svec full' if use_full else 'hsvec sketch'})"
+    print(f"      {label}: {len(rows_l0):,} rows  ({time.time()-t0:.1f}s)")
 
     # Upper levels
     for l in range(1, max_level + 1):
@@ -267,7 +314,14 @@ def main() -> None:
     parser.add_argument("--ef-construction", type=int, default=200)
     parser.add_argument("--sketch-dim",      type=int, default=0,
                         help="Expected sketch dimension (0 = infer from data)")
+    parser.add_argument("--full-vectors",    action="store_true",
+                        help="Store full svec in L0 (hybrid mode: exact L0, sketch upper)")
+    parser.add_argument("--main-table",      default="",
+                        help="Main sorted_heap table with svec embeddings (required with --full-vectors)")
     args = parser.parse_args()
+
+    if args.full_vectors and not args.main_table:
+        parser.error("--full-vectors requires --main-table")
 
     conn = psycopg2.connect(args.dsn)
     conn.autocommit = False
@@ -290,16 +344,29 @@ def main() -> None:
     src_ids_by_nid  = {nids[i]: src_ids[i]  for i in range(len(nids))}
     src_tids_by_nid = {nids[i]: src_tids[i] for i in range(len(nids))}
 
-    create_tables(cur, args.prefix, max_level, sketch_dim)
+    # Load full vectors for hybrid L0
+    l0_vecs_by_nid = None
+    l0_full_dim = 0
+    if args.full_vectors:
+        l0_vecs_by_nid = load_full_vectors(cur, args.main_table, nids, src_ids_by_nid)
+        # Infer dimension from first vector
+        sample = next(iter(l0_vecs_by_nid.values()))
+        l0_full_dim = sample.count(",") + 1
+        print(f"      L0 full vector dimension: {l0_full_dim}")
+
+    create_tables(cur, args.prefix, max_level, sketch_dim, l0_full_dim)
     conn.commit()
 
     write_tables(
         cur, conn, args.prefix,
         entry_nid, max_level, adj,
         sketches_by_nid, src_ids_by_nid, src_tids_by_nid,
+        l0_vecs_by_nid=l0_vecs_by_nid,
     )
 
-    print(f"\nDone. Tables: {args.prefix}_meta, _l0 .. _l{max_level}")
+    mode = "hybrid (svec L0 + hsvec upper)" if args.full_vectors else "sketch-only (hsvec)"
+    print(f"\nDone. Mode: {mode}")
+    print(f"Tables: {args.prefix}_meta, _l0 .. _l{max_level}")
     print(f"Entry point: nid={entry_nid}, max_level={max_level}")
     conn.close()
 

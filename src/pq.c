@@ -50,6 +50,9 @@
 #include "access/visibilitymap.h"
 #include "catalog/index.h"
 #include "catalog/pg_index.h"
+#include "catalog/pg_attribute.h"
+#include "catalog/pg_type.h"
+#include "utils/syscache.h"
 
 #include <float.h>
 #include <math.h>
@@ -87,14 +90,18 @@ int sorted_heap_hnsw_ef_patience = 0;
 #define HNSW_CACHE_SKETCH_DIM  384
 #define HNSW_CACHE_MAX_NBRS     32
 
+/*
+ * HnswL0CacheNode — fixed-size part of each cached L0 node.
+ * Vector data (f16 sketch or f32 full) lives in a separate contiguous
+ * array (HnswL0Cache.vec_data) to allow variable dimensions.
+ */
 typedef struct
 {
-	int16			sketch[HNSW_CACHE_SKETCH_DIM]; /* hsvec float16  768 B */
 	int32			nbrs[HNSW_CACHE_MAX_NBRS];	   /* neighbors       128 B */
 	int8			nbr_count;					   /* actual count      1 B */
 	int8			_pad[5];					   /* alignment pad     5 B */
 	ItemPointerData src_tid;					   /* heap TID          6 B */
-	/* total: 908 bytes */
+	/* total: 140 bytes (vector data stored separately) */
 } HnswL0CacheNode;
 
 typedef struct
@@ -105,6 +112,10 @@ typedef struct
 	int32			 alloc_nids;	/* allocated slots (nodes[0..alloc-1]) */
 	int32			 max_nid;		/* maximum nid seen during build */
 	HnswL0CacheNode *nodes;			/* direct-indexed by nid */
+	char			*vec_data;		/* contiguous vector storage */
+	int32			 vec_dim;		/* dimension of stored vectors */
+	int32			 vec_stride;	/* bytes per vector (dim*sizeof(type)) */
+	bool			 vec_is_f32;	/* true=svec float32, false=hsvec float16 */
 	int64			 cache_bytes;
 	double			 build_ms;		/* wall-clock build time */
 	int64			 use_count;		/* warm queries served */
@@ -151,6 +162,44 @@ sorted_heap_hnsw_relcache_invalidate(Oid relid)
 	}
 }
 
+/*
+ * Detect whether the "sketch" column is svec (float32) or hsvec (float16).
+ * Returns true for svec/float32, false for hsvec/float16.
+ */
+static bool
+l0_sketch_is_svec(Oid l0_oid, AttrNumber att_sketch)
+{
+	HeapTuple		 tp;
+	Form_pg_attribute att;
+	Oid				 typid;
+	bool			 is_svec;
+
+	tp = SearchSysCache2(ATTNUM,
+						 ObjectIdGetDatum(l0_oid),
+						 Int16GetDatum(att_sketch));
+	if (!HeapTupleIsValid(tp))
+		return false;
+	att = (Form_pg_attribute) GETSTRUCT(tp);
+	typid = att->atttypid;
+	ReleaseSysCache(tp);
+
+	{
+		HeapTuple	 typ_tp;
+
+		typ_tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+		if (HeapTupleIsValid(typ_tp))
+		{
+			Form_pg_type typtup = (Form_pg_type) GETSTRUCT(typ_tp);
+
+			is_svec = (strcmp(NameStr(typtup->typname), "svec") == 0);
+			ReleaseSysCache(typ_tp);
+		}
+		else
+			is_svec = false;
+	}
+	return is_svec;
+}
+
 static HnswL0Cache *
 build_hnsw_l0_cache(Relation l0_rel, Oid l0_oid, Snapshot snap)
 {
@@ -163,8 +212,18 @@ build_hnsw_l0_cache(Relation l0_rel, Oid l0_oid, Snapshot snap)
 	AttrNumber		 att_nid, att_sketch, att_nbrs, att_src_tid;
 	int32			 alloc_nids;
 	int32			 max_nid = -1;
+	bool			 is_f32;
+	int32			 vec_stride;
 
 	INSTR_TIME_SET_CURRENT(t0);
+
+	att_nid		= get_attnum(l0_oid, "nid");
+	att_sketch	= get_attnum(l0_oid, "sketch");
+	att_nbrs	= get_attnum(l0_oid, "neighbors");
+	att_src_tid = get_attnum(l0_oid, "src_tid");
+
+	/* Detect vector type: svec (f32) or hsvec (f16) */
+	is_f32 = l0_sketch_is_svec(l0_oid, att_sketch);
 
 	/* Allocate cache + nodes array in a dedicated long-lived context */
 	mctx = AllocSetContextCreate(TopMemoryContext,
@@ -175,6 +234,8 @@ build_hnsw_l0_cache(Relation l0_rel, Oid l0_oid, Snapshot snap)
 	cache = (HnswL0Cache *) palloc0(sizeof(HnswL0Cache));
 	cache->mctx		  = mctx;
 	cache->l0_rel_oid = l0_oid;
+	cache->vec_is_f32 = is_f32;
+	cache->vec_dim    = 0;		/* set on first row */
 
 	alloc_nids = (int32)(l0_rel->rd_rel->reltuples * 1.05) + 2048;
 	if (alloc_nids < 65536)
@@ -183,14 +244,8 @@ build_hnsw_l0_cache(Relation l0_rel, Oid l0_oid, Snapshot snap)
 		palloc0((Size) alloc_nids * sizeof(HnswL0CacheNode));
 	cache->nodes	  = nodes;
 	cache->alloc_nids = alloc_nids;
-	cache->cache_bytes = (int64) alloc_nids * sizeof(HnswL0CacheNode);
 
-	MemoryContextSwitchTo(old_ctx);	/* temp datum allocs in caller ctx */
-
-	att_nid		= get_attnum(l0_oid, "nid");
-	att_sketch	= get_attnum(l0_oid, "sketch");
-	att_nbrs	= get_attnum(l0_oid, "neighbors");
-	att_src_tid = get_attnum(l0_oid, "src_tid");	/* InvalidAttrNumber if absent */
+	MemoryContextSwitchTo(old_ctx);
 
 	slot = table_slot_create(l0_rel, NULL);
 	scan = table_beginscan(l0_rel, snap, 0, NULL);
@@ -208,7 +263,7 @@ build_hnsw_l0_cache(Relation l0_rel, Oid l0_oid, Snapshot snap)
 			continue;
 		}
 
-		/* Expand nodes array if nid exceeds current allocation */
+		/* Expand nodes + vec_data arrays if nid exceeds allocation */
 		if (nid >= cache->alloc_nids)
 		{
 			int32		 new_alloc = Max(nid + 2048, cache->alloc_nids * 2);
@@ -220,10 +275,19 @@ build_hnsw_l0_cache(Relation l0_rel, Oid l0_oid, Snapshot snap)
 			memset(nodes + cache->alloc_nids, 0,
 				   (Size)(new_alloc - cache->alloc_nids) *
 				   sizeof(HnswL0CacheNode));
+
+			if (cache->vec_data != NULL)
+			{
+				cache->vec_data = repalloc_huge(cache->vec_data,
+										   (Size) new_alloc * cache->vec_stride);
+				memset(cache->vec_data + (Size) cache->alloc_nids * cache->vec_stride,
+					   0,
+					   (Size)(new_alloc - cache->alloc_nids) * cache->vec_stride);
+			}
+
 			MemoryContextSwitchTo(save);
 			cache->nodes	   = nodes;
 			cache->alloc_nids  = new_alloc;
-			cache->cache_bytes = (int64) new_alloc * sizeof(HnswL0CacheNode);
 		}
 
 		cn = &cache->nodes[nid];
@@ -231,18 +295,66 @@ build_hnsw_l0_cache(Relation l0_rel, Oid l0_oid, Snapshot snap)
 			max_nid = nid;
 		cache->n_nodes++;
 
-		/* sketch */
+		/* vector (sketch or full) */
 		{
 			Datum  sk_d = slot_getattr(slot, att_sketch, &isnull);
 
 			if (!isnull)
 			{
-				Hsvec  *sk	 = (Hsvec *) PG_DETOAST_DATUM(sk_d);
-				int		cdim = Min(sk->dim, HNSW_CACHE_SKETCH_DIM);
+				if (is_f32)
+				{
+					/* svec: float32 full-precision vector */
+					Svec   *sv = (Svec *) PG_DETOAST_DATUM(sk_d);
 
-				memcpy(cn->sketch, sk->x, (Size) cdim * sizeof(int16));
-				if (sk != (Hsvec *) DatumGetPointer(sk_d))
-					pfree(sk);
+					/* First row: set dimension and allocate vec_data */
+					if (cache->vec_dim == 0)
+					{
+						MemoryContext save = MemoryContextSwitchTo(mctx);
+
+						cache->vec_dim    = sv->dim;
+						cache->vec_stride = (int32)(sv->dim * sizeof(float));
+						{
+							Size sz = (Size) cache->alloc_nids * cache->vec_stride;
+							cache->vec_data = MemoryContextAllocHuge(mctx, sz);
+							memset(cache->vec_data, 0, sz);
+						}
+						MemoryContextSwitchTo(save);
+					}
+
+					memcpy(cache->vec_data + (Size) nid * cache->vec_stride,
+						   sv->x,
+						   (Size) Min(sv->dim, cache->vec_dim) * sizeof(float));
+
+					if (sv != (Svec *) DatumGetPointer(sk_d))
+						pfree(sv);
+				}
+				else
+				{
+					/* hsvec: float16 sketch */
+					Hsvec  *sk = (Hsvec *) PG_DETOAST_DATUM(sk_d);
+
+					/* First row: set dimension and allocate vec_data */
+					if (cache->vec_dim == 0)
+					{
+						MemoryContext save = MemoryContextSwitchTo(mctx);
+
+						cache->vec_dim    = sk->dim;
+						cache->vec_stride = (int32)(sk->dim * sizeof(int16));
+						{
+							Size sz = (Size) cache->alloc_nids * cache->vec_stride;
+							cache->vec_data = MemoryContextAllocHuge(mctx, sz);
+							memset(cache->vec_data, 0, sz);
+						}
+						MemoryContextSwitchTo(save);
+					}
+
+					memcpy(cache->vec_data + (Size) nid * cache->vec_stride,
+						   sk->x,
+						   (Size) Min(sk->dim, cache->vec_dim) * sizeof(int16));
+
+					if (sk != (Hsvec *) DatumGetPointer(sk_d))
+						pfree(sk);
+				}
 			}
 		}
 
@@ -281,6 +393,10 @@ build_hnsw_l0_cache(Relation l0_rel, Oid l0_oid, Snapshot snap)
 	ExecDropSingleTupleTableSlot(slot);
 
 	cache->max_nid = max_nid;
+	vec_stride = cache->vec_stride;
+	cache->cache_bytes = (int64) cache->alloc_nids * sizeof(HnswL0CacheNode)
+		+ (cache->vec_data ? (int64) cache->alloc_nids * vec_stride : 0);
+
 	INSTR_TIME_SET_CURRENT(t1);
 	cache->build_ms = INSTR_TIME_GET_MILLISEC(t1) -
 		INSTR_TIME_GET_MILLISEC(t0);
@@ -2706,6 +2822,63 @@ cosine_distance_f32_f16_prenorm(const float *a, const half *b, int dim,
 
 		dot    += (double) a[i] * bi;
 		norm_b += bi * bi;
+	}
+#endif
+
+	if (norm_a == 0.0 || norm_b == 0.0)
+		return get_float8_nan();
+
+	similarity = dot / (sqrt(norm_a) * sqrt(norm_b));
+	if (similarity > 1.0)
+		similarity = 1.0;
+	else if (similarity < -1.0)
+		similarity = -1.0;
+
+	return 1.0 - similarity;
+}
+
+/* --- f32×f32 cosine distance with precomputed query norm (hybrid L0) --- */
+
+static float8
+cosine_distance_f32_f32_prenorm(const float *a, const float *b, int dim,
+								double norm_a)
+{
+	double		dot;
+	double		norm_b;
+	double		similarity;
+	int			i;
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+	{
+		float32x4_t vdot = vdupq_n_f32(0.0f);
+		float32x4_t vnb  = vdupq_n_f32(0.0f);
+
+		for (i = 0; i + 3 < dim; i += 4)
+		{
+			float32x4_t va = vld1q_f32(&a[i]);
+			float32x4_t vb = vld1q_f32(&b[i]);
+
+			vdot = vfmaq_f32(vdot, va, vb);
+			vnb  = vfmaq_f32(vnb, vb, vb);
+		}
+
+		dot    = (double) vaddvq_f32(vdot);
+		norm_b = (double) vaddvq_f32(vnb);
+
+		for (; i < dim; i++)
+		{
+			dot    += (double) a[i] * (double) b[i];
+			norm_b += (double) b[i] * (double) b[i];
+		}
+	}
+#else
+	dot = 0.0;
+	norm_b = 0.0;
+
+	for (i = 0; i < dim; i++)
+	{
+		dot    += (double) a[i] * (double) b[i];
+		norm_b += (double) b[i] * (double) b[i];
 	}
 #endif
 
@@ -5239,6 +5412,25 @@ visited_set(uint64 **bits_p, int *nwords_p, int32 nid)
 }
 
 /*
+ * Compute cosine distance between query and a cached L0/upper-level node.
+ * Dispatches to f32×f32 or f32×f16 based on cache->vec_is_f32.
+ */
+static inline float8
+hnsw_cache_distance(const HnswL0Cache *cache, int32 nid,
+					const float *qx, int qdim, double qnorm)
+{
+	const char *vec = cache->vec_data + (Size) nid * cache->vec_stride;
+	int			dim = Min(cache->vec_dim, qdim);
+
+	if (cache->vec_is_f32)
+		return cosine_distance_f32_f32_prenorm(qx, (const float *) vec,
+											   dim, qnorm);
+	else
+		return cosine_distance_f32_f16_prenorm(qx, (const half *) vec,
+											   dim, qnorm);
+}
+
+/*
  * Cache-only beam search (no HnswLevel / no catalog access).
  *
  * Used for upper-level greedy descent when cache is already built.
@@ -5270,7 +5462,6 @@ hnsw_search_cached(const HnswL0Cache *cache,
 	{
 		int32		ep = entry_nids[i];
 		float8		d;
-		const HnswL0CacheNode *cn;
 
 		if (ep < 0 || ep > cache->max_nid)
 			continue;
@@ -5279,10 +5470,7 @@ hnsw_search_cached(const HnswL0Cache *cache,
 		visited_set(&visited_bits, &visited_nwords, ep);
 		n_visited++;
 
-		cn = &cache->nodes[ep];
-		d = cosine_distance_f32_f16_prenorm(qx, (const half *) cn->sketch,
-											Min(HNSW_CACHE_SKETCH_DIM, qdim),
-											qnorm);
+		d = hnsw_cache_distance(cache, ep, qx, qdim, qnorm);
 
 		candidates[cand_size].dist = d;
 		candidates[cand_size].nid  = ep;
@@ -5333,7 +5521,6 @@ hnsw_search_cached(const HnswL0Cache *cache,
 		{
 			int32	n_nid = cn->nbrs[k];
 			float8	n_dist;
-			const HnswL0CacheNode *nn;
 
 			if (n_nid < 0 || n_nid > cache->max_nid)
 				continue;
@@ -5341,8 +5528,6 @@ hnsw_search_cached(const HnswL0Cache *cache,
 				continue;
 			visited_set(&visited_bits, &visited_nwords, n_nid);
 			n_visited++;
-
-			nn = &cache->nodes[n_nid];
 
 			/* Prefetch next unvisited neighbor */
 			for (int pk = k + 1; pk < (int) cn->nbr_count; pk++)
@@ -5353,13 +5538,13 @@ hnsw_search_cached(const HnswL0Cache *cache,
 					!visited_test(visited_bits, visited_nwords, pnid))
 				{
 					__builtin_prefetch(&cache->nodes[pnid], 0, 1);
+					__builtin_prefetch(cache->vec_data +
+									   (Size) pnid * cache->vec_stride, 0, 1);
 					break;
 				}
 			}
 
-			n_dist = cosine_distance_f32_f16_prenorm(qx, (const half *) nn->sketch,
-													 Min(HNSW_CACHE_SKETCH_DIM,
-														 qdim), qnorm);
+			n_dist = hnsw_cache_distance(cache, n_nid, qx, qdim, qnorm);
 
 			f_dist = (res_size >= ef) ? res_out[0].dist : DBL_MAX;
 			if (n_dist < f_dist || res_size < ef)
@@ -5453,12 +5638,8 @@ hnsw_search_level(HnswLevel *h,
 
 		if (l0_cache != NULL && ep <= l0_cache->max_nid)
 		{
-			/* Cache fast path: f32 sketches, precomputed query norm */
-			const HnswL0CacheNode *cn = &l0_cache->nodes[ep];
-
-			d = cosine_distance_f32_f16_prenorm(qx, (const half *) cn->sketch,
-												Min(HNSW_CACHE_SKETCH_DIM, qdim),
-												qnorm);
+			/* Cache fast path: dispatch f32 or f16 based on vec type */
+			d = hnsw_cache_distance(l0_cache, ep, qx, qdim, qnorm);
 		}
 		else
 		{
@@ -5553,7 +5734,6 @@ hnsw_search_level(HnswLevel *h,
 			{
 				int32	n_nid = nbrs_c[k];
 				float8	n_dist;
-				const HnswL0CacheNode *nn;
 
 				if (n_nid < 0 || n_nid > l0_cache->max_nid)
 					continue;
@@ -5562,8 +5742,6 @@ hnsw_search_level(HnswLevel *h,
 					continue;
 				visited_set(&visited_bits, &visited_nwords, n_nid);
 				n_visited++;
-
-				nn = &l0_cache->nodes[n_nid];
 
 				/* Prefetch next unvisited neighbor's cache node */
 				for (int pk = k + 1; pk < n_nbrs_c; pk++)
@@ -5574,13 +5752,14 @@ hnsw_search_level(HnswLevel *h,
 						!visited_test(visited_bits, visited_nwords, pnid))
 					{
 						__builtin_prefetch(&l0_cache->nodes[pnid], 0, 1);
+						__builtin_prefetch(l0_cache->vec_data +
+										   (Size) pnid * l0_cache->vec_stride,
+										   0, 1);
 						break;
 					}
 				}
 
-				n_dist = cosine_distance_f32_f16_prenorm(qx, (const half *) nn->sketch,
-														 Min(HNSW_CACHE_SKETCH_DIM,
-															 qdim), qnorm);
+				n_dist = hnsw_cache_distance(l0_cache, n_nid, qx, qdim, qnorm);
 
 				f_dist = (res_size >= ef) ? res_out[0].dist : DBL_MAX;
 				if (n_dist < f_dist || res_size < ef)
