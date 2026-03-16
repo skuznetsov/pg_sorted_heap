@@ -17,6 +17,15 @@ instead of reduced hsvec sketches. This enables exact distance computation
 during L0 traversal for 100% recall at the cost of larger L0 cache (~1.2 GB
 for 103K x 2880-dim vs ~93 MB with sketches).
 
+With --l0-dim, the full vectors are prefix-truncated to the given dimension.
+This is useful for MRL/Matryoshka embeddings where the first N dimensions
+capture most of the information, allowing a recall/memory tradeoff:
+
+  hsvec(384)   →  0.7ms  ~97% recall   ~75MB cache
+  svec(768)    →  ~1ms   ~99% recall  ~300MB cache
+  svec(1536)   →  ~1.2ms ~99.8%       ~600MB cache
+  svec(full)   →  1.4ms  ~100%        ~1.1GB cache  (2880-dim example)
+
 Usage:
   python3 scripts/build_hnsw_graph.py \
     --dsn 'host=localhost port=15432 dbname=cogniformerus user=postgres password=postgres' \
@@ -31,6 +40,13 @@ Usage:
     --prefix gutenberg_gptoss_hnsw \
     --M 16 --ef-construction 200 \
     --full-vectors --main-table gutenberg_gptoss_sh
+
+  # Truncated L0: first 768 dims for balanced recall/memory
+  python3 scripts/build_hnsw_graph.py \
+    --dsn '...' --source-table gutenberg_gptoss_sh_graph \
+    --prefix gutenberg_gptoss_hnsw \
+    --M 16 --ef-construction 200 \
+    --full-vectors --main-table gutenberg_gptoss_sh --l0-dim 768
 """
 from __future__ import annotations
 
@@ -318,10 +334,15 @@ def main() -> None:
                         help="Store full svec in L0 (hybrid mode: exact L0, sketch upper)")
     parser.add_argument("--main-table",      default="",
                         help="Main sorted_heap table with svec embeddings (required with --full-vectors)")
+    parser.add_argument("--l0-dim",          type=int, default=0,
+                        help="Truncate L0 vectors to this prefix length (0 = no truncation). "
+                             "Requires --full-vectors. Stores svec(l0_dim) in L0.")
     args = parser.parse_args()
 
     if args.full_vectors and not args.main_table:
         parser.error("--full-vectors requires --main-table")
+    if args.l0_dim > 0 and not args.full_vectors:
+        parser.error("--l0-dim requires --full-vectors")
 
     conn = psycopg2.connect(args.dsn)
     conn.autocommit = False
@@ -351,8 +372,22 @@ def main() -> None:
         l0_vecs_by_nid = load_full_vectors(cur, args.main_table, nids, src_ids_by_nid)
         # Infer dimension from first vector
         sample = next(iter(l0_vecs_by_nid.values()))
-        l0_full_dim = sample.count(",") + 1
-        print(f"      L0 full vector dimension: {l0_full_dim}")
+        orig_dim = sample.count(",") + 1
+
+        # Prefix truncation: keep first l0_dim components
+        if args.l0_dim > 0 and args.l0_dim < orig_dim:
+            print(f"      Truncating L0 vectors: {orig_dim} → {args.l0_dim} dims")
+            for nid in l0_vecs_by_nid:
+                vals = l0_vecs_by_nid[nid].strip("[]").split(",")[:args.l0_dim]
+                l0_vecs_by_nid[nid] = "[" + ",".join(vals) + "]"
+            l0_full_dim = args.l0_dim
+        elif args.l0_dim > 0 and args.l0_dim >= orig_dim:
+            print(f"      --l0-dim={args.l0_dim} >= orig {orig_dim}, using full vectors")
+            l0_full_dim = orig_dim
+        else:
+            l0_full_dim = orig_dim
+
+        print(f"      L0 vector dimension: {l0_full_dim}")
 
     create_tables(cur, args.prefix, max_level, sketch_dim, l0_full_dim)
     conn.commit()
