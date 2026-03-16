@@ -76,6 +76,9 @@ bool sorted_heap_hnsw_cache_l0 = false;
 /* GUC: adaptive ef — early termination after N stale expansions (0 = off) */
 int sorted_heap_hnsw_ef_patience = 0;
 
+/* GUC: quantize f32 vectors to SQ8 (uint8) in L0 cache — 4x compression */
+bool sorted_heap_hnsw_cache_sq8 = true;
+
 /* ----------------------------------------------------------------
  *  HNSW L0 backend-local node cache
  *
@@ -116,6 +119,9 @@ typedef struct
 	int32			 vec_dim;		/* dimension of stored vectors */
 	int32			 vec_stride;	/* bytes per vector (dim*sizeof(type)) */
 	bool			 vec_is_f32;	/* true=svec float32, false=hsvec float16 */
+	bool			 vec_is_sq8;	/* true=SQ8 quantized uint8 */
+	float			*sq8_mins;		/* per-dim minimum (for dequant) */
+	float			*sq8_scales;	/* per-dim scale = (max-min)/255  */
 	int64			 cache_bytes;
 	double			 build_ms;		/* wall-clock build time */
 	int64			 use_count;		/* warm queries served */
@@ -393,6 +399,114 @@ build_hnsw_l0_cache(Relation l0_rel, Oid l0_oid, Snapshot snap)
 	ExecDropSingleTupleTableSlot(slot);
 
 	cache->max_nid = max_nid;
+
+	/* ---- SQ8 quantization: convert f32 vec_data to uint8 ---- */
+	if (sorted_heap_hnsw_cache_sq8 && cache->vec_is_f32 &&
+		cache->vec_dim > 0 && cache->vec_data != NULL)
+	{
+		MemoryContext save;
+		int32		dim = cache->vec_dim;
+		int32		f32_stride = cache->vec_stride;
+		float	   *mins;
+		float	   *maxs;
+		float	   *scales;
+		uint8	   *sq8_data;
+		Size		sq8_size;
+		int32		d, nid_i;
+
+		save = MemoryContextSwitchTo(mctx);
+
+		mins  = palloc(sizeof(float) * dim);
+		maxs  = palloc(sizeof(float) * dim);
+		scales = palloc(sizeof(float) * dim);
+
+		/* Init min/max */
+		for (d = 0; d < dim; d++)
+		{
+			mins[d] = FLT_MAX;
+			maxs[d] = -FLT_MAX;
+		}
+
+		/* Pass 1: compute per-dimension min/max */
+		for (nid_i = 0; nid_i <= max_nid; nid_i++)
+		{
+			const float *src;
+
+			if (cache->nodes[nid_i].nbr_count == 0 && nid_i != 0)
+				continue;	/* skip unused slots */
+
+			src = (const float *)(cache->vec_data +
+								  (Size) nid_i * f32_stride);
+
+			for (d = 0; d < dim; d++)
+			{
+				if (src[d] < mins[d]) mins[d] = src[d];
+				if (src[d] > maxs[d]) maxs[d] = src[d];
+			}
+		}
+
+		/* Compute scales */
+		for (d = 0; d < dim; d++)
+		{
+			float range = maxs[d] - mins[d];
+
+			scales[d] = (range > 0.0f) ? (range / 255.0f) : 0.0f;
+		}
+
+		/* Allocate SQ8 buffer */
+		sq8_size = (Size)(max_nid + 1) * dim;
+		sq8_data = (uint8 *) MemoryContextAllocHuge(mctx, sq8_size);
+		memset(sq8_data, 0, sq8_size);
+
+		/* Pass 2: quantize */
+		for (nid_i = 0; nid_i <= max_nid; nid_i++)
+		{
+			const float *src;
+			uint8	   *dst;
+
+			if (cache->nodes[nid_i].nbr_count == 0 && nid_i != 0)
+				continue;
+
+			src = (const float *)(cache->vec_data +
+								  (Size) nid_i * f32_stride);
+			dst = sq8_data + (Size) nid_i * dim;
+
+			for (d = 0; d < dim; d++)
+			{
+				float val;
+
+				if (scales[d] > 0.0f)
+					val = (src[d] - mins[d]) / scales[d];
+				else
+					val = 0.0f;
+
+				if (val < 0.0f) val = 0.0f;
+				else if (val > 255.0f) val = 255.0f;
+				dst[d] = (uint8) (val + 0.5f);		/* round */
+			}
+		}
+
+		MemoryContextSwitchTo(save);
+
+		/* Replace f32 vec_data with SQ8 */
+		pfree(cache->vec_data);
+		cache->vec_data   = (char *) sq8_data;
+		cache->vec_stride = dim;			/* 1 byte per component */
+		cache->vec_is_f32 = false;
+		cache->vec_is_sq8 = true;
+		cache->sq8_mins   = mins;
+		cache->sq8_scales = scales;
+
+		pfree(maxs);
+
+		elog(DEBUG1, "hnsw_l0_cache: SQ8 quantized %d-dim vectors "
+			 "(%lld bytes -> %lld bytes, %.1fx compression)",
+			 dim,
+			 (long long)((Size)(max_nid + 1) * f32_stride),
+			 (long long) sq8_size,
+			 (double)((Size)(max_nid + 1) * f32_stride) / (double) sq8_size);
+	}
+
 	vec_stride = cache->vec_stride;
 	cache->cache_bytes = (int64) cache->alloc_nids * sizeof(HnswL0CacheNode)
 		+ (cache->vec_data ? (int64) cache->alloc_nids * vec_stride : 0);
@@ -2879,6 +2993,94 @@ cosine_distance_f32_f32_prenorm(const float *a, const float *b, int dim,
 	{
 		dot    += (double) a[i] * (double) b[i];
 		norm_b += (double) b[i] * (double) b[i];
+	}
+#endif
+
+	if (norm_a == 0.0 || norm_b == 0.0)
+		return get_float8_nan();
+
+	similarity = dot / (sqrt(norm_a) * sqrt(norm_b));
+	if (similarity > 1.0)
+		similarity = 1.0;
+	else if (similarity < -1.0)
+		similarity = -1.0;
+
+	return 1.0 - similarity;
+}
+
+/*
+ * Asymmetric cosine distance: float32 query × SQ8-quantized candidate.
+ * Dequantizes on-the-fly: x[i] = mins[i] + raw[i] * scales[i].
+ */
+static float8
+cosine_distance_f32_sq8_prenorm(const float *a, const uint8 *b,
+								const float *mins, const float *scales,
+								int dim, double norm_a)
+{
+	double		dot;
+	double		norm_b;
+	double		similarity;
+	int			i;
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+	{
+		float32x4_t vdot = vdupq_n_f32(0.0f);
+		float32x4_t vnb  = vdupq_n_f32(0.0f);
+
+		for (i = 0; i + 7 < dim; i += 8)
+		{
+			/* Load 8 uint8 values → widen to float32 */
+			uint8x8_t	raw8 = vld1_u8(&b[i]);
+			uint16x8_t	raw16 = vmovl_u8(raw8);
+
+			/* First 4 elements */
+			{
+				uint32x4_t	r32 = vmovl_u16(vget_low_u16(raw16));
+				float32x4_t fr  = vcvtq_f32_u32(r32);
+				float32x4_t vm  = vld1q_f32(&mins[i]);
+				float32x4_t vs  = vld1q_f32(&scales[i]);
+				float32x4_t val = vfmaq_f32(vm, fr, vs);	/* min + raw*scale */
+				float32x4_t vq  = vld1q_f32(&a[i]);
+
+				vdot = vfmaq_f32(vdot, vq, val);
+				vnb  = vfmaq_f32(vnb, val, val);
+			}
+
+			/* Next 4 elements */
+			{
+				uint32x4_t	r32 = vmovl_u16(vget_high_u16(raw16));
+				float32x4_t fr  = vcvtq_f32_u32(r32);
+				float32x4_t vm  = vld1q_f32(&mins[i + 4]);
+				float32x4_t vs  = vld1q_f32(&scales[i + 4]);
+				float32x4_t val = vfmaq_f32(vm, fr, vs);
+				float32x4_t vq  = vld1q_f32(&a[i + 4]);
+
+				vdot = vfmaq_f32(vdot, vq, val);
+				vnb  = vfmaq_f32(vnb, val, val);
+			}
+		}
+
+		dot    = (double) vaddvq_f32(vdot);
+		norm_b = (double) vaddvq_f32(vnb);
+
+		for (; i < dim; i++)
+		{
+			double bi = (double) mins[i] + (double) b[i] * (double) scales[i];
+
+			dot    += (double) a[i] * bi;
+			norm_b += bi * bi;
+		}
+	}
+#else
+	dot = 0.0;
+	norm_b = 0.0;
+
+	for (i = 0; i < dim; i++)
+	{
+		double bi = (double) mins[i] + (double) b[i] * (double) scales[i];
+
+		dot    += (double) a[i] * bi;
+		norm_b += bi * bi;
 	}
 #endif
 
@@ -5413,7 +5615,7 @@ visited_set(uint64 **bits_p, int *nwords_p, int32 nid)
 
 /*
  * Compute cosine distance between query and a cached L0/upper-level node.
- * Dispatches to f32×f32 or f32×f16 based on cache->vec_is_f32.
+ * Dispatches to SQ8, f32, or f16 based on cache vector type.
  */
 static inline float8
 hnsw_cache_distance(const HnswL0Cache *cache, int32 nid,
@@ -5422,7 +5624,12 @@ hnsw_cache_distance(const HnswL0Cache *cache, int32 nid,
 	const char *vec = cache->vec_data + (Size) nid * cache->vec_stride;
 	int			dim = Min(cache->vec_dim, qdim);
 
-	if (cache->vec_is_f32)
+	if (cache->vec_is_sq8)
+		return cosine_distance_f32_sq8_prenorm(qx, (const uint8 *) vec,
+											   cache->sq8_mins,
+											   cache->sq8_scales,
+											   dim, qnorm);
+	else if (cache->vec_is_f32)
 		return cosine_distance_f32_f32_prenorm(qx, (const float *) vec,
 											   dim, qnorm);
 	else

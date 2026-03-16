@@ -1564,6 +1564,18 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("sorted_heap.hnsw_cache_sq8",
+							 "Quantize float32 vectors to SQ8 (uint8) in the L0 "
+							 "cache for 4x memory compression. Minimal recall "
+							 "impact when combined with exact rerank. "
+							 "Only affects svec columns; hsvec is unchanged.",
+							 NULL,
+							 &sorted_heap_hnsw_cache_sq8,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomIntVariable("sorted_heap.hnsw_ef_patience",
 						 "Adaptive ef: stop L0 beam search after N consecutive "
 						 "node expansions with no result set improvement. "
