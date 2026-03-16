@@ -140,23 +140,28 @@ Result: **no measurable recall difference**. Float16 precision loss (~1e-7) is
 The recall bottleneck is PQ quantization and IVF routing, not input precision.
 This confirms hsvec is a safe storage choice for ANN workloads.
 
-### Comparison with pgvector HNSW
+### Comparison with other vector search engines
 
-Same dataset (103K × 2880-dim), 2 Gi k8s pod, `shared_buffers=512MB`,
-isolated per-config protocol (warmup + measure pass per config).
+Same dataset (103K × 2880-dim), warm cache, top-10.
 
-| Method | Recall@10 | p50 latency | Index size | Max dim |
-|---|---|---|---|---|
-| Exact brute-force (svec `<=>`) | 100% | 996 ms | — | 16,000 / 32,000 |
-| pgvector HNSW ef=64 | 99.8% | 1.70 ms | 806 MB | 2,000 / 4,000 |
-| IVF-PQ nprobe=10, rerank=2000 | 99.0% | 64 ms | 27 MB | 16,000 / 32,000 |
-| **svec_hnsw_scan ef=96, rk=48** | **96.8%** | **0.98 ms** | ~100 MB | 16,000 / 32,000 |
-| svec_hnsw_scan ef=96, rk=0 | 98.4% | 1.83 ms | ~100 MB | 16,000 / 32,000 |
-| svec_hnsw_scan ef=64, rk=32 | 92.8% | 0.85 ms | ~100 MB | 16,000 / 32,000 |
+| Method | Recall@10 | p50 latency | Memory/Index |
+|--------|:---------:|:-----------:|:------------:|
+| **psh HNSW SQ8** ef=96 | **98.4%** | **1.3ms** | **283 MB** |
+| **psh HNSW sketch** ef=96, rk=48 | **96.8%** | **0.7ms** | **75 MB** |
+| **psh HNSW f32** ef=96 | **99.6%** | **1.5ms** | **1.1 GB** |
+| zvec HNSW M=32, ef=100 | 100% | 1.04ms | 1,173 MB |
+| pgvector HNSW ef=64 | 99.8% | 1.70ms | 806 MB |
+| **psh IVF-PQ** np=10, rr=200 | **99.0%** | **10.7ms** | **27 MB** |
+| Qdrant HNSW M=32, ef=100 | 100% | 23.2ms | 2,626 MB |
 
-`svec_hnsw_scan` at ef=96/rk=48 is 1.7x faster than pgvector HNSW at 3 points
-lower recall. Requires `sorted_heap.hnsw_cache_l0 = on` (session-local cache,
-~100 MB, built on first query). Navigation uses hsvec(384) sketches (no TOAST).
+psh = pg_sorted_heap. zvec: in-process embedded C++ (Alibaba Proxima).
+Qdrant: Rust server via Docker (server-side ~19ms). pgvector / pg_sorted_heap:
+PostgreSQL extensions via unix socket.
+
+psh HNSW requires `sorted_heap.hnsw_cache_l0 = on` (session-local cache, built
+on first query). Three L0 cache modes: hsvec(384) sketch (75 MB), SQ8 quantized
+svec (283 MB, default), or full float32 svec (1.1 GB). SQ8 is controlled by
+`sorted_heap.hnsw_cache_sq8` GUC (default on).
 
 ### CRUD performance (500K rows, svec(128), prepared mode)
 

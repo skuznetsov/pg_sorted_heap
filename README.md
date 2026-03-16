@@ -95,23 +95,32 @@ SELECT * FROM svec_ann_scan(
 
 ### Sub-millisecond HNSW search
 
-Hierarchical HNSW via compact sidecar tables. Navigation uses hsvec(384)
-sketches (no TOAST reads). With session-local cache: **0.98ms p50, 96.8%
-recall@10** -- 3.6x faster than pgvector HNSW.
+Hierarchical HNSW via compact sidecar tables. Three cache modes let you
+trade memory for recall:
+
+| L0 cache mode | Cache size | Latency (ef=96) | Recall@10 |
+|---------------|:----------:|:---------------:|:---------:|
+| hsvec(384) sketch | ~75 MB | 0.7ms | 97% |
+| svec full + SQ8 (default) | ~283 MB | 1.3ms | 98.4% |
+| svec full + f32 | ~1.1 GB | 1.5ms | 99.6% |
 
 ```sql
--- Enable session-local cache (~100 MB, built on first query)
+-- Enable session-local cache (built on first query)
 SET sorted_heap.hnsw_cache_l0 = on;
 
--- Balanced: 0.98ms, 96.8% recall@10
+-- Fast mode: hsvec(384) sketches in L0, 0.7ms, 97% recall
 SELECT * FROM svec_hnsw_scan(
     'documents', query_vec, 'documents_hnsw',
     ef_search := 96, lim := 10, rerank_topk := 48);
 
--- Quality-first: 1.83ms, 98.4% recall@10
+-- SQ8 mode (default for svec L0): 1.3ms, 98.4% recall, 4x less memory
+-- Automatically quantizes float32 vectors to uint8 in cache
 SELECT * FROM svec_hnsw_scan(
     'documents', query_vec, 'documents_hnsw',
     ef_search := 96, lim := 10, rerank_topk := 0);
+
+-- Full precision: disable SQ8 for maximum recall without rerank
+SET sorted_heap.hnsw_cache_sq8 = off;
 ```
 
 ### Large-table analytics with range predicates
@@ -275,19 +284,28 @@ write-heavy workloads.
 
 ### Vector search comparison
 
-103K x 2880-dim vectors, Apple M-series, warm cache.
+103K x 2880-dim vectors, Apple M-series, warm cache, top-10.
 
-| Method | Recall@10 | p50 latency | Index size |
-|--------|:---------:|:-----------:|:----------:|
-| **svec_hnsw_scan ef=96, rk=48** | **96.8%** | **0.70ms** | ~100 MB |
+| Method | Recall@10 | p50 latency | Memory/Index |
+|--------|:---------:|:-----------:|:------------:|
+| **psh HNSW SQ8** ef=96 | **98.4%** | **1.3ms** | **283 MB** |
+| **psh HNSW sketch** ef=96, rk=48 | **96.8%** | **0.7ms** | **75 MB** |
+| **psh HNSW f32** ef=96 | **99.6%** | **1.5ms** | **1.1 GB** |
 | zvec HNSW M=32, ef=100 | 100% | 1.04ms | 1,173 MB |
 | pgvector HNSW ef=64 | 99.8% | 1.70ms | 806 MB |
-| IVF-PQ nprobe=10, rr=200 | 99.0% | 10.7ms | 27 MB |
+| **psh IVF-PQ** np=10, rr=200 | **99.0%** | **10.7ms** | **27 MB** |
 | Qdrant HNSW M=32, ef=100 | 100% | 23.2ms | 2,626 MB |
 
-zvec: in-process embedded C++ (Alibaba Proxima). Qdrant: Rust server via
-Docker. pgvector / pg_sorted_heap: PostgreSQL extensions via unix socket.
-Qdrant server-side latency ~19ms (rest is Docker VM overhead).
+psh = pg_sorted_heap. zvec: in-process embedded C++ (Alibaba Proxima).
+Qdrant: Rust server via Docker. pgvector / pg_sorted_heap: PostgreSQL
+extensions via unix socket. Qdrant server-side latency ~19ms (rest is
+Docker VM overhead).
+
+**Key tradeoffs:**
+- psh HNSW SQ8: best balance -- 98.4% recall, 1.3ms, 283 MB (4x less than f32)
+- psh HNSW sketch: fastest -- 0.7ms, but capped at ~97% recall
+- psh IVF-PQ: smallest index -- 27 MB, good for disk-constrained setups
+- For 16K-dim vectors: SQ8 cache = 1.6 GB (vs 6.3 GB f32, vs 75 MB sketch)
 
 ## Quick start
 
@@ -409,9 +427,17 @@ SELECT * FROM svec_ann_scan('tbl', query, nprobe:=10, lim:=10, rerank_topk:=200,
 ```sql
 SET sorted_heap.hnsw_cache_l0 = on;  -- session-local cache
 
--- Balanced: 0.98ms, 96.8% recall@10
+-- Balanced: 1.3ms, 98.4% recall@10 (SQ8 cache, default)
+SELECT * FROM svec_hnsw_scan('tbl', query, 'tbl_hnsw',
+    ef_search:=96, lim:=10, rerank_topk:=0);
+
+-- Fast: 0.7ms, 96.8% recall@10 (hsvec sketch L0, with rerank)
 SELECT * FROM svec_hnsw_scan('tbl', query, 'tbl_hnsw',
     ef_search:=96, lim:=10, rerank_topk:=48);
+
+-- High-recall: ef=300 + exact rerank
+SELECT * FROM svec_hnsw_scan('tbl', query, 'tbl_hnsw',
+    ef_search:=300, lim:=10, rerank_topk:=48);
 ```
 
 ### Configuration
@@ -421,6 +447,7 @@ SET sorted_heap.enable_scan_pruning = on;       -- zone map pruning (default: on
 SET sorted_heap.vacuum_rebuild_zonemap = on;     -- VACUUM rebuilds zone map (default: on)
 SET sorted_heap.lazy_update = on;                -- skip per-UPDATE zone map flush
 SET sorted_heap.hnsw_cache_l0 = on;              -- session-local HNSW L0+upper cache
+SET sorted_heap.hnsw_cache_sq8 = on;             -- SQ8 quantize svec in cache (4x smaller)
 SET sorted_heap.hnsw_ef_patience = 0;            -- adaptive ef early termination (0=off)
 SET sorted_heap.ann_timing = on;                 -- timing breakdown in DEBUG1
 ```

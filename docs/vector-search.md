@@ -243,27 +243,32 @@ precision loss (~1e-7) is 1000× smaller than typical distance gaps between
 neighbors (~1e-4). Precision is not the recall bottleneck; PQ quantization
 and IVF routing are. This confirms hsvec is a safe storage choice for ANN.
 
-### Comparison with pgvector HNSW
+### Comparison with other vector search engines
 
-Same dataset (103K × 2880-dim), same k8s pod (warm buffer pool).
+Same dataset (103K × 2880-dim), warm cache, top-10.
 
-| Method | Recall@10 | p50 latency | Index size | Max dim |
-|---|---|---|---|---|
-| Exact brute-force (svec `<=>`) | 100% | 996 ms | — | 16,000 / 32,000 |
-| pgvector HNSW ef=64 | 99.8% | 3.6 ms | 806 MB | 2,000 (`vector`) / 4,000 (`halfvec`) |
-| IVF-PQ nprobe=10, rerank=2000 | 99.0% | 64 ms | 27 MB | 16,000 / 32,000 |
-| svec_hnsw_scan ef=96, rk=48 | 96.8% | 0.98 ms | ~100 MB† | 16,000 / 32,000 |
-| svec_hnsw_scan ef=96, rk=0 | 98.4% | 1.83 ms | ~100 MB† | 16,000 / 32,000 |
+| Method | Recall@10 | p50 latency | Memory/Index |
+|--------|:---------:|:-----------:|:------------:|
+| **psh HNSW SQ8** ef=96 | **98.4%** | **1.3ms** | **283 MB** |
+| **psh HNSW sketch** ef=96, rk=48 | **96.8%** | **0.7ms** | **75 MB** |
+| **psh HNSW f32** ef=96 | **99.6%** | **1.5ms** | **1.1 GB** |
+| zvec HNSW M=32, ef=100 | 100% | 1.04ms | 1,173 MB |
+| pgvector HNSW ef=64 | 99.8% | 1.70ms | 806 MB |
+| **psh IVF-PQ** np=10, rr=200 | **99.0%** | **10.7ms** | **27 MB** |
+| Qdrant HNSW M=32, ef=100 | 100% | 23.2ms | 2,626 MB |
 
-†Hierarchical sidecar tables (L0–L4, hsvec(384) sketches). Requires
-`sorted_heap.hnsw_cache_l0 = on` for the sub-2ms operating points (session-local
-cache built on first query, ~100 MB per session).
+psh = pg_sorted_heap. zvec: in-process embedded C++ (Alibaba Proxima).
+Qdrant: Rust server via Docker. pgvector / pg_sorted_heap: PostgreSQL
+extensions via unix socket. Qdrant server-side latency ~19ms (rest is Docker
+VM overhead).
 
-`svec_hnsw_scan` at ef=96/rk=48 is 3.6× faster than pgvector HNSW ef=64 at
-2.3 points lower recall (96.8% vs 99.8%). The quality-first point (rk=0,
-98.4%) is 2× faster at 1.4 points lower recall. Navigation uses compact
-hsvec(384) sketches (no TOAST) and the session-local cache eliminates repeated
-btree lookups. See [HNSW search](#hnsw-search-svec_hnsw_scan) below.
+**Key tradeoffs:**
+- psh HNSW SQ8: best balance — 98.4% recall, 1.3ms, 283 MB (4x less than f32)
+- psh HNSW sketch: fastest — 0.7ms, but capped at ~97% recall
+- psh IVF-PQ: smallest index — 27 MB, good for disk-constrained setups
+- For 16K-dim vectors: SQ8 cache = 1.6 GB (vs 6.3 GB f32, vs 75 MB sketch)
+
+See [HNSW search](#hnsw-search-svec_hnsw_scan) below for cache mode details.
 
 ### Self-query vs cross-query
 
@@ -377,32 +382,56 @@ Builder notes:
 
 ## HNSW search (`svec_hnsw_scan`)
 
-`svec_hnsw_scan` performs hierarchical HNSW search using compact hsvec(384)
-sketch sidecar tables. Navigation never touches the main table's TOAST
-embeddings — only exact rerank does, and only for the final `rerank_topk`
-candidates.
+`svec_hnsw_scan` performs hierarchical HNSW search using compact sidecar
+tables. The L0 column type controls the recall/memory tradeoff:
+
+| L0 column | Cache mode | Cache size (103K) | Recall@10 (ef=96) | p50 |
+|-----------|------------|:------------------:|:-----------------:|:---:|
+| `hsvec(384)` | float16 sketch | ~75 MB | 97% | 0.7ms |
+| `svec(D)` | SQ8 quantized (default) | ~D/4 × N | 98.4% | 1.3ms |
+| `svec(D)` + `sq8=off` | float32 full | ~D×4 × N | 99.6% | 1.5ms |
+
+The cache auto-detects the L0 column type (svec vs hsvec) at build time.
+For svec columns, SQ8 scalar quantization (uint8 per dimension) is applied
+automatically for 4x memory savings, controlled by the
+`sorted_heap.hnsw_cache_sq8` GUC (default on).
 
 ### Table requirements
 
 ```
 {prefix}_meta   — entry_nid int4, max_level int2
-{prefix}_l0     — nid int4 PK, sketch hsvec(N), neighbors int4[], src_id text, src_tid tid
+{prefix}_l0     — nid int4 PK, sketch hsvec(N)|svec(D), neighbors int4[],
+                  src_id text, src_tid tid
 {prefix}_l1..lN — nid int4 PK, sketch hsvec(N), neighbors int4[]
 ```
 
-Build these with `scripts/build_hnsw_graph.py`:
+Upper levels always use hsvec sketches. Only L0 supports svec for hybrid mode.
+
+### Building the graph
 
 ```bash
+# Sketch-only L0 (fastest, smallest cache, ~97% recall)
 python scripts/build_hnsw_graph.py \
   --dsn 'host=... dbname=...' \
-  --source-table my_table \
-  --prefix my_table_hnsw \
-  --M 16 \
-  --ef-construction 200 \
-  --sketch-dim 384
+  --source-table my_graph_table \
+  --prefix my_hnsw \
+  --M 16 --ef-construction 200
 
-# Or via Make (uses bench_nomic defaults):
-make build-hnsw-bench-nomic VECTOR_BENCH_DSN='host=... dbname=...'
+# Hybrid L0: full vectors in L0, sketches in upper levels (~99%+ recall)
+python scripts/build_hnsw_graph.py \
+  --dsn 'host=... dbname=...' \
+  --source-table my_graph_table \
+  --prefix my_hnsw \
+  --M 16 --ef-construction 200 \
+  --full-vectors --main-table my_sorted_heap_table
+
+# Truncated L0: first 768 dims only (for MRL/Matryoshka embeddings)
+python scripts/build_hnsw_graph.py \
+  --dsn 'host=... dbname=...' \
+  --source-table my_graph_table \
+  --prefix my_hnsw \
+  --M 16 --ef-construction 200 \
+  --full-vectors --main-table my_sorted_heap_table --l0-dim 768
 ```
 
 ### Calling the function
@@ -419,11 +448,15 @@ SELECT * FROM svec_hnsw_scan(
 );
 ```
 
-Enable the session-local cache for best latency (built once per session,
-~100 MB for 100K nodes):
+Enable the session-local cache for best latency (built once per session):
 
 ```sql
 SET sorted_heap.hnsw_cache_l0 = on;
+
+-- SQ8 quantization (default on, 4x memory saving for svec L0):
+SET sorted_heap.hnsw_cache_sq8 = on;   -- default
+-- To disable SQ8 for maximum recall without rerank:
+SET sorted_heap.hnsw_cache_sq8 = off;
 ```
 
 ### `rerank_topk` semantics
@@ -445,15 +478,28 @@ default build.
 
 ### Recommended operating points (103K × 2880-dim, warm cache)
 
+**hsvec(384) sketch L0:**
+
 | Goal | ef_search | rerank_topk | p50 latency | Recall@10 |
 |---|---|---|---|---|
-| Latency-first | 64 | 32 | 0.85 ms | 9.28/10 (92.8%) |
-| Balanced | 96 | 48 | 0.98 ms | 9.68/10 (96.8%) |
-| Quality-first | 96 | 0 | 1.83 ms | 9.84/10 (98.4%) |
+| Latency-first | 64 | 32 | 0.50ms | 92.8% |
+| Balanced | 96 | 48 | 0.70ms | 96.8% |
+| Quality-first | 96 | 0 | 1.15ms | 98.4% |
+
+**svec(D) hybrid L0 (SQ8 cache, default):**
+
+| Goal | ef_search | rerank_topk | p50 latency | Recall@10 |
+|---|---|---|---|---|
+| Balanced | 96 | 0 | 1.3ms | 98.4% |
+| Quality-first | 96 | 0 (sq8=off) | 1.5ms | 99.6% |
+
+SQ8 quantizes float32 → uint8 per dimension in the session-local cache (4x
+memory savings). Set `sorted_heap.hnsw_cache_sq8 = off` for full float32
+precision when rerank is disabled.
 
 Measured with `shared_buffers=512MB` (2 Gi pod), isolated per-config protocol
 (warmup pass + measure pass, no cross-config TOAST sharing). Requires
-`sorted_heap.hnsw_cache_l0 = on`. Cold first-call latency is 2--3x higher
+`sorted_heap.hnsw_cache_l0 = on`. Cold first-call latency is 2–3x higher
 due to TOAST page faults.
 
 ### Dense r1 pre-filter (`rerank1_topk`)
