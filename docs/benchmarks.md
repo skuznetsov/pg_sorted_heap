@@ -142,36 +142,34 @@ This confirms hsvec is a safe storage choice for ANN workloads.
 
 ### Comparison with other vector search engines
 
-Same dataset (103K × 2880-dim), k8s (4 Gi pod, shared_buffers=512MB),
+Same dataset (103K × 2880-dim), k8s (2 Gi pod, shared_buffers=512MB),
 warm cache, top-10, 50 queries.
 
 | Method | Recall@10 | p50 latency | Memory/Index |
 |--------|:---------:|:-----------:|:------------:|
 | **psh HNSW sketch** ef=96, rk=48 | **96.8%** | **1.02ms** | **75 MB** |
 | pgvector HNSW ef=64 | 99.8% | 1.29ms | 806 MB |
-| **psh HNSW SQ8** ef=96, rk=48 | **99.8%** | **1.70ms** | **283 MB** |
+| **psh HNSW SQ8** ef=96, rk=20 | **99.8%** | **1.35ms** | **283 MB** |
 | pgvector HNSW ef=100 | 99.8% | 1.75ms | 806 MB |
 | zvec HNSW M=32, ef=100 | 100% | 1.04ms† | 1,173 MB |
 | **psh IVF-PQ** np=10, rr=200 | **99.0%** | **16.96ms** | **27 MB** |
 | Qdrant HNSW M=32, ef=100 | 100% | 23.2ms† | 2,626 MB |
 
 †zvec and Qdrant measured locally (in-process / Docker); all others on the
-same k8s pod. psh = pg_sorted_heap.
+same k8s pod. psh = pg_sorted_heap. SQ8 cache built via streaming two-pass
+(no f32 intermediate).
 
-**psh HNSW SQ8 topK latency sweep (k8s, svec L0):**
+**psh HNSW SQ8 topK latency sweep (k8s 2 Gi pod, svec L0, streaming build):**
 
 | ef | lim | rerank_topk | p50 latency | Recall@10 |
 |:--:|:---:|:-----------:|:-----------:|:---------:|
 | 32 | 1 | 1 | 0.51ms | — |
 | 64 | 1 | 1 | 0.90ms | — |
-| 64 | 5 | 5 | 1.00ms | — |
-| 96 | 10 | 10 | 1.19ms | 98.6% |
-| 96 | 10 | 20 | 1.52ms | 99.8% |
-| 96 | 10 | 48 | 1.70ms | 99.8% |
-| 64 | 10 | 10 | 3.40ms | 98.4% |
-| 64 | 10 | 20 | 3.56ms | 99.6% |
-| 96 | 10 | 0 | 6.35ms | 99.8% |
-| 64 | 10 | 48 | 7.30ms | 99.6% |
+| 64 | 5 | 5 | 0.87ms | 98.8% |
+| 96 | 10 | 10 | 1.25ms | 98.6% |
+| 96 | 10 | 20 | 1.35ms | 99.8% |
+| 96 | 10 | 48 | 1.64ms | 99.8% |
+| 96 | 10 | 0 | 6.94ms | 99.8% |
 
 Rule of thumb: set `rerank_topk = max(lim, 20)` for 99.8% recall with
 minimal TOAST I/O. Each TOAST read fetches one full svec row, so fewer
@@ -185,9 +183,10 @@ producing better candidates that need less over-fetching.
 | f32 ef=96, rk=48 | 5.53ms | 99.8% |
 | f32 ef=96, rk=0 | 3.87ms | 99.8% |
 
-SQ8 with rk=48 is the best operating point: rk limits TOAST reads to 48
-candidates while the 283 MB cache leaves room for buffer pool. f32 cache
-(1.1 GB) causes memory pressure on pods with ≤4 Gi.
+SQ8 with rk=20 is the best operating point: 99.8% recall at 1.35ms with
+only 20 TOAST reads per query. The 283 MB streaming SQ8 cache (built via
+two-pass scan, no f32 intermediate) runs comfortably on 2 Gi pods. f32
+cache (1.1 GB) causes memory pressure on pods with ≤4 Gi.
 
 ### CRUD performance (500K rows, svec(128), prepared mode)
 

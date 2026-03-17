@@ -285,24 +285,24 @@ write-heavy workloads.
 
 ### Vector search comparison
 
-103K x 2880-dim vectors, k8s (4 Gi pod, shared_buffers=512MB), warm cache, top-10.
+103K x 2880-dim vectors, k8s (2 Gi pod, shared_buffers=512MB), warm cache, top-10.
 
 | Method | Recall@10 | p50 latency | Memory/Index |
 |--------|:---------:|:-----------:|:------------:|
 | **psh HNSW sketch** ef=96, rk=48 | **96.8%** | **1.02ms** | **75 MB** |
 | pgvector HNSW ef=64 | 99.8% | 1.29ms | 806 MB |
-| **psh HNSW SQ8** ef=96, rk=48 | **99.8%** | **1.70ms** | **283 MB** |
+| **psh HNSW SQ8** ef=96, rk=20 | **99.8%** | **1.35ms** | **283 MB** |
 | pgvector HNSW ef=100 | 99.8% | 1.75ms | 806 MB |
 | zvec HNSW M=32, ef=100 | 100% | 1.04ms* | 1,173 MB |
 | **psh IVF-PQ** np=10, rr=200 | **99.0%** | **16.96ms** | **27 MB** |
 | Qdrant HNSW M=32, ef=100 | 100% | 23.2ms* | 2,626 MB |
 
 *zvec and Qdrant measured locally; all others on the same k8s pod.
-psh = pg_sorted_heap.
+psh = pg_sorted_heap. SQ8 cache built via streaming two-pass (no f32 intermediate).
 
 **Key tradeoffs:**
 - psh HNSW sketch: fastest at 1.02ms, 75 MB cache, capped at ~97% recall
-- psh HNSW SQ8: 99.8% recall at 1.70ms, 3x less memory than pgvector
+- psh HNSW SQ8: 99.8% recall at 1.35ms, 3x less memory than pgvector, runs on 2 Gi pods
 - psh IVF-PQ: smallest index (27 MB), good for disk-constrained setups
 - For 16K-dim vectors: SQ8 cache = 1.6 GB (vs 6.3 GB f32, vs 75 MB sketch)
 

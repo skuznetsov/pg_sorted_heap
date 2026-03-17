@@ -245,25 +245,26 @@ and IVF routing are. This confirms hsvec is a safe storage choice for ANN.
 
 ### Comparison with other vector search engines
 
-Same dataset (103K × 2880-dim), k8s (4 Gi pod, shared_buffers=512MB),
+Same dataset (103K × 2880-dim), k8s (2 Gi pod, shared_buffers=512MB),
 warm cache, top-10, 50 queries.
 
 | Method | Recall@10 | p50 latency | Memory/Index |
 |--------|:---------:|:-----------:|:------------:|
 | **psh HNSW sketch** ef=96, rk=48 | **96.8%** | **1.02ms** | **75 MB** |
 | pgvector HNSW ef=64 | 99.8% | 1.29ms | 806 MB |
-| **psh HNSW SQ8** ef=96, rk=48 | **99.8%** | **1.70ms** | **283 MB** |
+| **psh HNSW SQ8** ef=96, rk=20 | **99.8%** | **1.35ms** | **283 MB** |
 | pgvector HNSW ef=100 | 99.8% | 1.75ms | 806 MB |
 | zvec HNSW M=32, ef=100 | 100% | 1.04ms† | 1,173 MB |
 | **psh IVF-PQ** np=10, rr=200 | **99.0%** | **16.96ms** | **27 MB** |
 | Qdrant HNSW M=32, ef=100 | 100% | 23.2ms† | 2,626 MB |
 
 †zvec and Qdrant measured locally (in-process / Docker); all others on the
-same k8s pod. psh = pg_sorted_heap.
+same k8s pod. psh = pg_sorted_heap. SQ8 cache built via streaming two-pass
+(no f32 intermediate).
 
 **Key tradeoffs:**
 - psh HNSW sketch: fastest at 1.02ms, 75 MB cache, but capped at ~97% recall
-- psh HNSW SQ8: 99.8% recall at 1.70ms with 3x less memory than pgvector
+- psh HNSW SQ8: 99.8% recall at 1.35ms with 3x less memory than pgvector, runs on 2 Gi pods
 - psh IVF-PQ: smallest index (27 MB), good for disk-constrained setups
 - For 16K-dim vectors: SQ8 cache = 1.6 GB (vs 6.3 GB f32, vs 75 MB sketch)
 
@@ -475,34 +476,24 @@ candidates". To return results by sketch distance only (skipping TOAST reads
 entirely), the L0 table must omit the `src_tid` column — this is not the
 default build.
 
-### Recommended operating points (103K × 2880-dim, k8s 4 Gi pod)
+### Recommended operating points (103K × 2880-dim, k8s 2 Gi pod)
 
 **hsvec(384) sketch L0:**
 
 | Goal | ef_search | rerank_topk | p50 latency | Recall@10 |
 |---|---|---|---|---|
-| Latency-first | 64 | 32 | 0.96ms | 92.8% |
 | Balanced | 96 | 48 | 1.02ms | 96.8% |
-| Quality-first | 96 | 0 | 1.89ms | 98.4% |
-| Max quality | 200 | 0 | 5.08ms | 99.4% |
 
 **svec(D) hybrid L0 (SQ8 cache, default):**
 
 | Goal | ef_search | lim | rerank_topk | p50 latency | Recall@10 |
 |---|---|---|---|---|---|
 | Fastest top-1 | 32 | 1 | 1 | 0.51ms | — |
-| Fast top-5 | 64 | 5 | 5 | 1.00ms | — |
-| Fast top-10 | 96 | 10 | 10 | 1.19ms | 98.6% |
-| Balanced top-10 | 96 | 10 | 20 | 1.52ms | 99.8% |
-| Safe top-10 | 96 | 10 | 48 | 1.70ms | 99.8% |
-| Rerank-all | 96 | 10 | 0 | 6.35ms | 99.8% |
-
-**svec(D) hybrid L0 (f32 cache, sq8=off):**
-
-| Goal | ef_search | rerank_topk | p50 latency | Recall@10 |
-|---|---|---|---|---|
-| Balanced | 96 | 48 | 5.53ms | 99.8% |
-| Rerank-all | 96 | 0 | 3.87ms | 99.8% |
+| Fast top-5 | 64 | 5 | 5 | 0.87ms | 98.8% |
+| Fast top-10 | 96 | 10 | 10 | 1.25ms | 98.6% |
+| Balanced top-10 | 96 | 10 | 20 | 1.35ms | 99.8% |
+| Safe top-10 | 96 | 10 | 48 | 1.64ms | 99.8% |
+| Rerank-all | 96 | 10 | 0 | 6.94ms | 99.8% |
 
 **Tuning `rerank_topk` for lowest latency:** set `rerank_topk = max(lim, 20)`
 for 99.8% recall with minimal TOAST reads. Each TOAST read fetches one full
@@ -511,12 +502,13 @@ cache navigates accurately enough that reranking just 20 candidates already
 achieves 99.8% recall — no need for 48 or more.
 
 SQ8 quantizes float32 → uint8 per dimension in the session-local cache (4x
-memory savings). With `rerank_topk > 0`, SQ8 is faster than f32 because the
-smaller cache (283 MB vs 1.1 GB) leaves more room for buffer pool and OS
-page cache. Set `sorted_heap.hnsw_cache_sq8 = off` only when memory is
-abundant and you need zero-rerank operation.
+memory savings). The streaming two-pass build avoids allocating a float32
+intermediate buffer, so peak memory is just the SQ8 cache itself (283 MB for
+103K × 2880-dim). This runs comfortably on 2 Gi pods. Set
+`sorted_heap.hnsw_cache_sq8 = off` only when memory is abundant and you need
+zero-rerank operation.
 
-Measured with `shared_buffers=512MB` (4 Gi pod), warm cache, 50 queries.
+Measured with `shared_buffers=512MB` (2 Gi pod), warm cache, 50 queries.
 Requires `sorted_heap.hnsw_cache_l0 = on`. Cold first-call latency is 2–3x
 higher due to TOAST page faults and cache build.
 
