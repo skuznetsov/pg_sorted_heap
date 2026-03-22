@@ -22,6 +22,8 @@
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
 #include "optimizer/optimizer.h"
+#include "common/pg_prng.h"
+#include "storage/smgr.h"
 
 #include <float.h>
 #include <math.h>
@@ -34,6 +36,55 @@ int		sorted_hnsw_ef_search = 96;
 bool	sorted_hnsw_sq8 = true;
 
 static relopt_kind shnsw_relopt_kind = 0;
+
+/* ---- Shared types used by both Insert and Scan ---- */
+
+typedef struct ScanCandidate
+{
+	float		dist;
+	int32		nid;
+} ScanCandidate;
+
+/* ---- Types shared between Insert and Scan ---- */
+
+typedef struct ShnswCacheNode
+{
+	ItemPointerData heap_tid;
+	int16		n_neighbors;
+	int16		level;
+	uint8		flags;
+	int32	   *neighbors;
+} ShnswCacheNode;
+
+typedef struct ShnswUpperNbr
+{
+	int32		nid;
+	int16		n_neighbors;
+	int32	   *neighbors;
+} ShnswUpperNbr;
+
+typedef struct ShnswScanCache
+{
+	int			M;
+	int			dim;
+	int			n_nodes;
+	int			entry_nid;
+	int			max_level;
+	int			ef_search;
+	float	   *sq8_mins;
+	float	   *sq8_scales;
+	ShnswCacheNode *nodes;
+	uint8	   *sq8_data;
+	ShnswUpperNbr **upper;
+	int		   *upper_count;
+	int		  **upper_nbr_idx;
+} ShnswScanCache;
+
+/* Forward declarations */
+static ShnswScanCache *shnsw_load_cache(Relation index);
+static int shnsw_search_level(ShnswScanCache *cache, const float *query,
+							  int entry_nid, int ef, int level,
+							  ScanCandidate *results, int max_results);
 
 /* ---- Forward declarations ---- */
 
@@ -708,6 +759,68 @@ shnsw_buildempty(Relation index)
  * Insert (aminsert)
  * ================================================================ */
 
+/*
+ * Helper: read an L0 node's neighbor list from its index page.
+ * Returns pointer to the node header within the pinned buffer page.
+ * Caller must UnlockReleaseBuffer(buf) after use.
+ */
+static ShnswNodeHeader *
+shnsw_read_l0_node(Relation index, int32 nid, int M, int dim,
+				   BlockNumber l0_start, int nodes_per_page,
+				   Buffer *out_buf)
+{
+	BlockNumber	blk;
+	int			offset_in_page;
+	int			node_size;
+	Page		page;
+
+	node_size = MAXALIGN(ShnswNodeSize(M, dim));
+	blk = l0_start + nid / nodes_per_page;
+	offset_in_page = nid % nodes_per_page;
+
+	*out_buf = ReadBuffer(index, blk);
+	LockBuffer(*out_buf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(*out_buf);
+
+	return (ShnswNodeHeader *)
+		((char *) PageGetContents(page) + offset_in_page * node_size);
+}
+
+/*
+ * Helper: add nid as a neighbor to an existing node's neighbor list.
+ * Reads the node's L0 page, modifies in place, marks dirty.
+ * Returns true if added, false if neighbor list already full.
+ */
+static bool
+shnsw_add_neighbor_on_page(Relation index, int32 target_nid, int32 new_nbr_nid,
+						   int M, int dim, BlockNumber l0_start,
+						   int nodes_per_page)
+{
+	Buffer		buf;
+	ShnswNodeHeader *nh;
+	int32	   *nbrs;
+	int			max_nbrs = 2 * M;
+	bool		added = false;
+
+	nh = shnsw_read_l0_node(index, target_nid, M, dim, l0_start,
+							nodes_per_page, &buf);
+
+	nbrs = ShnswNodeNeighbors(nh);
+
+	if (nh->n_neighbors < max_nbrs)
+	{
+		nbrs[nh->n_neighbors] = new_nbr_nid;
+		nh->n_neighbors++;
+		added = true;
+		MarkBufferDirty(buf);
+	}
+	/* If full, skip — shrink_connections would be needed but is expensive.
+	 * For Phase 1, we accept slightly suboptimal connectivity. */
+
+	UnlockReleaseBuffer(buf);
+	return added;
+}
+
 static bool
 shnsw_insert(Relation index, Datum *values, bool *isnull,
 			  ItemPointer heap_tid, Relation heap,
@@ -715,65 +828,209 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 			  bool indexUnchanged,
 			  IndexInfo *indexInfo)
 {
-	/*
-	 * Incremental insert not yet implemented.  Accept the tuple silently
-	 * so that DML on the table does not error out.  The new row will not
-	 * be found via the HNSW index until REINDEX is run.
-	 *
-	 * TODO: implement full HNSW node insertion (search → connect → WAL).
-	 */
-	return false;
+	ShnswScanCache *cache;
+	Svec		   *sv;
+	int				dim, M, n_nodes, new_nid;
+	int				node_level, level;
+	int				ep_nid;
+	int				nodes_per_page, node_size;
+	BlockNumber		l0_start;
+	float		   *query_vec;
+	ScanCandidate  *cand_buf;
+	int32		   *selected;
+	int				d;
+
+	if (isnull[0])
+		return false;
+
+	/* Load index cache (shared across inserts in this backend) */
+	cache = shnsw_load_cache(index);
+	if (cache->n_nodes == 0)
+	{
+		/* Empty index — just return, full rebuild needed via REINDEX */
+		return false;
+	}
+
+	sv = DatumGetSvecP(values[0]);
+	dim = cache->dim;
+	M = cache->M;
+	n_nodes = cache->n_nodes;
+	l0_start = 0;	/* read from metapage below */
+	nodes_per_page = ShnswL0NodesPerPage(M, dim);
+	node_size = MAXALIGN(ShnswNodeSize(M, dim));
+
+	if (nodes_per_page < 1) nodes_per_page = 1;
+	if (sv->dim != dim)
+	{
+		ereport(WARNING,
+				(errmsg("sorted_hnsw: insert vector dim %d != index dim %d, skipping",
+						sv->dim, dim)));
+		return false;
+	}
+
+	/* Read l0_start from metapage */
+	{
+		Buffer	mbuf = ReadBuffer(index, SHNSW_METAPAGE_BLKNO);
+		Page	mpage;
+		ShnswMetaPageData *meta;
+
+		LockBuffer(mbuf, BUFFER_LOCK_SHARE);
+		mpage = BufferGetPage(mbuf);
+		meta = (ShnswMetaPageData *) PageGetContents(mpage);
+		l0_start = meta->shnsw_l0_start;
+		UnlockReleaseBuffer(mbuf);
+	}
+
+	/* Prepare query vector (float32 copy for SQ8 distance computation) */
+	query_vec = sv->x;
+
+	/* Pick random level */
+	{
+		double ml = 1.0 / log((double) M);
+		double r = pg_prng_double(&pg_global_prng_state);
+
+		if (r < 1e-10) r = 1e-10;
+		node_level = (int)(-log(r) * ml);
+		if (node_level > SHNSW_MAX_LEVELS - 1)
+			node_level = SHNSW_MAX_LEVELS - 1;
+		/* For Phase 1, cap at L0 only to avoid complex upper-level page management */
+		node_level = 0;
+	}
+
+	/* Navigate upper levels to find good entry point for L0 */
+	ep_nid = cache->entry_nid;
+	for (level = cache->max_level; level >= 1; level--)
+	{
+		ScanCandidate one;
+		int found;
+
+		memset(&one, 0, sizeof(one));
+		found = shnsw_search_level(cache, query_vec, ep_nid,
+								   1, level, &one, 1);
+		if (found > 0)
+			ep_nid = one.nid;
+	}
+
+	/* Search L0 for ef_construction neighbors */
+	{
+		int ef = Min(sorted_hnsw_ef_search, 32);	/* use smaller ef for insert */
+
+		cand_buf = palloc(sizeof(ScanCandidate) * ef);
+		(void) shnsw_search_level(cache, query_vec, ep_nid,
+								  ef, 0, cand_buf, ef);
+	}
+
+	/* Select M best neighbors using simple closest-first (no heuristic for speed) */
+	new_nid = n_nodes;	/* new node gets the next nid */
+	selected = palloc(sizeof(int32) * 2 * M);
+	{
+		int n_sel = 0;
+		int max_sel = 2 * M;
+
+		/* cand_buf is already sorted by distance ascending */
+		for (d = 0; d < Min(max_sel, sorted_hnsw_ef_search) && d < 32; d++)
+		{
+			if (cand_buf[d].nid >= 0 && cand_buf[d].nid < n_nodes)
+				selected[n_sel++] = cand_buf[d].nid;
+		}
+
+		/* Append new L0 node to the index */
+		{
+			BlockNumber new_blk;
+			int			offset_in_page;
+			Buffer		buf;
+			Page		page;
+			ShnswNodeHeader *nh;
+			int32	   *nbrs;
+			uint8	   *sq8;
+
+			/* Check if there's room on the last L0 page */
+			offset_in_page = new_nid % nodes_per_page;
+			new_blk = l0_start + new_nid / nodes_per_page;
+
+			if (offset_in_page == 0)
+			{
+				/* Need a new page */
+				buf = ReadBufferExtended(index, MAIN_FORKNUM, P_NEW,
+										 RBM_NORMAL, NULL);
+			}
+			else
+			{
+				buf = ReadBuffer(index, new_blk);
+			}
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+			page = BufferGetPage(buf);
+
+			if (offset_in_page == 0)
+			{
+				/* Initialize new page */
+				ShnswPageOpaque opaque;
+				PageInit(page, BLCKSZ, sizeof(ShnswPageOpaqueData));
+				opaque = ShnswPageGetOpaque(page);
+				opaque->shnsw_page_type = SHNSW_PAGE_L0;
+				opaque->shnsw_level = 0;
+				opaque->shnsw_next = InvalidBlockNumber;
+			}
+
+			nh = (ShnswNodeHeader *)
+				((char *) PageGetContents(page) + offset_in_page * node_size);
+			nh->nid = new_nid;
+			ItemPointerCopy(heap_tid, &nh->heap_tid);
+			nh->level = 0;
+			nh->n_neighbors = n_sel;
+			nh->flags = 0;
+			nh->padding = 0;
+
+			nbrs = ShnswNodeNeighbors(nh);
+			for (d = 0; d < n_sel; d++)
+				nbrs[d] = selected[d];
+			for (d = n_sel; d < 2 * M; d++)
+				nbrs[d] = -1;
+
+			/* SQ8 quantize */
+			sq8 = ShnswNodeSQ8Vec(nh, M);
+			for (d = 0; d < dim; d++)
+				sq8[d] = sq8_quantize(sv->x[d], cache->sq8_mins[d],
+									  cache->sq8_scales[d]);
+
+			MarkBufferDirty(buf);
+			UnlockReleaseBuffer(buf);
+		}
+
+		/* Add reverse connections: for each selected neighbor, add new_nid */
+		for (d = 0; d < n_sel; d++)
+		{
+			shnsw_add_neighbor_on_page(index, selected[d], new_nid,
+									   M, dim, l0_start, nodes_per_page);
+		}
+
+		/* Update metapage: increment node_count */
+		{
+			Buffer	mbuf = ReadBuffer(index, SHNSW_METAPAGE_BLKNO);
+			Page	mpage;
+			ShnswMetaPageData *meta;
+
+			LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+			mpage = BufferGetPage(mbuf);
+			meta = (ShnswMetaPageData *) PageGetContents(mpage);
+			meta->shnsw_node_count++;
+			MarkBufferDirty(mbuf);
+			UnlockReleaseBuffer(mbuf);
+		}
+
+		pfree(selected);
+	}
+
+	pfree(cand_buf);
+
+	return false;	/* not unique */
 }
 
 /* ================================================================
  * Scan
  * ================================================================ */
 
-/* ---- Scan-local index cache ---- */
-
-typedef struct ShnswCacheNode
-{
-	ItemPointerData heap_tid;
-	int16		n_neighbors;	/* L0 neighbor count */
-	int16		level;
-	uint8		flags;
-	int32	   *neighbors;		/* L0 neighbors */
-	/* SQ8 vector is at sq8_data + nid * dim */
-} ShnswCacheNode;
-
-/* Upper level neighbor list for one node at one level */
-typedef struct ShnswUpperNbr
-{
-	int32		nid;
-	int16		n_neighbors;
-	int32	   *neighbors;
-} ShnswUpperNbr;
-
-typedef struct ShnswScanCache
-{
-	/* From metapage */
-	int			M;
-	int			dim;
-	int			n_nodes;
-	int			entry_nid;
-	int			max_level;
-	int			ef_search;
-
-	/* SQ8 data */
-	float	   *sq8_mins;
-	float	   *sq8_scales;
-
-	/* L0 nodes */
-	ShnswCacheNode *nodes;		/* array[n_nodes] */
-	uint8	   *sq8_data;		/* n_nodes * dim */
-
-	/* Upper levels: array per level */
-	ShnswUpperNbr **upper;		/* upper[lev] = array of entries */
-	int		   *upper_count;	/* count per level */
-
-	/* NID lookup for upper levels */
-	int		  **upper_nbr_idx;	/* upper_nbr_idx[lev][nid] = index into upper[lev], or -1 */
-} ShnswScanCache;
+/* (ShnswScanCache and related types defined at top of file) */
 
 /* ---- SQ8 distance computation ---- */
 
@@ -1026,12 +1283,7 @@ shnsw_load_cache(Relation index)
 }
 
 /* ---- Graph search using scan cache ---- */
-
-typedef struct ScanCandidate
-{
-	float		dist;
-	int32		nid;
-} ScanCandidate;
+/* (ScanCandidate defined at top of file) */
 
 static int
 cmp_candidate_asc(const void *a, const void *b)
