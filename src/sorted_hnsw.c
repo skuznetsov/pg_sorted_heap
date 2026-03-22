@@ -856,6 +856,9 @@ shnsw_load_cache(Relation index)
 	if (n_nodes == 0)
 		return cache;
 
+	elog(NOTICE, "shnsw_load_cache: loading %d nodes, dim=%d, M=%d, l0_start=%u, l0_npages=%d",
+		 n_nodes, dim, M, l0_start, l0_npages);
+
 	/* Load SQ8 mins/scales */
 	{
 		Size	total = 2 * dim * sizeof(float);
@@ -886,6 +889,7 @@ shnsw_load_cache(Relation index)
 	}
 
 	/* Load L0 nodes */
+	elog(NOTICE, "shnsw_load_cache: SQ8 metadata loaded");
 	cache->nodes = palloc0(sizeof(ShnswCacheNode) * n_nodes);
 	cache->sq8_data = palloc(n_nodes * (Size)dim);
 
@@ -939,6 +943,8 @@ shnsw_load_cache(Relation index)
 			UnlockReleaseBuffer(buf);
 		}
 	}
+
+	elog(NOTICE, "shnsw_load_cache: L0 nodes loaded");
 
 	/* Load upper levels */
 	cache->upper = palloc0(sizeof(ShnswUpperNbr *) * (cache->max_level + 1));
@@ -1042,8 +1048,11 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 	int			dim = cache->dim;
 	int			b;
 
+	{
+	int cand_cap = Max(ef * 8, 256);
+
 	visited = palloc0(sizeof(bool) * cache->n_nodes);
-	candidates = palloc(sizeof(ScanCandidate) * (ef * 4 + 1));
+	candidates = palloc(sizeof(ScanCandidate) * cand_cap);
 	best = palloc(sizeof(ScanCandidate) * (ef + 1));
 
 	/* Seed with entry point */
@@ -1109,6 +1118,12 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 
 				if (nbr_dist < furthest_dist || n_best < ef)
 				{
+					if (n_cand >= cand_cap)
+					{
+						cand_cap *= 2;
+						candidates = repalloc(candidates,
+							sizeof(ScanCandidate) * cand_cap);
+					}
 					candidates[n_cand].dist = nbr_dist;
 					candidates[n_cand].nid = nbr;
 					n_cand++;
@@ -1121,7 +1136,6 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 					}
 					else
 					{
-						/* Replace furthest in best */
 						int worst = 0;
 						for (b = 1; b < n_best; b++)
 							if (best[b].dist > best[worst].dist)
@@ -1161,6 +1175,12 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 
 					if (nbr_dist < furthest_dist || n_best < ef)
 					{
+						if (n_cand >= cand_cap)
+						{
+							cand_cap *= 2;
+							candidates = repalloc(candidates,
+								sizeof(ScanCandidate) * cand_cap);
+						}
 						candidates[n_cand].dist = nbr_dist;
 						candidates[n_cand].nid = nbr;
 						n_cand++;
@@ -1185,6 +1205,8 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 			}
 		}
 	}
+
+	} /* end cand_cap block */
 
 	/* Copy best to results */
 	{
@@ -1296,6 +1318,8 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 		}
 		query = DatumGetSvecP(scan->orderByData[0].sk_argument);
 
+		elog(DEBUG1, "sorted_hnsw scan: query dim=%d", query->dim);
+
 		/* Load index into cache */
 		cache = shnsw_load_cache(index);
 		if (cache->n_nodes == 0)
@@ -1304,6 +1328,9 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 			goto done_search;
 		}
 
+		elog(DEBUG1, "sorted_hnsw scan: cache loaded, %d nodes, entry=%d, max_level=%d",
+			 cache->n_nodes, cache->entry_nid, cache->max_level);
+
 		ef = cache->ef_search;
 		ep_nid = cache->entry_nid;
 
@@ -1311,10 +1338,15 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 		for (level = cache->max_level; level >= 1; level--)
 		{
 			ScanCandidate one;
-			int found = shnsw_search_level(cache, query->x, ep_nid,
-										   1, level, &one, 1);
+			int found;
+
+			memset(&one, 0, sizeof(one));
+			found = shnsw_search_level(cache, query->x, ep_nid,
+									   1, level, &one, 1);
 			if (found > 0)
 				ep_nid = one.nid;
+			elog(DEBUG1, "sorted_hnsw scan: upper level %d → ep=%d",
+				 level, ep_nid);
 		}
 
 		/* Search L0 with full ef */
@@ -1322,48 +1354,62 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 		n_cand = shnsw_search_level(cache, query->x, ep_nid,
 									ef, 0, candidates, ef);
 
+		elog(DEBUG1, "sorted_hnsw scan: L0 search found %d candidates", n_cand);
+
 		/* Exact rerank: fetch heap tuples, compute svec <=> distance */
-		heap = table_open(index->rd_index->indrelid, AccessShareLock);
-		results = palloc(sizeof(ScanResult) * n_cand);
-		n_results = 0;
-
-		for (i = 0; i < n_cand; i++)
 		{
-			int32			nid = candidates[i].nid;
-			ItemPointerData	htid;
+			Snapshot		snap = GetActiveSnapshot();
 			TupleTableSlot *slot;
-			bool			found;
 
-			ItemPointerCopy(&cache->nodes[nid].heap_tid, &htid);
-
+			heap = table_open(index->rd_index->indrelid, AccessShareLock);
 			slot = table_slot_create(heap, NULL);
-			found = table_tuple_fetch_row_version(heap, &htid,
-												  GetActiveSnapshot(),
-												  slot);
-			if (found)
-			{
-				bool	isnull;
-				Datum	val;
-				Svec   *sv;
+			results = palloc(sizeof(ScanResult) * n_cand);
+			n_results = 0;
 
-				val = slot_getattr(slot,
-								   index->rd_index->indkey.values[0],
-								   &isnull);
-				if (!isnull)
+			for (i = 0; i < n_cand; i++)
+			{
+				int32			nid = candidates[i].nid;
+				ItemPointerData	htid;
+				bool			fetched;
+
+				if (nid < 0 || nid >= cache->n_nodes)
+					continue;
+
+				ItemPointerCopy(&cache->nodes[nid].heap_tid, &htid);
+
+				if (!ItemPointerIsValid(&htid))
+					continue;
+
+				fetched = table_tuple_fetch_row_version(heap, &htid,
+														snap, slot);
+				if (fetched)
 				{
-					sv = DatumGetSvecP(val);
-					results[n_results].exact_dist =
-						svec_cosine_distance_internal(query, sv);
-					ItemPointerCopy(&htid, &results[n_results].tid);
-					n_results++;
-					if (sv != (Svec *) DatumGetPointer(val))
-						pfree(sv);
+					bool	isnull;
+					Datum	val;
+					Svec   *sv;
+
+					val = slot_getattr(slot,
+									   index->rd_index->indkey.values[0],
+									   &isnull);
+					if (!isnull)
+					{
+						sv = DatumGetSvecP(val);
+						results[n_results].exact_dist =
+							svec_cosine_distance_internal(query, sv);
+						ItemPointerCopy(&htid, &results[n_results].tid);
+						n_results++;
+						if (sv != (Svec *) DatumGetPointer(val))
+							pfree(sv);
+					}
 				}
+				ExecClearTuple(slot);
 			}
+
 			ExecDropSingleTupleTableSlot(slot);
+			table_close(heap, AccessShareLock);
 		}
 
-		table_close(heap, AccessShareLock);
+		elog(DEBUG1, "sorted_hnsw scan: reranked %d results", n_results);
 
 		/* Sort by exact distance */
 		qsort(results, n_results, sizeof(ScanResult), cmp_result_asc);
@@ -1393,7 +1439,7 @@ done_search:
 		scan->xs_heaptid = so->result_tids[so->result_idx];
 		scan->xs_recheck = false;
 
-		if (scan->numberOfOrderBys > 0)
+		if (scan->numberOfOrderBys > 0 && scan->xs_orderbyvals != NULL)
 		{
 			scan->xs_orderbyvals[0] =
 				Float8GetDatum(so->result_dists[so->result_idx]);
