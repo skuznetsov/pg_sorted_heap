@@ -462,6 +462,10 @@ does not set `SHM_FLAG_ZONEMAP_VALID`. Run `sorted_heap_compact()` (or
 `sorted_heap_merge()`) after restore to re-enable scan pruning. Tested:
 10 checks (data integrity, TOAST, secondary indexes, zone map rebuild).
 
+**HNSW sidecar tables:** `src_tid` values become stale after restore (heap
+TIDs change during COPY). Recall drops silently until the sidecar is rebuilt
+via `build_hnsw_graph.py`. Always rebuild HNSW after `pg_dump`/`pg_restore`.
+
 ### Logical Replication
 Subscribers receive changes via the apply worker, which uses standard DML.
 Initial table sync uses COPY. Same as pg_dump: run compact after initial sync

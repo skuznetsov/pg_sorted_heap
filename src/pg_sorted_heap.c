@@ -26,6 +26,7 @@
 #include "storage/itemptr.h"
 #include "utils/selfuncs.h"
 #include "sorted_heap.h"
+#include "sorted_hnsw.h"
 #include <inttypes.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -1606,4 +1607,5 @@ _PG_init(void)
 	CacheRegisterRelcacheCallback(pg_sorted_heap_relcache_callback, (Datum) 0);
 	CacheRegisterRelcacheCallback(sorted_heap_relcache_callback, (Datum) 0);
 	sorted_heap_scan_init();
+	sorted_hnsw_init();
 }

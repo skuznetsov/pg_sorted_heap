@@ -378,6 +378,16 @@ Builder notes:
 - `M`, `M-max`, and `n-adjacent` change graph topology; re-run the harness
   after each build rather than carrying over numbers from an older graph.
 
+**pg_dump / pg_restore limitation:** HNSW sidecar tables store `src_tid`
+(physical heap tuple pointer) which changes after `pg_restore` because
+COPY rewrites all heap pages with new TIDs. After restore, the sidecar's
+`src_tid` values point to wrong or nonexistent heap tuples, causing
+recall to silently drop (observed: 88% → 99.8% after rebuild on the same
+data). **Always rebuild the HNSW sidecar after `pg_dump`/`pg_restore`.**
+This limitation will be removed by the planned Index AM (`sorted_hnsw`),
+which stores index-managed TIDs that are maintained by PostgreSQL's
+standard index infrastructure.
+
 ---
 
 ## HNSW search (`svec_hnsw_scan`)

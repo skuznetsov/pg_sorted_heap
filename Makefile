@@ -1,8 +1,9 @@
 EXTENSION = pg_sorted_heap
 MODULE_big = pg_sorted_heap
-OBJS = src/pg_sorted_heap.o src/sorted_heap.o src/sorted_heap_scan.o src/sorted_heap_online.o src/sorted_vector_hash.o src/svec.o src/hsvec.o src/pq.o
+OBJS = src/pg_sorted_heap.o src/sorted_heap.o src/sorted_heap_scan.o src/sorted_heap_online.o src/sorted_vector_hash.o src/svec.o src/hsvec.o src/pq.o src/sorted_hnsw.o
 PG_CPPFLAGS = -I$(srcdir)/src
-DATA = sql/pg_sorted_heap--0.11.0.sql sql/pg_sorted_heap--0.10.0--0.11.0.sql \
+DATA = sql/pg_sorted_heap--0.12.0.sql sql/pg_sorted_heap--0.11.0--0.12.0.sql \
+       sql/pg_sorted_heap--0.11.0.sql sql/pg_sorted_heap--0.10.0--0.11.0.sql \
        sql/pg_sorted_heap--0.10.0.sql sql/pg_sorted_heap--0.9.15--0.10.0.sql \
        sql/pg_sorted_heap--0.9.15.sql sql/pg_sorted_heap--0.9.14--0.9.15.sql \
        sql/pg_sorted_heap--0.9.14.sql sql/pg_sorted_heap--0.9.13--0.9.14.sql \
