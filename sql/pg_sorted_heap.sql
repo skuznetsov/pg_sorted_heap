@@ -3177,9 +3177,8 @@ SELECT count(*) FROM scan2_lazy;
 
 DROP TABLE scan2_lazy;
 
--- NOTE: sorted_hnsw regression tests in sql/sorted_hnsw.sql (isolated)
--- Cannot run in same session as sorted_heap custom scan tests due to
--- planner hook interaction (crashes). Use: make check-hnsw
+-- HNSW tests: sql/sorted_hnsw.sql (isolated — passes sorted_heap + HNSW combo
+-- manually, but full regression suite has memory corruption from prior tests)
 
 -- Cleanup: drop codebook tables (have svec columns) before extension
 DROP TABLE ann_test;

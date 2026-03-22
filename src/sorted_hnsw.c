@@ -1557,6 +1557,9 @@ cmp_result_asc(const void *a, const void *b)
 
 typedef struct ShnswScanOpaqueData
 {
+	/* Deep-copied query vector (scan-owned, survives context resets) */
+	Svec	   *query;
+
 	/* Results: sorted by exact distance */
 	int			n_results;
 	int			result_idx;		/* next to return */
@@ -1601,9 +1604,29 @@ shnsw_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 	so->n_results = 0;
 	so->result_idx = 0;
 
+	/* Free previous query copy */
+	if (so->query)
+	{
+		pfree(so->query);
+		so->query = NULL;
+	}
+
 	if (norderbys > 0 && orderbys)
+	{
+		/* Deep-copy ORDER BY argument from the orderbys parameter
+		 * (which the executor guarantees is valid at rescan time).
+		 * Copy into scan-owned storage before it can be freed. */
+		if (!(orderbys[0].sk_flags & SK_ISNULL))
+		{
+			Datum	d = orderbys[0].sk_argument;
+			Svec   *copy = (Svec *) PG_DETOAST_DATUM_COPY(d);
+
+			so->query = copy;
+		}
+
 		memmove(scan->orderByData, orderbys,
 				sizeof(ScanKeyData) * norderbys);
+	}
 }
 
 static bool
@@ -1630,15 +1653,13 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 
 		so->first_call = false;
 
-		/* Extract and copy query vector BEFORE switching memory contexts.
-		 * The sk_argument Datum may point to executor expression context
-		 * memory that can be freed during subsequent operations. */
-		if (scan->numberOfOrderBys < 1)
+		/* Use the scan-owned deep copy from rescan */
+		if (scan->numberOfOrderBys < 1 || so->query == NULL)
 		{
 			so->n_results = 0;
 			goto done_search;
 		}
-		query = DatumGetSvecP(scan->orderByData[0].sk_argument);
+		query = so->query;
 
 		/* Use a scan-scoped memory context for cache allocations */
 		scan_ctx = AllocSetContextCreate(CurrentMemoryContext,
@@ -1791,6 +1812,8 @@ shnsw_endscan(IndexScanDesc scan)
 {
 	ShnswScanOpaque so = (ShnswScanOpaque) scan->opaque;
 
+	if (so->query)
+		pfree(so->query);
 	if (so->result_tids)
 		pfree(so->result_tids);
 	if (so->result_dists)
