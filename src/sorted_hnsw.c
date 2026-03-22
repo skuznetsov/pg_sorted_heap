@@ -599,6 +599,13 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 
 			if (upage != NULL)
 			{
+				/* Write sentinel after last entry */
+				if (page_entries < entries_per_page)
+				{
+					ShnswUpperEntry *sentinel = (ShnswUpperEntry *)
+						((char *) PageGetContents(upage) + page_entries * entry_size);
+					sentinel->nid = -1;
+				}
 				shnsw_flush_page(index, ubuf, upage);
 				UnlockReleaseBuffer(ubuf);
 				pfree(upage);
@@ -708,20 +715,13 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 			  bool indexUnchanged,
 			  IndexInfo *indexInfo)
 {
-	/* TODO: Phase 1 incremental insert
-	 * 1. Read metapage for params and entry point
-	 * 2. Quantize vector to SQ8
-	 * 3. Pick random level
-	 * 4. Greedy search from entry to target level
-	 * 5. At each level: search ef_construction neighbors, select M best
-	 * 6. Write new node to L0 page (and upper pages if level > 0)
-	 * 7. Update neighbor lists (GenericXLog)
-	 * 8. Update metapage if new entry point
+	/*
+	 * Incremental insert not yet implemented.  Accept the tuple silently
+	 * so that DML on the table does not error out.  The new row will not
+	 * be found via the HNSW index until REINDEX is run.
+	 *
+	 * TODO: implement full HNSW node insertion (search → connect → WAL).
 	 */
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("sorted_hnsw insert not yet implemented")));
-
 	return false;
 }
 
@@ -856,7 +856,7 @@ shnsw_load_cache(Relation index)
 	if (n_nodes == 0)
 		return cache;
 
-	elog(NOTICE, "shnsw_load_cache: loading %d nodes, dim=%d, M=%d, l0_start=%u, l0_npages=%d",
+	elog(DEBUG1, "shnsw_load_cache: loading %d nodes, dim=%d, M=%d, l0_start=%u, l0_npages=%d",
 		 n_nodes, dim, M, l0_start, l0_npages);
 
 	/* Load SQ8 mins/scales */
@@ -889,7 +889,7 @@ shnsw_load_cache(Relation index)
 	}
 
 	/* Load L0 nodes */
-	elog(NOTICE, "shnsw_load_cache: SQ8 metadata loaded");
+	elog(DEBUG1, "shnsw_load_cache: SQ8 metadata loaded");
 	cache->nodes = palloc0(sizeof(ShnswCacheNode) * n_nodes);
 	cache->sq8_data = palloc(n_nodes * (Size)dim);
 
@@ -944,7 +944,7 @@ shnsw_load_cache(Relation index)
 		}
 	}
 
-	elog(NOTICE, "shnsw_load_cache: L0 nodes loaded");
+	elog(DEBUG1, "shnsw_load_cache: L0 nodes loaded");
 
 	/* Load upper levels */
 	cache->upper = palloc0(sizeof(ShnswUpperNbr *) * (cache->max_level + 1));
@@ -964,25 +964,36 @@ shnsw_load_cache(Relation index)
 
 		entries = palloc(sizeof(ShnswUpperNbr) * alloc);
 
+		if (upper_npages_arr[lev] == 0 || upper_starts[lev] == 0)
+		{
+			cache->upper[lev] = entries;
+			cache->upper_count[lev] = 0;
+			cache->upper_nbr_idx[lev] = palloc(sizeof(int) * n_nodes);
+			memset(cache->upper_nbr_idx[lev], -1, sizeof(int) * n_nodes);
+			continue;
+		}
+
 		for (p = 0; p < upper_npages_arr[lev]; p++)
 		{
 			int		j;
-			int		page_count;
 
 			buf = ReadBuffer(index, upper_starts[lev] + p);
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buf);
 
-			page_count = entries_per_page;  /* may read beyond, entries self-validate */
-
-			for (j = 0; j < page_count; j++)
+			for (j = 0; j < entries_per_page; j++)
 			{
 				ShnswUpperEntry *ue = (ShnswUpperEntry *)
 					((char *) PageGetContents(page) + j * entry_size);
 				int		k;
 
-				if (ue->nid < 0 || ue->nid >= n_nodes || ue->n_neighbors < 0)
-					break;		/* end of valid entries on this page */
+				/* End-of-data sentinel: nid=0 with n_neighbors=0 could be
+				 * a real node, but padding byte will be non-zero for real
+				 * entries written by build. Use a size check instead: */
+				if (ue->n_neighbors < 0 || ue->n_neighbors > M)
+					break;
+				if (ue->nid < 0 || ue->nid >= n_nodes)
+					break;
 
 				if (total_entries >= alloc)
 				{
