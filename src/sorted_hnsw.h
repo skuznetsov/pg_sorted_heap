@@ -146,15 +146,32 @@ typedef struct ShnswNodeHeader
 /* ---- Upper Level Node ---- */
 
 /*
- * Upper level nodes store hsvec sketches for navigation.
+ * Upper level entry: compact neighbor list only.
+ * SQ8 vectors are looked up from L0 during scan.
  * Layout:
  *   int32       nid
  *   int16       n_neighbors
- *   uint8       flags
- *   uint8       padding
- *   int32       neighbors[2*M]
- *   float16     sketch[sketch_dim]
+ *   int16       padding
+ *   int32       neighbors[M]  (upper levels use M, not 2*M)
  */
+typedef struct ShnswUpperEntry
+{
+	int32		nid;
+	int16		n_neighbors;
+	int16		padding;
+	/* followed by: int32 neighbors[M] */
+} ShnswUpperEntry;
+
+#define ShnswUpperEntryNeighbors(entry) \
+	((int32 *) ((char *)(entry) + sizeof(ShnswUpperEntry)))
+
+#define ShnswUpperEntrySize(M) \
+	(sizeof(ShnswUpperEntry) + sizeof(int32) * (M))
+
+#define ShnswUpperEntriesPerPage(M) \
+	((int)((BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - \
+	        MAXALIGN(sizeof(ShnswPageOpaqueData))) / \
+	       MAXALIGN(ShnswUpperEntrySize(M))))
 
 /* ---- Reloptions ---- */
 
@@ -179,5 +196,30 @@ extern IndexAmRoutine *sorted_hnsw_handler_internal(void);
 
 /* Init function (called from _PG_init) */
 extern void sorted_hnsw_init(void);
+
+/* ---- Build graph (hnsw_build.c) ---- */
+
+/* Opaque build state — defined in hnsw_build.c */
+typedef struct HnswBuildState HnswBuildState;
+
+/* In-memory node info, for reading back after build */
+typedef struct HnswBuiltNode
+{
+	int32			nid;
+	int16			level;
+	ItemPointerData	heap_tid;
+	int32		  **neighbors;		/* per-level neighbor arrays */
+	int16		   *n_neighbors;	/* count per level */
+} HnswBuiltNode;
+
+extern HnswBuildState *shnsw_build_graph(float *vectors, ItemPointer tids,
+										  int n_nodes, int dim,
+										  int M, int ef_construction,
+										  MemoryContext build_ctx);
+
+/* Accessors for build state */
+extern int			shnsw_build_max_level(HnswBuildState *state);
+extern int			shnsw_build_entry_nid(HnswBuildState *state);
+extern HnswBuiltNode *shnsw_build_get_node(HnswBuildState *state, int nid);
 
 #endif							/* SORTED_HNSW_H */
