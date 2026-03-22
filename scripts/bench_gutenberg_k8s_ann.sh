@@ -54,7 +54,7 @@ HNSW_EF_SEARCH="${HNSW_EF_SEARCH:-100}"
 NPROBE="${NPROBE:-10}"
 RERANK_TOPK="${RERANK_TOPK:-2000}"
 SKETCH_TOPK="${SKETCH_TOPK:-128}"
-CB_ID="${CB_ID:-7}"
+CB_ID="${CB_ID:-1}"
 IVF_CB_ID="${IVF_CB_ID:-1}"
 PQ_COLUMN="${PQ_COLUMN:-pq_code}"
 
@@ -68,6 +68,9 @@ HNSW_CACHED_SKIP="${HNSW_CACHED_SKIP:-0}"
 HNSW_PREFIX="${HNSW_PREFIX:-public.gutenberg_gptoss_sh_hnsw}"
 HNSW_CACHED_EF_LATENCY="${HNSW_CACHED_EF_LATENCY:-64}"
 HNSW_CACHED_EF_QUALITY="${HNSW_CACHED_EF_QUALITY:-96}"
+HNSW_CACHED_RERANK_TOPKS="${HNSW_CACHED_RERANK_TOPKS:-0,10,20,48}"
+HNSW_CACHED_LIMS="${HNSW_CACHED_LIMS:-10}"
+BENCH_PASSES="${BENCH_PASSES:-3}"
 
 # Ground truth mode (applies to ALL methods including cached-HNSW section)
 #   halfvec  — brute-force seqscan on the pgvector table (fast, 16-bit distances)
@@ -370,6 +373,7 @@ echo "IVF-PQ:  nprobe=${NPROBE}, rerank_topk=${RERANK_TOPK}, cb_id=${CB_ID}, ivf
 echo "Sketch:  table=${SKETCH_TABLE}, sketch_topk=${SKETCH_TOPK}"
 echo "Graph:   table=${GRAPH_TABLE}, entry=${GRAPH_ENTRY_TABLE}, ef=${GRAPH_EF_SEARCH}, rerank=${GRAPH_RERANK_TOPK}, skip=${GRAPH_SKIP}"
 echo "HNSWcache: prefix=${HNSW_PREFIX}, ef_latency=${HNSW_CACHED_EF_LATENCY}, ef_quality=${HNSW_CACHED_EF_QUALITY}, skip=${HNSW_CACHED_SKIP}"
+echo "RK sweep: ${HNSW_CACHED_RERANK_TOPKS}  lim=${HNSW_CACHED_LIMS}  passes=${BENCH_PASSES}"
 if [ "$GT_MODE" = "svec" ]; then
   echo "GT:      mode=svec (exhaustive IVF nprobe=${GT_SVEC_NPROBE}, rerank_topk=${GT_SVEC_RERANK_TOPK})"
 else
@@ -467,7 +471,7 @@ echo "------------------------------------------------------------"
   summarize_method "hnsw"
   summarize_method "ivfpq"
   summarize_method "ivfpq_sketch"
-  [ "$GRAPH_SKIP" != "1" ] && summarize_method "graph"
+  [ "$GRAPH_SKIP" != "1" ] && summarize_method "graph" || true
 } | column -t -s $'\t'
 
 if [ "$HNSW_CACHED_SKIP" != "1" ]; then
@@ -511,75 +515,118 @@ if [ "$HNSW_CACHED_SKIP" != "1" ]; then
   fi
   # All statements run in one psql session so the backend-local L0/upper caches
   # built during warmup persist for the entire benchmark loop.
+  #
+  # GT source: bench_gt_50 if available (precomputed brute-force top-K),
+  # otherwise falls back to inline GT computation via hnsw_gt_sql.
+  gt_table_exists="$(POD_PSQL -c "SELECT to_regclass('bench_gt_50') IS NOT NULL;" | tr -d ' \r\n')"
+
+  # Convert comma-separated rerank_topks to PG array literal
+  rk_array_literal=$(echo "$HNSW_CACHED_RERANK_TOPKS" | sed 's/,/,/g')
+
   kubectl exec -i -n "$NAMESPACE" "$POD" -- \
     psql -U "$DBUSER" -d "$DATABASE" -v ON_ERROR_STOP=1 <<SQL
 
+LOAD 'pg_sorted_heap';
 SET sorted_heap.hnsw_cache_l0 = on;
-CREATE TEMP TABLE _hnsw_bench (method text, latency_ms float8, recall int);
+SET sorted_heap.hnsw_cache_sq8 = on;
 
--- Warmup: prime L0 and upper-level caches before timing
+CREATE TEMP TABLE _hnsw_bench (
+    pass int, method text, qid text, latency_ms float8, recall int
+);
+
+-- Cache build: first query builds L0 + upper caches
 SELECT id
 FROM ${EXT_SCHEMA}.svec_hnsw_scan(
     '${SH_TABLE}'::regclass,
     (SELECT ${QUERY_VEC_COL} FROM ${QUERY_TABLE} ORDER BY ${QUERY_ID_COL} LIMIT 1),
-    '${HNSW_PREFIX}', ${HNSW_CACHED_EF_LATENCY}, ${K}, 0)
+    '${HNSW_PREFIX}', ${HNSW_CACHED_EF_QUALITY}, ${K}, 48)
 LIMIT 1;
 
+-- TOAST warmup: run all queries once with rk=48 to prime buffer pool
 DO \$\$
-DECLARE
-    qrec       RECORD;
-    t0         timestamptz;
-    elapsed_ms float8;
-    result_ids text[];
-    truth_ids  text[];
-    hits       int;
+DECLARE qrec RECORD;
 BEGIN
     FOR qrec IN
-        SELECT ${QUERY_ID_COL} AS qid, ${QUERY_VEC_COL} AS qvec
-        FROM ${QUERY_TABLE}
-        ORDER BY ${QUERY_ID_COL}
+        SELECT ${QUERY_VEC_COL} AS qvec
+        FROM ${QUERY_TABLE} ORDER BY ${QUERY_ID_COL}
         LIMIT ${QUERY_LIMIT}
     LOOP
-${hnsw_gt_sql}
-
-        -- Latency-first operating point (ef=${HNSW_CACHED_EF_LATENCY})
-        t0 := clock_timestamp();
-        SELECT array_agg(id) INTO result_ids
-        FROM ${EXT_SCHEMA}.svec_hnsw_scan(
+        PERFORM id FROM ${EXT_SCHEMA}.svec_hnsw_scan(
             '${SH_TABLE}'::regclass, qrec.qvec,
-            '${HNSW_PREFIX}', ${HNSW_CACHED_EF_LATENCY}, ${K}, 0);
-        elapsed_ms := extract(epoch from (clock_timestamp() - t0)) * 1000.0;
-
-        SELECT count(*) INTO hits
-        FROM unnest(result_ids) r(id)
-        WHERE r.id = ANY(truth_ids);
-
-        INSERT INTO _hnsw_bench VALUES
-            ('hnsw_cached_ef${HNSW_CACHED_EF_LATENCY}', elapsed_ms, hits);
-
-        -- Quality-first operating point (ef=${HNSW_CACHED_EF_QUALITY})
-        t0 := clock_timestamp();
-        SELECT array_agg(id) INTO result_ids
-        FROM ${EXT_SCHEMA}.svec_hnsw_scan(
-            '${SH_TABLE}'::regclass, qrec.qvec,
-            '${HNSW_PREFIX}', ${HNSW_CACHED_EF_QUALITY}, ${K}, 0);
-        elapsed_ms := extract(epoch from (clock_timestamp() - t0)) * 1000.0;
-
-        SELECT count(*) INTO hits
-        FROM unnest(result_ids) r(id)
-        WHERE r.id = ANY(truth_ids);
-
-        INSERT INTO _hnsw_bench VALUES
-            ('hnsw_cached_ef${HNSW_CACHED_EF_QUALITY}', elapsed_ms, hits);
+            '${HNSW_PREFIX}', ${HNSW_CACHED_EF_QUALITY}, ${K}, 48);
     END LOOP;
 END;
 \$\$ LANGUAGE plpgsql;
 
+-- Measurement: ${BENCH_PASSES} passes × rerank_topk sweep × queries
+DO \$\$
+DECLARE
+    qrec        RECORD;
+    t0          timestamptz;
+    elapsed_ms  float8;
+    result_ids  text[];
+    truth_ids   text[];
+    hits        int;
+    pass        int;
+    rk          int;
+    rk_list     int[] := ARRAY[${rk_array_literal}];
+    lim_val     int := ${HNSW_CACHED_LIMS};
+    method_name text;
+    use_gt_table bool;
+    i           int;
+BEGIN
+    -- Check if bench_gt_50 exists for precomputed ground truth
+    use_gt_table := (SELECT to_regclass('bench_gt_50') IS NOT NULL);
+
+    FOR pass IN 1..${BENCH_PASSES} LOOP
+        FOR qrec IN
+            SELECT ${QUERY_ID_COL} AS qid, ${QUERY_VEC_COL} AS qvec
+            FROM ${QUERY_TABLE}
+            ORDER BY ${QUERY_ID_COL}
+            LIMIT ${QUERY_LIMIT}
+        LOOP
+            -- Ground truth
+            IF use_gt_table THEN
+                SELECT g.gt_ids[1:lim_val] INTO truth_ids
+                FROM bench_gt_50 g WHERE g.qid = qrec.qid;
+            ELSE
+${hnsw_gt_sql}
+            END IF;
+
+            FOREACH rk IN ARRAY rk_list LOOP
+                t0 := clock_timestamp();
+                SELECT array_agg(id ORDER BY distance) INTO result_ids
+                FROM ${EXT_SCHEMA}.svec_hnsw_scan(
+                    '${SH_TABLE}'::regclass, qrec.qvec,
+                    '${HNSW_PREFIX}', ${HNSW_CACHED_EF_QUALITY},
+                    lim_val, rk);
+                elapsed_ms := extract(epoch from (clock_timestamp() - t0)) * 1000.0;
+
+                hits := 0;
+                IF truth_ids IS NOT NULL AND result_ids IS NOT NULL THEN
+                    FOR i IN 1..coalesce(array_length(result_ids, 1), 0) LOOP
+                        IF result_ids[i] = ANY(truth_ids) THEN
+                            hits := hits + 1;
+                        END IF;
+                    END LOOP;
+                END IF;
+
+                method_name := format('sq8_ef%s_lim%s_rk%s',
+                                      ${HNSW_CACHED_EF_QUALITY}, lim_val, rk);
+                INSERT INTO _hnsw_bench VALUES
+                    (pass, method_name, qrec.qid, elapsed_ms, hits);
+            END LOOP;
+        END LOOP;
+    END LOOP;
+END;
+\$\$ LANGUAGE plpgsql;
+
+-- Summary with percentiles and variance
 SELECT
     method,
     round(percentile_cont(0.50) WITHIN GROUP (ORDER BY latency_ms)::numeric, 2) AS p50_ms,
     round(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)::numeric, 2) AS p95_ms,
-    round(avg(latency_ms)::numeric, 2)                                           AS avg_ms,
+    round(stddev(latency_ms)::numeric, 3)                                        AS stddev_ms,
     round(avg(recall)::numeric * 100.0 / ${K}, 1)                               AS "recall%",
     count(*)                                                                     AS n
 FROM _hnsw_bench
