@@ -650,11 +650,12 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 
 			if (upage != NULL)
 			{
-				/* Write sentinel after last entry */
-				if (page_entries < entries_per_page)
+				/* Mark all unused slots with nid=-1 sentinel */
+				int s;
+				for (s = page_entries; s < entries_per_page; s++)
 				{
 					ShnswUpperEntry *sentinel = (ShnswUpperEntry *)
-						((char *) PageGetContents(upage) + page_entries * entry_size);
+						((char *) PageGetContents(upage) + s * entry_size);
 					sentinel->nid = -1;
 				}
 				shnsw_flush_page(index, ubuf, upage);
@@ -1219,6 +1220,9 @@ shnsw_load_cache(Relation index)
 
 		if (entries_per_page < 1) entries_per_page = 1;
 
+		elog(NOTICE, "shnsw_load_cache: loading upper level %d, start=%u, npages=%d, epp=%d",
+			 lev, upper_starts[lev], upper_npages_arr[lev], entries_per_page);
+
 		entries = palloc(sizeof(ShnswUpperNbr) * alloc);
 
 		if (upper_npages_arr[lev] == 0 || upper_starts[lev] == 0)
@@ -1529,6 +1533,14 @@ shnsw_beginscan(Relation index, int nkeys, int norderbys)
 
 	scan = RelationGetIndexScan(index, nkeys, norderbys);
 
+	/* Allocate orderby result arrays if not done by RelationGetIndexScan */
+	if (norderbys > 0 && scan->xs_orderbyvals == NULL)
+	{
+		scan->xs_orderbyvals = palloc0(sizeof(Datum) * norderbys);
+		scan->xs_orderbynulls = palloc(sizeof(bool) * norderbys);
+		memset(scan->xs_orderbynulls, true, sizeof(bool) * norderbys);
+	}
+
 	so = (ShnswScanOpaque) palloc0(sizeof(ShnswScanOpaqueData));
 	so->first_call = true;
 	scan->opaque = so;
@@ -1591,7 +1603,7 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 			goto done_search;
 		}
 
-		elog(DEBUG1, "sorted_hnsw scan: cache loaded, %d nodes, entry=%d, max_level=%d",
+		elog(NOTICE, "sorted_hnsw scan: cache loaded, %d nodes, entry=%d, max_level=%d",
 			 cache->n_nodes, cache->entry_nid, cache->max_level);
 
 		ef = cache->ef_search;
@@ -1608,7 +1620,7 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 									   1, level, &one, 1);
 			if (found > 0)
 				ep_nid = one.nid;
-			elog(DEBUG1, "sorted_hnsw scan: upper level %d → ep=%d",
+			elog(NOTICE, "sorted_hnsw scan: upper level %d → ep=%d",
 				 level, ep_nid);
 		}
 
