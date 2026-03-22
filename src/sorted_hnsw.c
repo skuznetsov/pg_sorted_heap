@@ -1778,21 +1778,28 @@ shnsw_costestimate(PlannerInfo *root, IndexPath *path,
 		dim = 768;	/* fallback */
 
 	ef = (double) sorted_hnsw_ef_search;
+
+	/* Cap ef at actual table size — no point searching more nodes than exist */
+	if (rel->tuples > 0 && ef > rel->tuples)
+		ef = rel->tuples;
+
 	visited = ef * 1.5;
 	live_cand = ef;
 
-	/* Phase 1: Index navigation (SQ8 distances) */
-	nav_cpu = visited * dim * cpu_operator_cost / 100.0;
-	nav_io = (visited / 2.0) * random_page_cost * 0.2;
+	/* Phase 1: Index navigation (SQ8 distances in memory cache)
+	 * Very cheap — just CPU, no I/O (cache loaded once per scan) */
+	nav_cpu = visited * dim * cpu_operator_cost / 200.0;
+	nav_io = 0;		/* cache is in memory */
 
-	/* Phase 2: Heap fetch + visibility */
+	/* Phase 2: Heap fetch + visibility for each candidate */
 	heap_cpu = live_cand * cpu_tuple_cost;
-	heap_io = live_cand * random_page_cost * 0.3;
+	heap_io = live_cand * seq_page_cost * 0.1;	/* mostly buffer cache hits */
 
-	/* Phase 3: Exact rerank (TOAST detoast + cosine) */
-	toast_chunks = ceil((double)(dim * 4) / 2000.0);
-	rerank_io = live_cand * toast_chunks * random_page_cost * 0.5;
-	rerank_cpu = live_cand * dim * cpu_operator_cost / 50.0;
+	/* Phase 3: Exact rerank (cosine distance)
+	 * For small dims: inline svec, no TOAST. For large dims: TOAST reads. */
+	toast_chunks = (dim * 4 > 2000) ? ceil((double)(dim * 4) / 2000.0) : 0;
+	rerank_io = live_cand * toast_chunks * random_page_cost * 0.3;
+	rerank_cpu = live_cand * dim * cpu_operator_cost / 100.0;
 
 	*indexStartupCost = 0;
 	*indexTotalCost = nav_cpu + nav_io +
