@@ -3177,6 +3177,7 @@ SELECT count(*) FROM scan2_lazy;
 
 DROP TABLE scan2_lazy;
 
+
 -- Cleanup: drop codebook tables (have svec columns) before extension
 DROP TABLE ann_test;
 DROP TABLE IF EXISTS _ivf_centroids, _pq_codebooks, _ivf_meta, _pq_codebook_meta;

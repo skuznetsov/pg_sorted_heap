@@ -814,9 +814,8 @@ shnsw_add_neighbor_on_page(Relation index, int32 target_nid, int32 new_nbr_nid,
 		nh->n_neighbors++;
 		added = true;
 		MarkBufferDirty(buf);
+		log_newpage_buffer(buf, false);
 	}
-	/* If full, skip — shrink_connections would be needed but is expensive.
-	 * For Phase 1, we accept slightly suboptimal connectivity. */
 
 	UnlockReleaseBuffer(buf);
 	return added;
@@ -844,13 +843,14 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 	if (isnull[0])
 		return false;
 
-	/* Load index cache (shared across inserts in this backend) */
+	/* Load index cache */
 	cache = shnsw_load_cache(index);
-	if (cache->n_nodes == 0)
-	{
-		/* Empty index — just return, full rebuild needed via REINDEX */
+
+	/* Empty index: accept silently. The vector will appear after REINDEX.
+	 * We cannot bootstrap the first node here because the metapage has no
+	 * SQ8 min/max yet (needs at least one full build pass). */
+	if (cache->n_nodes == 0 || cache->entry_nid < 0)
 		return false;
-	}
 
 	sv = DatumGetSvecP(values[0]);
 	dim = cache->dim;
@@ -995,6 +995,7 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 									  cache->sq8_scales[d]);
 
 			MarkBufferDirty(buf);
+			log_newpage_buffer(buf, false);
 			UnlockReleaseBuffer(buf);
 		}
 
@@ -1016,6 +1017,7 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 			meta = (ShnswMetaPageData *) PageGetContents(mpage);
 			meta->shnsw_node_count++;
 			MarkBufferDirty(mbuf);
+			log_newpage_buffer(mbuf, false);
 			UnlockReleaseBuffer(mbuf);
 		}
 
@@ -1202,7 +1204,15 @@ shnsw_load_cache(Relation index)
 		}
 	}
 
-	elog(DEBUG1, "shnsw_load_cache: L0 nodes loaded");
+	/* Verify all nodes were loaded (unloaded nodes have NULL neighbors) */
+	{
+		int loaded = 0;
+		for (i = 0; i < n_nodes; i++)
+			if (cache->nodes[i].neighbors != NULL)
+				loaded++;
+		elog(DEBUG1, "shnsw_load_cache: L0 %d/%d nodes loaded from %d pages",
+			 loaded, n_nodes, l0_npages);
+	}
 
 	/* Load upper levels */
 	cache->upper = palloc0(sizeof(ShnswUpperNbr *) * (cache->max_level + 1));
@@ -1313,14 +1323,22 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 	ScanCandidate *best;		/* max-sorted result set */
 	int			n_cand = 0, n_best = 0;
 	int			dim = cache->dim;
-	int			b;
-
-	{
-	int cand_cap = Max(ef * 8, 256);
+	int			b, ret;
+	int			cand_cap = Max(ef * 8, 256);
 
 	visited = palloc0(sizeof(bool) * cache->n_nodes);
 	candidates = palloc(sizeof(ScanCandidate) * cand_cap);
 	best = palloc(sizeof(ScanCandidate) * (ef + 1));
+
+	/* Validate entry point */
+	if (entry_nid < 0 || entry_nid >= cache->n_nodes ||
+		cache->nodes[entry_nid].neighbors == NULL)
+	{
+		pfree(visited);
+		pfree(candidates);
+		pfree(best);
+		return 0;
+	}
 
 	/* Seed with entry point */
 	{
@@ -1362,7 +1380,11 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 		if (level == 0)
 		{
 			ShnswCacheNode *cn = &cache->nodes[nearest.nid];
+			if (cn->neighbors == NULL)
+				continue;	/* node not loaded, skip */
 			nn = cn->n_neighbors;
+			if (nn < 0 || nn > 2 * cache->M)
+				nn = 0;		/* corrupted neighbor count, skip */
 			for (k = 0; k < nn; k++)
 			{
 				int32 nbr = cn->neighbors[k];
@@ -1480,11 +1502,7 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 		}
 	}
 
-	} /* end cand_cap block */
-
 	/* Copy best to results */
-	{
-	int ret;
 	qsort(best, n_best, sizeof(ScanCandidate), cmp_candidate_asc);
 	ret = Min(n_best, max_results);
 	memcpy(results, best, sizeof(ScanCandidate) * ret);
@@ -1494,7 +1512,6 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 	pfree(best);
 
 	return ret;
-	}
 }
 
 /* ---- Result entry for exact rerank ---- */
@@ -1768,7 +1785,7 @@ shnsw_costestimate(PlannerInfo *root, IndexPath *path,
 	double		ef;
 	double		visited;
 	double		live_cand;
-	double		nav_cpu, nav_io;
+	double		nav_cpu;
 	double		heap_cpu, heap_io;
 	double		toast_chunks, rerank_io, rerank_cpu;
 
@@ -1786,14 +1803,22 @@ shnsw_costestimate(PlannerInfo *root, IndexPath *path,
 	visited = ef * 1.5;
 	live_cand = ef;
 
-	/* Phase 1: Index navigation (SQ8 distances in memory cache)
-	 * Very cheap — just CPU, no I/O (cache loaded once per scan) */
+	/*
+	 * Phase 0: Cache load startup cost.
+	 * Current implementation loads ALL index pages into memory on first
+	 * gettuple call. This is O(index_pages) I/O, mostly sequential.
+	 */
+	{
+		double index_pages_d = (double) RelationGetNumberOfBlocks(index);
+		*indexStartupCost = index_pages_d * seq_page_cost * 0.5;
+	}
+
+	/* Phase 1: SQ8 navigation (CPU only, cache is in memory after load) */
 	nav_cpu = visited * dim * cpu_operator_cost / 200.0;
-	nav_io = 0;		/* cache is in memory */
 
 	/* Phase 2: Heap fetch + visibility for each candidate */
 	heap_cpu = live_cand * cpu_tuple_cost;
-	heap_io = live_cand * seq_page_cost * 0.1;	/* mostly buffer cache hits */
+	heap_io = live_cand * seq_page_cost * 0.1;
 
 	/* Phase 3: Exact rerank (cosine distance)
 	 * For small dims: inline svec, no TOAST. For large dims: TOAST reads. */
@@ -1801,8 +1826,8 @@ shnsw_costestimate(PlannerInfo *root, IndexPath *path,
 	rerank_io = live_cand * toast_chunks * random_page_cost * 0.3;
 	rerank_cpu = live_cand * dim * cpu_operator_cost / 100.0;
 
-	*indexStartupCost = 0;
-	*indexTotalCost = nav_cpu + nav_io +
+	*indexTotalCost = *indexStartupCost +
+					  nav_cpu +
 					  heap_cpu + heap_io +
 					  rerank_io + rerank_cpu;
 
@@ -1897,7 +1922,10 @@ shnsw_bulkdelete(IndexVacuumInfo *info,
 		}
 
 		if (page_dirty)
+		{
 			MarkBufferDirty(buf);
+			log_newpage_buffer(buf, false);
+		}
 		UnlockReleaseBuffer(buf);
 	}
 
