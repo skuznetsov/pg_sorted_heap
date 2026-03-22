@@ -1320,13 +1320,11 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 	ScanCandidate *best;		/* max-sorted result set */
 	int			n_cand = 0, n_best = 0;
 	int			dim;
-
-	elog(DEBUG1, "shnsw_search_level: ENTRY cache=%p query=%p ep=%d ef=%d level=%d",
-		 cache, query, entry_nid, ef, level);
+	int			b, ret;
+	int			cand_cap;
 
 	dim = cache->dim;
-	int			b, ret;
-	int			cand_cap = Max(ef * 8, cache->n_nodes * 2);
+	cand_cap = Max(ef * 8, cache->n_nodes * 2);
 
 	elog(DEBUG1, "shnsw_search_level: allocating cand_cap=%d n_nodes=%d", cand_cap, cache->n_nodes);
 	visited = palloc0(sizeof(bool) * (cache->n_nodes + 1));
