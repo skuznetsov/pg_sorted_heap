@@ -434,15 +434,12 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	{
 		Buffer		buf;
 		Page		page;
-		GenericXLogState *state;
 
 		buf = ReadBufferExtended(index, MAIN_FORKNUM, P_NEW, RBM_NORMAL, NULL);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-
-		state = GenericXLogStart(index);
-		page = GenericXLogRegisterBuffer(state, buf, GENERIC_XLOG_FULL_IMAGE);
+		page = BufferGetPage(buf);
 		PageInit(page, BLCKSZ, sizeof(ShnswPageOpaqueData));
-		GenericXLogFinish(state);
+		MarkBufferDirty(buf);
 		UnlockReleaseBuffer(buf);
 		next_blkno = 1;
 	}
@@ -715,6 +712,9 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	elog(NOTICE, "sorted_hnsw: build complete. %d nodes, %d L0 pages, %d SQ8 aux pages",
 		 n_nodes, (int)(next_blkno - 1 - sq8_aux_npages), sq8_aux_npages);
 
+	/* Ensure all index pages are flushed to disk */
+	FlushRelationBuffers(index);
+
 	MemoryContextDelete(build_ctx);
 
 	result = palloc0(sizeof(IndexBuildResult));
@@ -729,16 +729,13 @@ shnsw_buildempty(Relation index)
 	/* Write an empty metapage for an unlogged index */
 	Buffer		buf;
 	Page		page;
-	GenericXLogState *state;
 	ShnswMetaPageData *meta;
 	ShnswPageOpaque opaque;
 
 	buf = ReadBufferExtended(index, INIT_FORKNUM, P_NEW, RBM_NORMAL, NULL);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 
-	state = GenericXLogStart(index);
-	page = GenericXLogRegisterBuffer(state, buf, GENERIC_XLOG_FULL_IMAGE);
-
+	page = BufferGetPage(buf);
 	PageInit(page, BLCKSZ, sizeof(ShnswPageOpaqueData));
 	opaque = ShnswPageGetOpaque(page);
 	opaque->shnsw_page_type = SHNSW_PAGE_META;
@@ -752,7 +749,7 @@ shnsw_buildempty(Relation index)
 	meta->shnsw_entry_nid = -1;
 	meta->shnsw_max_level = -1;
 
-	GenericXLogFinish(state);
+	MarkBufferDirty(buf);
 	UnlockReleaseBuffer(buf);
 }
 
@@ -1230,7 +1227,7 @@ shnsw_load_cache(Relation index)
 
 		if (entries_per_page < 1) entries_per_page = 1;
 
-		elog(NOTICE, "shnsw_load_cache: loading upper level %d, start=%u, npages=%d, epp=%d",
+		elog(DEBUG1, "shnsw_load_cache: loading upper level %d, start=%u, npages=%d, epp=%d",
 			 lev, upper_starts[lev], upper_npages_arr[lev], entries_per_page);
 
 		entries = palloc(sizeof(ShnswUpperNbr) * alloc);
@@ -1322,18 +1319,35 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 	ScanCandidate *candidates;	/* min-sorted working set */
 	ScanCandidate *best;		/* max-sorted result set */
 	int			n_cand = 0, n_best = 0;
-	int			dim = cache->dim;
-	int			b, ret;
-	int			cand_cap = Max(ef * 8, 256);
+	int			dim;
 
-	visited = palloc0(sizeof(bool) * cache->n_nodes);
-	candidates = palloc(sizeof(ScanCandidate) * cand_cap);
-	best = palloc(sizeof(ScanCandidate) * (ef + 1));
+	elog(DEBUG1, "shnsw_search_level: ENTRY cache=%p query=%p ep=%d ef=%d level=%d",
+		 cache, query, entry_nid, ef, level);
+
+	dim = cache->dim;
+	int			b, ret;
+	int			cand_cap = Max(ef * 8, cache->n_nodes * 2);
+
+	elog(DEBUG1, "shnsw_search_level: allocating cand_cap=%d n_nodes=%d", cand_cap, cache->n_nodes);
+	visited = palloc0(sizeof(bool) * (cache->n_nodes + 1));
+	elog(DEBUG1, "shnsw_search_level: visited=%p", visited);
+	candidates = palloc0(sizeof(ScanCandidate) * (cand_cap + 1));
+	elog(DEBUG1, "shnsw_search_level: candidates=%p", candidates);
+	best = palloc0(sizeof(ScanCandidate) * (ef + 2));
+	elog(DEBUG1, "shnsw_search_level: best=%p, validating entry", best);
 
 	/* Validate entry point */
-	if (entry_nid < 0 || entry_nid >= cache->n_nodes ||
-		cache->nodes[entry_nid].neighbors == NULL)
+	if (entry_nid < 0 || entry_nid >= cache->n_nodes)
 	{
+		pfree(visited);
+		pfree(candidates);
+		pfree(best);
+		return 0;
+	}
+	if (cache->nodes[entry_nid].neighbors == NULL)
+	{
+		elog(WARNING, "shnsw_search: entry nid=%d has NULL neighbors (n_nodes=%d)",
+			 entry_nid, cache->n_nodes);
 		pfree(visited);
 		pfree(candidates);
 		pfree(best);
@@ -1342,9 +1356,14 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 
 	/* Seed with entry point */
 	{
-		float d = sq8_cosine_distance(query, dim,
-									  cache->sq8_data + (Size)entry_nid * dim,
-									  cache->sq8_mins, cache->sq8_scales, dim);
+		float d;
+		elog(DEBUG1, "shnsw_search: seeding entry_nid=%d, sq8_mins=%p, sq8_scales=%p, nodes[%d].nbrs=%p n_nbrs=%d",
+			 entry_nid, cache->sq8_mins, cache->sq8_scales,
+			 entry_nid, cache->nodes[entry_nid].neighbors,
+			 cache->nodes[entry_nid].n_neighbors);
+		d = sq8_cosine_distance(query, dim,
+								cache->sq8_data + (Size)entry_nid * dim,
+								cache->sq8_mins, cache->sq8_scales, dim);
 		candidates[0].dist = d;
 		candidates[0].nid = entry_nid;
 		n_cand = 1;
@@ -1606,8 +1625,17 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 		int				ep_nid;
 		int				level;
 		int				i;
+		MemoryContext	old_ctx;
+		MemoryContext	scan_ctx;
 
 		so->first_call = false;
+
+		/* Use a scan-scoped memory context for all cache allocations.
+		 * The executor's per-tuple context may be too short-lived. */
+		scan_ctx = AllocSetContextCreate(CurrentMemoryContext,
+										 "sorted_hnsw scan",
+										 ALLOCSET_DEFAULT_SIZES);
+		old_ctx = MemoryContextSwitchTo(scan_ctx);
 
 		/* Extract query vector from ORDER BY operator */
 		if (scan->numberOfOrderBys < 1)
@@ -1627,7 +1655,7 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 			goto done_search;
 		}
 
-		elog(NOTICE, "sorted_hnsw scan: cache loaded, %d nodes, entry=%d, max_level=%d",
+		elog(DEBUG1, "sorted_hnsw scan: cache loaded, %d nodes, entry=%d, max_level=%d",
 			 cache->n_nodes, cache->entry_nid, cache->max_level);
 
 		ef = cache->ef_search;
@@ -1644,11 +1672,14 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 									   1, level, &one, 1);
 			if (found > 0)
 				ep_nid = one.nid;
-			elog(NOTICE, "sorted_hnsw scan: upper level %d → ep=%d",
+			elog(DEBUG1, "sorted_hnsw scan: upper level %d → ep=%d",
 				 level, ep_nid);
 		}
 
 		/* Search L0 with full ef */
+		elog(DEBUG1, "sorted_hnsw scan: starting L0 search ep=%d ef=%d nodes=%d dim=%d sq8=%p",
+			 ep_nid, ef, cache->n_nodes, cache->dim,
+			 cache->sq8_data);
 		candidates = palloc(sizeof(ScanCandidate) * ef);
 		n_cand = shnsw_search_level(cache, query->x, ep_nid,
 									ef, 0, candidates, ef);
@@ -1713,11 +1744,13 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 		/* Sort by exact distance */
 		qsort(results, n_results, sizeof(ScanResult), cmp_result_asc);
 
-		/* Store in scan state */
+		/* Store in scan state (allocate in outer context, survives scan_ctx delete) */
 		so->n_results = n_results;
 		so->result_idx = 0;
-		so->result_tids = palloc(sizeof(ItemPointerData) * n_results);
-		so->result_dists = palloc(sizeof(float8) * n_results);
+		MemoryContextSwitchTo(old_ctx);
+		so->result_tids = palloc(sizeof(ItemPointerData) * Max(n_results, 1));
+		so->result_dists = palloc(sizeof(float8) * Max(n_results, 1));
+		MemoryContextSwitchTo(scan_ctx);
 		for (i = 0; i < n_results; i++)
 		{
 			ItemPointerCopy(&results[i].tid, &so->result_tids[i]);
@@ -1726,10 +1759,10 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 
 		pfree(results);
 		pfree(candidates);
-		/* cache is in CurrentMemoryContext, freed when scan ends */
 
 done_search:
-		;
+		MemoryContextSwitchTo(old_ctx);
+		MemoryContextDelete(scan_ctx);
 	}
 
 	/* Return next result */
