@@ -1630,20 +1630,21 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 
 		so->first_call = false;
 
-		/* Use a scan-scoped memory context for all cache allocations.
-		 * The executor's per-tuple context may be too short-lived. */
-		scan_ctx = AllocSetContextCreate(CurrentMemoryContext,
-										 "sorted_hnsw scan",
-										 ALLOCSET_DEFAULT_SIZES);
-		old_ctx = MemoryContextSwitchTo(scan_ctx);
-
-		/* Extract query vector from ORDER BY operator */
+		/* Extract and copy query vector BEFORE switching memory contexts.
+		 * The sk_argument Datum may point to executor expression context
+		 * memory that can be freed during subsequent operations. */
 		if (scan->numberOfOrderBys < 1)
 		{
 			so->n_results = 0;
 			goto done_search;
 		}
 		query = DatumGetSvecP(scan->orderByData[0].sk_argument);
+
+		/* Use a scan-scoped memory context for cache allocations */
+		scan_ctx = AllocSetContextCreate(CurrentMemoryContext,
+										 "sorted_hnsw scan",
+										 ALLOCSET_DEFAULT_SIZES);
+		old_ctx = MemoryContextSwitchTo(scan_ctx);
 
 		elog(DEBUG1, "sorted_hnsw scan: query dim=%d", query->dim);
 
