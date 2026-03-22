@@ -1372,6 +1372,10 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 					continue;
 				visited[nbr] = true;
 
+				/* Skip deleted nodes */
+				if (cache->nodes[nbr].flags & SHNSW_NODE_DELETED)
+					continue;
+
 				nbr_dist = sq8_cosine_distance(
 					query, dim,
 					cache->sq8_data + (Size)nbr * dim,
@@ -1429,6 +1433,9 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 					if (nbr < 0 || nbr >= cache->n_nodes || visited[nbr])
 						continue;
 					visited[nbr] = true;
+
+					if (cache->nodes[nbr].flags & SHNSW_NODE_DELETED)
+						continue;
 
 					nbr_dist = sq8_cosine_distance(
 						query, dim,
@@ -1811,9 +1818,84 @@ shnsw_bulkdelete(IndexVacuumInfo *info,
 				  IndexBulkDeleteCallback callback,
 				  void *callback_state)
 {
-	/* TODO: lazy deletion — mark nodes with SHNSW_NODE_DELETED flag */
+	Relation	index = info->index;
+	Buffer		mbuf;
+	Page		mpage;
+	ShnswMetaPageData *meta;
+	int			M, dim, n_nodes;
+	BlockNumber	l0_start;
+	int			l0_npages;
+	int			nodes_per_page, node_size;
+	int			i;
+	int			n_deleted = 0;
+
 	if (stats == NULL)
 		stats = palloc0(sizeof(IndexBulkDeleteResult));
+
+	/* Read metapage */
+	mbuf = ReadBuffer(index, SHNSW_METAPAGE_BLKNO);
+	LockBuffer(mbuf, BUFFER_LOCK_SHARE);
+	mpage = BufferGetPage(mbuf);
+	meta = (ShnswMetaPageData *) PageGetContents(mpage);
+
+	if (meta->shnsw_magic != SORTED_HNSW_MAGIC)
+	{
+		UnlockReleaseBuffer(mbuf);
+		return stats;
+	}
+
+	M = meta->shnsw_m;
+	dim = meta->shnsw_dim;
+	n_nodes = meta->shnsw_node_count;
+	l0_start = meta->shnsw_l0_start;
+	l0_npages = meta->shnsw_l0_npages;
+	UnlockReleaseBuffer(mbuf);
+
+	if (n_nodes == 0)
+		return stats;
+
+	node_size = MAXALIGN(ShnswNodeSize(M, dim));
+	nodes_per_page = ShnswL0NodesPerPage(M, dim);
+	if (nodes_per_page < 1) nodes_per_page = 1;
+
+	/* Scan L0 pages, mark deleted nodes */
+	for (i = 0; i < l0_npages; i++)
+	{
+		Buffer	buf;
+		Page	page;
+		int		j;
+		int		page_count;
+		bool	page_dirty = false;
+
+		buf = ReadBuffer(index, l0_start + i);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+
+		page_count = Min(nodes_per_page, n_nodes - i * nodes_per_page);
+		for (j = 0; j < page_count; j++)
+		{
+			ShnswNodeHeader *nh = (ShnswNodeHeader *)
+				((char *) PageGetContents(page) + j * node_size);
+
+			if (nh->nid < 0 || (nh->flags & SHNSW_NODE_DELETED))
+				continue;
+
+			/* Check if this heap TID should be deleted */
+			if (callback(&nh->heap_tid, callback_state))
+			{
+				nh->flags |= SHNSW_NODE_DELETED;
+				page_dirty = true;
+				n_deleted++;
+			}
+		}
+
+		if (page_dirty)
+			MarkBufferDirty(buf);
+		UnlockReleaseBuffer(buf);
+	}
+
+	stats->tuples_removed = n_deleted;
+	stats->num_index_tuples = n_nodes - n_deleted;
 
 	return stats;
 }
@@ -1825,8 +1907,23 @@ shnsw_vacuumcleanup(IndexVacuumInfo *info,
 	if (stats == NULL)
 		stats = palloc0(sizeof(IndexBulkDeleteResult));
 
-	/* Report index size */
 	stats->num_pages = RelationGetNumberOfBlocks(info->index);
+
+	/* If bulkdelete was not called (no dead tuples), count tuples */
+	if (stats->num_index_tuples == 0)
+	{
+		Buffer		mbuf;
+		Page		mpage;
+		ShnswMetaPageData *meta;
+
+		mbuf = ReadBuffer(info->index, SHNSW_METAPAGE_BLKNO);
+		LockBuffer(mbuf, BUFFER_LOCK_SHARE);
+		mpage = BufferGetPage(mbuf);
+		meta = (ShnswMetaPageData *) PageGetContents(mpage);
+		if (meta->shnsw_magic == SORTED_HNSW_MAGIC)
+			stats->num_index_tuples = meta->shnsw_node_count;
+		UnlockReleaseBuffer(mbuf);
+	}
 
 	return stats;
 }
