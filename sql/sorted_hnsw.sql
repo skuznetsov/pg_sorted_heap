@@ -43,6 +43,14 @@ SELECT round(min(v <=> (SELECT v FROM hnsw_test WHERE id = 1))::numeric, 6) AS s
   SELECT v FROM hnsw_test ORDER BY v <=> (SELECT v FROM hnsw_test WHERE id = 1) LIMIT 5
 ) x;
 
+-- Planner guard: automatic index path is only valid for LIMIT <= ef_search
+RESET enable_seqscan;
+EXPLAIN (COSTS OFF)
+SELECT id FROM hnsw_test ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec;
+EXPLAIN (COSTS OFF)
+SELECT id FROM hnsw_test ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec LIMIT 40;
+SET enable_seqscan = off;
+
 -- Dead heap tuples before VACUUM: top-up must still fill LIMIT K
 CREATE TABLE hnsw_dead (id int PRIMARY KEY, v svec(4));
 INSERT INTO hnsw_dead

@@ -102,6 +102,7 @@ static ShnswScanCache *shnsw_get_scan_cache(Relation index);
 static void shnsw_ensure_scan_cache_hash(void);
 static void shnsw_scan_cache_relcache_callback(Datum arg, Oid relid);
 static void shnsw_scan_cache_invalidate(ShnswScanCacheEntry *entry);
+static bool shnsw_scan_cache_is_warm(Relation index);
 static uint64 shnsw_read_cache_generation(Relation index);
 static int shnsw_search_level(ShnswScanCache *cache, const float *query,
 							  int entry_nid, int ef, int level,
@@ -323,6 +324,25 @@ shnsw_scan_cache_relcache_callback(Datum arg, Oid relid)
 		while ((entry = hash_seq_search(&status)) != NULL)
 			shnsw_scan_cache_invalidate(entry);
 	}
+}
+
+static bool
+shnsw_scan_cache_is_warm(Relation index)
+{
+	uint64				cache_gen;
+	ShnswScanCacheEntry *entry;
+
+	if (shnsw_scan_cache_hash == NULL)
+		return false;
+
+	cache_gen = shnsw_read_cache_generation(index);
+	entry = hash_search(shnsw_scan_cache_hash, &index->rd_id, HASH_FIND, NULL);
+
+	return entry != NULL &&
+		entry->cache != NULL &&
+		entry->cache_ctx != NULL &&
+		entry->cache_gen == cache_gen &&
+		RelFileLocatorEquals(entry->locator, index->rd_locator);
 }
 
 static uint64
@@ -2305,6 +2325,7 @@ shnsw_costestimate(PlannerInfo *root, IndexPath *path,
 	Relation	index;
 	int			dim;
 	double		ef;
+	double		limit_tuples;
 	double		visited;
 	double		live_cand;
 	double		nav_cpu;
@@ -2317,6 +2338,23 @@ shnsw_costestimate(PlannerInfo *root, IndexPath *path,
 	 * unordered queries like COUNT(*), even with enable_seqscan=off.
 	 */
 	if (path->indexorderbys == NIL)
+	{
+		*indexStartupCost = 1.0e12;
+		*indexTotalCost = 1.0e12;
+		*indexSelectivity = 1.0;
+		*indexCorrelation = 0.0;
+		*indexPages = 0;
+		return;
+	}
+
+	/*
+	 * Phase 1 sorted_hnsw only produces up to ef_search ordered candidates
+	 * per scan. Do not let the planner treat it as a general ORDER BY path
+	 * when the query has no LIMIT or asks for more rows than the AM can
+	 * faithfully return.
+	 */
+	limit_tuples = root->limit_tuples;
+	if (limit_tuples < 0 || limit_tuples > (double) sorted_hnsw_ef_search)
 	{
 		*indexStartupCost = 1.0e12;
 		*indexTotalCost = 1.0e12;
@@ -2349,7 +2387,21 @@ shnsw_costestimate(PlannerInfo *root, IndexPath *path,
 	 */
 	{
 		double index_pages_d = (double) RelationGetNumberOfBlocks(index);
-		*indexStartupCost = index_pages_d * seq_page_cost * 0.5;
+
+		if (shnsw_scan_cache_is_warm(index))
+		{
+			/*
+			 * Backend-local decoded cache already exists and matches the
+			 * current relfilenode/cache generation, so startup is CPU-only.
+			 * Keep a small non-zero term so the planner still distinguishes
+			 * warm scans from essentially free operators.
+			 */
+			*indexStartupCost = Max(1.0, index_pages_d * cpu_operator_cost);
+		}
+		else
+		{
+			*indexStartupCost = index_pages_d * seq_page_cost * 0.5;
+		}
 	}
 
 	/* Phase 1: SQ8 navigation (CPU only, cache is in memory after load) */
