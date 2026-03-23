@@ -282,17 +282,24 @@ Current repo-owned harnesses:
 
 Restored Gutenberg dump on AWS ARM64 (`ubuntu@dev.rigelstar.com`, 4 CPU,
 7.6 GiB RAM), top-10. Ground truth is recomputed by exact PostgreSQL heap
-search on the restored `svec` table; the stored `bench_hnsw_gt` table matched
-that exact GT on 98% of the 50 benchmark queries after restore, so the fresh
-heap GT is the authoritative recall baseline.
+search on the restored `svec` table; in the current rerun the stored
+`bench_hnsw_gt` table matched that exact GT on 100% of the 50 benchmark
+queries, so the fresh heap GT and the historical GT table agree.
 
 | Method | p50 latency | Recall@10 | Notes |
 |--------|:-----------:|:---------:|-------|
-| Exact heap (`svec`) | 473.237ms | 100% | brute-force GT on restored corpus |
-| **sorted_hnsw** | **2.177ms** | **98.2%** | `ef_search=96`, index 404 MB |
-| pgvector HNSW (`halfvec`) | 2.109ms | 99.8% | `ef_search=64`, index 804 MB |
+| Exact heap (`svec`) | 467.628ms | 100% | brute-force GT on restored corpus |
+| `sorted_hnsw` (`svec`) | 2.353ms | 99.8% | `ef_search=96`, index 404 MB, total 1902 MB |
+| **`sorted_hnsw` (`hsvec`)** | **2.306ms** | **99.8%** | `ef_search=96`, index 404 MB, total 1032 MB |
+| pgvector HNSW (`halfvec`) | 1.985ms | 97.8% | `ef_search=64`, index 804 MB, total 1615 MB |
 | zvec HNSW | 51.130ms | 100% | in-process collection, `ef=64`, ~1.12 GiB on disk |
 | Qdrant HNSW | 6.689ms | 99.6% | local Docker on same AWS host, `hnsw_ef=64`, 103,260 points |
+
+The precision-matched AWS row is `sorted_hnsw (hsvec)` vs pgvector
+`halfvec`. The `sorted_hnsw` index stays 404 MB for both `svec` and `hsvec`
+because the index stores SQ8 graph state; the space win from `hsvec` appears
+in the base table and TOAST footprint (`1902 MB -> 1032 MB`), not in the
+index itself.
 
 Synthetic 10K x 384D cosine corpus, top-10, warm query loop. PostgreSQL
 methods were rerun across 3 fresh builds and the table below reports median

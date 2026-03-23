@@ -61,14 +61,19 @@ class PgRunResult:
     sorted_p50: float
     sorted_avg: float
     sorted_recall: float
+    sorted_hs_p50: float
+    sorted_hs_avg: float
+    sorted_hs_recall: float
     pgv_p50: float
     pgv_avg: float
     pgv_recall: float
     exact_ids: list[list[str]]
     query_literals: list[str]
     sh_index_size: str
+    sh_hs_index_size: str
     pgv_index_size: str
     sh_total_size: str
+    sh_hs_total_size: str
     pgv_total_size: str
     gt_table_exact_match_pct: float
 
@@ -287,13 +292,35 @@ def run_pg_benchmark(tmp: Path, port: int, k: int, pgv_ef: int, sh_ef: int) -> P
         gt_matches = sum(1 for exact, stored in zip(exact_ids, gt_table_ids) if exact == stored)
         gt_match_pct = 100.0 * gt_matches / len(exact_ids) if exact_ids else 0.0
 
+        cur.execute("DROP TABLE IF EXISTS public.gutenberg_gptoss_hs CASCADE")
+        cur.execute(
+            """
+            CREATE TABLE public.gutenberg_gptoss_hs (
+              id text PRIMARY KEY,
+              embedding hsvec(2880)
+            )
+            """
+        )
+        cur.execute(
+            """
+            INSERT INTO public.gutenberg_gptoss_hs (id, embedding)
+            SELECT id, embedding::hsvec
+            FROM public.gutenberg_gptoss_sh
+            """
+        )
+        cur.execute("ANALYZE public.gutenberg_gptoss_hs")
+
         cur.execute("CREATE INDEX gutenberg_gptoss_emb_idx ON public.gutenberg_gptoss USING hnsw (embedding halfvec_cosine_ops) WITH (m=16, ef_construction=100)")
         cur.execute("ANALYZE public.gutenberg_gptoss")
         cur.execute("CREATE INDEX gutenberg_gptoss_sh_shnsw_idx ON public.gutenberg_gptoss_sh USING sorted_hnsw (embedding) WITH (m=16, ef_construction=64)")
         cur.execute("ANALYZE public.gutenberg_gptoss_sh")
+        cur.execute("CREATE INDEX gutenberg_gptoss_hs_shnsw_idx ON public.gutenberg_gptoss_hs USING sorted_hnsw (embedding hsvec_cosine_ops) WITH (m=16, ef_construction=64)")
+        cur.execute("ANALYZE public.gutenberg_gptoss_hs")
 
         sorted_ms: list[float] = []
         sorted_recall_parts: list[float] = []
+        sorted_hs_ms: list[float] = []
+        sorted_hs_recall_parts: list[float] = []
         cur.execute("SET enable_seqscan = off")
         cur.execute("SET enable_indexscan = on")
         cur.execute("SET enable_bitmapscan = on")
@@ -306,6 +333,14 @@ def run_pg_benchmark(tmp: Path, port: int, k: int, pgv_ef: int, sh_ef: int) -> P
             ids = [row[0] for row in cur.fetchall()]
             sorted_ms.append((time.perf_counter() - t0) * 1000.0)
             sorted_recall_parts.append(recall_at_k(ids, exact_ids[qi], k))
+
+        for qi, lit in enumerate(query_literals):
+            cur.execute(f"SELECT id FROM public.gutenberg_gptoss_hs ORDER BY embedding <=> %s::hsvec LIMIT {k}", (lit,))
+            t0 = time.perf_counter()
+            cur.execute(f"SELECT id FROM public.gutenberg_gptoss_hs ORDER BY embedding <=> %s::hsvec LIMIT {k}", (lit,))
+            ids = [row[0] for row in cur.fetchall()]
+            sorted_hs_ms.append((time.perf_counter() - t0) * 1000.0)
+            sorted_hs_recall_parts.append(recall_at_k(ids, exact_ids[qi], k))
 
         pgv_ms: list[float] = []
         pgv_recall_parts: list[float] = []
@@ -322,12 +357,14 @@ def run_pg_benchmark(tmp: Path, port: int, k: int, pgv_ef: int, sh_ef: int) -> P
             """
             SELECT
               pg_size_pretty(pg_relation_size('public.gutenberg_gptoss_sh_shnsw_idx'::regclass)),
+              pg_size_pretty(pg_relation_size('public.gutenberg_gptoss_hs_shnsw_idx'::regclass)),
               pg_size_pretty(pg_relation_size('public.gutenberg_gptoss_emb_idx'::regclass)),
               pg_size_pretty(pg_total_relation_size('public.gutenberg_gptoss_sh'::regclass)),
+              pg_size_pretty(pg_total_relation_size('public.gutenberg_gptoss_hs'::regclass)),
               pg_size_pretty(pg_total_relation_size('public.gutenberg_gptoss'::regclass))
             """
         )
-        sh_index_size, pgv_index_size, sh_total_size, pgv_total_size = cur.fetchone()
+        sh_index_size, sh_hs_index_size, pgv_index_size, sh_total_size, sh_hs_total_size, pgv_total_size = cur.fetchone()
 
         return PgRunResult(
             exact_p50=median_ms(exact_ms),
@@ -335,14 +372,19 @@ def run_pg_benchmark(tmp: Path, port: int, k: int, pgv_ef: int, sh_ef: int) -> P
             sorted_p50=median_ms(sorted_ms),
             sorted_avg=avg_ms(sorted_ms),
             sorted_recall=avg_ms(sorted_recall_parts),
+            sorted_hs_p50=median_ms(sorted_hs_ms),
+            sorted_hs_avg=avg_ms(sorted_hs_ms),
+            sorted_hs_recall=avg_ms(sorted_hs_recall_parts),
             pgv_p50=median_ms(pgv_ms),
             pgv_avg=avg_ms(pgv_ms),
             pgv_recall=avg_ms(pgv_recall_parts),
             exact_ids=exact_ids,
             query_literals=query_literals,
             sh_index_size=sh_index_size,
+            sh_hs_index_size=sh_hs_index_size,
             pgv_index_size=pgv_index_size,
             sh_total_size=sh_total_size,
+            sh_hs_total_size=sh_hs_total_size,
             pgv_total_size=pgv_total_size,
             gt_table_exact_match_pct=gt_match_pct,
         )
@@ -600,11 +642,13 @@ def main() -> int:
 
         pg = run_pg_benchmark(tmp, args.port, args.k, args.pgv_ef, args.sh_ef)
         print_result("exact_heap", pg.exact_p50, pg.exact_avg, 100.0, args.k)
-        print_result("sorted_hnsw", pg.sorted_p50, pg.sorted_avg, pg.sorted_recall, args.k, extra=f"index={pg.sh_index_size}")
+        print_result("sorted_hnsw_svec", pg.sorted_p50, pg.sorted_avg, pg.sorted_recall, args.k, extra=f"index={pg.sh_index_size}")
+        print_result("sorted_hnsw_hsvec", pg.sorted_hs_p50, pg.sorted_hs_avg, pg.sorted_hs_recall, args.k, extra=f"index={pg.sh_hs_index_size}")
         print_result("pgvector_hnsw_halfvec", pg.pgv_p50, pg.pgv_avg, pg.pgv_recall, args.k, extra=f"index={pg.pgv_index_size}")
         print(
-            f"pg_sizes|sorted_hnsw_index={pg.sh_index_size}|pgvector_index={pg.pgv_index_size}"
-            f"|bench_sh_total={pg.sh_total_size}|bench_pgv_total={pg.pgv_total_size}"
+            f"pg_sizes|sorted_hnsw_svec_index={pg.sh_index_size}|sorted_hnsw_hsvec_index={pg.sh_hs_index_size}"
+            f"|pgvector_index={pg.pgv_index_size}|bench_sh_total={pg.sh_total_size}"
+            f"|bench_hs_total={pg.sh_hs_total_size}|bench_pgv_total={pg.pgv_total_size}"
         )
         print(f"gt_sanity|bench_hnsw_gt_exact_match_pct={pg.gt_table_exact_match_pct:.1f}")
 
