@@ -11,7 +11,7 @@ set -euo pipefail
 #   graph-shape noise you get when every timing run rebuilds HNSW from scratch.
 #
 # Usage:
-#   ./scripts/bench_sorted_hnsw_fixed_graph.sh [tmp_root] [port] [rows] [runs] [dim]
+#   ./scripts/bench_sorted_hnsw_fixed_graph.sh [tmp_root] [port] [rows] [runs] [dim] [mode]
 #
 # Output:
 #   - per-run execution time in ms
@@ -22,6 +22,7 @@ PORT="${2:-65441}"
 ROWS="${3:-50000}"
 RUNS="${4:-10}"
 DIM="${5:-4}"
+MODE="${6:-fresh}"
 
 if [[ "$TMP_ROOT" != /* ]]; then
   echo "tmp_root must be absolute: $TMP_ROOT" >&2
@@ -41,6 +42,10 @@ if ! [[ "$RUNS" =~ ^[0-9]+$ ]] || [ "$RUNS" -le 0 ]; then
 fi
 if ! [[ "$DIM" =~ ^[0-9]+$ ]] || [ "$DIM" -le 0 ]; then
   echo "dim must be a positive integer" >&2
+  exit 2
+fi
+if [[ "$MODE" != "fresh" && "$MODE" != "reuse" ]]; then
+  echo "mode must be 'fresh' or 'reuse'" >&2
   exit 2
 fi
 
@@ -84,6 +89,7 @@ echo "============================================================"
 echo "rows: $ROWS"
 echo "runs: $RUNS"
 echo "dim:  $DIM"
+echo "mode: $MODE"
 echo "port: $PORT"
 echo
 
@@ -121,14 +127,19 @@ CREATE INDEX bench_idx ON bench USING sorted_hnsw(v) WITH (m=16, ef_construction
 ANALYZE bench;
 SQL
 
-echo "Built fixed graph once; measuring repeated ordered scans on the same index."
+if [[ "$MODE" = "fresh" ]]; then
+  echo "Built fixed graph once; measuring fresh-backend ordered scans on the same index."
+else
+  echo "Built fixed graph once; measuring warm same-backend ordered scans on the same index."
+fi
 echo
 
 QUERY_VEC="$(make_query_vec)"
 
-sum=0
-for i in $(seq 1 "$RUNS"); do
-  ms=$(PSQL <<SQL | awk '/Execution Time/ {print $(NF-1)}'
+if [[ "$MODE" = "fresh" ]]; then
+  sum=0
+  for i in $(seq 1 "$RUNS"); do
+    ms=$(PSQL <<SQL | awk '/Execution Time/ {print $(NF-1)}'
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS)
 SELECT id
 FROM bench
@@ -136,8 +147,47 @@ ORDER BY v <=> '$QUERY_VEC'::svec($DIM)
 LIMIT 10;
 SQL
 )
-  echo "run_$i=$ms"
-  sum=$(awk -v a="$sum" -v b="$ms" 'BEGIN {printf "%.6f", a + b}')
-done
+    echo "run_$i=$ms"
+    sum=$(awk -v a="$sum" -v b="$ms" 'BEGIN {printf "%.6f", a + b}')
+  done
 
-awk -v total="$sum" -v runs="$RUNS" 'BEGIN {printf "avg_ms=%.4f\n", total / runs}'
+  awk -v total="$sum" -v runs="$RUNS" 'BEGIN {printf "avg_ms=%.4f\n", total / runs}'
+else
+  PSQL <<SQL
+SET enable_seqscan = off;
+DO \$warm\$
+BEGIN
+  PERFORM id
+  FROM bench
+  ORDER BY v <=> '$QUERY_VEC'::svec($DIM)
+  LIMIT 1;
+END
+\$warm\$;
+
+CREATE TEMP TABLE bench_times(run int, ms double precision);
+
+DO \$do\$
+DECLARE
+  i int;
+  t0 timestamptz;
+BEGIN
+  FOR i IN 1..$RUNS LOOP
+    t0 := clock_timestamp();
+    PERFORM id
+    FROM bench
+    ORDER BY v <=> '$QUERY_VEC'::svec($DIM)
+    LIMIT 10;
+    INSERT INTO bench_times(run, ms)
+    VALUES (i, EXTRACT(EPOCH FROM clock_timestamp() - t0) * 1000.0);
+  END LOOP;
+END
+\$do\$;
+
+SELECT format('run_%s=%s', run, to_char(ms, 'FM999999990.000'))
+FROM bench_times
+ORDER BY run;
+
+SELECT format('avg_ms=%s', to_char(avg(ms), 'FM999999990.0000'))
+FROM bench_times;
+SQL
+fi
