@@ -86,6 +86,7 @@ typedef struct ShnswScanCache
 	int			node_size;
 	uint8	   *l0_page_loaded;
 	ShnswUpperNbr **upper;
+	int32	  **upper_neighbors;
 	int		   *upper_count;
 	int		  **upper_nbr_idx;
 } ShnswScanCache;
@@ -129,6 +130,9 @@ static Size shnsw_l0_neighbors_bytes(int n_nodes, int M);
 static int32 *shnsw_cache_l0_neighbors_slot(ShnswScanCache *cache, int32 nid);
 static void shnsw_cache_refresh_l0_neighbor_ptrs(ShnswScanCache *cache,
 												 int start_nid);
+static Size shnsw_upper_neighbors_bytes(int entry_count, int M);
+static int32 *shnsw_cache_upper_neighbors_slot(ShnswScanCache *cache,
+												 int level, int entry_idx);
 static void shnsw_cache_load_l0_page(Relation index, ShnswScanCache *cache,
 									 int page_idx);
 static bool shnsw_cache_ensure_node_loaded(Relation index,
@@ -453,6 +457,7 @@ shnsw_scan_cache_seed_from_build(Relation index,
 	}
 
 	cache->upper = palloc0(sizeof(ShnswUpperNbr *) * (max_level + 1));
+	cache->upper_neighbors = palloc0(sizeof(int32 *) * (max_level + 1));
 	cache->upper_count = palloc0(sizeof(int) * (max_level + 1));
 	cache->upper_nbr_idx = palloc0(sizeof(int *) * (max_level + 1));
 
@@ -469,6 +474,8 @@ shnsw_scan_cache_seed_from_build(Relation index,
 		}
 
 		cache->upper[lev] = palloc0(sizeof(ShnswUpperNbr) * Max(count, 1));
+		cache->upper_neighbors[lev] =
+			palloc(shnsw_upper_neighbors_bytes(count, M));
 		cache->upper_count[lev] = count;
 		cache->upper_nbr_idx[lev] = palloc(sizeof(int) * n_nodes);
 		memset(cache->upper_nbr_idx[lev], -1, sizeof(int) * n_nodes);
@@ -486,7 +493,7 @@ shnsw_scan_cache_seed_from_build(Relation index,
 			ue->nid = bn->nid;
 			n_upper = Min(bn->n_neighbors[lev], M);
 			ue->n_neighbors = n_upper;
-			ue->neighbors = palloc(sizeof(int32) * M);
+			ue->neighbors = shnsw_cache_upper_neighbors_slot(cache, lev, pos);
 			for (d = 0; d < n_upper; d++)
 				ue->neighbors[d] = bn->neighbors[lev][d];
 			for (d = n_upper; d < M; d++)
@@ -553,6 +560,18 @@ shnsw_cache_refresh_l0_neighbor_ptrs(ShnswScanCache *cache, int start_nid)
 			cache->nodes[nid].neighbors =
 				shnsw_cache_l0_neighbors_slot(cache, nid);
 	}
+}
+
+static Size
+shnsw_upper_neighbors_bytes(int entry_count, int M)
+{
+	return (Size) Max(entry_count, 1) * (Size) M * sizeof(int32);
+}
+
+static int32 *
+shnsw_cache_upper_neighbors_slot(ShnswScanCache *cache, int level, int entry_idx)
+{
+	return cache->upper_neighbors[level] + (Size) entry_idx * (Size) cache->M;
 }
 
 static void
@@ -1920,6 +1939,7 @@ shnsw_load_cache(Relation index)
 		int		alloc = 256;
 		int		p;
 		ShnswUpperNbr *entries;
+		int32  *neighbor_slab;
 
 		if (entries_per_page < 1) entries_per_page = 1;
 
@@ -1927,10 +1947,12 @@ shnsw_load_cache(Relation index)
 			 lev, upper_starts[lev], upper_npages_arr[lev], entries_per_page);
 
 		entries = palloc(sizeof(ShnswUpperNbr) * alloc);
+		neighbor_slab = palloc(shnsw_upper_neighbors_bytes(alloc, M));
 
 		if (upper_npages_arr[lev] == 0 || upper_starts[lev] == 0)
 		{
 			cache->upper[lev] = entries;
+			cache->upper_neighbors[lev] = neighbor_slab;
 			cache->upper_count[lev] = 0;
 			cache->upper_nbr_idx[lev] = palloc(sizeof(int) * n_nodes);
 			memset(cache->upper_nbr_idx[lev], -1, sizeof(int) * n_nodes);
@@ -1963,11 +1985,20 @@ shnsw_load_cache(Relation index)
 				{
 					alloc *= 2;
 					entries = repalloc(entries, sizeof(ShnswUpperNbr) * alloc);
+					neighbor_slab = repalloc(neighbor_slab,
+											 shnsw_upper_neighbors_bytes(alloc, M));
+					if (neighbor_slab != NULL)
+					{
+						for (k = 0; k < total_entries; k++)
+							entries[k].neighbors =
+								neighbor_slab + (Size) k * (Size) M;
+					}
 				}
 
 				entries[total_entries].nid = ue->nid;
 				entries[total_entries].n_neighbors = ue->n_neighbors;
-				entries[total_entries].neighbors = palloc(sizeof(int32) * M);
+				entries[total_entries].neighbors =
+					neighbor_slab + (Size) total_entries * (Size) M;
 				for (k = 0; k < Min(ue->n_neighbors, M); k++)
 					entries[total_entries].neighbors[k] =
 						ShnswUpperEntryNeighbors(ue)[k];
@@ -1977,6 +2008,7 @@ shnsw_load_cache(Relation index)
 		}
 
 		cache->upper[lev] = entries;
+		cache->upper_neighbors[lev] = neighbor_slab;
 		cache->upper_count[lev] = total_entries;
 
 		/* Build NID → index lookup */
