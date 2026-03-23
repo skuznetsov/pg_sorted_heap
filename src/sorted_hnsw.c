@@ -235,6 +235,13 @@ static void shnsw_write_empty_metapage(Relation index, ForkNumber forknum,
 static bool shnsw_bootstrap_first_node(Relation index, const Svec *sv,
 										ItemPointer heap_tid,
 										int M, int ef_construction, int dim);
+static Size shnsw_vector_buffer_bytes(int n_nodes, int dim);
+
+static Size
+shnsw_vector_buffer_bytes(int n_nodes, int dim)
+{
+	return mul_size(mul_size((Size) n_nodes, (Size) dim), sizeof(float));
+}
 
 /* ================================================================
  * AM Handler
@@ -1273,7 +1280,8 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 		n_nodes = 0;
 		alloc_nodes = 1024;
 		old_ctx = MemoryContextSwitchTo(build_ctx);
-		vectors = palloc(sizeof(float) * alloc_nodes * dim);
+		vectors = (float *) MemoryContextAllocHuge(build_ctx,
+												   shnsw_vector_buffer_bytes(alloc_nodes, dim));
 		tids = palloc(sizeof(ItemPointerData) * alloc_nodes);
 		MemoryContextSwitchTo(old_ctx);
 
@@ -1301,7 +1309,8 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 			{
 				alloc_nodes *= 2;
 				old_ctx = MemoryContextSwitchTo(build_ctx);
-				vectors = repalloc(vectors, sizeof(float) * (Size)alloc_nodes * dim);
+				vectors = (float *) repalloc_huge(vectors,
+												  shnsw_vector_buffer_bytes(alloc_nodes, dim));
 				tids = repalloc(tids, sizeof(ItemPointerData) * alloc_nodes);
 				MemoryContextSwitchTo(old_ctx);
 			}
