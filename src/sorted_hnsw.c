@@ -359,6 +359,20 @@ shnsw_flush_page(Relation index, Buffer buf, Page src_page)
 }
 
 static void
+shnsw_page_set_payload_end(Page page, Size payload_bytes)
+{
+	PageHeader	header = (PageHeader) page;
+	LocationIndex lower;
+
+	lower = (LocationIndex) MAXALIGN(SizeOfPageHeaderData + payload_bytes);
+	if (lower > header->pd_special)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("sorted_hnsw page payload exceeds page capacity")));
+	header->pd_lower = lower;
+}
+
+static void
 shnsw_write_empty_metapage(Relation index, ForkNumber forknum,
 							 int M, int ef_construction, int dim)
 {
@@ -387,6 +401,7 @@ shnsw_write_empty_metapage(Relation index, ForkNumber forknum,
 	meta->shnsw_entry_nid = -1;
 	meta->shnsw_max_level = -1;
 	meta->shnsw_cache_gen = 1;
+	shnsw_page_set_payload_end(page, sizeof(ShnswMetaPageData));
 
 	MarkBufferDirty(buf);
 	if (forknum == MAIN_FORKNUM)
@@ -628,6 +643,7 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 
 			chunk = Min(total_bytes - offset, usable);
 			memcpy(PageGetContents(page), (char *)sq8_data + offset, chunk);
+			shnsw_page_set_payload_end(page, chunk);
 
 			shnsw_flush_page(index, buf, page);
 			UnlockReleaseBuffer(buf);
@@ -709,6 +725,7 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 				sq8[d] = sq8_quantize(vec[d], sq8_mins[d], sq8_scales[d]);
 
 			page_nodes++;
+			shnsw_page_set_payload_end(page, (Size) page_nodes * node_size);
 		}
 
 		/* Flush last page */
@@ -801,6 +818,8 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 						((char *) PageGetContents(upage) + s * entry_size);
 					sentinel->nid = -1;
 				}
+				shnsw_page_set_payload_end(upage,
+										   (Size) entries_per_page * entry_size);
 				shnsw_flush_page(index, ubuf, upage);
 				UnlockReleaseBuffer(ubuf);
 				pfree(upage);
@@ -850,6 +869,7 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 				meta->shnsw_upper_start[lev] = upper_starts[lev];
 				meta->shnsw_upper_npages[lev] = upper_npages[lev];
 			}
+			shnsw_page_set_payload_end(page, sizeof(ShnswMetaPageData));
 			MarkBufferDirty(buf);
 			log_newpage_buffer(buf, true);
 			UnlockReleaseBuffer(buf);
@@ -946,6 +966,7 @@ shnsw_bootstrap_first_node(Relation index, const Svec *sv, ItemPointer heap_tid,
 
 		chunk = Min(total_bytes - offset, usable);
 		memcpy(PageGetContents(page), (char *) sq8_data + offset, chunk);
+		shnsw_page_set_payload_end(page, chunk);
 		shnsw_flush_page(index, buf, page);
 		UnlockReleaseBuffer(buf);
 		pfree(page);
@@ -973,6 +994,7 @@ shnsw_bootstrap_first_node(Relation index, const Svec *sv, ItemPointer heap_tid,
 		ShnswNodeNeighbors(nh)[d] = -1;
 	sq8 = ShnswNodeSQ8Vec(nh, M);
 	memset(sq8, 0, dim);
+	shnsw_page_set_payload_end(page, MAXALIGN(ShnswNodeSize(M, dim)));
 
 	shnsw_flush_page(index, buf, page);
 	UnlockReleaseBuffer(buf);
@@ -997,6 +1019,7 @@ shnsw_bootstrap_first_node(Relation index, const Svec *sv, ItemPointer heap_tid,
 	meta->shnsw_l0_start = l0_start;
 	meta->shnsw_l0_npages = 1;
 	meta->shnsw_cache_gen = 1;
+	shnsw_page_set_payload_end(mpage, sizeof(ShnswMetaPageData));
 	MarkBufferDirty(mbuf);
 	log_newpage_buffer(mbuf, false);
 	UnlockReleaseBuffer(mbuf);
@@ -1278,6 +1301,8 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 			for (d = 0; d < dim; d++)
 				sq8[d] = sq8_quantize(sv->x[d], cache->sq8_mins[d],
 									  cache->sq8_scales[d]);
+			shnsw_page_set_payload_end(page,
+									   (Size) (offset_in_page + 1) * node_size);
 
 			MarkBufferDirty(buf);
 			log_newpage_buffer(buf, false);
@@ -1302,6 +1327,7 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 			meta = (ShnswMetaPageData *) PageGetContents(mpage);
 			meta->shnsw_node_count++;
 			meta->shnsw_cache_gen++;
+			shnsw_page_set_payload_end(mpage, sizeof(ShnswMetaPageData));
 			MarkBufferDirty(mbuf);
 			log_newpage_buffer(mbuf, false);
 			UnlockReleaseBuffer(mbuf);
@@ -2456,6 +2482,7 @@ shnsw_bulkdelete(IndexVacuumInfo *info,
 		update_mpage = BufferGetPage(update_mbuf);
 		update_meta = (ShnswMetaPageData *) PageGetContents(update_mpage);
 		update_meta->shnsw_cache_gen++;
+		shnsw_page_set_payload_end(update_mpage, sizeof(ShnswMetaPageData));
 		MarkBufferDirty(update_mbuf);
 		log_newpage_buffer(update_mbuf, false);
 		UnlockReleaseBuffer(update_mbuf);
