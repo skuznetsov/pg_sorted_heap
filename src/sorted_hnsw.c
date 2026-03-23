@@ -102,6 +102,14 @@ static ShnswScanCache *shnsw_get_scan_cache(Relation index);
 static void shnsw_ensure_scan_cache_hash(void);
 static void shnsw_scan_cache_relcache_callback(Datum arg, Oid relid);
 static void shnsw_scan_cache_invalidate(ShnswScanCacheEntry *entry);
+static void shnsw_scan_cache_record_insert(Relation index, uint64 cache_gen,
+										   ItemPointer heap_tid,
+										   int32 new_nid,
+										   const int32 *selected,
+										   const bool *reverse_added,
+										   int n_sel,
+										   const uint8 *sq8,
+										   int M, int dim);
 static bool shnsw_scan_cache_is_warm(Relation index);
 static uint64 shnsw_read_cache_generation(Relation index);
 static int shnsw_search_level(ShnswScanCache *cache, const float *query,
@@ -343,6 +351,94 @@ shnsw_scan_cache_is_warm(Relation index)
 		entry->cache_ctx != NULL &&
 		entry->cache_gen == cache_gen &&
 		RelFileLocatorEquals(entry->locator, index->rd_locator);
+}
+
+static void
+shnsw_scan_cache_record_insert(Relation index, uint64 cache_gen,
+							   ItemPointer heap_tid,
+							   int32 new_nid,
+							   const int32 *selected,
+							   const bool *reverse_added,
+							   int n_sel,
+							   const uint8 *sq8,
+							   int M, int dim)
+{
+	Oid					relid = RelationGetRelid(index);
+	ShnswScanCacheEntry *entry;
+	ShnswScanCache	   *cache;
+	MemoryContext		old_ctx;
+	int					old_n_nodes;
+	int					lev;
+	int32			   *nbrs;
+
+	if (shnsw_scan_cache_hash == NULL)
+		return;
+
+	entry = hash_search(shnsw_scan_cache_hash, &relid, HASH_FIND, NULL);
+	if (entry == NULL ||
+		entry->cache == NULL ||
+		entry->cache_ctx == NULL ||
+		!RelFileLocatorEquals(entry->locator, index->rd_locator))
+		return;
+
+	cache = entry->cache;
+	old_n_nodes = cache->n_nodes;
+	if (new_nid != old_n_nodes)
+	{
+		shnsw_scan_cache_invalidate(entry);
+		return;
+	}
+
+	old_ctx = MemoryContextSwitchTo(entry->cache_ctx);
+
+	cache->nodes = repalloc(cache->nodes,
+							sizeof(ShnswCacheNode) * (old_n_nodes + 1));
+	memset(&cache->nodes[old_n_nodes], 0, sizeof(ShnswCacheNode));
+
+	cache->sq8_data = repalloc(cache->sq8_data, (Size) (old_n_nodes + 1) * dim);
+	memcpy(cache->sq8_data + (Size) old_n_nodes * dim, sq8, dim);
+
+	cache->nodes[old_n_nodes].neighbors = palloc(sizeof(int32) * 2 * M);
+	nbrs = cache->nodes[old_n_nodes].neighbors;
+	cache->nodes[old_n_nodes].n_neighbors = n_sel;
+	cache->nodes[old_n_nodes].level = 0;
+	cache->nodes[old_n_nodes].flags = 0;
+	ItemPointerCopy(heap_tid, &cache->nodes[old_n_nodes].heap_tid);
+	for (lev = 0; lev < n_sel; lev++)
+		nbrs[lev] = selected[lev];
+	for (lev = n_sel; lev < 2 * M; lev++)
+		nbrs[lev] = -1;
+
+	for (lev = 1; lev <= cache->max_level; lev++)
+	{
+		cache->upper_nbr_idx[lev] = repalloc(cache->upper_nbr_idx[lev],
+											 sizeof(int) * (old_n_nodes + 1));
+		cache->upper_nbr_idx[lev][old_n_nodes] = -1;
+	}
+
+	for (lev = 0; lev < n_sel; lev++)
+	{
+		int32 target_nid = selected[lev];
+		ShnswCacheNode *target;
+
+		if (!reverse_added[lev] ||
+			target_nid < 0 ||
+			target_nid >= old_n_nodes)
+			continue;
+
+		target = &cache->nodes[target_nid];
+		if (target->neighbors == NULL || target->n_neighbors >= 2 * M)
+			continue;
+
+		target->neighbors[target->n_neighbors] = new_nid;
+		target->n_neighbors++;
+	}
+
+	cache->n_nodes = old_n_nodes + 1;
+	entry->cache_gen = cache_gen;
+	entry->locator = index->rd_locator;
+
+	MemoryContextSwitchTo(old_ctx);
 }
 
 static uint64
@@ -1130,10 +1226,13 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 	float		   *query_vec;
 	ScanCandidate  *cand_buf;
 	int32		   *selected;
+	bool		   *reverse_added;
+	uint8		   *new_sq8;
 	int				d;
 	Buffer			mbuf;
 	Page			mpage;
 	ShnswMetaPageData *meta;
+	uint64			new_cache_gen;
 
 	if (isnull[0])
 		return false;
@@ -1188,7 +1287,7 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 	}
 
 	/* Load index cache */
-	cache = shnsw_load_cache(index);
+	cache = shnsw_get_scan_cache(index);
 	dim = cache->dim;
 	M = cache->M;
 	n_nodes = cache->n_nodes;
@@ -1252,6 +1351,8 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 	/* Select M best neighbors using simple closest-first (no heuristic for speed) */
 	new_nid = n_nodes;	/* new node gets the next nid */
 	selected = palloc(sizeof(int32) * 2 * M);
+	reverse_added = palloc0(sizeof(bool) * 2 * M);
+	new_sq8 = palloc(dim);
 	{
 		int n_sel = 0;
 		int max_sel = 2 * M;
@@ -1319,8 +1420,11 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 			/* SQ8 quantize */
 			sq8 = ShnswNodeSQ8Vec(nh, M);
 			for (d = 0; d < dim; d++)
-				sq8[d] = sq8_quantize(sv->x[d], cache->sq8_mins[d],
-									  cache->sq8_scales[d]);
+			{
+				new_sq8[d] = sq8_quantize(sv->x[d], cache->sq8_mins[d],
+										  cache->sq8_scales[d]);
+				sq8[d] = new_sq8[d];
+			}
 			shnsw_page_set_payload_end(page,
 									   (Size) (offset_in_page + 1) * node_size);
 
@@ -1332,8 +1436,8 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 		/* Add reverse connections: for each selected neighbor, add new_nid */
 		for (d = 0; d < n_sel; d++)
 		{
-			shnsw_add_neighbor_on_page(index, selected[d], new_nid,
-									   M, dim, l0_start, nodes_per_page);
+			reverse_added[d] = shnsw_add_neighbor_on_page(index, selected[d], new_nid,
+														  M, dim, l0_start, nodes_per_page);
 		}
 
 		/* Update metapage: increment node_count */
@@ -1347,15 +1451,22 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 			meta = (ShnswMetaPageData *) PageGetContents(mpage);
 			meta->shnsw_node_count++;
 			meta->shnsw_cache_gen++;
+			new_cache_gen = meta->shnsw_cache_gen;
 			shnsw_page_set_payload_end(mpage, sizeof(ShnswMetaPageData));
 			MarkBufferDirty(mbuf);
 			log_newpage_buffer(mbuf, false);
 			UnlockReleaseBuffer(mbuf);
 		}
 
+		shnsw_scan_cache_record_insert(index, new_cache_gen, heap_tid, new_nid,
+									   selected, reverse_added, n_sel,
+									   new_sq8, M, dim);
+
 		pfree(selected);
 	}
 
+	pfree(new_sq8);
+	pfree(reverse_added);
 	pfree(cand_buf);
 	if (sv != (Svec *) DatumGetPointer(values[0]))
 		pfree(sv);
