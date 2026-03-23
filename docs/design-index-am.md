@@ -9,6 +9,7 @@ scans for `ORDER BY embedding <=> query LIMIT K` queries.
 ```sql
 -- Creation
 CREATE INDEX ON documents USING sorted_hnsw (embedding svec_cosine_ops)
+-- or: CREATE INDEX ON documents USING sorted_hnsw (embedding hsvec_cosine_ops)
   WITH (m = 16, ef_construction = 200);
 
 -- Query (planner chooses index scan automatically)

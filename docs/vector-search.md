@@ -63,7 +63,10 @@ SELECT svec_cosine_distance('[1,0,0]'::hsvec, '[0,1,0]'::hsvec);
 
 ## Current default: `sorted_hnsw`
 
-For new deployments, prefer the Index AM:
+For new deployments, prefer the Index AM. It supports both `svec` and `hsvec`
+source columns; use `hsvec` when you want the heap/TOAST footprint to stay
+close to pgvector `halfvec`, with float32 used only as internal scratch during
+build/search/rerank.
 
 ```sql
 CREATE TABLE items (
@@ -83,6 +86,20 @@ SELECT id, body
 FROM items
 ORDER BY embedding <=> '[0.1,0.2,0.3,...]'::pg_sorted_heap.svec
 LIMIT 10;
+```
+
+Compact-storage variant:
+
+```sql
+CREATE TABLE items_compact (
+    id        bigserial PRIMARY KEY,
+    embedding pg_sorted_heap.hsvec(384),
+    body      text
+);
+
+CREATE INDEX items_compact_embedding_idx
+ON items_compact USING sorted_hnsw (embedding hsvec_cosine_ops)
+WITH (m = 16, ef_construction = 64);
 ```
 
 This path is planner-integrated and exact-reranks internally. There is no

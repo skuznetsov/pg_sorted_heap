@@ -126,8 +126,28 @@ SELECT count(*) AS empty_query_count FROM (
   SELECT id FROM hnsw_empty ORDER BY v <=> '[1,0,0,0]'::svec LIMIT 1
 ) x;
 
+-- Native hsvec path: no upcasted storage contract
+CREATE TABLE hnsw_half (id serial PRIMARY KEY, v hsvec(4));
+INSERT INTO hnsw_half (v)
+SELECT format('[%s,%s,%s,%s]',
+  round((sin(id * 1.0))::numeric, 4),
+  round((cos(id * 1.0))::numeric, 4),
+  round((sin(id * 2.0))::numeric, 4),
+  round((cos(id * 2.0))::numeric, 4))::hsvec
+FROM generate_series(1, 80) AS id;
+CREATE INDEX hnsw_half_idx ON hnsw_half USING sorted_hnsw (v hsvec_cosine_ops) WITH (m = 16, ef_construction = 64);
+SELECT count(*) AS hsvec_result_count FROM (
+  SELECT id FROM hnsw_half ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::hsvec LIMIT 5
+) x;
+SELECT round(min(v <=> (SELECT v FROM hnsw_half WHERE id = 1))::numeric, 6) AS hsvec_self_dist FROM (
+  SELECT v FROM hnsw_half ORDER BY v <=> (SELECT v FROM hnsw_half WHERE id = 1) LIMIT 5
+) x;
+EXPLAIN (COSTS OFF)
+SELECT id FROM hnsw_half ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::hsvec LIMIT 5;
+
 RESET enable_seqscan;
 RESET sorted_hnsw.ef_search;
+DROP TABLE hnsw_half;
 DROP TABLE hnsw_empty;
 DROP TABLE hnsw_test;
 DROP EXTENSION pg_sorted_heap;

@@ -84,6 +84,21 @@ LIMIT 10;
 This is planner-integrated KNN search: no sidecar prefix argument, no manual
 rerank knob, and exact rerank happens inside the index scan.
 
+If you want the base table footprint closer to pgvector `halfvec`, use native
+`hsvec` instead of upcasting to `svec`:
+
+```sql
+CREATE TABLE documents_compact (
+    id        bigserial PRIMARY KEY,
+    embedding hsvec(384),
+    content   text
+);
+
+CREATE INDEX documents_compact_embedding_idx
+ON documents_compact USING sorted_hnsw (embedding hsvec_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+```
+
 ### Legacy/manual ANN paths
 
 The older explicit ANN paths are still available when you want manual control

@@ -13,6 +13,7 @@
 #include "access/table.h"
 #include "access/tableam.h"
 #include "catalog/index.h"
+#include "catalog/pg_type.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
@@ -23,6 +24,7 @@
 #include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/float.h"
 #include "utils/selfuncs.h"
 #include "optimizer/optimizer.h"
 #include "common/pg_prng.h"
@@ -30,6 +32,7 @@
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
+#include "utils/syscache.h"
 
 #include <float.h>
 #include <math.h>
@@ -38,7 +41,180 @@
 #include <arm_neon.h>
 #endif
 
+#include "hsvec.h"
 #include "svec.h"
+
+typedef enum ShnswVectorKind
+{
+	SHNSW_VECTOR_UNSUPPORTED = 0,
+	SHNSW_VECTOR_SVEC,
+	SHNSW_VECTOR_HSVEC
+} ShnswVectorKind;
+
+static ShnswVectorKind
+shnsw_vector_kind(Oid typid)
+{
+	HeapTuple	tup;
+	Form_pg_type typeform;
+	ShnswVectorKind kind = SHNSW_VECTOR_UNSUPPORTED;
+
+	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for type %u", typid);
+
+	typeform = (Form_pg_type) GETSTRUCT(tup);
+	if (strcmp(NameStr(typeform->typname), "svec") == 0)
+		kind = SHNSW_VECTOR_SVEC;
+	else if (strcmp(NameStr(typeform->typname), "hsvec") == 0)
+		kind = SHNSW_VECTOR_HSVEC;
+
+	ReleaseSysCache(tup);
+	return kind;
+}
+
+static ShnswVectorKind
+shnsw_index_vector_kind(Relation index, int *dim_out)
+{
+	Oid				typid = TupleDescAttr(index->rd_att, 0)->atttypid;
+	int				dim = TupleDescAttr(index->rd_att, 0)->atttypmod;
+	ShnswVectorKind kind = shnsw_vector_kind(typid);
+
+	if (kind == SHNSW_VECTOR_UNSUPPORTED)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("sorted_hnsw supports only svec and hsvec columns")));
+
+	if (dim <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("sorted_hnsw requires svec/hsvec with explicit dimension, e.g. svec(768) or hsvec(768)")));
+
+	if (dim_out)
+		*dim_out = dim;
+
+	return kind;
+}
+
+static void
+shnsw_copy_datum_to_float4(Datum val, ShnswVectorKind kind, int dim, float *dst)
+{
+	if (kind == SHNSW_VECTOR_SVEC)
+	{
+		Svec   *sv = DatumGetSvecP(val);
+
+		if (sv->dim != dim)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("vector dimension %d does not match index dimension %d",
+							sv->dim, dim)));
+
+		memcpy(dst, sv->x, sizeof(float) * dim);
+		if (sv != (Svec *) DatumGetPointer(val))
+			pfree(sv);
+		return;
+	}
+
+	if (kind == SHNSW_VECTOR_HSVEC)
+	{
+		Hsvec  *hv = (Hsvec *) PG_DETOAST_DATUM(val);
+		int		i;
+
+		if (hv->dim != dim)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("vector dimension %d does not match index dimension %d",
+							hv->dim, dim)));
+
+		for (i = 0; i < dim; i++)
+			dst[i] = HalfToFloat4(hv->x[i]);
+		if (hv != (Hsvec *) DatumGetPointer(val))
+			pfree(hv);
+		return;
+	}
+
+	elog(ERROR, "unsupported sorted_hnsw vector kind %d", (int) kind);
+}
+
+static bool
+shnsw_copy_query_arg_to_float4(float **dst, int *dst_dim, MemoryContext mcxt,
+								 ScanKey orderby, ShnswVectorKind kind, int dim)
+{
+	MemoryContext	old_ctx;
+	float		   *copy;
+
+	if (orderby == NULL || (orderby->sk_flags & SK_ISNULL))
+		return false;
+
+	old_ctx = MemoryContextSwitchTo(mcxt);
+	copy = palloc(sizeof(float) * dim);
+	MemoryContextSwitchTo(old_ctx);
+
+	shnsw_copy_datum_to_float4(orderby->sk_argument, kind, dim, copy);
+
+	*dst = copy;
+	*dst_dim = dim;
+	return true;
+}
+
+static float8
+shnsw_cosine_distance_query_svec(const float *query, int dim, double query_norm,
+								   const Svec *sv)
+{
+	double	dot = 0.0;
+	double	norm_b = 0.0;
+	double	similarity;
+	int		i;
+
+	for (i = 0; i < dim; i++)
+	{
+		double qi = (double) query[i];
+		double vi = (double) sv->x[i];
+
+		dot += qi * vi;
+		norm_b += vi * vi;
+	}
+
+	if (query_norm == 0.0 || norm_b == 0.0)
+		return get_float8_nan();
+
+	similarity = dot / (sqrt(query_norm) * sqrt(norm_b));
+	if (similarity > 1.0)
+		similarity = 1.0;
+	else if (similarity < -1.0)
+		similarity = -1.0;
+
+	return 1.0 - similarity;
+}
+
+static float8
+shnsw_cosine_distance_query_hsvec(const float *query, int dim, double query_norm,
+									const Hsvec *hv)
+{
+	double	dot = 0.0;
+	double	norm_b = 0.0;
+	double	similarity;
+	int		i;
+
+	for (i = 0; i < dim; i++)
+	{
+		double qi = (double) query[i];
+		double vi = (double) HalfToFloat4(hv->x[i]);
+
+		dot += qi * vi;
+		norm_b += vi * vi;
+	}
+
+	if (query_norm == 0.0 || norm_b == 0.0)
+		return get_float8_nan();
+
+	similarity = dot / (sqrt(query_norm) * sqrt(norm_b));
+	if (similarity > 1.0)
+		similarity = 1.0;
+	else if (similarity < -1.0)
+		similarity = -1.0;
+
+	return 1.0 - similarity;
+}
 
 /* ---- GUCs ---- */
 
@@ -195,7 +371,7 @@ static int shnsw_search_level(Relation index, ShnswScanCache *cache,
 							  int entry_nid, int ef, int level,
 							  ScanCandidate *results, int max_results);
 static int shnsw_rerank_candidates(Relation index, const ShnswScanCache *cache,
-								   const Svec *query,
+								   const float *query, int query_dim,
 								   const ScanCandidate *candidates, int n_cand,
 								   struct ScanResult *results, int max_results);
 
@@ -232,7 +408,7 @@ static bool shnsw_validate(Oid opclassoid);
 static bytea *shnsw_options(Datum reloptions, bool validate);
 static void shnsw_write_empty_metapage(Relation index, ForkNumber forknum,
 										int M, int ef_construction, int dim);
-static bool shnsw_bootstrap_first_node(Relation index, const Svec *sv,
+static bool shnsw_bootstrap_first_node(Relation index, const float *vec,
 										ItemPointer heap_tid,
 										int M, int ef_construction, int dim);
 static Size shnsw_vector_buffer_bytes(int n_nodes, int dim);
@@ -1228,6 +1404,7 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	MemoryContext		old_ctx;
 	HnswBuildState	   *graph;
 	ShnswOptions	   *opts;
+	ShnswVectorKind		vector_kind;
 	int					M, ef_construction, dim;
 	int					n_nodes;
 	int					max_level;
@@ -1252,12 +1429,8 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	M = opts ? opts->m : SHNSW_DEFAULT_M;
 	ef_construction = opts ? opts->ef_construction : SHNSW_DEFAULT_EF_CONSTRUCTION;
 
-	/* Determine vector dimension from the indexed column's typmod */
-	dim = TupleDescAttr(index->rd_att, 0)->atttypmod;
-	if (dim <= 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("sorted_hnsw requires svec with explicit dimension, e.g. svec(768)")));
+	/* Determine supported vector type and explicit dimension. */
+	vector_kind = shnsw_index_vector_kind(index, &dim);
 
 	build_ctx = AllocSetContextCreate(CurrentMemoryContext,
 									  "sorted_hnsw build",
@@ -1289,20 +1462,12 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 		{
 			bool	isnull;
 			Datum	val;
-			Svec   *sv;
 
 			CHECK_FOR_INTERRUPTS();
 
 			val = slot_getattr(slot, vec_attno, &isnull);
 			if (isnull)
 				continue;
-
-			sv = DatumGetSvecP(val);
-			if (sv->dim != dim)
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_EXCEPTION),
-						 errmsg("vector dimension %d does not match index dimension %d",
-								sv->dim, dim)));
 
 			/* Grow arrays if needed */
 			if (n_nodes >= alloc_nodes)
@@ -1315,12 +1480,10 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 				MemoryContextSwitchTo(old_ctx);
 			}
 
-			memcpy(vectors + (Size)n_nodes * dim, sv->x, sizeof(float) * dim);
+			shnsw_copy_datum_to_float4(val, vector_kind, dim,
+									   vectors + (Size) n_nodes * dim);
 			ItemPointerCopy(&slot->tts_tid, &tids[n_nodes]);
 			n_nodes++;
-
-			if (sv != (Svec *) DatumGetPointer(val))
-				pfree(sv);
 
 			ExecClearTuple(slot);
 		}
@@ -1710,7 +1873,7 @@ shnsw_buildempty(Relation index)
 }
 
 static bool
-shnsw_bootstrap_first_node(Relation index, const Svec *sv, ItemPointer heap_tid,
+shnsw_bootstrap_first_node(Relation index, const float *vec, ItemPointer heap_tid,
 							 int M, int ef_construction, int dim)
 {
 	float		   *sq8_data;
@@ -1746,7 +1909,7 @@ shnsw_bootstrap_first_node(Relation index, const Svec *sv, ItemPointer heap_tid,
 
 	/* mins = vector, scales = 0 so the first node quantizes to all-zeroes */
 	sq8_data = palloc0(total_bytes);
-	memcpy(sq8_data, sv->x, sizeof(float) * dim);
+	memcpy(sq8_data, vec, sizeof(float) * dim);
 
 	offset = 0;
 	for (p = 0; p < sq8_aux_npages; p++)
@@ -1900,7 +2063,8 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 			  IndexInfo *indexInfo)
 {
 	ShnswScanCache *cache;
-	Svec		   *sv;
+	ShnswVectorKind	vector_kind;
+	int				declared_dim;
 	int				dim, M, n_nodes, new_nid;
 	int				ef_construction;
 	int				node_level, level;
@@ -1922,7 +2086,7 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 	if (isnull[0])
 		return false;
 
-	sv = DatumGetSvecP(values[0]);
+	vector_kind = shnsw_index_vector_kind(index, &declared_dim);
 
 	/* Read metapage parameters first so empty indexes can bootstrap. */
 	mbuf = ReadBuffer(index, SHNSW_METAPAGE_BLKNO);
@@ -1938,36 +2102,22 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 	UnlockReleaseBuffer(mbuf);
 
 	if (dim <= 0)
-	{
-		dim = TupleDescAttr(index->rd_att, 0)->atttypmod;
-		if (dim <= 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("sorted_hnsw requires svec with explicit dimension")));
-	}
+		dim = declared_dim;
 	if (M <= 0)
 		M = SHNSW_DEFAULT_M;
 	if (ef_construction <= 0)
 		ef_construction = SHNSW_DEFAULT_EF_CONSTRUCTION;
 
-	if (sv->dim != dim)
-	{
-		ereport(WARNING,
-				(errmsg("sorted_hnsw: insert vector dim %d != index dim %d, skipping",
-						sv->dim, dim)));
-		if (sv != (Svec *) DatumGetPointer(values[0]))
-			pfree(sv);
-		return false;
-	}
+	query_vec = palloc(sizeof(float) * dim);
+	shnsw_copy_datum_to_float4(values[0], vector_kind, dim, query_vec);
 
 	if (n_nodes == 0 || ep_nid < 0)
 	{
 		bool inserted;
 
-		inserted = shnsw_bootstrap_first_node(index, sv, heap_tid,
+		inserted = shnsw_bootstrap_first_node(index, query_vec, heap_tid,
 											  M, ef_construction, dim);
-		if (sv != (Svec *) DatumGetPointer(values[0]))
-			pfree(sv);
+		pfree(query_vec);
 		return inserted;
 	}
 
@@ -1996,8 +2146,6 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 	}
 
 	/* Prepare query vector (float32 copy for SQ8 distance computation) */
-	query_vec = sv->x;
-
 	/* Pick random level */
 	{
 		double ml = 1.0 / log((double) M);
@@ -2106,7 +2254,7 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 			sq8 = ShnswNodeSQ8Vec(nh, M);
 			for (d = 0; d < dim; d++)
 			{
-				new_sq8[d] = sq8_quantize(sv->x[d], cache->sq8_mins[d],
+				new_sq8[d] = sq8_quantize(query_vec[d], cache->sq8_mins[d],
 										  cache->sq8_scales[d]);
 				sq8[d] = new_sq8[d];
 			}
@@ -2153,8 +2301,7 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 	pfree(new_sq8);
 	pfree(reverse_added);
 	pfree(cand_buf);
-	if (sv != (Svec *) DatumGetPointer(values[0]))
-		pfree(sv);
+	pfree(query_vec);
 
 	return false;	/* not unique */
 }
@@ -2796,15 +2943,28 @@ cmp_result_asc(const void *a, const void *b)
 
 static int
 shnsw_rerank_candidates(Relation index, const ShnswScanCache *cache,
-						   const Svec *query,
+						   const float *query, int query_dim,
 						   const ScanCandidate *candidates, int n_cand,
 						   ScanResult *results, int max_results)
 {
 	Relation	heap;
 	Snapshot	snap;
 	TupleTableSlot *slot;
+	ShnswVectorKind vector_kind;
+	double		query_norm = 0.0;
+	int			dim;
 	int			i;
 	int			n_results = 0;
+
+	vector_kind = shnsw_index_vector_kind(index, &dim);
+	if (dim != cache->dim || query_dim != dim)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("sorted_hnsw query dimension %d does not match index dimension %d",
+						query_dim, dim)));
+
+	for (i = 0; i < dim; i++)
+		query_norm += (double) query[i] * (double) query[i];
 
 	if (n_cand <= 0 || max_results <= 0)
 		return 0;
@@ -2832,20 +2992,36 @@ shnsw_rerank_candidates(Relation index, const ShnswScanCache *cache,
 		{
 			bool	isnull;
 			Datum	val;
-			Svec   *sv;
 
 			val = slot_getattr(slot,
 							   index->rd_index->indkey.values[0],
 							   &isnull);
 			if (!isnull)
 			{
-				sv = DatumGetSvecP(val);
-				results[n_results].exact_dist =
-					svec_cosine_distance_internal(query, sv);
+				if (vector_kind == SHNSW_VECTOR_SVEC)
+				{
+					Svec   *sv = DatumGetSvecP(val);
+
+					results[n_results].exact_dist =
+						shnsw_cosine_distance_query_svec(query, dim, query_norm, sv);
+					if (sv != (Svec *) DatumGetPointer(val))
+						pfree(sv);
+				}
+				else if (vector_kind == SHNSW_VECTOR_HSVEC)
+				{
+					Hsvec  *hv = (Hsvec *) PG_DETOAST_DATUM(val);
+
+					results[n_results].exact_dist =
+						shnsw_cosine_distance_query_hsvec(query, dim, query_norm, hv);
+					if (hv != (Hsvec *) DatumGetPointer(val))
+						pfree(hv);
+				}
+				else
+					elog(ERROR, "unsupported sorted_hnsw vector kind %d",
+						 (int) vector_kind);
+
 				ItemPointerCopy(&htid, &results[n_results].tid);
 				n_results++;
-				if (sv != (Svec *) DatumGetPointer(val))
-					pfree(sv);
 			}
 		}
 
@@ -2868,7 +3044,8 @@ typedef struct ShnswScanOpaqueData
 	MemoryContext state_ctx;
 
 	/* Deep-copied query vector (scan-owned, survives context resets) */
-	Svec	   *query;
+	float	   *query;
+	int			query_dim;
 
 	/* Results: sorted by exact distance */
 	int			n_results;
@@ -2886,27 +3063,11 @@ shnsw_reset_scan_state(ShnswScanOpaque so)
 {
 	MemoryContextReset(so->state_ctx);
 	so->query = NULL;
+	so->query_dim = 0;
 	so->n_results = 0;
 	so->result_idx = 0;
 	so->result_tids = NULL;
 	so->result_dists = NULL;
-}
-
-static bool
-shnsw_copy_query_arg(ShnswScanOpaque so, ScanKey orderby)
-{
-	MemoryContext old_ctx;
-	Svec	   *copy;
-
-	if (orderby == NULL || (orderby->sk_flags & SK_ISNULL))
-		return false;
-
-	old_ctx = MemoryContextSwitchTo(so->state_ctx);
-	copy = (Svec *) PG_DETOAST_DATUM_COPY(orderby->sk_argument);
-	MemoryContextSwitchTo(old_ctx);
-
-	so->query = copy;
-	return true;
 }
 
 static IndexScanDesc
@@ -2945,16 +3106,22 @@ shnsw_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 			  ScanKey orderbys, int norderbys)
 {
 	ShnswScanOpaque so = (ShnswScanOpaque) scan->opaque;
+	ShnswVectorKind vector_kind;
+	int				dim;
 
 	so->first_call = true;
 	shnsw_reset_scan_state(so);
 
 	if (norderbys > 0 && orderbys)
 	{
+		vector_kind = shnsw_index_vector_kind(scan->indexRelation, &dim);
+
 		/* Deep-copy ORDER BY argument from the orderbys parameter
 		 * (which the executor guarantees is valid at rescan time).
 		 * Copy into scan-owned storage before it can be freed. */
-		(void) shnsw_copy_query_arg(so, &orderbys[0]);
+		(void) shnsw_copy_query_arg_to_float4(&so->query, &so->query_dim,
+											  so->state_ctx, &orderbys[0],
+											  vector_kind, dim);
 
 		memmove(scan->orderByData, orderbys,
 				sizeof(ScanKeyData) * norderbys);
@@ -2974,7 +3141,7 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 	if (so->first_call)
 	{
 		Relation		index = scan->indexRelation;
-		Svec		   *query;
+		ShnswVectorKind	vector_kind;
 		ShnswScanCache *cache;
 		ScanCandidate  *candidates;
 		ScanResult	   *results;
@@ -2983,6 +3150,7 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 		int				ef;
 		int				ep_nid;
 		int				level;
+		int				dim;
 		int				i;
 		MemoryContext	old_ctx = CurrentMemoryContext;
 		MemoryContext	scan_ctx = NULL;
@@ -2993,14 +3161,17 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 		 * Materialize the ORDER BY query into scan-owned memory. The executor's
 		 * ScanKey storage is not ours to retain across context churn.
 		 */
+		vector_kind = shnsw_index_vector_kind(index, &dim);
 		if (so->query == NULL &&
 			(scan->orderByData == NULL ||
-			 !shnsw_copy_query_arg(so, &scan->orderByData[0])))
+			 !shnsw_copy_query_arg_to_float4(&so->query, &so->query_dim,
+											so->state_ctx,
+											&scan->orderByData[0],
+											vector_kind, dim)))
 		{
 			so->n_results = 0;
 			goto done_search;
 		}
-		query = so->query;
 
 		/* Use a scan-scoped memory context for cache allocations */
 		scan_ctx = AllocSetContextCreate(CurrentMemoryContext,
@@ -3008,7 +3179,7 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 										 ALLOCSET_DEFAULT_SIZES);
 		old_ctx = MemoryContextSwitchTo(scan_ctx);
 
-		elog(DEBUG1, "sorted_hnsw scan: query dim=%d", query->dim);
+		elog(DEBUG1, "sorted_hnsw scan: query dim=%d", so->query_dim);
 
 		/* Load index into cache */
 		cache = shnsw_get_scan_cache(index);
@@ -3031,7 +3202,7 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 			int found;
 
 			memset(&one, 0, sizeof(one));
-			found = shnsw_search_level(index, cache, query->x, ep_nid,
+			found = shnsw_search_level(index, cache, so->query, ep_nid,
 									   1, level, &one, 1);
 			if (found > 0)
 				ep_nid = one.nid;
@@ -3044,13 +3215,14 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 			 ep_nid, ef, cache->n_nodes, cache->dim,
 			 cache->sq8_data);
 		candidates = palloc(sizeof(ScanCandidate) * ef);
-		n_cand = shnsw_search_level(index, cache, query->x, ep_nid,
+		n_cand = shnsw_search_level(index, cache, so->query, ep_nid,
 									ef, 0, candidates, ef);
 
 		elog(DEBUG1, "sorted_hnsw scan: L0 search found %d candidates", n_cand);
 
 		results = palloc(sizeof(ScanResult) * Max(ef, 1));
-		n_results = shnsw_rerank_candidates(index, cache, query,
+		n_results = shnsw_rerank_candidates(index, cache, so->query,
+											so->query_dim,
 											candidates, n_cand,
 											results, Max(ef, 1));
 
@@ -3071,12 +3243,14 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 				int				topup_n_results;
 
 				topup_candidates = palloc(sizeof(ScanCandidate) * topup_ef);
-				topup_n_cand = shnsw_search_level(index, cache, query->x, ep_nid,
+				topup_n_cand = shnsw_search_level(index, cache, so->query, ep_nid,
 												 topup_ef, 0,
 												 topup_candidates, topup_ef);
 
 				topup_results = palloc(sizeof(ScanResult) * topup_ef);
-				topup_n_results = shnsw_rerank_candidates(index, cache, query,
+				topup_n_results = shnsw_rerank_candidates(index, cache,
+														  so->query,
+														  so->query_dim,
 														  topup_candidates,
 														  topup_n_cand,
 														  topup_results,
