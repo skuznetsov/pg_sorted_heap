@@ -3178,10 +3178,8 @@ SELECT count(*) FROM scan2_lazy;
 DROP TABLE scan2_lazy;
 
 -- sorted_hnsw regression: see sql/sorted_hnsw.sql (runs in isolation)
--- KNOWN BUG: ordered scan crashes after long session with many prior SQL
--- statements. The sk_argument Datum for ORDER BY becomes invalid when
--- memory contexts are recycled. Works correctly in fresh sessions.
--- Needs investigation: compare amhandler setup with pgvector.
+-- It runs in a separate pg_regress file so the ordered index scan path and
+-- same-session sorted_heap -> sorted_hnsw interaction are exercised explicitly.
 
 -- Cleanup: drop codebook tables (have svec columns) before extension
 DROP TABLE ann_test;

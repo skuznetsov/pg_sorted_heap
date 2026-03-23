@@ -117,6 +117,11 @@ static IndexBulkDeleteResult *shnsw_vacuumcleanup(IndexVacuumInfo *info,
 												   IndexBulkDeleteResult *stats);
 static bool shnsw_validate(Oid opclassoid);
 static bytea *shnsw_options(Datum reloptions, bool validate);
+static void shnsw_write_empty_metapage(Relation index, ForkNumber forknum,
+										int M, int ef_construction, int dim);
+static bool shnsw_bootstrap_first_node(Relation index, const Svec *sv,
+										ItemPointer heap_tid,
+										int M, int ef_construction, int dim);
 
 /* ================================================================
  * AM Handler
@@ -248,6 +253,41 @@ shnsw_flush_page(Relation index, Buffer buf, Page src_page)
 	log_newpage_buffer(buf, true);
 }
 
+static void
+shnsw_write_empty_metapage(Relation index, ForkNumber forknum,
+							 int M, int ef_construction, int dim)
+{
+	Buffer		buf;
+	Page		page;
+	ShnswMetaPageData *meta;
+	ShnswPageOpaque opaque;
+
+	buf = ReadBufferExtended(index, forknum, P_NEW, RBM_NORMAL, NULL);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+
+	page = BufferGetPage(buf);
+	PageInit(page, BLCKSZ, sizeof(ShnswPageOpaqueData));
+	opaque = ShnswPageGetOpaque(page);
+	opaque->shnsw_page_type = SHNSW_PAGE_META;
+	opaque->shnsw_level = 0;
+	opaque->shnsw_next = InvalidBlockNumber;
+
+	meta = (ShnswMetaPageData *) PageGetContents(page);
+	memset(meta, 0, sizeof(ShnswMetaPageData));
+	meta->shnsw_magic = SORTED_HNSW_MAGIC;
+	meta->shnsw_version = SORTED_HNSW_VERSION;
+	meta->shnsw_m = M;
+	meta->shnsw_ef_construction = ef_construction;
+	meta->shnsw_dim = dim;
+	meta->shnsw_entry_nid = -1;
+	meta->shnsw_max_level = -1;
+
+	MarkBufferDirty(buf);
+	if (forknum == MAIN_FORKNUM)
+		log_newpage_buffer(buf, true);
+	UnlockReleaseBuffer(buf);
+}
+
 /* ---- SQ8 quantization helpers ---- */
 
 static inline uint8
@@ -375,8 +415,8 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	if (n_nodes == 0)
 	{
-		/* Empty table — write empty metapage */
-		shnsw_buildempty(index);
+		/* Empty table — initialize the main-fork metapage so aminsert can bootstrap. */
+		shnsw_write_empty_metapage(index, MAIN_FORKNUM, M, ef_construction, dim);
 		result = palloc0(sizeof(IndexBuildResult));
 		return result;
 	}
@@ -726,31 +766,134 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 static void
 shnsw_buildempty(Relation index)
 {
-	/* Write an empty metapage for an unlogged index */
-	Buffer		buf;
-	Page		page;
-	ShnswMetaPageData *meta;
+	int			dim;
+	ShnswOptions *opts;
+	int			M;
+	int			ef_construction;
+
+	opts = (ShnswOptions *) index->rd_options;
+	M = opts ? opts->m : SHNSW_DEFAULT_M;
+	ef_construction = opts ? opts->ef_construction : SHNSW_DEFAULT_EF_CONSTRUCTION;
+	dim = TupleDescAttr(index->rd_att, 0)->atttypmod;
+	if (dim <= 0)
+		dim = 0;
+
+	/* Core uses ambuildempty() for the init fork of unlogged indexes. */
+	shnsw_write_empty_metapage(index, INIT_FORKNUM, M, ef_construction, dim);
+}
+
+static bool
+shnsw_bootstrap_first_node(Relation index, const Svec *sv, ItemPointer heap_tid,
+							 int M, int ef_construction, int dim)
+{
+	float		   *sq8_data;
+	Size			total_bytes;
+	Size			offset;
+	Size			usable;
+	int				sq8_aux_npages;
+	BlockNumber		sq8_start;
+	BlockNumber		l0_start;
+	int				nodes_per_page;
+	int				d;
+	int				p;
+	Buffer			buf;
+	Page			page;
 	ShnswPageOpaque opaque;
+	ShnswNodeHeader *nh;
+	uint8		   *sq8;
+	Buffer			mbuf;
+	Page			mpage;
+	ShnswMetaPageData *meta;
 
-	buf = ReadBufferExtended(index, INIT_FORKNUM, P_NEW, RBM_NORMAL, NULL);
+	total_bytes = 2 * dim * sizeof(float);
+	usable = BLCKSZ - MAXALIGN(SizeOfPageHeaderData) -
+		MAXALIGN(sizeof(ShnswPageOpaqueData));
+	sq8_aux_npages = (int) ceil((double) total_bytes / (double) usable);
+	if (sq8_aux_npages < 1)
+		sq8_aux_npages = 1;
+	sq8_start = 1;
+	l0_start = 1 + sq8_aux_npages;
+	nodes_per_page = ShnswL0NodesPerPage(M, dim);
+	if (nodes_per_page < 1)
+		nodes_per_page = 1;
+
+	/* mins = vector, scales = 0 so the first node quantizes to all-zeroes */
+	sq8_data = palloc0(total_bytes);
+	memcpy(sq8_data, sv->x, sizeof(float) * dim);
+
+	offset = 0;
+	for (p = 0; p < sq8_aux_npages; p++)
+	{
+		Size	chunk;
+
+		buf = ReadBufferExtended(index, MAIN_FORKNUM, P_NEW, RBM_NORMAL, NULL);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+
+		page = palloc0(BLCKSZ);
+		PageInit(page, BLCKSZ, sizeof(ShnswPageOpaqueData));
+		opaque = ShnswPageGetOpaque(page);
+		opaque->shnsw_page_type = SHNSW_PAGE_SQ8_AUX;
+		opaque->shnsw_level = 0;
+		opaque->shnsw_next = (p + 1 < sq8_aux_npages) ? (sq8_start + p + 1) :
+			InvalidBlockNumber;
+
+		chunk = Min(total_bytes - offset, usable);
+		memcpy(PageGetContents(page), (char *) sq8_data + offset, chunk);
+		shnsw_flush_page(index, buf, page);
+		UnlockReleaseBuffer(buf);
+		pfree(page);
+		offset += chunk;
+	}
+	pfree(sq8_data);
+
+	buf = ReadBufferExtended(index, MAIN_FORKNUM, P_NEW, RBM_NORMAL, NULL);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-
-	page = BufferGetPage(buf);
+	page = palloc0(BLCKSZ);
 	PageInit(page, BLCKSZ, sizeof(ShnswPageOpaqueData));
 	opaque = ShnswPageGetOpaque(page);
-	opaque->shnsw_page_type = SHNSW_PAGE_META;
+	opaque->shnsw_page_type = SHNSW_PAGE_L0;
 	opaque->shnsw_level = 0;
 	opaque->shnsw_next = InvalidBlockNumber;
 
-	meta = (ShnswMetaPageData *) PageGetContents(page);
+	nh = (ShnswNodeHeader *) PageGetContents(page);
+	nh->nid = 0;
+	ItemPointerCopy(heap_tid, &nh->heap_tid);
+	nh->level = 0;
+	nh->n_neighbors = 0;
+	nh->flags = 0;
+	nh->padding = 0;
+	for (d = 0; d < 2 * M; d++)
+		ShnswNodeNeighbors(nh)[d] = -1;
+	sq8 = ShnswNodeSQ8Vec(nh, M);
+	memset(sq8, 0, dim);
+
+	shnsw_flush_page(index, buf, page);
+	UnlockReleaseBuffer(buf);
+	pfree(page);
+
+	mbuf = ReadBuffer(index, SHNSW_METAPAGE_BLKNO);
+	LockBuffer(mbuf, BUFFER_LOCK_EXCLUSIVE);
+	mpage = BufferGetPage(mbuf);
+	meta = (ShnswMetaPageData *) PageGetContents(mpage);
 	memset(meta, 0, sizeof(ShnswMetaPageData));
 	meta->shnsw_magic = SORTED_HNSW_MAGIC;
 	meta->shnsw_version = SORTED_HNSW_VERSION;
-	meta->shnsw_entry_nid = -1;
-	meta->shnsw_max_level = -1;
+	meta->shnsw_flags = SHNSW_FLAG_SQ8_VALID;
+	meta->shnsw_m = M;
+	meta->shnsw_ef_construction = ef_construction;
+	meta->shnsw_dim = dim;
+	meta->shnsw_node_count = 1;
+	meta->shnsw_entry_nid = 0;
+	meta->shnsw_max_level = 0;
+	meta->shnsw_sq8_start = sq8_start;
+	meta->shnsw_sq8_npages = sq8_aux_npages;
+	meta->shnsw_l0_start = l0_start;
+	meta->shnsw_l0_npages = 1;
+	MarkBufferDirty(mbuf);
+	log_newpage_buffer(mbuf, false);
+	UnlockReleaseBuffer(mbuf);
 
-	MarkBufferDirty(buf);
-	UnlockReleaseBuffer(buf);
+	return false;
 }
 
 /* ================================================================
@@ -828,6 +971,7 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 	ShnswScanCache *cache;
 	Svec		   *sv;
 	int				dim, M, n_nodes, new_nid;
+	int				ef_construction;
 	int				node_level, level;
 	int				ep_nid;
 	int				nodes_per_page, node_size;
@@ -836,47 +980,84 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 	ScanCandidate  *cand_buf;
 	int32		   *selected;
 	int				d;
+	Buffer			mbuf;
+	Page			mpage;
+	ShnswMetaPageData *meta;
 
 	if (isnull[0])
 		return false;
 
-	/* Load index cache */
-	cache = shnsw_load_cache(index);
-
-	/* Empty index: accept silently. The vector will appear after REINDEX.
-	 * We cannot bootstrap the first node here because the metapage has no
-	 * SQ8 min/max yet (needs at least one full build pass). */
-	if (cache->n_nodes == 0 || cache->entry_nid < 0)
-		return false;
-
 	sv = DatumGetSvecP(values[0]);
-	dim = cache->dim;
-	M = cache->M;
-	n_nodes = cache->n_nodes;
-	l0_start = 0;	/* read from metapage below */
-	nodes_per_page = ShnswL0NodesPerPage(M, dim);
-	node_size = MAXALIGN(ShnswNodeSize(M, dim));
 
-	if (nodes_per_page < 1) nodes_per_page = 1;
+	/* Read metapage parameters first so empty indexes can bootstrap. */
+	mbuf = ReadBuffer(index, SHNSW_METAPAGE_BLKNO);
+	LockBuffer(mbuf, BUFFER_LOCK_SHARE);
+	mpage = BufferGetPage(mbuf);
+	meta = (ShnswMetaPageData *) PageGetContents(mpage);
+	M = meta->shnsw_m;
+	ef_construction = meta->shnsw_ef_construction;
+	dim = meta->shnsw_dim;
+	n_nodes = meta->shnsw_node_count;
+	ep_nid = meta->shnsw_entry_nid;
+	l0_start = meta->shnsw_l0_start;
+	UnlockReleaseBuffer(mbuf);
+
+	if (dim <= 0)
+	{
+		dim = TupleDescAttr(index->rd_att, 0)->atttypmod;
+		if (dim <= 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("sorted_hnsw requires svec with explicit dimension")));
+	}
+	if (M <= 0)
+		M = SHNSW_DEFAULT_M;
+	if (ef_construction <= 0)
+		ef_construction = SHNSW_DEFAULT_EF_CONSTRUCTION;
+
 	if (sv->dim != dim)
 	{
 		ereport(WARNING,
 				(errmsg("sorted_hnsw: insert vector dim %d != index dim %d, skipping",
 						sv->dim, dim)));
+		if (sv != (Svec *) DatumGetPointer(values[0]))
+			pfree(sv);
 		return false;
 	}
 
+	if (n_nodes == 0 || ep_nid < 0)
+	{
+		bool inserted;
+
+		inserted = shnsw_bootstrap_first_node(index, sv, heap_tid,
+											  M, ef_construction, dim);
+		if (sv != (Svec *) DatumGetPointer(values[0]))
+			pfree(sv);
+		return inserted;
+	}
+
+	/* Load index cache */
+	cache = shnsw_load_cache(index);
+	dim = cache->dim;
+	M = cache->M;
+	n_nodes = cache->n_nodes;
+	ep_nid = cache->entry_nid;
+	nodes_per_page = ShnswL0NodesPerPage(M, dim);
+	node_size = MAXALIGN(ShnswNodeSize(M, dim));
+
+	if (nodes_per_page < 1) nodes_per_page = 1;
+
 	/* Read l0_start from metapage */
 	{
-		Buffer	mbuf = ReadBuffer(index, SHNSW_METAPAGE_BLKNO);
-		Page	mpage;
-		ShnswMetaPageData *meta;
+		Buffer	mbuf2 = ReadBuffer(index, SHNSW_METAPAGE_BLKNO);
+		Page	mpage2;
+		ShnswMetaPageData *meta2;
 
-		LockBuffer(mbuf, BUFFER_LOCK_SHARE);
-		mpage = BufferGetPage(mbuf);
-		meta = (ShnswMetaPageData *) PageGetContents(mpage);
-		l0_start = meta->shnsw_l0_start;
-		UnlockReleaseBuffer(mbuf);
+		LockBuffer(mbuf2, BUFFER_LOCK_SHARE);
+		mpage2 = BufferGetPage(mbuf2);
+		meta2 = (ShnswMetaPageData *) PageGetContents(mpage2);
+		l0_start = meta2->shnsw_l0_start;
+		UnlockReleaseBuffer(mbuf2);
 	}
 
 	/* Prepare query vector (float32 copy for SQ8 distance computation) */
@@ -896,7 +1077,6 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 	}
 
 	/* Navigate upper levels to find good entry point for L0 */
-	ep_nid = cache->entry_nid;
 	for (level = cache->max_level; level >= 1; level--)
 	{
 		ScanCandidate one;
@@ -1022,6 +1202,8 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 	}
 
 	pfree(cand_buf);
+	if (sv != (Svec *) DatumGetPointer(values[0]))
+		pfree(sv);
 
 	return false;	/* not unique */
 }
@@ -1555,6 +1737,9 @@ cmp_result_asc(const void *a, const void *b)
 
 typedef struct ShnswScanOpaqueData
 {
+	/* Per-scan memory that survives executor context churn and rescans */
+	MemoryContext state_ctx;
+
 	/* Deep-copied query vector (scan-owned, survives context resets) */
 	Svec	   *query;
 
@@ -1568,6 +1753,34 @@ typedef struct ShnswScanOpaqueData
 } ShnswScanOpaqueData;
 
 typedef ShnswScanOpaqueData *ShnswScanOpaque;
+
+static void
+shnsw_reset_scan_state(ShnswScanOpaque so)
+{
+	MemoryContextReset(so->state_ctx);
+	so->query = NULL;
+	so->n_results = 0;
+	so->result_idx = 0;
+	so->result_tids = NULL;
+	so->result_dists = NULL;
+}
+
+static bool
+shnsw_copy_query_arg(ShnswScanOpaque so, ScanKey orderby)
+{
+	MemoryContext old_ctx;
+	Svec	   *copy;
+
+	if (orderby == NULL || (orderby->sk_flags & SK_ISNULL))
+		return false;
+
+	old_ctx = MemoryContextSwitchTo(so->state_ctx);
+	copy = (Svec *) PG_DETOAST_DATUM_COPY(orderby->sk_argument);
+	MemoryContextSwitchTo(old_ctx);
+
+	so->query = copy;
+	return true;
+}
 
 static IndexScanDesc
 shnsw_beginscan(Relation index, int nkeys, int norderbys)
@@ -1591,6 +1804,9 @@ shnsw_beginscan(Relation index, int nkeys, int norderbys)
 	}
 
 	so = (ShnswScanOpaque) palloc0(sizeof(ShnswScanOpaqueData));
+	so->state_ctx = AllocSetContextCreate(CurrentMemoryContext,
+										  "sorted_hnsw scan state",
+										  ALLOCSET_DEFAULT_SIZES);
 	so->first_call = true;
 	scan->opaque = so;
 
@@ -1604,28 +1820,14 @@ shnsw_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 	ShnswScanOpaque so = (ShnswScanOpaque) scan->opaque;
 
 	so->first_call = true;
-	so->n_results = 0;
-	so->result_idx = 0;
-
-	/* Free previous query copy */
-	if (so->query)
-	{
-		pfree(so->query);
-		so->query = NULL;
-	}
+	shnsw_reset_scan_state(so);
 
 	if (norderbys > 0 && orderbys)
 	{
 		/* Deep-copy ORDER BY argument from the orderbys parameter
 		 * (which the executor guarantees is valid at rescan time).
 		 * Copy into scan-owned storage before it can be freed. */
-		if (!(orderbys[0].sk_flags & SK_ISNULL))
-		{
-			Datum	d = orderbys[0].sk_argument;
-			Svec   *copy = (Svec *) PG_DETOAST_DATUM_COPY(d);
-
-			so->query = copy;
-		}
+		(void) shnsw_copy_query_arg(so, &orderbys[0]);
 
 		memmove(scan->orderByData, orderbys,
 				sizeof(ScanKeyData) * norderbys);
@@ -1661,18 +1863,18 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 
 		so->first_call = false;
 
-		/* Get query vector: prefer scan-owned copy from rescan,
-		 * fall back to orderByData for first-scan-without-rescan. */
-		if (so->query != NULL)
-			query = so->query;
-		else if (scan->orderByData != NULL &&
-				 !(scan->orderByData[0].sk_flags & SK_ISNULL))
-			query = DatumGetSvecP(scan->orderByData[0].sk_argument);
-		else
+		/*
+		 * Materialize the ORDER BY query into scan-owned memory. The executor's
+		 * ScanKey storage is not ours to retain across context churn.
+		 */
+		if (so->query == NULL &&
+			(scan->orderByData == NULL ||
+			 !shnsw_copy_query_arg(so, &scan->orderByData[0])))
 		{
 			so->n_results = 0;
 			goto done_search;
 		}
+		query = so->query;
 
 		/* Use a scan-scoped memory context for cache allocations */
 		scan_ctx = AllocSetContextCreate(CurrentMemoryContext,
@@ -1782,7 +1984,7 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 		/* Store in scan state (allocate in outer context, survives scan_ctx delete) */
 		so->n_results = n_results;
 		so->result_idx = 0;
-		MemoryContextSwitchTo(old_ctx);
+		MemoryContextSwitchTo(so->state_ctx);
 		so->result_tids = palloc(sizeof(ItemPointerData) * Max(n_results, 1));
 		so->result_dists = palloc(sizeof(float8) * Max(n_results, 1));
 		MemoryContextSwitchTo(scan_ctx);
@@ -1830,12 +2032,8 @@ shnsw_endscan(IndexScanDesc scan)
 {
 	ShnswScanOpaque so = (ShnswScanOpaque) scan->opaque;
 
-	if (so->query)
-		pfree(so->query);
-	if (so->result_tids)
-		pfree(so->result_tids);
-	if (so->result_dists)
-		pfree(so->result_dists);
+	if (so->state_ctx != NULL)
+		MemoryContextDelete(so->state_ctx);
 
 	pfree(so);
 	scan->opaque = NULL;
