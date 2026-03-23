@@ -162,6 +162,7 @@ static ShnswScanCache *shnsw_shared_scan_cache_attach(Relation index,
 static bool shnsw_shared_scan_cache_publish(Relation index,
 											 const ShnswScanCache *cache,
 											 uint64 cache_gen);
+static bool shnsw_shared_scan_cache_matches(Relation index, uint64 cache_gen);
 static void shnsw_scan_cache_seed_from_build(Relation index,
 											 HnswBuildState *graph,
 											 const float *vectors,
@@ -446,6 +447,24 @@ shnsw_shared_scan_cache_available(void)
 		shnsw_shared_scan_ctl != NULL &&
 		shnsw_shared_scan_payload != NULL &&
 		shnsw_shared_scan_lock != NULL;
+}
+
+static bool
+shnsw_shared_scan_cache_matches(Relation index, uint64 cache_gen)
+{
+	bool matches;
+
+	if (!shnsw_shared_scan_cache_available())
+		return false;
+
+	LWLockAcquire(shnsw_shared_scan_lock, LW_SHARED);
+	matches = shnsw_shared_scan_ctl->valid &&
+		shnsw_shared_scan_ctl->relid == RelationGetRelid(index) &&
+		RelFileLocatorEquals(shnsw_shared_scan_ctl->locator, index->rd_locator) &&
+		shnsw_shared_scan_ctl->cache_gen == cache_gen;
+	LWLockRelease(shnsw_shared_scan_lock);
+
+	return matches;
 }
 
 static char *
@@ -3149,6 +3168,7 @@ shnsw_costestimate(PlannerInfo *root, IndexPath *path,
 	int			M;
 	int			sq8_npages;
 	int			l0_npages;
+	uint64		cache_gen;
 	int			nodes_per_page;
 	int			lev;
 	double		ef;
@@ -3201,6 +3221,7 @@ shnsw_costestimate(PlannerInfo *root, IndexPath *path,
 	M = SHNSW_DEFAULT_M;
 	sq8_npages = 0;
 	l0_npages = 0;
+	cache_gen = 0;
 	startup_pages = 1.0;	/* metapage */
 
 	{
@@ -3218,6 +3239,7 @@ shnsw_costestimate(PlannerInfo *root, IndexPath *path,
 			M = meta->shnsw_m > 0 ? meta->shnsw_m : M;
 			sq8_npages = Max(meta->shnsw_sq8_npages, 0);
 			l0_npages = Max(meta->shnsw_l0_npages, 0);
+			cache_gen = meta->shnsw_cache_gen;
 			startup_pages += sq8_npages;
 			for (lev = 1; lev < SHNSW_MAX_LEVELS; lev++)
 				startup_pages += Max(meta->shnsw_upper_npages[lev], 0);
@@ -3256,6 +3278,16 @@ shnsw_costestimate(PlannerInfo *root, IndexPath *path,
 			 * warm scans from essentially free operators.
 			 */
 			*indexStartupCost = Max(1.0, startup_pages * cpu_operator_cost);
+		}
+		else if (shnsw_shared_scan_cache_matches(index, cache_gen))
+		{
+			/*
+			 * A matching immutable decoded cache already exists in main shared
+			 * memory, so a fresh backend only pays the wrapper/attach cost.
+			 * Keep this above the backend-local warm case, but well below the
+			 * fully cold path that decodes the graph privately.
+			 */
+			*indexStartupCost = Max(1.0, startup_pages * seq_page_cost * 0.15);
 		}
 		else
 		{
