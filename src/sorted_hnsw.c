@@ -2056,6 +2056,30 @@ shnsw_visited_set(uint64 *bits, int32 nid)
 	bits[w] |= ((uint64) 1 << (nid % 64));
 }
 
+static inline void
+shnsw_find_worst_candidate(const ScanCandidate *best, int n_best,
+						   int *worst_idx, float *worst_dist)
+{
+	int i;
+	int idx = 0;
+	float dist;
+
+	Assert(n_best > 0);
+
+	dist = best[0].dist;
+	for (i = 1; i < n_best; i++)
+	{
+		if (best[i].dist > dist)
+		{
+			idx = i;
+			dist = best[i].dist;
+		}
+	}
+
+	*worst_idx = idx;
+	*worst_dist = dist;
+}
+
 /*
  * Greedy search at one level using SQ8 distances from the cache.
  * Returns sorted candidates (ascending distance).
@@ -2071,8 +2095,10 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 	ScanCandidate *best;		/* max-sorted result set */
 	int			n_cand = 0, n_best = 0;
 	int			dim;
-	int			b, ret;
+	int			ret;
 	int			cand_cap;
+	int			worst_idx = 0;
+	float		worst_dist = 0.0f;
 
 	dim = cache->dim;
 	cand_cap = Max(ef * 8, 64);
@@ -2120,6 +2146,8 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 		best[0].dist = d;
 		best[0].nid = entry_nid;
 		n_best = 1;
+		worst_dist = d;
+		worst_idx = 0;
 		shnsw_visited_set(visited_bits, entry_nid);
 	}
 
@@ -2127,7 +2155,6 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 	{
 		/* Pop nearest candidate */
 		ScanCandidate nearest;
-		float	furthest_dist;
 		int		nn, k;
 		int		min_idx = 0;
 		for (k = 1; k < n_cand; k++)
@@ -2137,12 +2164,7 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 		candidates[min_idx] = candidates[--n_cand];
 
 		/* Check termination */
-		furthest_dist = best[0].dist;
-		for (k = 1; k < n_best; k++)
-			if (best[k].dist > furthest_dist)
-				furthest_dist = best[k].dist;
-
-		if (nearest.dist > furthest_dist && n_best >= ef)
+		if (nearest.dist > worst_dist && n_best >= ef)
 			break;
 
 		/* Get neighbors at this level */
@@ -2179,13 +2201,7 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 					cache->sq8_data + (Size)nbr * dim,
 					cache->sq8_mins, cache->sq8_scales, dim);
 
-				/* Update best set */
-				furthest_dist = best[0].dist;
-				for (b = 1; b < n_best; b++)
-					if (best[b].dist > furthest_dist)
-						furthest_dist = best[b].dist;
-
-				if (nbr_dist < furthest_dist || n_best < ef)
+				if (nbr_dist < worst_dist || n_best < ef)
 				{
 					if (n_cand >= cand_cap)
 					{
@@ -2202,15 +2218,18 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 						best[n_best].dist = nbr_dist;
 						best[n_best].nid = nbr;
 						n_best++;
+						if (nbr_dist > worst_dist)
+						{
+							worst_dist = nbr_dist;
+							worst_idx = n_best - 1;
+						}
 					}
 					else
 					{
-						int worst = 0;
-						for (b = 1; b < n_best; b++)
-							if (best[b].dist > best[worst].dist)
-								worst = b;
-						best[worst].dist = nbr_dist;
-						best[worst].nid = nbr;
+						best[worst_idx].dist = nbr_dist;
+						best[worst_idx].nid = nbr;
+						shnsw_find_worst_candidate(best, n_best,
+												   &worst_idx, &worst_dist);
 					}
 				}
 			}
@@ -2244,12 +2263,7 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 						cache->sq8_data + (Size)nbr * dim,
 						cache->sq8_mins, cache->sq8_scales, dim);
 
-					furthest_dist = best[0].dist;
-					for (b = 1; b < n_best; b++)
-						if (best[b].dist > furthest_dist)
-							furthest_dist = best[b].dist;
-
-					if (nbr_dist < furthest_dist || n_best < ef)
+					if (nbr_dist < worst_dist || n_best < ef)
 					{
 						if (n_cand >= cand_cap)
 						{
@@ -2266,15 +2280,18 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 							best[n_best].dist = nbr_dist;
 							best[n_best].nid = nbr;
 							n_best++;
+							if (nbr_dist > worst_dist)
+							{
+								worst_dist = nbr_dist;
+								worst_idx = n_best - 1;
+							}
 						}
 						else
 						{
-							int worst = 0;
-							for (b = 1; b < n_best; b++)
-								if (best[b].dist > best[worst].dist)
-									worst = b;
-							best[worst].dist = nbr_dist;
-							best[worst].nid = nbr;
+							best[worst_idx].dist = nbr_dist;
+							best[worst_idx].nid = nbr;
+							shnsw_find_worst_candidate(best, n_best,
+													   &worst_idx, &worst_dist);
 						}
 					}
 				}
