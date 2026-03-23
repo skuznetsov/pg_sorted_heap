@@ -277,10 +277,26 @@ and IVF routing are. This confirms hsvec is a safe storage choice for ANN.
 
 Current repo-owned harnesses:
 
+- `python3 scripts/bench_gutenberg_local_dump.py --dump /tmp/cogniformerus_backup/cogniformerus_backup.dump --port 65473`
+- `REMOTE_PYTHON=/home/ubuntu/.venvs/zvec-bench/bin/python ./scripts/bench_gutenberg_aws.sh ubuntu@dev.rigelstar.com /home/ubuntu/clustered_pg /home/ubuntu/cogniformerus_backup.dump 65475`
 - `scripts/bench_sorted_hnsw_vs_pgvector.sh /tmp 65485 10000 20 384 10 vector 64 96`
 - `python3 scripts/bench_ann_real_dataset.py --dataset nytimes-256 --sample-size 10000 --queries 20 --k 10 --pgv-ef 64 --sh-ef 96 --zvec-ef 64 --qdrant-ef 64`
 - `python3 scripts/bench_qdrant_synthetic.py --rows 10000 --queries 20 --dim 384 --k 10 --ef 64`
 - `python3 scripts/bench_zvec_synthetic.py --rows 10000 --queries 20 --dim 384 --k 10 --ef 64`
+
+AWS restored Gutenberg dump (`~104K x 2880D`, top-10, exact heap GT on the
+restored `svec` table). Host: AWS ARM64 `ubuntu@dev.rigelstar.com`, 4 CPU,
+7.6 GiB RAM. The stored `bench_hnsw_gt` table matched the recomputed exact GT
+on 98% of the 50 benchmark queries after restore, so the recall table below
+uses the fresh exact heap GT.
+
+| Method | p50 latency | Recall@10 | Notes |
+|--------|:-----------:|:---------:|-------|
+| Exact heap (`svec`) | 473.237 ms | 100% | brute-force GT on restored corpus |
+| **sorted_hnsw** | **2.177 ms** | **98.2%** | `ef_search=96`, index 404 MB |
+| pgvector HNSW (`halfvec`) | 2.109 ms | 99.8% | `ef_search=64`, index 804 MB |
+| zvec HNSW | 51.130 ms | 100% | in-process collection, `ef=64`, ~1.12 GiB on disk |
+| Qdrant HNSW | 6.689 ms | 99.6% | local Docker on same AWS host, `hnsw_ef=64`, 103,260 points |
 
 Synthetic 10K x 384D cosine corpus, top-10, warm query loop. PostgreSQL
 methods were rerun across 3 fresh builds and the table below reports median
