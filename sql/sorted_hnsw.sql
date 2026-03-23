@@ -88,6 +88,14 @@ SELECT round(min(v <=> '[0.8,0.6,0.9,0.1]'::svec)::numeric, 6) AS exact_after_in
   SELECT v FROM hnsw_test ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec LIMIT 1
 ) x;
 
+-- REINDEX must invalidate cached graph state via relfilenode/cache_gen
+SET client_min_messages = warning;
+REINDEX INDEX hnsw_test_idx;
+SET client_min_messages = notice;
+SELECT round(min(v <=> '[0.8,0.6,0.9,0.1]'::svec)::numeric, 6) AS exact_after_reindex FROM (
+  SELECT v FROM hnsw_test ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec LIMIT 1
+) x;
+
 -- Query after DML
 SELECT count(*) AS query_after_dml FROM (
   SELECT id FROM hnsw_test ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec LIMIT 5

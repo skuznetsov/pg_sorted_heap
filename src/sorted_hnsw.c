@@ -102,6 +102,12 @@ static ShnswScanCache *shnsw_get_scan_cache(Relation index);
 static void shnsw_ensure_scan_cache_hash(void);
 static void shnsw_scan_cache_relcache_callback(Datum arg, Oid relid);
 static void shnsw_scan_cache_invalidate(ShnswScanCacheEntry *entry);
+static void shnsw_scan_cache_seed_from_build(Relation index,
+											 HnswBuildState *graph,
+											 const float *vectors,
+											 const float *sq8_mins,
+											 const float *sq8_scales,
+											 int n_nodes, int dim, int M);
 static void shnsw_scan_cache_record_insert(Relation index, uint64 cache_gen,
 										   ItemPointer heap_tid,
 										   int32 new_nid,
@@ -112,6 +118,7 @@ static void shnsw_scan_cache_record_insert(Relation index, uint64 cache_gen,
 										   int M, int dim);
 static bool shnsw_scan_cache_is_warm(Relation index);
 static uint64 shnsw_read_cache_generation(Relation index);
+static inline uint8 sq8_quantize(float val, float min_val, float scale);
 static int shnsw_search_level(ShnswScanCache *cache, const float *query,
 							  int entry_nid, int ef, int level,
 							  ScanCandidate *results, int max_results);
@@ -315,15 +322,14 @@ shnsw_scan_cache_relcache_callback(Datum arg, Oid relid)
 	if (shnsw_scan_cache_hash == NULL)
 		return;
 
-	if (OidIsValid(relid))
-	{
-		ShnswScanCacheEntry *entry;
-
-		entry = hash_search(shnsw_scan_cache_hash, &relid, HASH_FIND, NULL);
-		if (entry != NULL)
-			shnsw_scan_cache_invalidate(entry);
-	}
-	else
+	/*
+	 * Keep relid-specific entries across relcache refreshes. The scan cache is
+	 * already keyed by relfilenode locator + metapage cache generation, which
+	 * are stricter than generic relcache invalidations and allow a freshly
+	 * built graph to remain warm for the first same-session ordered scan after
+	 * CREATE INDEX. Global invalidations still drop everything.
+	 */
+	if (!OidIsValid(relid))
 	{
 		HASH_SEQ_STATUS status;
 		ShnswScanCacheEntry *entry;
@@ -332,6 +338,133 @@ shnsw_scan_cache_relcache_callback(Datum arg, Oid relid)
 		while ((entry = hash_seq_search(&status)) != NULL)
 			shnsw_scan_cache_invalidate(entry);
 	}
+}
+
+static void
+shnsw_scan_cache_seed_from_build(Relation index,
+								 HnswBuildState *graph,
+								 const float *vectors,
+								 const float *sq8_mins,
+								 const float *sq8_scales,
+								 int n_nodes, int dim, int M)
+{
+	Oid					relid = RelationGetRelid(index);
+	ShnswScanCacheEntry *entry;
+	ShnswScanCache	   *cache;
+	MemoryContext		cache_ctx;
+	MemoryContext		old_ctx;
+	bool				found;
+	uint64				cache_gen;
+	int					max_level;
+	int					i, lev, d;
+
+	shnsw_ensure_scan_cache_hash();
+	cache_gen = shnsw_read_cache_generation(index);
+	entry = hash_search(shnsw_scan_cache_hash, &relid, HASH_ENTER, &found);
+
+	if (found)
+		shnsw_scan_cache_invalidate(entry);
+
+	cache_ctx = AllocSetContextCreate(TopMemoryContext,
+									  "sorted_hnsw build cache",
+									  ALLOCSET_DEFAULT_SIZES);
+	old_ctx = MemoryContextSwitchTo(cache_ctx);
+
+	cache = palloc0(sizeof(ShnswScanCache));
+	max_level = shnsw_build_max_level(graph);
+	cache->M = M;
+	cache->dim = dim;
+	cache->n_nodes = n_nodes;
+	cache->entry_nid = shnsw_build_entry_nid(graph);
+	cache->max_level = max_level;
+	cache->ef_search = sorted_hnsw_ef_search;
+
+	cache->sq8_mins = palloc(sizeof(float) * dim);
+	cache->sq8_scales = palloc(sizeof(float) * dim);
+	memcpy(cache->sq8_mins, sq8_mins, sizeof(float) * dim);
+	memcpy(cache->sq8_scales, sq8_scales, sizeof(float) * dim);
+
+	cache->nodes = palloc0(sizeof(ShnswCacheNode) * n_nodes);
+	cache->sq8_data = palloc((Size) n_nodes * dim);
+
+	for (i = 0; i < n_nodes; i++)
+	{
+		HnswBuiltNode   *bn = shnsw_build_get_node(graph, i);
+		ShnswCacheNode  *cn = &cache->nodes[i];
+		int32		   *nbrs;
+		int				n_l0;
+
+		ItemPointerCopy(&bn->heap_tid, &cn->heap_tid);
+		cn->level = bn->level;
+		cn->flags = 0;
+		n_l0 = Min(bn->n_neighbors[0], 2 * M);
+		cn->n_neighbors = n_l0;
+		cn->neighbors = palloc(sizeof(int32) * 2 * M);
+		nbrs = cn->neighbors;
+		for (d = 0; d < n_l0; d++)
+			nbrs[d] = bn->neighbors[0][d];
+		for (d = n_l0; d < 2 * M; d++)
+			nbrs[d] = -1;
+
+		for (d = 0; d < dim; d++)
+		{
+			cache->sq8_data[(Size) i * dim + d] =
+				sq8_quantize(vectors[(Size) i * dim + d],
+							 sq8_mins[d], sq8_scales[d]);
+		}
+	}
+
+	cache->upper = palloc0(sizeof(ShnswUpperNbr *) * (max_level + 1));
+	cache->upper_count = palloc0(sizeof(int) * (max_level + 1));
+	cache->upper_nbr_idx = palloc0(sizeof(int *) * (max_level + 1));
+
+	for (lev = 1; lev <= max_level; lev++)
+	{
+		int count = 0;
+		int pos = 0;
+
+		for (i = 0; i < n_nodes; i++)
+		{
+			HnswBuiltNode *bn = shnsw_build_get_node(graph, i);
+			if (bn->level >= lev)
+				count++;
+		}
+
+		cache->upper[lev] = palloc0(sizeof(ShnswUpperNbr) * Max(count, 1));
+		cache->upper_count[lev] = count;
+		cache->upper_nbr_idx[lev] = palloc(sizeof(int) * n_nodes);
+		memset(cache->upper_nbr_idx[lev], -1, sizeof(int) * n_nodes);
+
+		for (i = 0; i < n_nodes; i++)
+		{
+			HnswBuiltNode *bn = shnsw_build_get_node(graph, i);
+			ShnswUpperNbr *ue;
+			int n_upper;
+
+			if (bn->level < lev)
+				continue;
+
+			ue = &cache->upper[lev][pos];
+			ue->nid = bn->nid;
+			n_upper = Min(bn->n_neighbors[lev], M);
+			ue->n_neighbors = n_upper;
+			ue->neighbors = palloc(sizeof(int32) * M);
+			for (d = 0; d < n_upper; d++)
+				ue->neighbors[d] = bn->neighbors[lev][d];
+			for (d = n_upper; d < M; d++)
+				ue->neighbors[d] = -1;
+
+			cache->upper_nbr_idx[lev][ue->nid] = pos;
+			pos++;
+		}
+	}
+
+	entry->cache = cache;
+	entry->cache_ctx = cache_ctx;
+	entry->cache_gen = cache_gen;
+	entry->locator = index->rd_locator;
+
+	MemoryContextSwitchTo(old_ctx);
 }
 
 static bool
@@ -997,6 +1130,8 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	/* Ensure all index pages are flushed to disk */
 	FlushRelationBuffers(index);
+	shnsw_scan_cache_seed_from_build(index, graph, vectors, sq8_mins, sq8_scales,
+									 n_nodes, dim, M);
 
 	MemoryContextDelete(build_ctx);
 
