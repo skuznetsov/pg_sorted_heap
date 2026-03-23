@@ -1577,11 +1577,16 @@ shnsw_beginscan(Relation index, int nkeys, int norderbys)
 
 	scan = RelationGetIndexScan(index, nkeys, norderbys);
 
-	/* Allocate orderby result arrays if not done by RelationGetIndexScan */
-	if (norderbys > 0 && scan->xs_orderbyvals == NULL)
+	/*
+	 * Ordered scans write xs_orderbyvals/xs_orderbynulls on every returned
+	 * tuple. Do not rely on RelationGetIndexScan() to initialize them for us;
+	 * on PG18 these fields can be left as indeterminate garbage on first use.
+	 * Fresh scan-owned arrays are cheap and avoid session-dependent crashes.
+	 */
+	if (norderbys > 0)
 	{
 		scan->xs_orderbyvals = palloc0(sizeof(Datum) * norderbys);
-		scan->xs_orderbynulls = palloc(sizeof(bool) * norderbys);
+		scan->xs_orderbynulls = palloc0(sizeof(bool) * norderbys);
 		memset(scan->xs_orderbynulls, true, sizeof(bool) * norderbys);
 	}
 
@@ -1632,6 +1637,11 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 {
 	ShnswScanOpaque so = (ShnswScanOpaque) scan->opaque;
 
+	if (scan->numberOfOrderBys < 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("sorted_hnsw only supports ordered scans with ORDER BY distance")));
+
 	if (so->first_call)
 	{
 		Relation		index = scan->indexRelation;
@@ -1653,11 +1663,6 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 
 		/* Get query vector: prefer scan-owned copy from rescan,
 		 * fall back to orderByData for first-scan-without-rescan. */
-		if (scan->numberOfOrderBys < 1)
-		{
-			so->n_results = 0;
-			goto done_search;
-		}
 		if (so->query != NULL)
 			query = so->query;
 		else if (scan->orderByData != NULL &&
@@ -1804,7 +1809,9 @@ done_search:
 		scan->xs_heaptid = so->result_tids[so->result_idx];
 		scan->xs_recheck = false;
 
-		if (scan->numberOfOrderBys > 0 && scan->xs_orderbyvals != NULL)
+		if (scan->numberOfOrderBys > 0 &&
+			scan->xs_orderbyvals != NULL &&
+			scan->xs_orderbynulls != NULL)
 		{
 			scan->xs_orderbyvals[0] =
 				Float8GetDatum(so->result_dists[so->result_idx]);
@@ -1848,7 +1855,7 @@ shnsw_costestimate(PlannerInfo *root, IndexPath *path,
 					double *indexPages)
 {
 	RelOptInfo *rel = path->path.parent;
-	Relation	index = index_open(path->indexinfo->indexoid, NoLock);
+	Relation	index;
 	int			dim;
 	double		ef;
 	double		visited;
@@ -1856,6 +1863,23 @@ shnsw_costestimate(PlannerInfo *root, IndexPath *path,
 	double		nav_cpu;
 	double		heap_cpu, heap_io;
 	double		toast_chunks, rerank_io, rerank_cpu;
+
+	/*
+	 * sorted_hnsw only supports ORDER BY distance scans. Cost plain index
+	 * scans out of consideration so the planner will not pick this AM for
+	 * unordered queries like COUNT(*), even with enable_seqscan=off.
+	 */
+	if (path->indexorderbys == NIL)
+	{
+		*indexStartupCost = 1.0e12;
+		*indexTotalCost = 1.0e12;
+		*indexSelectivity = 1.0;
+		*indexCorrelation = 0.0;
+		*indexPages = 0;
+		return;
+	}
+
+	index = index_open(path->indexinfo->indexoid, NoLock);
 
 	/* Get vector dimension from index attribute typmod */
 	dim = TupleDescAttr(index->rd_att, 0)->atttypmod;
