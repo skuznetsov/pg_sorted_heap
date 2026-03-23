@@ -27,6 +27,9 @@
 #include "optimizer/optimizer.h"
 #include "common/pg_prng.h"
 #include "storage/smgr.h"
+#include "storage/ipc.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
 
 #include <float.h>
 #include <math.h>
@@ -41,8 +44,12 @@
 
 int		sorted_hnsw_ef_search = 96;
 bool	sorted_hnsw_sq8 = true;
+bool	sorted_hnsw_shared_cache = true;
 
 static relopt_kind shnsw_relopt_kind = 0;
+
+#define SHNSW_SHARED_CACHE_TRANCHE "sorted_hnsw"
+#define SHNSW_SHARED_CACHE_PAYLOAD_BYTES (64 * 1024 * 1024)
 
 /* ---- Shared types used by both Insert and Scan ---- */
 
@@ -93,6 +100,7 @@ typedef struct ShnswScanCache
 	ShnswUpperNbr **upper;
 	int		   *upper_count;
 	int		  **upper_nbr_idx;
+	bool		shared_immutable;
 } ShnswScanCache;
 
 typedef struct ShnswScanCacheEntry
@@ -106,6 +114,39 @@ typedef struct ShnswScanCacheEntry
 
 static HTAB *shnsw_scan_cache_hash = NULL;
 static bool shnsw_scan_cache_callback_registered = false;
+static shmem_request_hook_type prev_shnsw_shmem_request_hook = NULL;
+static shmem_startup_hook_type prev_shnsw_shmem_startup_hook = NULL;
+
+typedef struct ShnswSharedScanCacheCtl
+{
+	bool		valid;
+	Oid			relid;
+	RelFileLocator locator;
+	uint64		cache_gen;
+	int16		M;
+	int16		max_level;
+	int32		dim;
+	int32		n_nodes;
+	int32		entry_nid;
+	BlockNumber	l0_start;
+	int32		l0_npages;
+	int32		nodes_per_page;
+	int32		node_size;
+	Size		payload_bytes;
+	Size		sq8_mins_off;
+	Size		sq8_scales_off;
+	Size		nodes_off;
+	Size		l0_neighbors_off;
+	Size		sq8_data_off;
+	Size		upper_entries_off[SHNSW_MAX_LEVELS];
+	Size		upper_neighbors_off[SHNSW_MAX_LEVELS];
+	Size		upper_nbr_idx_off[SHNSW_MAX_LEVELS];
+	int32		upper_count[SHNSW_MAX_LEVELS];
+} ShnswSharedScanCacheCtl;
+
+static ShnswSharedScanCacheCtl *shnsw_shared_scan_ctl = NULL;
+static char *shnsw_shared_scan_payload = NULL;
+static LWLock *shnsw_shared_scan_lock = NULL;
 
 /* Forward declarations */
 static ShnswScanCache *shnsw_load_cache(Relation index);
@@ -113,6 +154,14 @@ static ShnswScanCache *shnsw_get_scan_cache(Relation index);
 static void shnsw_ensure_scan_cache_hash(void);
 static void shnsw_scan_cache_relcache_callback(Datum arg, Oid relid);
 static void shnsw_scan_cache_invalidate(ShnswScanCacheEntry *entry);
+static void shnsw_shmem_request(void);
+static void shnsw_shmem_startup(void);
+static bool shnsw_shared_scan_cache_available(void);
+static ShnswScanCache *shnsw_shared_scan_cache_attach(Relation index,
+													  uint64 cache_gen);
+static bool shnsw_shared_scan_cache_publish(Relation index,
+											 const ShnswScanCache *cache,
+											 uint64 cache_gen);
 static void shnsw_scan_cache_seed_from_build(Relation index,
 											 HnswBuildState *graph,
 											 const float *vectors,
@@ -127,6 +176,8 @@ static void shnsw_scan_cache_record_insert(Relation index, uint64 cache_gen,
 										   int n_sel,
 										   const uint8 *sq8,
 										   int M, int dim);
+static void shnsw_cache_materialize_all_l0_pages(Relation index,
+												 ShnswScanCache *cache);
 static bool shnsw_scan_cache_is_warm(Relation index);
 static uint64 shnsw_read_cache_generation(Relation index);
 static inline uint8 sq8_quantize(float val, float min_val, float scale);
@@ -269,6 +320,16 @@ sorted_hnsw_init(void)
 		PGC_USERSET, 0,
 		NULL, NULL, NULL);
 
+	DefineCustomBoolVariable(
+		"sorted_hnsw.shared_cache",
+		"Use shared memory for immutable sorted_hnsw scan metadata when "
+		"pg_sorted_heap is loaded via shared_preload_libraries.",
+		NULL,
+		&sorted_hnsw_shared_cache,
+		true,
+		PGC_USERSET, 0,
+		NULL, NULL, NULL);
+
 	/* Register custom reloption kind for sorted_hnsw indexes */
 	shnsw_relopt_kind = add_reloption_kind();
 	add_int_reloption(shnsw_relopt_kind, "m",
@@ -286,6 +347,48 @@ sorted_hnsw_init(void)
 									  (Datum) 0);
 		shnsw_scan_cache_callback_registered = true;
 	}
+
+	prev_shnsw_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook = shnsw_shmem_request;
+	prev_shnsw_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = shnsw_shmem_startup;
+}
+
+static void
+shnsw_shmem_request(void)
+{
+	if (prev_shnsw_shmem_request_hook)
+		prev_shnsw_shmem_request_hook();
+
+	RequestAddinShmemSpace(MAXALIGN(sizeof(ShnswSharedScanCacheCtl)) +
+						   MAXALIGN(SHNSW_SHARED_CACHE_PAYLOAD_BYTES));
+	RequestNamedLWLockTranche(SHNSW_SHARED_CACHE_TRANCHE, 1);
+}
+
+static void
+shnsw_shmem_startup(void)
+{
+	bool	ctl_found;
+	bool	payload_found;
+
+	if (prev_shnsw_shmem_startup_hook)
+		prev_shnsw_shmem_startup_hook();
+
+	shnsw_shared_scan_ctl =
+		ShmemInitStruct("sorted_hnsw shared scan ctl",
+						sizeof(ShnswSharedScanCacheCtl),
+						&ctl_found);
+	shnsw_shared_scan_payload =
+		ShmemInitStruct("sorted_hnsw shared scan payload",
+						SHNSW_SHARED_CACHE_PAYLOAD_BYTES,
+						&payload_found);
+	shnsw_shared_scan_lock =
+		&GetNamedLWLockTranche(SHNSW_SHARED_CACHE_TRANCHE)[0].lock;
+
+	if (!ctl_found)
+		MemSet(shnsw_shared_scan_ctl, 0, sizeof(ShnswSharedScanCacheCtl));
+	if (!payload_found)
+		MemSet(shnsw_shared_scan_payload, 0, SHNSW_SHARED_CACHE_PAYLOAD_BYTES);
 }
 
 /* ================================================================
@@ -334,6 +437,234 @@ shnsw_scan_cache_invalidate(ShnswScanCacheEntry *entry)
 	entry->cache = NULL;
 	entry->cache_gen = 0;
 	memset(&entry->locator, 0, sizeof(entry->locator));
+}
+
+static bool
+shnsw_shared_scan_cache_available(void)
+{
+	return sorted_hnsw_shared_cache &&
+		shnsw_shared_scan_ctl != NULL &&
+		shnsw_shared_scan_payload != NULL &&
+		shnsw_shared_scan_lock != NULL;
+}
+
+static char *
+shnsw_shared_scan_ptr(Size off)
+{
+	return shnsw_shared_scan_payload + off;
+}
+
+static ShnswScanCache *
+shnsw_shared_scan_cache_attach(Relation index, uint64 cache_gen)
+{
+	ShnswScanCache *cache;
+	int				lev;
+
+	if (!shnsw_shared_scan_cache_available())
+		return NULL;
+
+	LWLockAcquire(shnsw_shared_scan_lock, LW_SHARED);
+
+	if (!shnsw_shared_scan_ctl->valid ||
+		shnsw_shared_scan_ctl->relid != RelationGetRelid(index) ||
+		!RelFileLocatorEquals(shnsw_shared_scan_ctl->locator, index->rd_locator) ||
+		shnsw_shared_scan_ctl->cache_gen != cache_gen)
+	{
+		LWLockRelease(shnsw_shared_scan_lock);
+		return NULL;
+	}
+
+	cache = palloc0(sizeof(ShnswScanCache));
+	cache->M = shnsw_shared_scan_ctl->M;
+	cache->dim = shnsw_shared_scan_ctl->dim;
+	cache->n_nodes = shnsw_shared_scan_ctl->n_nodes;
+	cache->entry_nid = shnsw_shared_scan_ctl->entry_nid;
+	cache->max_level = shnsw_shared_scan_ctl->max_level;
+	cache->ef_search = sorted_hnsw_ef_search;
+	cache->l0_start = shnsw_shared_scan_ctl->l0_start;
+	cache->l0_npages = shnsw_shared_scan_ctl->l0_npages;
+	cache->nodes_per_page = shnsw_shared_scan_ctl->nodes_per_page;
+	cache->node_size = shnsw_shared_scan_ctl->node_size;
+	cache->shared_immutable = true;
+
+	cache->sq8_mins = (float *) shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->sq8_mins_off);
+	cache->sq8_scales = (float *) shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->sq8_scales_off);
+	cache->nodes = (ShnswCacheNode *)
+		shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->nodes_off);
+	cache->l0_neighbors = (int32 *)
+		shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->l0_neighbors_off);
+	cache->sq8_data = (uint8 *)
+		shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->sq8_data_off);
+	cache->l0_page_loaded = NULL;
+
+	cache->upper = palloc0(sizeof(ShnswUpperNbr *) * (cache->max_level + 1));
+	cache->upper_count = palloc0(sizeof(int) * (cache->max_level + 1));
+	cache->upper_nbr_idx = palloc0(sizeof(int *) * (cache->max_level + 1));
+
+	for (lev = 1; lev <= cache->max_level; lev++)
+	{
+		cache->upper_count[lev] = shnsw_shared_scan_ctl->upper_count[lev];
+		if (shnsw_shared_scan_ctl->upper_entries_off[lev] != 0)
+			cache->upper[lev] = (ShnswUpperNbr *)
+				shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->upper_entries_off[lev]);
+		if (shnsw_shared_scan_ctl->upper_nbr_idx_off[lev] != 0)
+			cache->upper_nbr_idx[lev] = (int *)
+				shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->upper_nbr_idx_off[lev]);
+	}
+
+	LWLockRelease(shnsw_shared_scan_lock);
+	return cache;
+}
+
+static bool
+shnsw_shared_scan_cache_publish(Relation index, const ShnswScanCache *cache,
+								   uint64 cache_gen)
+{
+	Size		off;
+	Size		sq8_bytes;
+	Size		nodes_bytes;
+	Size		l0_neighbors_bytes;
+	Size		sq8_data_bytes;
+	ShnswScanCache *mutable_cache = (ShnswScanCache *) cache;
+	int			lev;
+
+	if (!shnsw_shared_scan_cache_available())
+		return false;
+
+	shnsw_cache_materialize_all_l0_pages(index, mutable_cache);
+
+	sq8_bytes = sizeof(float) * (Size) cache->dim;
+	nodes_bytes = sizeof(ShnswCacheNode) * (Size) cache->n_nodes;
+	l0_neighbors_bytes = shnsw_l0_neighbors_bytes(cache->n_nodes, cache->M);
+	sq8_data_bytes = (Size) cache->n_nodes * (Size) cache->dim;
+	off = 0;
+	off += MAXALIGN(sq8_bytes);
+	off += MAXALIGN(sq8_bytes);
+	off += MAXALIGN(nodes_bytes);
+	off += MAXALIGN(l0_neighbors_bytes);
+	off += MAXALIGN(sq8_data_bytes);
+
+	for (lev = 1; lev <= cache->max_level; lev++)
+	{
+		int count = cache->upper_count[lev];
+
+		if (count > 0)
+		{
+			off += MAXALIGN(sizeof(ShnswUpperNbr) * (Size) count);
+			off += MAXALIGN(sizeof(int32) * (Size) cache->M * (Size) count);
+		}
+		off += MAXALIGN(sizeof(int) * (Size) cache->n_nodes);
+	}
+
+	if (off > SHNSW_SHARED_CACHE_PAYLOAD_BYTES)
+		return false;
+
+	LWLockAcquire(shnsw_shared_scan_lock, LW_EXCLUSIVE);
+
+	shnsw_shared_scan_ctl->valid = false;
+	shnsw_shared_scan_ctl->relid = RelationGetRelid(index);
+	shnsw_shared_scan_ctl->locator = index->rd_locator;
+	shnsw_shared_scan_ctl->cache_gen = cache_gen;
+	shnsw_shared_scan_ctl->M = cache->M;
+	shnsw_shared_scan_ctl->max_level = cache->max_level;
+	shnsw_shared_scan_ctl->dim = cache->dim;
+	shnsw_shared_scan_ctl->n_nodes = cache->n_nodes;
+	shnsw_shared_scan_ctl->entry_nid = cache->entry_nid;
+	shnsw_shared_scan_ctl->l0_start = cache->l0_start;
+	shnsw_shared_scan_ctl->l0_npages = cache->l0_npages;
+	shnsw_shared_scan_ctl->nodes_per_page = cache->nodes_per_page;
+	shnsw_shared_scan_ctl->node_size = cache->node_size;
+	shnsw_shared_scan_ctl->payload_bytes = off;
+
+	shnsw_shared_scan_ctl->nodes_off = 0;
+	shnsw_shared_scan_ctl->l0_neighbors_off = 0;
+	shnsw_shared_scan_ctl->sq8_data_off = 0;
+	MemSet(shnsw_shared_scan_ctl->upper_entries_off, 0,
+		   sizeof(shnsw_shared_scan_ctl->upper_entries_off));
+	MemSet(shnsw_shared_scan_ctl->upper_neighbors_off, 0,
+		   sizeof(shnsw_shared_scan_ctl->upper_neighbors_off));
+	MemSet(shnsw_shared_scan_ctl->upper_nbr_idx_off, 0,
+		   sizeof(shnsw_shared_scan_ctl->upper_nbr_idx_off));
+	MemSet(shnsw_shared_scan_ctl->upper_count, 0,
+		   sizeof(shnsw_shared_scan_ctl->upper_count));
+
+	off = 0;
+	shnsw_shared_scan_ctl->sq8_mins_off = off;
+	memcpy(shnsw_shared_scan_ptr(off), cache->sq8_mins, sq8_bytes);
+	off += MAXALIGN(sq8_bytes);
+
+	shnsw_shared_scan_ctl->sq8_scales_off = off;
+	memcpy(shnsw_shared_scan_ptr(off), cache->sq8_scales, sq8_bytes);
+	off += MAXALIGN(sq8_bytes);
+
+	shnsw_shared_scan_ctl->nodes_off = off;
+	off += MAXALIGN(nodes_bytes);
+
+	shnsw_shared_scan_ctl->l0_neighbors_off = off;
+	memcpy(shnsw_shared_scan_ptr(off), cache->l0_neighbors, l0_neighbors_bytes);
+	off += MAXALIGN(l0_neighbors_bytes);
+
+	shnsw_shared_scan_ctl->sq8_data_off = off;
+	memcpy(shnsw_shared_scan_ptr(off), cache->sq8_data, sq8_data_bytes);
+	off += MAXALIGN(sq8_data_bytes);
+
+	{
+		ShnswCacheNode *shared_nodes = (ShnswCacheNode *)
+			shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->nodes_off);
+		int32 *shared_l0_neighbors = (int32 *)
+			shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->l0_neighbors_off);
+		int i;
+
+		for (i = 0; i < cache->n_nodes; i++)
+		{
+			shared_nodes[i] = cache->nodes[i];
+			shared_nodes[i].neighbors = shared_l0_neighbors +
+				(Size) i * (Size) (2 * cache->M);
+		}
+	}
+
+	for (lev = 1; lev <= cache->max_level; lev++)
+	{
+		int				count = cache->upper_count[lev];
+		ShnswUpperNbr   *shared_entries = NULL;
+		int32		   *shared_neighbors = NULL;
+		int			   *shared_idx;
+		int				i;
+
+		shnsw_shared_scan_ctl->upper_count[lev] = count;
+
+		if (count > 0)
+		{
+			shnsw_shared_scan_ctl->upper_entries_off[lev] = off;
+			shared_entries = (ShnswUpperNbr *) shnsw_shared_scan_ptr(off);
+			off += MAXALIGN(sizeof(ShnswUpperNbr) * (Size) count);
+
+			shnsw_shared_scan_ctl->upper_neighbors_off[lev] = off;
+			shared_neighbors = (int32 *) shnsw_shared_scan_ptr(off);
+			off += MAXALIGN(sizeof(int32) * (Size) cache->M * (Size) count);
+
+			for (i = 0; i < count; i++)
+			{
+				shared_entries[i].nid = cache->upper[lev][i].nid;
+				shared_entries[i].n_neighbors = cache->upper[lev][i].n_neighbors;
+				shared_entries[i].neighbors = shared_neighbors +
+					(Size) i * (Size) cache->M;
+				memcpy(shared_entries[i].neighbors,
+					   cache->upper[lev][i].neighbors,
+					   sizeof(int32) * (Size) cache->M);
+			}
+		}
+
+		shnsw_shared_scan_ctl->upper_nbr_idx_off[lev] = off;
+		shared_idx = (int *) shnsw_shared_scan_ptr(off);
+		memcpy(shared_idx, cache->upper_nbr_idx[lev],
+			   sizeof(int) * (Size) cache->n_nodes);
+		off += MAXALIGN(sizeof(int) * (Size) cache->n_nodes);
+	}
+
+	shnsw_shared_scan_ctl->valid = true;
+	LWLockRelease(shnsw_shared_scan_lock);
+	return true;
 }
 
 static void
@@ -509,6 +840,7 @@ shnsw_scan_cache_seed_from_build(Relation index,
 	entry->cache_ctx = cache_ctx;
 	entry->cache_gen = cache_gen;
 	entry->locator = index->rd_locator;
+	(void) shnsw_shared_scan_cache_publish(index, cache, cache_gen);
 
 	MemoryContextSwitchTo(old_ctx);
 }
@@ -610,6 +942,21 @@ shnsw_cache_load_l0_page(Relation index, ShnswScanCache *cache, int page_idx)
 	cache->l0_page_loaded[page_idx] = 1;
 }
 
+static void
+shnsw_cache_materialize_all_l0_pages(Relation index, ShnswScanCache *cache)
+{
+	int page_idx;
+
+	if (cache == NULL || cache->l0_page_loaded == NULL)
+		return;
+
+	for (page_idx = 0; page_idx < cache->l0_npages; page_idx++)
+	{
+		if (!cache->l0_page_loaded[page_idx])
+			shnsw_cache_load_l0_page(index, cache, page_idx);
+	}
+}
+
 static bool
 shnsw_cache_ensure_node_loaded(Relation index, ShnswScanCache *cache, int32 nid)
 {
@@ -662,6 +1009,11 @@ shnsw_scan_cache_record_insert(Relation index, uint64 cache_gen,
 		return;
 
 	cache = entry->cache;
+	if (cache->shared_immutable)
+	{
+		shnsw_scan_cache_invalidate(entry);
+		return;
+	}
 	old_n_nodes = cache->n_nodes;
 	if (new_nid != old_n_nodes)
 	{
@@ -2066,7 +2418,12 @@ shnsw_get_scan_cache(Relation index)
 											 "sorted_hnsw cached scan",
 											 ALLOCSET_DEFAULT_SIZES);
 	old_ctx = MemoryContextSwitchTo(entry->cache_ctx);
-	entry->cache = shnsw_load_cache(index);
+	entry->cache = shnsw_shared_scan_cache_attach(index, cache_gen);
+	if (entry->cache == NULL)
+	{
+		entry->cache = shnsw_load_cache(index);
+		(void) shnsw_shared_scan_cache_publish(index, entry->cache, cache_gen);
+	}
 	MemoryContextSwitchTo(old_ctx);
 
 	entry->cache_gen = cache_gen;

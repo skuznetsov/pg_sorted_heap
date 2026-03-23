@@ -11,7 +11,7 @@ set -euo pipefail
 #   graph-shape noise you get when every timing run rebuilds HNSW from scratch.
 #
 # Usage:
-#   ./scripts/bench_sorted_hnsw_fixed_graph.sh [tmp_root] [port] [rows] [runs] [dim] [mode]
+#   ./scripts/bench_sorted_hnsw_fixed_graph.sh [tmp_root] [port] [rows] [runs] [dim] [mode] [preload] [shared_cache]
 #
 # Output:
 #   - per-run execution time in ms
@@ -23,6 +23,8 @@ ROWS="${3:-50000}"
 RUNS="${4:-10}"
 DIM="${5:-4}"
 MODE="${6:-fresh}"
+PRELOAD="${7:-off}"
+SHARED_CACHE="${8:-on}"
 
 if [[ "$TMP_ROOT" != /* ]]; then
   echo "tmp_root must be absolute: $TMP_ROOT" >&2
@@ -46,6 +48,14 @@ if ! [[ "$DIM" =~ ^[0-9]+$ ]] || [ "$DIM" -le 0 ]; then
 fi
 if [[ "$MODE" != "fresh" && "$MODE" != "reuse" ]]; then
   echo "mode must be 'fresh' or 'reuse'" >&2
+  exit 2
+fi
+if [[ "$PRELOAD" != "off" && "$PRELOAD" != "on" ]]; then
+  echo "preload must be 'off' or 'on'" >&2
+  exit 2
+fi
+if [[ "$SHARED_CACHE" != "off" && "$SHARED_CACHE" != "on" ]]; then
+  echo "shared_cache must be 'off' or 'on'" >&2
   exit 2
 fi
 
@@ -90,6 +100,8 @@ echo "rows: $ROWS"
 echo "runs: $RUNS"
 echo "dim:  $DIM"
 echo "mode: $MODE"
+echo "preload: $PRELOAD"
+echo "shared_cache: $SHARED_CACHE"
 echo "port: $PORT"
 echo
 
@@ -105,6 +117,10 @@ fsync = on
 max_wal_size = 1GB
 log_min_messages = warning
 PGCONF
+
+if [[ "$PRELOAD" = "on" ]]; then
+  echo "shared_preload_libraries = 'pg_sorted_heap'" >> "$TMP_DIR/data/postgresql.conf"
+fi
 
 "$PG_BINDIR/pg_ctl" -D "$TMP_DIR/data" -l "$TMP_DIR/postmaster.log" \
   -o "-k $TMP_DIR -p $PORT" start >/dev/null
@@ -140,6 +156,7 @@ if [[ "$MODE" = "fresh" ]]; then
   sum=0
   for i in $(seq 1 "$RUNS"); do
     ms=$(PSQL <<SQL | awk '/Execution Time/ {print $(NF-1)}'
+SET sorted_hnsw.shared_cache = $SHARED_CACHE;
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS)
 SELECT id
 FROM bench
@@ -155,6 +172,7 @@ SQL
 else
   PSQL <<SQL
 SET enable_seqscan = off;
+SET sorted_hnsw.shared_cache = $SHARED_CACHE;
 DO \$warm\$
 BEGIN
   PERFORM id

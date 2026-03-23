@@ -190,6 +190,7 @@ typedef struct ShnswOptions
 
 extern int	sorted_hnsw_ef_search;
 extern bool	sorted_hnsw_sq8;
+extern bool	sorted_hnsw_shared_cache;
 
 /* ---- AM handler ---- */
 
