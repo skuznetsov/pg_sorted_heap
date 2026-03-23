@@ -88,6 +88,14 @@ SELECT round(min(v <=> '[0.8,0.6,0.9,0.1]'::svec)::numeric, 6) AS exact_after_in
   SELECT v FROM hnsw_test ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec LIMIT 1
 ) x;
 
+-- Repeated same-session inserts must keep cached neighbor pointers valid
+INSERT INTO hnsw_test (v)
+SELECT format('[0.8,0.6,0.9,%s]', round((g / 100.0)::numeric, 2))::svec
+FROM generate_series(11, 26) AS g;
+SELECT round(min(v <=> '[0.8,0.6,0.9,0.1]'::svec)::numeric, 6) AS exact_after_many_inserts FROM (
+  SELECT v FROM hnsw_test ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec LIMIT 1
+) x;
+
 -- REINDEX must invalidate cached graph state via relfilenode/cache_gen
 SET client_min_messages = warning;
 REINDEX INDEX hnsw_test_idx;
