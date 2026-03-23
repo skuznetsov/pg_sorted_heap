@@ -1651,16 +1651,23 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 
 		so->first_call = false;
 
-		/* Get query vector directly from orderByData.
-		 * The executor guarantees sk_argument is valid during gettuple.
-		 * (Same approach as pgvector's GetScanValue) */
-		if (scan->numberOfOrderBys < 1 ||
-			(scan->orderByData[0].sk_flags & SK_ISNULL))
+		/* Get query vector: prefer scan-owned copy from rescan,
+		 * fall back to orderByData for first-scan-without-rescan. */
+		if (scan->numberOfOrderBys < 1)
 		{
 			so->n_results = 0;
 			goto done_search;
 		}
-		query = DatumGetSvecP(scan->orderByData[0].sk_argument);
+		if (so->query != NULL)
+			query = so->query;
+		else if (scan->orderByData != NULL &&
+				 !(scan->orderByData[0].sk_flags & SK_ISNULL))
+			query = DatumGetSvecP(scan->orderByData[0].sk_argument);
+		else
+		{
+			so->n_results = 0;
+			goto done_search;
+		}
 
 		/* Use a scan-scoped memory context for cache allocations */
 		scan_ctx = AllocSetContextCreate(CurrentMemoryContext,
