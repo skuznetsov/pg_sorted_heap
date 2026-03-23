@@ -104,6 +104,7 @@ heap-without-index -- roughly 30% less than heap + btree at scale.
 Repo-owned harnesses:
 
 - `scripts/bench_sorted_hnsw_vs_pgvector.sh /tmp 65485 10000 20 384 10 vector 64 96`
+- `python3 scripts/bench_ann_real_dataset.py --dataset nytimes-256 --sample-size 10000 --queries 20 --k 10 --pgv-ef 64 --sh-ef 96 --zvec-ef 64 --qdrant-ef 64`
 - `python3 scripts/bench_qdrant_synthetic.py --rows 10000 --queries 20 --dim 384 --k 10 --ef 64`
 - `python3 scripts/bench_zvec_synthetic.py --rows 10000 --queries 20 --dim 384 --k 10 --ef 64`
 
@@ -119,6 +120,29 @@ Docker collection.
 | pgvector HNSW (`vector`) | 0.446 ms | 90% median (90-95 range) | `ef_search=64`, same `M=16`, `ef_construction=64`, index ~2.0 MB |
 | zvec HNSW | 0.611 ms | 100% | local in-process collection, `ef=64` |
 | Qdrant HNSW | 1.94 ms | 100% | local Docker, `hnsw_ef=64` |
+
+### Current local real-dataset sample (`nytimes-256-angular`)
+
+Repo-owned harness:
+
+- `python3 scripts/bench_ann_real_dataset.py --dataset nytimes-256 --sample-size 10000 --queries 20 --k 10 --pgv-ef 64 --sh-ef 96 --zvec-ef 64 --qdrant-ef 64`
+
+ANN-Benchmarks `nytimes-256-angular`, sampled to 10K base vectors and 20
+queries, top-10. The table below reports medians across 3 full harness runs.
+Ground truth comes from exact PostgreSQL heap search on the sampled `svec`
+corpus.
+
+| Method | p50 latency | Recall@10 | Notes |
+|--------|:-----------:|:---------:|-------|
+| Exact heap (`svec`) | 1.557 ms | 100% | brute-force ground truth |
+| **sorted_hnsw** | **0.327 ms** | **85.0% median** (83.5-85.5 range) | `shared_cache=on`, `ef_search=96`, index ~4.1 MB |
+| pgvector HNSW (`vector`) | 0.751 ms | 79.0% median (78.5-79.0 range) | `ef_search=64`, same `M=16`, `ef_construction=64`, index ~13 MB |
+| zvec HNSW | 0.403 ms | 99.5% | local in-process collection, `ef=64`, ~14.1 MB on disk |
+| Qdrant HNSW | 1.704 ms | 99.5% | local Docker, `hnsw_ef=64` |
+
+This corpus is materially harder than the deterministic synthetic one. It is a
+better signal for default-parameter recall, while the synthetic table remains
+useful for controlled same-host engine comparisons and regression tracking.
 
 ### Legacy/manual IVF-PQ benchmark
 
@@ -216,3 +240,7 @@ The tables above use cross-query (self-match excluded) for honest comparison.
   `scripts/bench_qdrant_synthetic.py`, 3 warm measurement passes on one local
   Docker collection; zvec via `scripts/bench_zvec_synthetic.py`, 3 warm
   measurement passes on one local in-process collection
+- **Current local real-dataset sample:** `scripts/bench_ann_real_dataset.py`
+  on ANN-Benchmarks `nytimes-256-angular`, sampled to 10K base vectors and 20
+  queries. Ground truth is exact PostgreSQL `svec` heap search on the sampled
+  corpus. Numbers above are medians across 3 full harness runs.

@@ -259,6 +259,7 @@ write-heavy workloads.
 Current repo-owned local harnesses:
 
 - `scripts/bench_sorted_hnsw_vs_pgvector.sh /tmp 65485 10000 20 384 10 vector 64 96`
+- `python3 scripts/bench_ann_real_dataset.py --dataset nytimes-256 --sample-size 10000 --queries 20 --k 10 --pgv-ef 64 --sh-ef 96 --zvec-ef 64 --qdrant-ef 64`
 - `python3 scripts/bench_qdrant_synthetic.py --rows 10000 --queries 20 --dim 384 --k 10 --ef 64`
 - `python3 scripts/bench_zvec_synthetic.py --rows 10000 --queries 20 --dim 384 --k 10 --ef 64`
 
@@ -274,6 +275,22 @@ Docker collection.
 | pgvector HNSW (`vector`) | 0.446ms | 90% median (90-95 range) | `ef_search=64`, same `M=16`, `ef_construction=64`, index ~2.0 MB |
 | zvec HNSW | 0.611ms | 100% | local in-process collection, `ef=64` |
 | Qdrant HNSW | 1.94ms | 100% | local Docker, `hnsw_ef=64` |
+
+Real-dataset sample (`nytimes-256-angular`, sampled 10K x 256D, top-10). The
+table below reports medians across 3 full harness runs. Ground truth is exact
+heap search inside PostgreSQL on the sampled corpus, not numpy-side cosine.
+
+| Method | p50 latency | Recall@10 | Notes |
+|--------|:-----------:|:---------:|-------|
+| Exact heap (`svec`) | 1.557ms | 100% | ground truth |
+| **sorted_hnsw** | **0.327ms** | **85.0% median** (83.5-85.5 range) | `shared_cache=on`, `ef_search=96`, index ~4.1 MB |
+| pgvector HNSW (`vector`) | 0.751ms | 79.0% median (78.5-79.0 range) | `ef_search=64`, same `M=16`, `ef_construction=64`, index ~13 MB |
+| zvec HNSW | 0.403ms | 99.5% | local in-process collection, `ef=64`, ~14.1 MB on disk |
+| Qdrant HNSW | 1.704ms | 99.5% | local Docker, `hnsw_ef=64` |
+
+The synthetic corpus is an easy case; the `nytimes-256` sample is a much
+harsher recall test at the same fixed HNSW settings. Treat the synthetic table
+as an upper-bound speed/quality shape, not the only baseline.
 
 ## Quick start
 
