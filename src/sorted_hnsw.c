@@ -45,6 +45,8 @@ typedef struct ScanCandidate
 	int32		nid;
 } ScanCandidate;
 
+typedef struct ScanResult ScanResult;
+
 /* ---- Types shared between Insert and Scan ---- */
 
 typedef struct ShnswCacheNode
@@ -85,6 +87,10 @@ static ShnswScanCache *shnsw_load_cache(Relation index);
 static int shnsw_search_level(ShnswScanCache *cache, const float *query,
 							  int entry_nid, int ef, int level,
 							  ScanCandidate *results, int max_results);
+static int shnsw_rerank_candidates(Relation index, const ShnswScanCache *cache,
+								   const Svec *query,
+								   const ScanCandidate *candidates, int n_cand,
+								   struct ScanResult *results, int max_results);
 
 /* ---- Forward declarations ---- */
 
@@ -1737,11 +1743,11 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 
 /* ---- Result entry for exact rerank ---- */
 
-typedef struct ScanResult
+struct ScanResult
 {
 	ItemPointerData tid;
 	float8		exact_dist;
-} ScanResult;
+};
 
 static int
 cmp_result_asc(const void *a, const void *b)
@@ -1751,6 +1757,70 @@ cmp_result_asc(const void *a, const void *b)
 	if (da < db) return -1;
 	if (da > db) return 1;
 	return 0;
+}
+
+static int
+shnsw_rerank_candidates(Relation index, const ShnswScanCache *cache,
+						   const Svec *query,
+						   const ScanCandidate *candidates, int n_cand,
+						   ScanResult *results, int max_results)
+{
+	Relation	heap;
+	Snapshot	snap;
+	TupleTableSlot *slot;
+	int			i;
+	int			n_results = 0;
+
+	if (n_cand <= 0 || max_results <= 0)
+		return 0;
+
+	heap = table_open(index->rd_index->indrelid, AccessShareLock);
+	snap = GetActiveSnapshot();
+	slot = table_slot_create(heap, NULL);
+
+	for (i = 0; i < n_cand && n_results < max_results; i++)
+	{
+		int32			nid = candidates[i].nid;
+		ItemPointerData	htid;
+		bool			fetched;
+
+		if (nid < 0 || nid >= cache->n_nodes)
+			continue;
+
+		ItemPointerCopy(&cache->nodes[nid].heap_tid, &htid);
+
+		if (!ItemPointerIsValid(&htid))
+			continue;
+
+		fetched = table_tuple_fetch_row_version(heap, &htid, snap, slot);
+		if (fetched)
+		{
+			bool	isnull;
+			Datum	val;
+			Svec   *sv;
+
+			val = slot_getattr(slot,
+							   index->rd_index->indkey.values[0],
+							   &isnull);
+			if (!isnull)
+			{
+				sv = DatumGetSvecP(val);
+				results[n_results].exact_dist =
+					svec_cosine_distance_internal(query, sv);
+				ItemPointerCopy(&htid, &results[n_results].tid);
+				n_results++;
+				if (sv != (Svec *) DatumGetPointer(val))
+					pfree(sv);
+			}
+		}
+
+		ExecClearTuple(slot);
+	}
+
+	ExecDropSingleTupleTableSlot(slot);
+	table_close(heap, AccessShareLock);
+
+	return n_results;
 }
 
 /* ================================================================
@@ -1869,7 +1939,6 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 	if (so->first_call)
 	{
 		Relation		index = scan->indexRelation;
-		Relation		heap;
 		Svec		   *query;
 		ShnswScanCache *cache;
 		ScanCandidate  *candidates;
@@ -1945,57 +2014,50 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 
 		elog(DEBUG1, "sorted_hnsw scan: L0 search found %d candidates", n_cand);
 
-		/* Exact rerank: fetch heap tuples, compute svec <=> distance */
+		results = palloc(sizeof(ScanResult) * Max(ef, 1));
+		n_results = shnsw_rerank_candidates(index, cache, query,
+											candidates, n_cand,
+											results, Max(ef, 1));
+
+		/*
+		 * Writable tables can leave dead heap tuples behind the graph. If the
+		 * first ef-sized batch underflows after MVCC visibility checks, do one
+		 * bounded top-up pass with a wider beam before returning fewer rows.
+		 */
+		if (n_results < Min(ef, cache->n_nodes))
 		{
-			Snapshot		snap = GetActiveSnapshot();
-			TupleTableSlot *slot;
+			int				topup_ef = Min(cache->n_nodes, ef * 2);
 
-			heap = table_open(index->rd_index->indrelid, AccessShareLock);
-			slot = table_slot_create(heap, NULL);
-			results = palloc(sizeof(ScanResult) * n_cand);
-			n_results = 0;
-
-			for (i = 0; i < n_cand; i++)
+			if (topup_ef > ef)
 			{
-				int32			nid = candidates[i].nid;
-				ItemPointerData	htid;
-				bool			fetched;
+				ScanCandidate  *topup_candidates;
+				ScanResult	   *topup_results;
+				int				topup_n_cand;
+				int				topup_n_results;
 
-				if (nid < 0 || nid >= cache->n_nodes)
-					continue;
+				topup_candidates = palloc(sizeof(ScanCandidate) * topup_ef);
+				topup_n_cand = shnsw_search_level(cache, query->x, ep_nid,
+												 topup_ef, 0,
+												 topup_candidates, topup_ef);
 
-				ItemPointerCopy(&cache->nodes[nid].heap_tid, &htid);
+				topup_results = palloc(sizeof(ScanResult) * topup_ef);
+				topup_n_results = shnsw_rerank_candidates(index, cache, query,
+														  topup_candidates,
+														  topup_n_cand,
+														  topup_results,
+														  topup_ef);
 
-				if (!ItemPointerIsValid(&htid))
-					continue;
-
-				fetched = table_tuple_fetch_row_version(heap, &htid,
-														snap, slot);
-				if (fetched)
+				if (topup_n_results > n_results)
 				{
-					bool	isnull;
-					Datum	val;
-					Svec   *sv;
-
-					val = slot_getattr(slot,
-									   index->rd_index->indkey.values[0],
-									   &isnull);
-					if (!isnull)
-					{
-						sv = DatumGetSvecP(val);
-						results[n_results].exact_dist =
-							svec_cosine_distance_internal(query, sv);
-						ItemPointerCopy(&htid, &results[n_results].tid);
-						n_results++;
-						if (sv != (Svec *) DatumGetPointer(val))
-							pfree(sv);
-					}
+					pfree(results);
+					results = topup_results;
+					n_results = topup_n_results;
 				}
-				ExecClearTuple(slot);
-			}
+				else
+					pfree(topup_results);
 
-			ExecDropSingleTupleTableSlot(slot);
-			table_close(heap, AccessShareLock);
+				pfree(topup_candidates);
+			}
 		}
 
 		elog(DEBUG1, "sorted_hnsw scan: reranked %d results", n_results);

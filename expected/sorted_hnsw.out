@@ -62,6 +62,31 @@ SELECT round(min(v <=> (SELECT v FROM hnsw_test WHERE id = 1))::numeric, 6) AS s
   0.000000
 (1 row)
 
+-- Dead heap tuples before VACUUM: top-up must still fill LIMIT K
+CREATE TABLE hnsw_dead (id int PRIMARY KEY, v svec(4));
+INSERT INTO hnsw_dead
+SELECT i,
+       CASE
+         WHEN i <= 20
+           THEN format('[1,%s,0,0]', round((i / 1000.0)::numeric, 3))
+         ELSE format('[0,1,%s,0]', round(((i - 20) / 1000.0)::numeric, 3))
+       END::svec
+FROM generate_series(1, 40) AS i;
+SET client_min_messages = warning;
+CREATE INDEX hnsw_dead_idx ON hnsw_dead USING sorted_hnsw (v) WITH (m = 16, ef_construction = 64);
+SET client_min_messages = notice;
+SET sorted_hnsw.ef_search = 8;
+DELETE FROM hnsw_dead WHERE id BETWEEN 1 AND 10;
+SELECT count(*) AS dead_topup_count FROM (
+  SELECT id FROM hnsw_dead ORDER BY v <=> '[1,0,0,0]'::svec LIMIT 5
+) x;
+ dead_topup_count 
+------------------
+                5
+(1 row)
+
+DROP TABLE hnsw_dead;
+SET sorted_hnsw.ef_search = 32;
 -- DELETE + VACUUM
 DELETE FROM hnsw_test WHERE id BETWEEN 1 AND 5;
 VACUUM hnsw_test;
