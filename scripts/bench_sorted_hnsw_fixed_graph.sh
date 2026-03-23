@@ -11,7 +11,7 @@ set -euo pipefail
 #   graph-shape noise you get when every timing run rebuilds HNSW from scratch.
 #
 # Usage:
-#   ./scripts/bench_sorted_hnsw_fixed_graph.sh [tmp_root] [port] [rows] [runs]
+#   ./scripts/bench_sorted_hnsw_fixed_graph.sh [tmp_root] [port] [rows] [runs] [dim]
 #
 # Output:
 #   - per-run execution time in ms
@@ -21,6 +21,7 @@ TMP_ROOT="${1:-${TMPDIR:-/tmp}}"
 PORT="${2:-65441}"
 ROWS="${3:-50000}"
 RUNS="${4:-10}"
+DIM="${5:-4}"
 
 if [[ "$TMP_ROOT" != /* ]]; then
   echo "tmp_root must be absolute: $TMP_ROOT" >&2
@@ -36,6 +37,10 @@ if ! [[ "$ROWS" =~ ^[0-9]+$ ]] || [ "$ROWS" -le 0 ]; then
 fi
 if ! [[ "$RUNS" =~ ^[0-9]+$ ]] || [ "$RUNS" -le 0 ]; then
   echo "runs must be a positive integer" >&2
+  exit 2
+fi
+if ! [[ "$DIM" =~ ^[0-9]+$ ]] || [ "$DIM" -le 0 ]; then
+  echo "dim must be a positive integer" >&2
   exit 2
 fi
 
@@ -62,11 +67,23 @@ PSQL() {
   "$PG_BINDIR/psql" -h "$TMP_DIR" -p "$PORT" postgres -v ON_ERROR_STOP=1 -qtAX "$@"
 }
 
+make_query_vec() {
+  awk -v dim="$DIM" 'BEGIN {
+    printf "[";
+    for (i = 1; i <= dim; i++) {
+      if (i > 1) printf ",";
+      printf "%.6f", (((i * 19) % 1000) / 1000.0);
+    }
+    printf "]";
+  }'
+}
+
 echo "============================================================"
 echo "sorted_hnsw fixed-graph search benchmark"
 echo "============================================================"
 echo "rows: $ROWS"
 echo "runs: $RUNS"
+echo "dim:  $DIM"
 echo "port: $PORT"
 echo
 
@@ -88,14 +105,18 @@ PGCONF
 
 PSQL <<SQL
 CREATE EXTENSION pg_sorted_heap;
-CREATE TABLE bench(id int PRIMARY KEY, v svec(4));
+CREATE TABLE bench(id int PRIMARY KEY, v svec($DIM));
 INSERT INTO bench
-SELECT g, format('[%s,%s,%s,%s]',
-                 ((g * 17) % 1000)::float / 1000.0,
-                 ((g * 31) % 1000)::float / 1000.0,
-                 ((g * 47) % 1000)::float / 1000.0,
-                 ((g * 61) % 1000)::float / 1000.0)::svec
-FROM generate_series(1, $ROWS) AS g;
+SELECT g,
+       ('[' ||
+        string_agg(
+          ((((g * (((d * 17) % 97) + 1)) + (d * 13)) % 1000)::float / 1000.0)::text,
+          ',' ORDER BY d
+        ) ||
+        ']')::svec($DIM)
+FROM generate_series(1, $ROWS) AS g
+CROSS JOIN LATERAL generate_series(1, $DIM) AS d
+GROUP BY g;
 CREATE INDEX bench_idx ON bench USING sorted_hnsw(v) WITH (m=16, ef_construction=64);
 ANALYZE bench;
 SQL
@@ -103,13 +124,15 @@ SQL
 echo "Built fixed graph once; measuring repeated ordered scans on the same index."
 echo
 
+QUERY_VEC="$(make_query_vec)"
+
 sum=0
 for i in $(seq 1 "$RUNS"); do
-  ms=$(PSQL <<'SQL' | awk '/Execution Time/ {print $(NF-1)}'
+  ms=$(PSQL <<SQL | awk '/Execution Time/ {print $(NF-1)}'
 EXPLAIN (ANALYZE, COSTS OFF, BUFFERS)
 SELECT id
 FROM bench
-ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec
+ORDER BY v <=> '$QUERY_VEC'::svec($DIM)
 LIMIT 10;
 SQL
 )
