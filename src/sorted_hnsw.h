@@ -91,6 +91,7 @@ typedef struct ShnswMetaPageData
 
 	/* SQ8 drift tracking */
 	int32		shnsw_sq8_oor_count;	/* out-of-range insert count */
+	uint64		shnsw_cache_gen;		/* bump on scan-visible graph changes */
 } ShnswMetaPageData;
 
 /* ---- L0 Node (packed in index pages) ---- */

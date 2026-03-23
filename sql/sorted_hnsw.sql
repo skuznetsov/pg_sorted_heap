@@ -72,8 +72,13 @@ SELECT count(*) AS after_delete FROM (
 ) x;
 
 -- INSERT after build
-INSERT INTO hnsw_test (v) VALUES ('[0.5,0.5,0.5,0.5]');
+INSERT INTO hnsw_test (v) VALUES ('[0.8,0.6,0.9,0.1]');
 SELECT count(*) AS total_after_insert FROM hnsw_test;
+
+-- Same-session scan cache must see the new exact vector immediately
+SELECT round(min(v <=> '[0.8,0.6,0.9,0.1]'::svec)::numeric, 6) AS exact_after_insert FROM (
+  SELECT v FROM hnsw_test ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec LIMIT 1
+) x;
 
 -- Query after DML
 SELECT count(*) AS query_after_dml FROM (

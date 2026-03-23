@@ -18,6 +18,8 @@
 #include "optimizer/cost.h"
 #include "storage/bufmgr.h"
 #include "utils/guc.h"
+#include "utils/hsearch.h"
+#include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
@@ -82,8 +84,25 @@ typedef struct ShnswScanCache
 	int		  **upper_nbr_idx;
 } ShnswScanCache;
 
+typedef struct ShnswScanCacheEntry
+{
+	Oid				relid;
+	RelFileLocator	locator;
+	uint64			cache_gen;
+	MemoryContext	cache_ctx;
+	ShnswScanCache *cache;
+} ShnswScanCacheEntry;
+
+static HTAB *shnsw_scan_cache_hash = NULL;
+static bool shnsw_scan_cache_callback_registered = false;
+
 /* Forward declarations */
 static ShnswScanCache *shnsw_load_cache(Relation index);
+static ShnswScanCache *shnsw_get_scan_cache(Relation index);
+static void shnsw_ensure_scan_cache_hash(void);
+static void shnsw_scan_cache_relcache_callback(Datum arg, Oid relid);
+static void shnsw_scan_cache_invalidate(ShnswScanCacheEntry *entry);
+static uint64 shnsw_read_cache_generation(Relation index);
 static int shnsw_search_level(ShnswScanCache *cache, const float *query,
 							  int entry_nid, int ef, int level,
 							  ScanCandidate *results, int max_results);
@@ -224,6 +243,13 @@ sorted_hnsw_init(void)
 					  "Build-time beam width for HNSW graph construction",
 					  SHNSW_DEFAULT_EF_CONSTRUCTION, 4, SHNSW_MAX_EF_CONSTRUCTION,
 					  AccessExclusiveLock);
+
+	if (!shnsw_scan_cache_callback_registered)
+	{
+		CacheRegisterRelcacheCallback(shnsw_scan_cache_relcache_callback,
+									  (Datum) 0);
+		shnsw_scan_cache_callback_registered = true;
+	}
 }
 
 /* ================================================================
@@ -242,6 +268,79 @@ shnsw_options(Datum reloptions, bool validate)
 									  shnsw_relopt_kind,
 									  sizeof(ShnswOptions),
 									  tab, lengthof(tab));
+}
+
+static void
+shnsw_ensure_scan_cache_hash(void)
+{
+	HASHCTL ctl;
+
+	if (shnsw_scan_cache_hash != NULL)
+		return;
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(ShnswScanCacheEntry);
+	ctl.hcxt = TopMemoryContext;
+	shnsw_scan_cache_hash = hash_create("sorted_hnsw scan cache",
+										32, &ctl,
+										HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+static void
+shnsw_scan_cache_invalidate(ShnswScanCacheEntry *entry)
+{
+	if (entry->cache_ctx != NULL)
+	{
+		MemoryContextDelete(entry->cache_ctx);
+		entry->cache_ctx = NULL;
+	}
+	entry->cache = NULL;
+	entry->cache_gen = 0;
+	memset(&entry->locator, 0, sizeof(entry->locator));
+}
+
+static void
+shnsw_scan_cache_relcache_callback(Datum arg, Oid relid)
+{
+	if (shnsw_scan_cache_hash == NULL)
+		return;
+
+	if (OidIsValid(relid))
+	{
+		ShnswScanCacheEntry *entry;
+
+		entry = hash_search(shnsw_scan_cache_hash, &relid, HASH_FIND, NULL);
+		if (entry != NULL)
+			shnsw_scan_cache_invalidate(entry);
+	}
+	else
+	{
+		HASH_SEQ_STATUS status;
+		ShnswScanCacheEntry *entry;
+
+		hash_seq_init(&status, shnsw_scan_cache_hash);
+		while ((entry = hash_seq_search(&status)) != NULL)
+			shnsw_scan_cache_invalidate(entry);
+	}
+}
+
+static uint64
+shnsw_read_cache_generation(Relation index)
+{
+	Buffer	buf;
+	Page	page;
+	ShnswMetaPageData *meta;
+	uint64	gen;
+
+	buf = ReadBuffer(index, SHNSW_METAPAGE_BLKNO);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	meta = (ShnswMetaPageData *) PageGetContents(page);
+	gen = meta->shnsw_cache_gen;
+	UnlockReleaseBuffer(buf);
+
+	return gen;
 }
 
 /* ================================================================
@@ -287,6 +386,7 @@ shnsw_write_empty_metapage(Relation index, ForkNumber forknum,
 	meta->shnsw_dim = dim;
 	meta->shnsw_entry_nid = -1;
 	meta->shnsw_max_level = -1;
+	meta->shnsw_cache_gen = 1;
 
 	MarkBufferDirty(buf);
 	if (forknum == MAIN_FORKNUM)
@@ -744,6 +844,7 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 			meta->shnsw_l0_npages = upper_starts[1] > 0 ?
 				upper_starts[1] - l0_start_blk :
 				next_blkno - l0_start_blk;
+			meta->shnsw_cache_gen = 1;
 			for (lev = 1; lev < SHNSW_MAX_LEVELS; lev++)
 			{
 				meta->shnsw_upper_start[lev] = upper_starts[lev];
@@ -895,6 +996,7 @@ shnsw_bootstrap_first_node(Relation index, const Svec *sv, ItemPointer heap_tid,
 	meta->shnsw_sq8_npages = sq8_aux_npages;
 	meta->shnsw_l0_start = l0_start;
 	meta->shnsw_l0_npages = 1;
+	meta->shnsw_cache_gen = 1;
 	MarkBufferDirty(mbuf);
 	log_newpage_buffer(mbuf, false);
 	UnlockReleaseBuffer(mbuf);
@@ -1199,6 +1301,7 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 			mpage = BufferGetPage(mbuf);
 			meta = (ShnswMetaPageData *) PageGetContents(mpage);
 			meta->shnsw_node_count++;
+			meta->shnsw_cache_gen++;
 			MarkBufferDirty(mbuf);
 			log_newpage_buffer(mbuf, false);
 			UnlockReleaseBuffer(mbuf);
@@ -1479,6 +1582,42 @@ shnsw_load_cache(Relation index)
 	}
 
 	return cache;
+}
+
+static ShnswScanCache *
+shnsw_get_scan_cache(Relation index)
+{
+	Oid					relid = RelationGetRelid(index);
+	uint64				cache_gen;
+	ShnswScanCacheEntry *entry;
+	bool				found;
+	MemoryContext		old_ctx;
+
+	shnsw_ensure_scan_cache_hash();
+	cache_gen = shnsw_read_cache_generation(index);
+	entry = hash_search(shnsw_scan_cache_hash, &relid, HASH_ENTER, &found);
+
+	if (found &&
+		entry->cache != NULL &&
+		entry->cache_gen == cache_gen &&
+		memcmp(&entry->locator, &index->rd_locator,
+			   sizeof(RelFileLocator)) == 0)
+		return entry->cache;
+
+	if (found)
+		shnsw_scan_cache_invalidate(entry);
+
+	entry->cache_ctx = AllocSetContextCreate(TopMemoryContext,
+											 "sorted_hnsw cached scan",
+											 ALLOCSET_DEFAULT_SIZES);
+	old_ctx = MemoryContextSwitchTo(entry->cache_ctx);
+	entry->cache = shnsw_load_cache(index);
+	MemoryContextSwitchTo(old_ctx);
+
+	entry->cache_gen = cache_gen;
+	entry->locator = index->rd_locator;
+
+	return entry->cache;
 }
 
 /* ---- Graph search using scan cache ---- */
@@ -1976,7 +2115,7 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 		elog(DEBUG1, "sorted_hnsw scan: query dim=%d", query->dim);
 
 		/* Load index into cache */
-		cache = shnsw_load_cache(index);
+		cache = shnsw_get_scan_cache(index);
 		if (cache->n_nodes == 0)
 		{
 			so->n_results = 0;
@@ -2305,6 +2444,22 @@ shnsw_bulkdelete(IndexVacuumInfo *info,
 
 	stats->tuples_removed = n_deleted;
 	stats->num_index_tuples = n_nodes - n_deleted;
+
+	if (n_deleted > 0)
+	{
+		Buffer		update_mbuf;
+		Page		update_mpage;
+		ShnswMetaPageData *update_meta;
+
+		update_mbuf = ReadBuffer(index, SHNSW_METAPAGE_BLKNO);
+		LockBuffer(update_mbuf, BUFFER_LOCK_EXCLUSIVE);
+		update_mpage = BufferGetPage(update_mbuf);
+		update_meta = (ShnswMetaPageData *) PageGetContents(update_mpage);
+		update_meta->shnsw_cache_gen++;
+		MarkBufferDirty(update_mbuf);
+		log_newpage_buffer(update_mbuf, false);
+		UnlockReleaseBuffer(update_mbuf);
+	}
 
 	return stats;
 }
