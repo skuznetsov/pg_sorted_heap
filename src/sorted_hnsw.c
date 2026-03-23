@@ -2030,15 +2030,15 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 	int			cand_cap;
 
 	dim = cache->dim;
-	cand_cap = Max(ef * 8, cache->n_nodes * 2);
+	cand_cap = Max(ef * 8, 64);
 	visited_nwords = Max(1, (cache->n_nodes + 63) / 64);
 
 	elog(DEBUG1, "shnsw_search_level: allocating cand_cap=%d n_nodes=%d", cand_cap, cache->n_nodes);
 	visited_bits = palloc0(sizeof(uint64) * visited_nwords);
 	elog(DEBUG1, "shnsw_search_level: visited=%p", visited_bits);
-	candidates = palloc0(sizeof(ScanCandidate) * (cand_cap + 1));
+	candidates = palloc(sizeof(ScanCandidate) * cand_cap);
 	elog(DEBUG1, "shnsw_search_level: candidates=%p", candidates);
-	best = palloc0(sizeof(ScanCandidate) * (ef + 2));
+	best = palloc(sizeof(ScanCandidate) * (ef + 2));
 	elog(DEBUG1, "shnsw_search_level: best=%p, validating entry", best);
 
 	/* Validate entry point */
