@@ -1646,18 +1646,21 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 		int				ep_nid;
 		int				level;
 		int				i;
-		MemoryContext	old_ctx;
-		MemoryContext	scan_ctx;
+		MemoryContext	old_ctx = CurrentMemoryContext;
+		MemoryContext	scan_ctx = NULL;
 
 		so->first_call = false;
 
-		/* Use the scan-owned deep copy from rescan */
-		if (scan->numberOfOrderBys < 1 || so->query == NULL)
+		/* Get query vector directly from orderByData.
+		 * The executor guarantees sk_argument is valid during gettuple.
+		 * (Same approach as pgvector's GetScanValue) */
+		if (scan->numberOfOrderBys < 1 ||
+			(scan->orderByData[0].sk_flags & SK_ISNULL))
 		{
 			so->n_results = 0;
 			goto done_search;
 		}
-		query = so->query;
+		query = DatumGetSvecP(scan->orderByData[0].sk_argument);
 
 		/* Use a scan-scoped memory context for cache allocations */
 		scan_ctx = AllocSetContextCreate(CurrentMemoryContext,
@@ -1781,8 +1784,11 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 		pfree(candidates);
 
 done_search:
-		MemoryContextSwitchTo(old_ctx);
-		MemoryContextDelete(scan_ctx);
+		if (scan_ctx != NULL)
+		{
+			MemoryContextSwitchTo(old_ctx);
+			MemoryContextDelete(scan_ctx);
+		}
 	}
 
 	/* Return next result */

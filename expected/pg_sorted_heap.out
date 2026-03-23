@@ -4684,8 +4684,11 @@ SELECT count(*) FROM scan2_lazy;
 (1 row)
 
 DROP TABLE scan2_lazy;
--- HNSW tests: sql/sorted_hnsw.sql (isolated — passes sorted_heap + HNSW combo
--- manually, but full regression suite has memory corruption from prior tests)
+-- sorted_hnsw regression: see sql/sorted_hnsw.sql (runs in isolation)
+-- KNOWN BUG: ordered scan crashes after long session with many prior SQL
+-- statements. The sk_argument Datum for ORDER BY becomes invalid when
+-- memory contexts are recycled. Works correctly in fresh sessions.
+-- Needs investigation: compare amhandler setup with pgvector.
 -- Cleanup: drop codebook tables (have svec columns) before extension
 DROP TABLE ann_test;
 DROP TABLE IF EXISTS _ivf_centroids, _pq_codebooks, _ivf_meta, _pq_codebook_meta;
