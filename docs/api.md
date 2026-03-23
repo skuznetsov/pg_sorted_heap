@@ -234,9 +234,10 @@ SET sorted_heap.hnsw_cache_l0 = on;
 | Default | `0` (disabled) |
 | Context | user (SET) |
 
-Patience-based early termination for L0 beam search. When set to N > 0, the
-search stops after N consecutive expansions that don't improve the result set.
-`ef_search` becomes the maximum budget.
+Patience-based early termination for L0 beam search. Applies to both
+`svec_hnsw_scan()` and `sorted_hnsw` ordered index scans. When set to N > 0,
+the search stops after N consecutive expansions that don't improve the result
+set. `ef_search` becomes the maximum budget.
 
 ```sql
 SET sorted_heap.hnsw_ef_patience = 20;

@@ -42,6 +42,11 @@ SELECT count(*) AS hnsw_result_count FROM (
 SELECT round(min(v <=> (SELECT v FROM hnsw_test WHERE id = 1))::numeric, 6) AS self_dist FROM (
   SELECT v FROM hnsw_test ORDER BY v <=> (SELECT v FROM hnsw_test WHERE id = 1) LIMIT 5
 ) x;
+SET sorted_heap.hnsw_ef_patience = 4;
+SELECT round(min(v <=> (SELECT v FROM hnsw_test WHERE id = 1))::numeric, 6) AS self_dist_patience FROM (
+  SELECT v FROM hnsw_test ORDER BY v <=> (SELECT v FROM hnsw_test WHERE id = 1) LIMIT 5
+) x;
+RESET sorted_heap.hnsw_ef_patience;
 
 -- Planner guard: automatic index path is only valid for LIMIT <= ef_search
 RESET enable_seqscan;

@@ -6,6 +6,7 @@
  * Phase 1 MVP: build + scan + insert + lazy delete.
  */
 #include "sorted_hnsw.h"
+#include "sorted_heap.h"
 
 #include "access/amapi.h"
 #include "access/reloptions.h"
@@ -2101,11 +2102,14 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 	float		worst_dist = 0.0f;
 	double		query_norm = 0.0;
 	double		query_inv_norm = 0.0;
+	int			patience;
+	int			stale_steps = 0;
 	int			q;
 
 	dim = cache->dim;
 	cand_cap = Max(ef * 8, 64);
 	visited_nwords = Max(1, (cache->n_nodes + 63) / 64);
+	patience = (level == 0) ? sorted_heap_hnsw_ef_patience : 0;
 	for (q = 0; q < dim; q++)
 	{
 		double qd = (double) query[q];
@@ -2169,6 +2173,7 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 		ScanCandidate nearest;
 		int		nn, k;
 		int		min_idx = 0;
+		bool	improved = false;
 		for (k = 1; k < n_cand; k++)
 			if (candidates[k].dist < candidates[min_idx].dist)
 				min_idx = k;
@@ -2231,6 +2236,7 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 						best[n_best].dist = nbr_dist;
 						best[n_best].nid = nbr;
 						n_best++;
+						improved = true;
 						if (nbr_dist > worst_dist)
 						{
 							worst_dist = nbr_dist;
@@ -2243,6 +2249,7 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 						best[worst_idx].nid = nbr;
 						shnsw_find_worst_candidate(best, n_best,
 												   &worst_idx, &worst_dist);
+						improved = true;
 					}
 				}
 			}
@@ -2289,28 +2296,38 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 						candidates[n_cand].nid = nbr;
 						n_cand++;
 
-						if (n_best < ef)
+					if (n_best < ef)
+					{
+						best[n_best].dist = nbr_dist;
+						best[n_best].nid = nbr;
+						n_best++;
+						improved = true;
+						if (nbr_dist > worst_dist)
 						{
-							best[n_best].dist = nbr_dist;
-							best[n_best].nid = nbr;
-							n_best++;
-							if (nbr_dist > worst_dist)
-							{
-								worst_dist = nbr_dist;
-								worst_idx = n_best - 1;
-							}
+							worst_dist = nbr_dist;
+							worst_idx = n_best - 1;
 						}
-						else
-						{
-							best[worst_idx].dist = nbr_dist;
-							best[worst_idx].nid = nbr;
-							shnsw_find_worst_candidate(best, n_best,
-													   &worst_idx, &worst_dist);
 						}
+					else
+					{
+						best[worst_idx].dist = nbr_dist;
+						best[worst_idx].nid = nbr;
+						shnsw_find_worst_candidate(best, n_best,
+												   &worst_idx, &worst_dist);
+						improved = true;
 					}
 				}
 			}
 		}
+
+		if (patience > 0 && n_best >= ef)
+		{
+			if (improved)
+				stale_steps = 0;
+			else if (++stale_steps >= patience)
+				break;
+		}
+	}
 	}
 
 	/* Copy best to results */
