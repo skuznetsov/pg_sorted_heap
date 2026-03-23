@@ -48,6 +48,7 @@ create_cluster() {
   "$PG_BINDIR/initdb" -D "$dir/data" -A trust --no-locale >/dev/null 2>&1
   cat >> "$dir/data/postgresql.conf" <<'PGCONF'
 log_min_messages = warning
+listen_addresses = ''
 checkpoint_timeout = 30s
 max_wal_size = 64MB
 PGCONF
