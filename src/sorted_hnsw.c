@@ -1488,6 +1488,24 @@ cmp_candidate_asc(const void *a, const void *b)
 	return 0;
 }
 
+static inline bool
+shnsw_visited_test(const uint64 *bits, int nwords, int32 nid)
+{
+	int w = nid / 64;
+
+	if (nid < 0 || w >= nwords)
+		return false;
+	return (bits[w] & ((uint64) 1 << (nid % 64))) != 0;
+}
+
+static inline void
+shnsw_visited_set(uint64 *bits, int32 nid)
+{
+	int w = nid / 64;
+
+	bits[w] |= ((uint64) 1 << (nid % 64));
+}
+
 /*
  * Greedy search at one level using SQ8 distances from the cache.
  * Returns sorted candidates (ascending distance).
@@ -1497,7 +1515,8 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 				   int entry_nid, int ef, int level,
 				   ScanCandidate *results, int max_results)
 {
-	bool	   *visited;
+	uint64	   *visited_bits;
+	int			visited_nwords;
 	ScanCandidate *candidates;	/* min-sorted working set */
 	ScanCandidate *best;		/* max-sorted result set */
 	int			n_cand = 0, n_best = 0;
@@ -1507,10 +1526,11 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 
 	dim = cache->dim;
 	cand_cap = Max(ef * 8, cache->n_nodes * 2);
+	visited_nwords = Max(1, (cache->n_nodes + 63) / 64);
 
 	elog(DEBUG1, "shnsw_search_level: allocating cand_cap=%d n_nodes=%d", cand_cap, cache->n_nodes);
-	visited = palloc0(sizeof(bool) * (cache->n_nodes + 1));
-	elog(DEBUG1, "shnsw_search_level: visited=%p", visited);
+	visited_bits = palloc0(sizeof(uint64) * visited_nwords);
+	elog(DEBUG1, "shnsw_search_level: visited=%p", visited_bits);
 	candidates = palloc0(sizeof(ScanCandidate) * (cand_cap + 1));
 	elog(DEBUG1, "shnsw_search_level: candidates=%p", candidates);
 	best = palloc0(sizeof(ScanCandidate) * (ef + 2));
@@ -1519,7 +1539,7 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 	/* Validate entry point */
 	if (entry_nid < 0 || entry_nid >= cache->n_nodes)
 	{
-		pfree(visited);
+		pfree(visited_bits);
 		pfree(candidates);
 		pfree(best);
 		return 0;
@@ -1528,7 +1548,7 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 	{
 		elog(WARNING, "shnsw_search: entry nid=%d has NULL neighbors (n_nodes=%d)",
 			 entry_nid, cache->n_nodes);
-		pfree(visited);
+		pfree(visited_bits);
 		pfree(candidates);
 		pfree(best);
 		return 0;
@@ -1550,7 +1570,7 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 		best[0].dist = d;
 		best[0].nid = entry_nid;
 		n_best = 1;
-		visited[entry_nid] = true;
+		shnsw_visited_set(visited_bits, entry_nid);
 	}
 
 	while (n_cand > 0)
@@ -1589,9 +1609,10 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 				int32 nbr = cn->neighbors[k];
 				float nbr_dist;
 
-				if (nbr < 0 || nbr >= cache->n_nodes || visited[nbr])
+				if (nbr < 0 || nbr >= cache->n_nodes ||
+					shnsw_visited_test(visited_bits, visited_nwords, nbr))
 					continue;
-				visited[nbr] = true;
+				shnsw_visited_set(visited_bits, nbr);
 
 				/* Skip deleted nodes */
 				if (cache->nodes[nbr].flags & SHNSW_NODE_DELETED)
@@ -1651,9 +1672,10 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 					int32 nbr = un->neighbors[k];
 					float nbr_dist;
 
-					if (nbr < 0 || nbr >= cache->n_nodes || visited[nbr])
+					if (nbr < 0 || nbr >= cache->n_nodes ||
+						shnsw_visited_test(visited_bits, visited_nwords, nbr))
 						continue;
-					visited[nbr] = true;
+					shnsw_visited_set(visited_bits, nbr);
 
 					if (cache->nodes[nbr].flags & SHNSW_NODE_DELETED)
 						continue;
@@ -1706,7 +1728,7 @@ shnsw_search_level(ShnswScanCache *cache, const float *query,
 	ret = Min(n_best, max_results);
 	memcpy(results, best, sizeof(ScanCandidate) * ret);
 
-	pfree(visited);
+	pfree(visited_bits);
 	pfree(candidates);
 	pfree(best);
 
