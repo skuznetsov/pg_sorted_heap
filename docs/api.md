@@ -243,6 +243,25 @@ set. `ef_search` becomes the maximum budget.
 SET sorted_heap.hnsw_ef_patience = 20;
 ```
 
+### `sorted_hnsw.shared_cache`
+
+| Property | Value |
+|----------|-------|
+| Type | boolean |
+| Default | `on` |
+| Context | user (SET) |
+
+Enables the preloaded shared decoded scan cache for ordered `sorted_hnsw`
+index scans. Effective only when `pg_sorted_heap` is loaded via
+`shared_preload_libraries`; otherwise scans fall back to backend-local cache
+builds. When active, fresh backends can attach to a shared immutable snapshot
+keyed by `{relid, relfilenode, cache_gen}` instead of rebuilding the decoded
+graph privately.
+
+```sql
+SET sorted_hnsw.shared_cache = on;
+```
+
 ### `sorted_heap.ann_timing`
 
 | Property | Value |

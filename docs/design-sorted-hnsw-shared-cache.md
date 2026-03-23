@@ -1,5 +1,16 @@
 # Design: `sorted_hnsw` Shared Scan Cache
 
+## Status
+
+Implemented in:
+
+- `f33d620` `perf: share decoded sorted_hnsw scan cache across backends`
+- `27e77a3` `perf: cost sorted_hnsw shared-cache startup separately`
+
+The original upper-level-only payload was a useful falsifier, but it only cut
+fresh 50k/384D scans by about 10% and missed the bar. The implemented version
+therefore promotes the shared slot to a full decoded immutable scan snapshot.
+
 ## Problem
 
 `sorted_hnsw` already keeps a decoded scan cache per backend in
@@ -19,7 +30,7 @@ The new fixed-graph harness can now measure the gap directly:
 - `fresh` mode: one ordered scan per new backend
 - `reuse` mode: one warmup query, then repeated scans in a single backend
 
-Representative 384D result on the current tree:
+Representative pre-shared-cache 384D result:
 
 - `fresh avg_ms = 0.5803`
 - `reuse avg_ms = 0.3007`
@@ -52,7 +63,7 @@ Today each backend does:
 
 That means `fresh` mode repeatedly duplicates the same immutable decode work.
 
-## Proposed Phase A: single-slot shared immutable cache
+## Implemented Phase A: single-slot shared immutable cache
 
 Start with one experimental shared cache slot, effective only when the
 extension is loaded via `shared_preload_libraries`.
@@ -65,10 +76,13 @@ Why a single slot first:
 
 ### What to share
 
-Share only immutable scan-side data:
+Share immutable decoded scan-side data:
 
 - SQ8 mins
 - SQ8 scales
+- decoded L0 node headers
+- decoded L0 neighbor slab
+- decoded L0 SQ8 vectors
 - upper-level adjacency
 - upper-level `nid -> index` arrays
 - immutable header fields: `M`, `dim`, `n_nodes`, `entry_nid`, `max_level`,
@@ -84,12 +98,10 @@ Keep these backend-local:
 
 ### Why this split
 
-The fresh-vs-reuse gap points at scan-cache setup, not L0 search arithmetic
-alone. SQ8 metadata plus upper-level decode are immutable across scans until
-`cache_gen` changes, so they are the safest first payload to share.
-
-L0 is left backend-local because it is larger, lazy-loaded, and currently more
-tightly coupled to writable-path cache updates.
+The upper-level-only split was safe but insufficient. The dominant remaining
+fresh-backend tax was the decoded L0 snapshot itself, so the implemented slot
+stores the full immutable decoded graph and relies on `cache_gen` invalidation
+to keep writable-path updates from reusing stale state.
 
 ## Shared memory layout
 
@@ -132,11 +144,12 @@ typedef struct ShnswSharedScanCacheCtl
 
 ### Initial payload budget
 
-Start with a conservative fixed budget just for the experimental slot.
+Start with a fixed budget just for the experimental slot.
 
-The budget should be chosen from measured need, not guesswork. Phase A only has
-to cover the current hot benchmark shape. If the payload does not fit, log a
-DEBUG1 miss and fall back to backend-local decode.
+Current payload budget: `64 MB`.
+
+If the decoded snapshot does not fit, publication bails out and the backend
+falls back to the normal private decode path.
 
 ## Backend behavior
 
@@ -149,8 +162,9 @@ On scan-cache lookup:
    - skip SQ8/upper decode
 4. Otherwise:
    - build the normal backend-local cache
+   - materialize any deferred L0 pages
    - if the shared slot is empty or stale and the payload fits, publish the
-     immutable portion into shared memory
+     decoded immutable snapshot into shared memory
 
 On insert, vacuum tombstone, rebuild, relfilenode swap, or reindex:
 
@@ -160,7 +174,7 @@ On insert, vacuum tombstone, rebuild, relfilenode swap, or reindex:
 
 ## Correctness constraints
 
-- shared cache must never be authoritative for mutable L0 state
+- shared cache must never survive a `cache_gen` mismatch
 - any `cache_gen` mismatch forces a miss
 - payload publication must be all-or-nothing
 - fallback to backend-local decode must remain correct when shmem is disabled,
@@ -168,19 +182,21 @@ On insert, vacuum tombstone, rebuild, relfilenode swap, or reindex:
 
 ## Falsifier
 
-Phase A is only worth continuing if it clears this gate:
+The branch cleared the original gate:
 
-- `fresh` 384D fixed-graph average improves materially
-- `reuse` stays unchanged within noise
-- `make installcheck` remains green
-- `scripts/test_sorted_hnsw_crash_recovery.sh` remains green
+- `fresh` 50k/384D fixed-graph average:
+  - `shared_cache=off -> 1.9213 ms`
+  - `shared_cache=on  -> 0.6337 ms`
+- warm same-backend 50k/384D:
+  - `shared_cache=off -> 0.2180 ms`
+  - `shared_cache=on  -> 0.0917 ms`
+- `make installcheck` green
+- `scripts/test_sorted_hnsw_crash_recovery.sh` green
+- fresh-backend insert invalidation check:
+  - nearest before insert `833:0.000258`
+  - nearest after insert `2001:0.000000`
 
-Suggested numeric bar:
-
-- at least `20%` improvement in `fresh`
-- no measurable regression in `reuse`
-
-If it misses that bar, stop and do not expand into a multi-slot shared cache.
+That is enough to keep the branch and stop treating it as speculative.
 
 ## Validation plan
 
@@ -194,8 +210,10 @@ Required checks:
 
 - `make installcheck REGRESS='pg_sorted_heap sorted_hnsw'`
 - `./scripts/test_sorted_hnsw_crash_recovery.sh /tmp <port>`
-- `./scripts/bench_sorted_hnsw_fixed_graph.sh /tmp <port> 2000 8 384 fresh`
-- `./scripts/bench_sorted_hnsw_fixed_graph.sh /tmp <port> 2000 8 384 reuse`
+- `./scripts/bench_sorted_hnsw_fixed_graph.sh /tmp <port> 2000 8 384 fresh on off`
+- `./scripts/bench_sorted_hnsw_fixed_graph.sh /tmp <port> 2000 8 384 fresh on on`
+- `./scripts/bench_sorted_hnsw_fixed_graph.sh /tmp <port> 2000 8 384 reuse on off`
+- `./scripts/bench_sorted_hnsw_fixed_graph.sh /tmp <port> 2000 8 384 reuse on on`
 
 ## If Phase A works
 
