@@ -105,6 +105,7 @@ Repo-owned harnesses:
 
 - `scripts/bench_sorted_hnsw_vs_pgvector.sh /tmp 65485 10000 20 384 10 vector 64 96`
 - `python3 scripts/bench_qdrant_synthetic.py --rows 10000 --queries 20 --dim 384 --k 10 --ef 64`
+- `python3 scripts/bench_zvec_synthetic.py --rows 10000 --queries 20 --dim 384 --k 10 --ef 64`
 
 Synthetic 10K x 384D cosine corpus, top-10, warm query loop. PostgreSQL
 methods were rerun across 3 fresh builds and the table below reports median
@@ -116,11 +117,8 @@ Docker collection.
 | Exact heap (`svec`) | 2.03 ms | 100% | Brute-force ground truth |
 | **sorted_hnsw** | **0.158 ms** | **100%** | `shared_cache=on`, `ef_search=96`, index ~5.4 MB |
 | pgvector HNSW (`vector`) | 0.446 ms | 90% median (90-95 range) | `ef_search=64`, same `M=16`, `ef_construction=64`, index ~2.0 MB |
+| zvec HNSW | 0.611 ms | 100% | local in-process collection, `ef=64` |
 | Qdrant HNSW | 1.94 ms | 100% | local Docker, `hnsw_ef=64` |
-
-`zvec` is omitted from the current table because it is not installed in this
-local environment. Older `zvec` rows from previous docs were not re-verified
-and should not be treated as the current baseline.
 
 ### Legacy/manual IVF-PQ benchmark
 
@@ -216,4 +214,5 @@ The tables above use cross-query (self-match excluded) for honest comparison.
   384D corpus via `scripts/bench_sorted_hnsw_vs_pgvector.sh`, 3 fresh builds
   for PostgreSQL methods, median p50 / median recall reported; Qdrant via
   `scripts/bench_qdrant_synthetic.py`, 3 warm measurement passes on one local
-  Docker collection
+  Docker collection; zvec via `scripts/bench_zvec_synthetic.py`, 3 warm
+  measurement passes on one local in-process collection
