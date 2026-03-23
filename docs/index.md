@@ -38,9 +38,8 @@ btree-competitive query performance without a separate index structure.
   runtime parameters.
 
 - **Vector search** -- Built-in `svec` (float32, up to 16K dim) and `hsvec`
-  (float16, up to 32K dim) vector types with cosine distance, IVF-PQ ANN
-  search (30x smaller than HNSW), and hierarchical HNSW via sidecar tables
-  (sub-ms with cache). No pgvector dependency, no 2,000-dim index limit.
+  (float16, up to 32K dim) vector types with cosine distance, planner-integrated
+  `sorted_hnsw` KNN index scans, and legacy/manual IVF-PQ + sidecar HNSW paths.
   See [Vector Search](vector-search).
 
 - **Lazy update mode** -- `sorted_heap.lazy_update = on` skips per-UPDATE zone

@@ -6,10 +6,11 @@ nav_order: 3
 
 # Vector Search
 
-pg_sorted_heap includes two built-in vector types and IVF-PQ approximate
-nearest neighbor search. The key insight: sorted_heap's physical clustering by
-primary key prefix **is** the inverted file index — no separate index structure
-needed, no pgvector dependency, no 800 MB HNSW graph.
+pg_sorted_heap includes two built-in vector types, a planner-integrated
+`sorted_hnsw` Index AM, and legacy/manual ANN paths (`svec_ann_scan`,
+`svec_hnsw_scan`). The default vector story is now `CREATE INDEX ... USING
+sorted_hnsw`; the older IVF-PQ and sidecar HNSW APIs remain available when you
+want explicit control over storage or rerank behavior.
 
 ---
 
@@ -60,7 +61,36 @@ SELECT svec_cosine_distance('[1,0,0]'::hsvec, '[0,1,0]'::hsvec);
 
 ---
 
-## Quick start
+## Current default: `sorted_hnsw`
+
+For new deployments, prefer the Index AM:
+
+```sql
+CREATE TABLE items (
+    id        bigserial PRIMARY KEY,
+    embedding pg_sorted_heap.svec(384),
+    body      text
+);
+
+CREATE INDEX items_embedding_idx
+ON items USING sorted_hnsw (embedding)
+WITH (m = 16, ef_construction = 64);
+
+SET sorted_hnsw.shared_cache = on;
+SET sorted_hnsw.ef_search = 96;
+
+SELECT id, body
+FROM items
+ORDER BY embedding <=> '[0.1,0.2,0.3,...]'::pg_sorted_heap.svec
+LIMIT 10;
+```
+
+This path is planner-integrated and exact-reranks internally. There is no
+sidecar prefix argument and no manual `rerank_topk` in the index-scan path.
+
+---
+
+## Legacy/manual IVF-PQ quick start
 
 ### 1. Create table
 
@@ -245,30 +275,29 @@ and IVF routing are. This confirms hsvec is a safe storage choice for ANN.
 
 ### Comparison with other vector search engines
 
-Same dataset (103K × 2880-dim), k8s (2 Gi pod, shared_buffers=512MB),
-warm cache, top-10, 50 queries.
+Current repo-owned harnesses:
 
-| Method | Recall@10 | p50 latency | Memory/Index |
-|--------|:---------:|:-----------:|:------------:|
-| **psh HNSW sketch** ef=96, rk=48 | **96.8%** | **1.02ms** | **75 MB** |
-| pgvector HNSW ef=64 | 99.8% | 1.29ms | 806 MB |
-| **psh HNSW SQ8** ef=96, rk=20 | **99.8%** | **1.35ms** | **283 MB** |
-| pgvector HNSW ef=100 | 99.8% | 1.75ms | 806 MB |
-| zvec HNSW M=32, ef=100 | 100% | 1.04ms† | 1,173 MB |
-| **psh IVF-PQ** np=10, rr=200 | **99.0%** | **16.96ms** | **27 MB** |
-| Qdrant HNSW M=32, ef=100 | 100% | 23.2ms† | 2,626 MB |
+- `scripts/bench_sorted_hnsw_vs_pgvector.sh /tmp 65485 10000 20 384 10 vector 64 96`
+- `python3 scripts/bench_qdrant_synthetic.py --rows 10000 --queries 20 --dim 384 --k 10 --ef 64`
 
-†zvec and Qdrant measured locally (in-process / Docker); all others on the
-same k8s pod. psh = pg_sorted_heap. SQ8 cache built via streaming two-pass
-(no f32 intermediate).
+Synthetic 10K x 384D cosine corpus, top-10, warm query loop. PostgreSQL
+methods were rerun across 3 fresh builds and the table below reports median
+`p50` / median recall. Qdrant uses 3 warm measurement passes on one local
+Docker collection.
 
-**Key tradeoffs:**
-- psh HNSW sketch: fastest at 1.02ms, 75 MB cache, but capped at ~97% recall
-- psh HNSW SQ8: 99.8% recall at 1.35ms with 3x less memory than pgvector, runs on 2 Gi pods
-- psh IVF-PQ: smallest index (27 MB), good for disk-constrained setups
-- For 16K-dim vectors: SQ8 cache = 1.6 GB (vs 6.3 GB f32, vs 75 MB sketch)
+| Method | p50 latency | Recall@10 | Notes |
+|--------|:-----------:|:---------:|-------|
+| Exact heap (`svec`) | 2.03 ms | 100% | Brute-force ground truth |
+| **sorted_hnsw** | **0.158 ms** | **100%** | `shared_cache=on`, `ef_search=96`, index ~5.4 MB |
+| pgvector HNSW (`vector`) | 0.446 ms | 90% median (90-95 range) | `ef_search=64`, same `M=16`, `ef_construction=64`, index ~2.0 MB |
+| Qdrant HNSW | 1.94 ms | 100% | local Docker, `hnsw_ef=64` |
 
-See [HNSW search](#hnsw-search-svec_hnsw_scan) below for cache mode details.
+`zvec` is intentionally omitted from the current table because it is not
+installed in this local environment. Older `zvec` rows from previous docs were
+not re-verified and should not be treated as a current baseline.
+
+See [Sidecar HNSW search](#sidecar-hnsw-search-legacy-svec_hnsw_scan) below
+for the legacy/manual `svec_hnsw_scan` path and its cache-mode tradeoffs.
 
 ### Self-query vs cross-query
 
@@ -384,16 +413,17 @@ COPY rewrites all heap pages with new TIDs. After restore, the sidecar's
 `src_tid` values point to wrong or nonexistent heap tuples, causing
 recall to silently drop (observed: 88% → 99.8% after rebuild on the same
 data). **Always rebuild the HNSW sidecar after `pg_dump`/`pg_restore`.**
-This limitation will be removed by the planned Index AM (`sorted_hnsw`),
-which stores index-managed TIDs that are maintained by PostgreSQL's
-standard index infrastructure.
+This limitation does **not** affect `sorted_hnsw`, which uses PostgreSQL's
+normal index infrastructure instead of sidecar `src_tid` joins.
 
 ---
 
-## HNSW search (`svec_hnsw_scan`)
+## Sidecar HNSW search (legacy: `svec_hnsw_scan`)
 
 `svec_hnsw_scan` performs hierarchical HNSW search using compact sidecar
-tables. The L0 column type controls the recall/memory tradeoff:
+tables. The latency/recall tables in this section describe that legacy/manual
+path, not the current `sorted_hnsw` Index AM baseline. The L0 column type
+controls the recall/memory tradeoff:
 
 | L0 column | Cache mode | Cache size (103K) | Recall@10 (ef=96) | p50 |
 |-----------|------------|:------------------:|:-----------------:|:---:|

@@ -1,8 +1,8 @@
 # pg_sorted_heap
 
 A PostgreSQL extension that physically sorts data by primary key, prunes
-irrelevant blocks via per-page zone maps, and includes built-in vector search
--- all without pgvector or external indexes.
+irrelevant blocks via per-page zone maps, and includes built-in vector types
+plus planner-integrated HNSW search.
 
 ## When to use pg_sorted_heap
 
@@ -56,73 +56,44 @@ WHERE device_id = 1042
   AND ts BETWEEN '2026-03-01' AND '2026-03-07';
 ```
 
-### RAG and vector search (IVF-PQ)
+### Planner-integrated vector search (`sorted_hnsw`)
 
 Built-in `svec` (float32, up to 16K dims) and `hsvec` (float16, up to 32K
-dims) types with IVF-PQ approximate nearest neighbor search. The sorted
-storage itself acts as the inverted file index -- no separate HNSW graph, no
-pgvector dependency, 30x smaller index.
+dims) can now use a real PostgreSQL Index AM. The default ANN path is:
 
 ```sql
 CREATE TABLE documents (
-    id           text,
-    partition_id int2 GENERATED ALWAYS AS (
-                     svec_ivf_assign(embedding, 1)) STORED,
-    embedding    svec(768),
-    pq_code      bytea GENERATED ALWAYS AS (
-                     svec_pq_encode_residual(embedding,
-                         svec_ivf_assign(embedding, 1), 1, 1)) STORED,
-    content      text,
-    PRIMARY KEY (partition_id, id)
-) USING sorted_heap;
+    id        bigserial PRIMARY KEY,
+    embedding svec(384),
+    content   text
+);
 
--- Load documents + embeddings, then compact
-SELECT sorted_heap_compact('documents');
+CREATE INDEX documents_embedding_idx
+ON documents USING sorted_hnsw (embedding)
+WITH (m = 16, ef_construction = 64);
 
--- Train IVF centroids + PQ codebook (one-time)
-SELECT * FROM svec_ann_train(
-    'SELECT embedding FROM documents',
-    nlist := 64, m := 192);
--- Re-compact after training to re-cluster by partition_id
-SELECT sorted_heap_compact('documents');
+SET sorted_hnsw.shared_cache = on;  -- requires shared_preload_libraries='pg_sorted_heap'
+SET sorted_hnsw.ef_search = 96;
 
--- Search: 8ms, 100% recall for self-query (RAG) workloads
-SELECT * FROM svec_ann_scan(
-    'documents', query_vec,
-    nprobe := 3, lim := 10,
-    cb_id := 1, ivf_cb_id := 1);
+SELECT id, content
+FROM documents
+ORDER BY embedding <=> '[0.1,0.2,0.3,...]'::svec
+LIMIT 10;
 ```
 
-### Sub-millisecond HNSW search
+This is planner-integrated KNN search: no sidecar prefix argument, no manual
+rerank knob, and exact rerank happens inside the index scan.
 
-Hierarchical HNSW via compact sidecar tables. Three cache modes let you
-trade memory for recall:
+### Legacy/manual ANN paths
 
-| L0 cache mode | Cache size | p50 (ef=96, rk=20) | Recall@10 |
-|---------------|:----------:|:------------------:|:---------:|
-| hsvec(384) sketch | ~75 MB | 1.02ms | 96.8% |
-| svec + SQ8 (default) | ~283 MB | 1.52ms | 99.8% |
-| svec + f32 | ~1.1 GB | 5.53ms | 99.8% |
+The older explicit ANN paths are still available when you want manual control
+over recall/latency tradeoffs or compressed storage:
 
-```sql
--- Enable session-local cache (built on first query)
-SET sorted_heap.hnsw_cache_l0 = on;
+- `svec_ann_scan(...)` / `svec_ann_search(...)` for IVF-PQ
+- `svec_hnsw_scan(...)` for sidecar-table HNSW experiments and manual rerank
 
--- Fastest top-1: 0.51ms (SQ8 cache, 1 TOAST read)
-SELECT * FROM svec_hnsw_scan(
-    'documents', query_vec, 'documents_hnsw',
-    ef_search := 32, lim := 1, rerank_topk := 1);
-
--- Fast top-10: 1.19ms, 98.6% recall (10 TOAST reads)
-SELECT * FROM svec_hnsw_scan(
-    'documents', query_vec, 'documents_hnsw',
-    ef_search := 96, lim := 10, rerank_topk := 10);
-
--- Balanced top-10: 1.52ms, 99.8% recall (20 TOAST reads)
-SELECT * FROM svec_hnsw_scan(
-    'documents', query_vec, 'documents_hnsw',
-    ef_search := 96, lim := 10, rerank_topk := 20);
-```
+Those paths are still documented, but they are no longer the default vector
+story for this repository.
 
 ### Large-table analytics with range predicates
 
@@ -285,26 +256,26 @@ write-heavy workloads.
 
 ### Vector search comparison
 
-103K x 2880-dim vectors, k8s (2 Gi pod, shared_buffers=512MB), warm cache, top-10.
+Current repo-owned local harnesses:
 
-| Method | Recall@10 | p50 latency | Memory/Index |
-|--------|:---------:|:-----------:|:------------:|
-| **psh HNSW sketch** ef=96, rk=48 | **96.8%** | **1.02ms** | **75 MB** |
-| pgvector HNSW ef=64 | 99.8% | 1.29ms | 806 MB |
-| **psh HNSW SQ8** ef=96, rk=20 | **99.8%** | **1.35ms** | **283 MB** |
-| pgvector HNSW ef=100 | 99.8% | 1.75ms | 806 MB |
-| zvec HNSW M=32, ef=100 | 100% | 1.04ms* | 1,173 MB |
-| **psh IVF-PQ** np=10, rr=200 | **99.0%** | **16.96ms** | **27 MB** |
-| Qdrant HNSW M=32, ef=100 | 100% | 23.2ms* | 2,626 MB |
+- `scripts/bench_sorted_hnsw_vs_pgvector.sh /tmp 65485 10000 20 384 10 vector 64 96`
+- `python3 scripts/bench_qdrant_synthetic.py --rows 10000 --queries 20 --dim 384 --k 10 --ef 64`
 
-*zvec and Qdrant measured locally; all others on the same k8s pod.
-psh = pg_sorted_heap. SQ8 cache built via streaming two-pass (no f32 intermediate).
+Synthetic 10K x 384D cosine corpus, top-10, warm query loop. PostgreSQL
+methods were rerun across 3 fresh builds and the table below reports median
+`p50` / median recall. Qdrant uses 3 warm measurement passes on one local
+Docker collection.
 
-**Key tradeoffs:**
-- psh HNSW sketch: fastest at 1.02ms, 75 MB cache, capped at ~97% recall
-- psh HNSW SQ8: 99.8% recall at 1.35ms, 3x less memory than pgvector, runs on 2 Gi pods
-- psh IVF-PQ: smallest index (27 MB), good for disk-constrained setups
-- For 16K-dim vectors: SQ8 cache = 1.6 GB (vs 6.3 GB f32, vs 75 MB sketch)
+| Method | p50 latency | Recall@10 | Notes |
+|--------|:-----------:|:---------:|-------|
+| Exact heap (`svec`) | 2.03ms | 100% | Brute-force ground truth |
+| **sorted_hnsw** | **0.158ms** | **100%** | `shared_cache=on`, `ef_search=96`, index ~5.4 MB |
+| pgvector HNSW (`vector`) | 0.446ms | 90% median (90-95 range) | `ef_search=64`, same `M=16`, `ef_construction=64`, index ~2.0 MB |
+| Qdrant HNSW | 1.94ms | 100% | local Docker, `hnsw_ef=64` |
+
+`zvec` is intentionally omitted from the current table: it is not installed in
+this local environment, so the older `zvec` row from previous docs was not
+re-verified and should not be treated as a current baseline.
 
 ## Quick start
 
@@ -410,7 +381,7 @@ CREATE TABLE items_h (id text PRIMARY KEY, embedding hsvec(768)) USING sorted_he
 SELECT a.embedding <=> b.embedding FROM items a, items b WHERE a.id='a' AND b.id='b';
 ```
 
-### IVF-PQ search
+### IVF-PQ search (legacy/manual path)
 
 ```sql
 -- PQ-only (fastest, ~8ms)
@@ -421,10 +392,26 @@ SELECT * FROM svec_ann_scan('tbl', query, nprobe:=10, lim:=10, rerank_topk:=200,
                             cb_id:=1, ivf_cb_id:=1);
 ```
 
-### HNSW search
+### HNSW index (`sorted_hnsw`)
 
 ```sql
-SET sorted_heap.hnsw_cache_l0 = on;  -- session-local cache
+CREATE INDEX items_embedding_idx
+ON items USING sorted_hnsw (embedding)
+WITH (m = 16, ef_construction = 64);
+
+SET sorted_hnsw.shared_cache = on;
+SET sorted_hnsw.ef_search = 96;
+
+SELECT id
+FROM items
+ORDER BY embedding <=> query
+LIMIT 10;
+```
+
+### HNSW sidecar search (`svec_hnsw_scan`, legacy/manual path)
+
+```sql
+SET sorted_heap.hnsw_cache_l0 = on;  -- session-local sidecar cache
 
 -- Fastest top-1: 0.51ms (SQ8 cache, 1 TOAST read)
 SELECT * FROM svec_hnsw_scan('tbl', query, 'tbl_hnsw',
@@ -445,6 +432,8 @@ SELECT * FROM svec_hnsw_scan('tbl', query, 'tbl_hnsw',
 SET sorted_heap.enable_scan_pruning = on;       -- zone map pruning (default: on)
 SET sorted_heap.vacuum_rebuild_zonemap = on;     -- VACUUM rebuilds zone map (default: on)
 SET sorted_heap.lazy_update = on;                -- skip per-UPDATE zone map flush
+SET sorted_hnsw.shared_cache = on;               -- shared decoded cache for sorted_hnsw
+SET sorted_hnsw.ef_search = 96;                  -- sorted_hnsw beam width
 SET sorted_heap.hnsw_cache_l0 = on;              -- session-local HNSW L0+upper cache
 SET sorted_heap.hnsw_cache_sq8 = on;             -- SQ8 quantize svec in cache (4x smaller)
 SET sorted_heap.hnsw_ef_patience = 0;            -- adaptive ef early termination (0=off)
@@ -462,7 +451,7 @@ SET sorted_heap.ann_timing = on;                 -- timing breakdown in DEBUG1
 | `pg_sorted_heap.c` | Extension entry, legacy clustered index AM, GUC registration |
 | `svec.h` / `svec.c` | svec type (float32): I/O, typmod, NEON cosine distance `<=>` |
 | `hsvec.h` / `hsvec.c` | hsvec type (float16): I/O, cosine distance, NEON SIMD, casts |
-| `pq.h` / `pq.c` | PQ, IVF, ANN scan, HNSW search, graph scan, beam search |
+| `pq.h` / `pq.c` | PQ, IVF, ANN scan, sidecar HNSW search, graph scan, beam search |
 
 ### Zone map details
 
@@ -495,7 +484,7 @@ SET sorted_heap.ann_timing = on;                 -- timing breakdown in DEBUG1
 ## Documentation
 
 - [Quick Start](docs/quickstart.md)
-- [Vector Search](docs/vector-search.md) -- IVF-PQ, HNSW, graph search
+- [Vector Search](docs/vector-search.md) -- `sorted_hnsw`, IVF-PQ, sidecar HNSW
 - [Architecture](docs/architecture.md) -- zone maps, custom scan, compaction
 - [SQL API](docs/api.md) -- full function reference
 - [Benchmarks](docs/benchmarks.md) -- latency, throughput, vector search

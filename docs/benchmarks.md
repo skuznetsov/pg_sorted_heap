@@ -97,9 +97,39 @@ heap-without-index -- roughly 30% less than heap + btree at scale.
 
 ---
 
-## Vector search (IVF-PQ)
+## Vector search
 
-All vector benchmarks use `svec_ann_scan` (C-level) with residual PQ.
+### Current local synthetic benchmark (`sorted_hnsw` Index AM)
+
+Repo-owned harnesses:
+
+- `scripts/bench_sorted_hnsw_vs_pgvector.sh /tmp 65485 10000 20 384 10 vector 64 96`
+- `python3 scripts/bench_qdrant_synthetic.py --rows 10000 --queries 20 --dim 384 --k 10 --ef 64`
+
+Synthetic 10K x 384D cosine corpus, top-10, warm query loop. PostgreSQL
+methods were rerun across 3 fresh builds and the table below reports median
+`p50` / median recall. Qdrant uses 3 warm measurement passes on one local
+Docker collection.
+
+| Method | p50 latency | Recall@10 | Notes |
+|--------|:-----------:|:---------:|-------|
+| Exact heap (`svec`) | 2.03 ms | 100% | Brute-force ground truth |
+| **sorted_hnsw** | **0.158 ms** | **100%** | `shared_cache=on`, `ef_search=96`, index ~5.4 MB |
+| pgvector HNSW (`vector`) | 0.446 ms | 90% median (90-95 range) | `ef_search=64`, same `M=16`, `ef_construction=64`, index ~2.0 MB |
+| Qdrant HNSW | 1.94 ms | 100% | local Docker, `hnsw_ef=64` |
+
+`zvec` is omitted from the current table because it is not installed in this
+local environment. Older `zvec` rows from previous docs were not re-verified
+and should not be treated as the current baseline.
+
+### Legacy/manual IVF-PQ benchmark
+
+The sections below are still useful for the explicit IVF-PQ API
+(`svec_ann_scan`), but they are no longer the default ANN baseline for the
+repository. Those measurements target the legacy/manual vector path, not the
+planner-integrated `sorted_hnsw` Index AM.
+
+All IVF-PQ benchmarks below use `svec_ann_scan` (C-level) with residual PQ.
 1 Gi k8s pod, PostgreSQL 18.
 
 ### 103K vectors, 2880-dim (Gutenberg corpus)
@@ -139,54 +169,6 @@ Result: **no measurable recall difference**. Float16 precision loss (~1e-7) is
 1000× smaller than typical distance gaps between consecutive neighbors (~1e-4).
 The recall bottleneck is PQ quantization and IVF routing, not input precision.
 This confirms hsvec is a safe storage choice for ANN workloads.
-
-### Comparison with other vector search engines
-
-Same dataset (103K × 2880-dim), k8s (2 Gi pod, shared_buffers=512MB),
-warm cache, top-10, 50 queries.
-
-| Method | Recall@10 | p50 latency | Memory/Index |
-|--------|:---------:|:-----------:|:------------:|
-| **psh HNSW sketch** ef=96, rk=48 | **96.8%** | **1.02ms** | **75 MB** |
-| pgvector HNSW ef=64 | 99.8% | 1.29ms | 806 MB |
-| **psh HNSW SQ8** ef=96, rk=20 | **99.8%** | **1.35ms** | **283 MB** |
-| pgvector HNSW ef=100 | 99.8% | 1.75ms | 806 MB |
-| zvec HNSW M=32, ef=100 | 100% | 1.04ms† | 1,173 MB |
-| **psh IVF-PQ** np=10, rr=200 | **99.0%** | **16.96ms** | **27 MB** |
-| Qdrant HNSW M=32, ef=100 | 100% | 23.2ms† | 2,626 MB |
-
-†zvec and Qdrant measured locally (in-process / Docker); all others on the
-same k8s pod. psh = pg_sorted_heap. SQ8 cache built via streaming two-pass
-(no f32 intermediate).
-
-**psh HNSW SQ8 topK latency sweep (k8s 2 Gi pod, svec L0, streaming build):**
-
-| ef | lim | rerank_topk | p50 latency | Recall@10 |
-|:--:|:---:|:-----------:|:-----------:|:---------:|
-| 32 | 1 | 1 | 0.51ms | — |
-| 64 | 1 | 1 | 0.90ms | — |
-| 64 | 5 | 5 | 0.87ms | 98.8% |
-| 96 | 10 | 10 | 1.25ms | 98.6% |
-| 96 | 10 | 20 | 1.35ms | 99.8% |
-| 96 | 10 | 48 | 1.64ms | 99.8% |
-| 96 | 10 | 0 | 6.94ms | 99.8% |
-
-Rule of thumb: set `rerank_topk = max(lim, 20)` for 99.8% recall with
-minimal TOAST I/O. Each TOAST read fetches one full svec row, so fewer
-reads = lower latency. ef=96 navigates more accurately than ef=64,
-producing better candidates that need less over-fetching.
-
-**Other cache modes (k8s, ef=96):**
-
-| Config | p50 latency | Recall@10 |
-|--------|:-----------:|:---------:|
-| f32 ef=96, rk=48 | 5.53ms | 99.8% |
-| f32 ef=96, rk=0 | 3.87ms | 99.8% |
-
-SQ8 with rk=20 is the best operating point: 99.8% recall at 1.35ms with
-only 20 TOAST reads per query. The 283 MB streaming SQ8 cache (built via
-two-pass scan, no f32 intermediate) runs comfortably on 2 Gi pods. f32
-cache (1.1 GB) causes memory pressure on pods with ≤4 Gi.
 
 ### CRUD performance (500K rows, svec(128), prepared mode)
 
@@ -230,3 +212,8 @@ The tables above use cross-query (self-match excluded) for honest comparison.
   by requesting `lim := 11` and taking positions 2–11. Ground truth via exact
   brute-force cosine (`<=>` operator). Latency measured via `clock_timestamp()`
   per-query in PL/pgSQL loop (20 queries, warm cache)
+- **Current local `sorted_hnsw` comparison:** deterministic synthetic 10K x
+  384D corpus via `scripts/bench_sorted_hnsw_vs_pgvector.sh`, 3 fresh builds
+  for PostgreSQL methods, median p50 / median recall reported; Qdrant via
+  `scripts/bench_qdrant_synthetic.py`, 3 warm measurement passes on one local
+  Docker collection
