@@ -531,6 +531,7 @@ as tombstones. REINDEX rebuilds the full graph.
 - Pin hot upper-level pages in shared_buffers
 - Batch insert mode (for bulk loading after initial CREATE INDEX)
 - Parallel ambuild (PG's parallel index build infrastructure)
+- Experimental shared scan cache: see `docs/design-sorted-hnsw-shared-cache.md`
 
 ## Files
 
