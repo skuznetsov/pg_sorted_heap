@@ -1784,10 +1784,11 @@ shnsw_insert(Relation index, Datum *values, bool *isnull,
 
 static float
 sq8_cosine_distance(const float *query, int query_dim,
+					double query_inv_norm,
 					const uint8 *sq8_vec,
 					const float *mins, const float *scales, int dim)
 {
-	double	dot = 0.0, norm_q = 0.0, norm_v = 0.0;
+	double	dot = 0.0, norm_v = 0.0;
 	int		d;
 	int		use_dim = Min(query_dim, dim);
 
@@ -1797,13 +1798,12 @@ sq8_cosine_distance(const float *query, int query_dim,
 		double vd = (double) mins[d] + (double) sq8_vec[d] * (double) scales[d];
 
 		dot += qd * vd;
-		norm_q += qd * qd;
 		norm_v += vd * vd;
 	}
 
-	if (norm_q == 0.0 || norm_v == 0.0)
+	if (query_inv_norm == 0.0 || norm_v == 0.0)
 		return 2.0f;
-	return (float)(1.0 - dot / (sqrt(norm_q) * sqrt(norm_v)));
+	return (float) (1.0 - (dot * query_inv_norm) / sqrt(norm_v));
 }
 
 /* ---- Load index into scan cache ---- */
@@ -2099,10 +2099,21 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 	int			cand_cap;
 	int			worst_idx = 0;
 	float		worst_dist = 0.0f;
+	double		query_norm = 0.0;
+	double		query_inv_norm = 0.0;
+	int			q;
 
 	dim = cache->dim;
 	cand_cap = Max(ef * 8, 64);
 	visited_nwords = Max(1, (cache->n_nodes + 63) / 64);
+	for (q = 0; q < dim; q++)
+	{
+		double qd = (double) query[q];
+
+		query_norm += qd * qd;
+	}
+	if (query_norm > 0.0)
+		query_inv_norm = 1.0 / sqrt(query_norm);
 
 	elog(DEBUG1, "shnsw_search_level: allocating cand_cap=%d n_nodes=%d", cand_cap, cache->n_nodes);
 	visited_bits = palloc0(sizeof(uint64) * visited_nwords);
@@ -2138,6 +2149,7 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 			 entry_nid, cache->nodes[entry_nid].neighbors,
 			 cache->nodes[entry_nid].n_neighbors);
 		d = sq8_cosine_distance(query, dim,
+								query_inv_norm,
 								cache->sq8_data + (Size)entry_nid * dim,
 								cache->sq8_mins, cache->sq8_scales, dim);
 		candidates[0].dist = d;
@@ -2198,6 +2210,7 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 
 				nbr_dist = sq8_cosine_distance(
 					query, dim,
+					query_inv_norm,
 					cache->sq8_data + (Size)nbr * dim,
 					cache->sq8_mins, cache->sq8_scales, dim);
 
@@ -2260,6 +2273,7 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 
 					nbr_dist = sq8_cosine_distance(
 						query, dim,
+						query_inv_norm,
 						cache->sq8_data + (Size)nbr * dim,
 						cache->sq8_mins, cache->sq8_scales, dim);
 
