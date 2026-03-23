@@ -31,6 +31,10 @@
 #include <float.h>
 #include <math.h>
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 #include "svec.h"
 
 /* ---- GUCs ---- */
@@ -1789,11 +1793,56 @@ sq8_cosine_distance(const float *query, int query_dim,
 					const uint8 *sq8_vec,
 					const float *mins, const float *scales, int dim)
 {
-	double	dot = 0.0, norm_v = 0.0;
+	double	dot;
+	double	norm_v;
 	int		d;
 	int		use_dim = Min(query_dim, dim);
 
-	for (d = 0; d < use_dim; d++)
+#if defined(__aarch64__) && defined(__ARM_NEON)
+	{
+		float32x4_t vdot = vdupq_n_f32(0.0f);
+		float32x4_t vnb  = vdupq_n_f32(0.0f);
+
+		for (d = 0; d + 7 < use_dim; d += 8)
+		{
+			uint8x8_t	raw8 = vld1_u8(&sq8_vec[d]);
+			uint16x8_t	raw16 = vmovl_u8(raw8);
+
+			{
+				uint32x4_t	r32 = vmovl_u16(vget_low_u16(raw16));
+				float32x4_t fr  = vcvtq_f32_u32(r32);
+				float32x4_t vm  = vld1q_f32(&mins[d]);
+				float32x4_t vs  = vld1q_f32(&scales[d]);
+				float32x4_t vv  = vfmaq_f32(vm, fr, vs);
+				float32x4_t vq  = vld1q_f32(&query[d]);
+
+				vdot = vfmaq_f32(vdot, vq, vv);
+				vnb  = vfmaq_f32(vnb, vv, vv);
+			}
+
+			{
+				uint32x4_t	r32 = vmovl_u16(vget_high_u16(raw16));
+				float32x4_t fr  = vcvtq_f32_u32(r32);
+				float32x4_t vm  = vld1q_f32(&mins[d + 4]);
+				float32x4_t vs  = vld1q_f32(&scales[d + 4]);
+				float32x4_t vv  = vfmaq_f32(vm, fr, vs);
+				float32x4_t vq  = vld1q_f32(&query[d + 4]);
+
+				vdot = vfmaq_f32(vdot, vq, vv);
+				vnb  = vfmaq_f32(vnb, vv, vv);
+			}
+		}
+
+		dot = (double) vaddvq_f32(vdot);
+		norm_v = (double) vaddvq_f32(vnb);
+	}
+#else
+	dot = 0.0;
+	norm_v = 0.0;
+	d = 0;
+#endif
+
+	for (; d < use_dim; d++)
 	{
 		double qd = (double) query[d];
 		double vd = (double) mins[d] + (double) sq8_vec[d] * (double) scales[d];
