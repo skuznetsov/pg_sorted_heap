@@ -157,15 +157,38 @@ shnsw_copy_query_arg_to_float4(float **dst, int *dst_dim, MemoryContext mcxt,
 }
 
 static float8
-shnsw_cosine_distance_query_svec(const float *query, int dim, double query_norm,
-								   const Svec *sv)
+shnsw_cosine_distance_query_svec_prenorm(const float *query, int dim,
+										  double query_norm, const Svec *sv)
 {
-	double	dot = 0.0;
-	double	norm_b = 0.0;
+	double	dot;
+	double	norm_b;
 	double	similarity;
 	int		i;
 
-	for (i = 0; i < dim; i++)
+#if defined(__aarch64__) && defined(__ARM_NEON)
+	{
+		float32x4_t vdot = vdupq_n_f32(0.0f);
+		float32x4_t vnb = vdupq_n_f32(0.0f);
+
+		for (i = 0; i + 3 < dim; i += 4)
+		{
+			float32x4_t vq = vld1q_f32(&query[i]);
+			float32x4_t vv = vld1q_f32(&sv->x[i]);
+
+			vdot = vfmaq_f32(vdot, vq, vv);
+			vnb = vfmaq_f32(vnb, vv, vv);
+		}
+
+		dot = (double) vaddvq_f32(vdot);
+		norm_b = (double) vaddvq_f32(vnb);
+	}
+#else
+	dot = 0.0;
+	norm_b = 0.0;
+	i = 0;
+#endif
+
+	for (; i < dim; i++)
 	{
 		double qi = (double) query[i];
 		double vi = (double) sv->x[i];
@@ -187,15 +210,43 @@ shnsw_cosine_distance_query_svec(const float *query, int dim, double query_norm,
 }
 
 static float8
-shnsw_cosine_distance_query_hsvec(const float *query, int dim, double query_norm,
-									const Hsvec *hv)
+shnsw_cosine_distance_query_hsvec_prenorm(const float *query, int dim,
+										   double query_norm, const Hsvec *hv)
 {
-	double	dot = 0.0;
-	double	norm_b = 0.0;
+	double	dot;
+	double	norm_b;
 	double	similarity;
 	int		i;
 
-	for (i = 0; i < dim; i++)
+#if defined(__aarch64__) && defined(__ARM_NEON) && HSVEC_NATIVE_FP16
+	{
+		float32x4_t vdot = vdupq_n_f32(0.0f);
+		float32x4_t vnb = vdupq_n_f32(0.0f);
+
+		for (i = 0; i + 7 < dim; i += 8)
+		{
+			float16x8_t vh = vld1q_f16((const float16_t *) &hv->x[i]);
+			float32x4_t vv_lo = vcvt_f32_f16(vget_low_f16(vh));
+			float32x4_t vv_hi = vcvt_f32_f16(vget_high_f16(vh));
+			float32x4_t vq_lo = vld1q_f32(&query[i]);
+			float32x4_t vq_hi = vld1q_f32(&query[i + 4]);
+
+			vdot = vfmaq_f32(vdot, vq_lo, vv_lo);
+			vdot = vfmaq_f32(vdot, vq_hi, vv_hi);
+			vnb = vfmaq_f32(vnb, vv_lo, vv_lo);
+			vnb = vfmaq_f32(vnb, vv_hi, vv_hi);
+		}
+
+		dot = (double) vaddvq_f32(vdot);
+		norm_b = (double) vaddvq_f32(vnb);
+	}
+#else
+	dot = 0.0;
+	norm_b = 0.0;
+	i = 0;
+#endif
+
+	for (; i < dim; i++)
 	{
 		double qi = (double) query[i];
 		double vi = (double) HalfToFloat4(hv->x[i]);
@@ -2998,24 +3049,26 @@ shnsw_rerank_candidates(Relation index, const ShnswScanCache *cache,
 							   &isnull);
 			if (!isnull)
 			{
-				if (vector_kind == SHNSW_VECTOR_SVEC)
-				{
-					Svec   *sv = DatumGetSvecP(val);
+					if (vector_kind == SHNSW_VECTOR_SVEC)
+					{
+						Svec   *sv = DatumGetSvecP(val);
 
-					results[n_results].exact_dist =
-						shnsw_cosine_distance_query_svec(query, dim, query_norm, sv);
-					if (sv != (Svec *) DatumGetPointer(val))
-						pfree(sv);
-				}
-				else if (vector_kind == SHNSW_VECTOR_HSVEC)
-				{
-					Hsvec  *hv = (Hsvec *) PG_DETOAST_DATUM(val);
+						results[n_results].exact_dist =
+							shnsw_cosine_distance_query_svec_prenorm(query, dim,
+																	 query_norm, sv);
+						if (sv != (Svec *) DatumGetPointer(val))
+							pfree(sv);
+					}
+					else if (vector_kind == SHNSW_VECTOR_HSVEC)
+					{
+						Hsvec  *hv = (Hsvec *) PG_DETOAST_DATUM(val);
 
-					results[n_results].exact_dist =
-						shnsw_cosine_distance_query_hsvec(query, dim, query_norm, hv);
-					if (hv != (Hsvec *) DatumGetPointer(val))
-						pfree(hv);
-				}
+						results[n_results].exact_dist =
+							shnsw_cosine_distance_query_hsvec_prenorm(query, dim,
+																	  query_norm, hv);
+						if (hv != (Hsvec *) DatumGetPointer(val))
+							pfree(hv);
+					}
 				else
 					elog(ERROR, "unsupported sorted_hnsw vector kind %d",
 						 (int) vector_kind);
