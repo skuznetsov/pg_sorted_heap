@@ -295,7 +295,7 @@ and IVF routing are. This confirms hsvec is a safe storage choice for ANN.
 Current repo-owned harnesses:
 
 - `python3 scripts/bench_gutenberg_local_dump.py --dump /tmp/cogniformerus_backup/cogniformerus_backup.dump --port 65473`
-- `REMOTE_PYTHON=/home/ubuntu/.venvs/zvec-bench/bin/python ./scripts/bench_gutenberg_aws.sh ubuntu@dev.rigelstar.com /home/ubuntu/clustered_pg /home/ubuntu/cogniformerus_backup.dump 65475`
+- `REMOTE_PYTHON=/home/ubuntu/.venvs/zvec-bench/bin/python SH_EF=32 EXTRA_ARGS='--sh-ef-construction 200' ./scripts/bench_gutenberg_aws.sh ubuntu@dev.rigelstar.com /home/ubuntu/clustered_pg /home/ubuntu/cogniformerus_backup.dump 65485`
 - `scripts/bench_sorted_hnsw_vs_pgvector.sh /tmp 65485 10000 20 384 10 vector 64 96`
 - `python3 scripts/bench_ann_real_dataset.py --dataset nytimes-256 --sample-size 10000 --queries 20 --k 10 --pgv-ef 64 --sh-ef 96 --zvec-ef 64 --qdrant-ef 64`
 - `python3 scripts/bench_qdrant_synthetic.py --rows 10000 --queries 20 --dim 384 --k 10 --ef 64`
@@ -305,19 +305,24 @@ AWS restored Gutenberg dump (`~104K x 2880D`, top-10, exact heap GT on the
 restored `svec` table). Host: AWS ARM64 `ubuntu@dev.rigelstar.com`, 4 CPU,
 7.6 GiB RAM. In the current rerun the stored `bench_hnsw_gt` table matched the
 recomputed exact GT on 100% of the 50 benchmark queries after restore, so the
-fresh exact heap GT and the historical GT table agree.
+fresh exact heap GT and the historical GT table agree. This rerun uses
+`sorted_hnsw` `ef_construction=200` and `ef_search=32`, and the benchmark
+harness reconnects after build before timing ordered scans.
 
 | Method | p50 latency | Recall@10 | Notes |
 |--------|:-----------:|:---------:|-------|
-| Exact heap (`svec`) | 467.628 ms | 100% | brute-force GT on restored corpus |
-| `sorted_hnsw` (`svec`) | 2.353 ms | 99.8% | `ef_search=96`, index 404 MB, total 1902 MB |
-| **`sorted_hnsw` (`hsvec`)** | **2.306 ms** | **99.8%** | `ef_search=96`, index 404 MB, total 1032 MB |
-| pgvector HNSW (`halfvec`) | 1.985 ms | 97.8% | `ef_search=64`, index 804 MB, total 1615 MB |
-| zvec HNSW | 51.130 ms | 100% | in-process collection, `ef=64`, ~1.12 GiB on disk |
-| Qdrant HNSW | 6.689 ms | 99.6% | local Docker on same AWS host, `hnsw_ef=64`, 103,260 points |
+| Exact heap (`svec`) | 458.762 ms | 100.0% | brute-force GT on restored corpus |
+| **`sorted_hnsw` (`svec`)** | **1.287 ms** | **100.0%** | `ef_construction=200`, `ef_search=32`, index 404 MB, total 1902 MB |
+| `sorted_hnsw` (`hsvec`) | 1.404 ms | 100.0% | `ef_construction=200`, `ef_search=32`, index 404 MB, total 1032 MB |
+| pgvector HNSW (`halfvec`) | 2.031 ms | 99.8% | `ef_search=64`, index 804 MB, total 1615 MB |
+| zvec HNSW | 50.499 ms | 100.0% | in-process collection, `ef=64`, ~1.12 GiB on disk |
+| Qdrant HNSW | 6.028 ms | 99.2% | local Docker on same AWS host, `hnsw_ef=64`, 103,260 points |
 
 The precision-matched PostgreSQL row on Gutenberg is `sorted_hnsw (hsvec)`
-vs pgvector `halfvec`. The `sorted_hnsw` index stays 404 MB in both cases
+vs pgvector `halfvec`: `1.404 ms @ 100.0%` versus `2.031 ms @ 99.8%`, with
+total footprint `1032 MB` versus `1615 MB`. The raw fastest PostgreSQL row on
+this corpus is still `sorted_hnsw (svec)` at `1.287 ms`, but that uses
+float32 source storage. The `sorted_hnsw` index stays 404 MB in both cases
 because it stores SQ8 graph state; the size win from `hsvec` appears in the
 source table and TOAST footprint (`1902 MB -> 1032 MB`), not in the index.
 
