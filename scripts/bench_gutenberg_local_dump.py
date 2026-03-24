@@ -30,6 +30,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import psycopg2
@@ -64,9 +65,9 @@ class PgRunResult:
     sorted_hs_p50: float
     sorted_hs_avg: float
     sorted_hs_recall: float
-    pgv_p50: float
-    pgv_avg: float
-    pgv_recall: float
+    pgv_p50: Optional[float]
+    pgv_avg: Optional[float]
+    pgv_recall: Optional[float]
     exact_ids: list[list[str]]
     query_literals: list[str]
     sh_index_size: str
@@ -256,7 +257,16 @@ def restore_subset(tmp: Path, pg_bindir: str, port: int, dump_path: Path) -> Non
     )
 
 
-def run_pg_benchmark(tmp: Path, port: int, k: int, pgv_ef: int, sh_ef: int) -> PgRunResult:
+def run_pg_benchmark(
+    tmp: Path,
+    port: int,
+    k: int,
+    pgv_ef: int,
+    sh_ef: int,
+    pgv_ef_construction: int,
+    sh_ef_construction: int,
+    skip_pgv: bool,
+) -> PgRunResult:
     conn = psycopg2.connect(host=str(tmp), port=port, dbname="cogniformerus")
     conn.autocommit = True
     conn.set_client_encoding("UTF8")
@@ -310,11 +320,21 @@ def run_pg_benchmark(tmp: Path, port: int, k: int, pgv_ef: int, sh_ef: int) -> P
         )
         cur.execute("ANALYZE public.gutenberg_gptoss_hs")
 
-        cur.execute("CREATE INDEX gutenberg_gptoss_emb_idx ON public.gutenberg_gptoss USING hnsw (embedding halfvec_cosine_ops) WITH (m=16, ef_construction=100)")
-        cur.execute("ANALYZE public.gutenberg_gptoss")
-        cur.execute("CREATE INDEX gutenberg_gptoss_sh_shnsw_idx ON public.gutenberg_gptoss_sh USING sorted_hnsw (embedding) WITH (m=16, ef_construction=64)")
+        if not skip_pgv:
+            cur.execute(
+                f"CREATE INDEX gutenberg_gptoss_emb_idx ON public.gutenberg_gptoss "
+                f"USING hnsw (embedding halfvec_cosine_ops) WITH (m=16, ef_construction={pgv_ef_construction})"
+            )
+            cur.execute("ANALYZE public.gutenberg_gptoss")
+        cur.execute(
+            f"CREATE INDEX gutenberg_gptoss_sh_shnsw_idx ON public.gutenberg_gptoss_sh "
+            f"USING sorted_hnsw (embedding) WITH (m=16, ef_construction={sh_ef_construction})"
+        )
         cur.execute("ANALYZE public.gutenberg_gptoss_sh")
-        cur.execute("CREATE INDEX gutenberg_gptoss_hs_shnsw_idx ON public.gutenberg_gptoss_hs USING sorted_hnsw (embedding hsvec_cosine_ops) WITH (m=16, ef_construction=64)")
+        cur.execute(
+            f"CREATE INDEX gutenberg_gptoss_hs_shnsw_idx ON public.gutenberg_gptoss_hs "
+            f"USING sorted_hnsw (embedding hsvec_cosine_ops) WITH (m=16, ef_construction={sh_ef_construction})"
+        )
         cur.execute("ANALYZE public.gutenberg_gptoss_hs")
 
         sorted_ms: list[float] = []
@@ -344,27 +364,42 @@ def run_pg_benchmark(tmp: Path, port: int, k: int, pgv_ef: int, sh_ef: int) -> P
 
         pgv_ms: list[float] = []
         pgv_recall_parts: list[float] = []
-        cur.execute(f"SET hnsw.ef_search = {pgv_ef}")
-        for qi, lit in enumerate(query_literals):
-            cur.execute(f"SELECT id FROM public.gutenberg_gptoss ORDER BY embedding <=> %s::halfvec(2880) LIMIT {k}", (lit,))
-            t0 = time.perf_counter()
-            cur.execute(f"SELECT id FROM public.gutenberg_gptoss ORDER BY embedding <=> %s::halfvec(2880) LIMIT {k}", (lit,))
-            ids = [row[0] for row in cur.fetchall()]
-            pgv_ms.append((time.perf_counter() - t0) * 1000.0)
-            pgv_recall_parts.append(recall_at_k(ids, exact_ids[qi], k))
+        if not skip_pgv:
+            cur.execute(f"SET hnsw.ef_search = {pgv_ef}")
+            for qi, lit in enumerate(query_literals):
+                cur.execute(f"SELECT id FROM public.gutenberg_gptoss ORDER BY embedding <=> %s::halfvec(2880) LIMIT {k}", (lit,))
+                t0 = time.perf_counter()
+                cur.execute(f"SELECT id FROM public.gutenberg_gptoss ORDER BY embedding <=> %s::halfvec(2880) LIMIT {k}", (lit,))
+                ids = [row[0] for row in cur.fetchall()]
+                pgv_ms.append((time.perf_counter() - t0) * 1000.0)
+                pgv_recall_parts.append(recall_at_k(ids, exact_ids[qi], k))
 
-        cur.execute(
-            """
-            SELECT
-              pg_size_pretty(pg_relation_size('public.gutenberg_gptoss_sh_shnsw_idx'::regclass)),
-              pg_size_pretty(pg_relation_size('public.gutenberg_gptoss_hs_shnsw_idx'::regclass)),
-              pg_size_pretty(pg_relation_size('public.gutenberg_gptoss_emb_idx'::regclass)),
-              pg_size_pretty(pg_total_relation_size('public.gutenberg_gptoss_sh'::regclass)),
-              pg_size_pretty(pg_total_relation_size('public.gutenberg_gptoss_hs'::regclass)),
-              pg_size_pretty(pg_total_relation_size('public.gutenberg_gptoss'::regclass))
-            """
-        )
-        sh_index_size, sh_hs_index_size, pgv_index_size, sh_total_size, sh_hs_total_size, pgv_total_size = cur.fetchone()
+        if skip_pgv:
+            cur.execute(
+                """
+                SELECT
+                  pg_size_pretty(pg_relation_size('public.gutenberg_gptoss_sh_shnsw_idx'::regclass)),
+                  pg_size_pretty(pg_relation_size('public.gutenberg_gptoss_hs_shnsw_idx'::regclass)),
+                  pg_size_pretty(pg_total_relation_size('public.gutenberg_gptoss_sh'::regclass)),
+                  pg_size_pretty(pg_total_relation_size('public.gutenberg_gptoss_hs'::regclass))
+                """
+            )
+            sh_index_size, sh_hs_index_size, sh_total_size, sh_hs_total_size = cur.fetchone()
+            pgv_index_size = "skipped"
+            pgv_total_size = "skipped"
+        else:
+            cur.execute(
+                """
+                SELECT
+                  pg_size_pretty(pg_relation_size('public.gutenberg_gptoss_sh_shnsw_idx'::regclass)),
+                  pg_size_pretty(pg_relation_size('public.gutenberg_gptoss_hs_shnsw_idx'::regclass)),
+                  pg_size_pretty(pg_relation_size('public.gutenberg_gptoss_emb_idx'::regclass)),
+                  pg_size_pretty(pg_total_relation_size('public.gutenberg_gptoss_sh'::regclass)),
+                  pg_size_pretty(pg_total_relation_size('public.gutenberg_gptoss_hs'::regclass)),
+                  pg_size_pretty(pg_total_relation_size('public.gutenberg_gptoss'::regclass))
+                """
+            )
+            sh_index_size, sh_hs_index_size, pgv_index_size, sh_total_size, sh_hs_total_size, pgv_total_size = cur.fetchone()
 
         return PgRunResult(
             exact_p50=median_ms(exact_ms),
@@ -375,9 +410,9 @@ def run_pg_benchmark(tmp: Path, port: int, k: int, pgv_ef: int, sh_ef: int) -> P
             sorted_hs_p50=median_ms(sorted_hs_ms),
             sorted_hs_avg=avg_ms(sorted_hs_ms),
             sorted_hs_recall=avg_ms(sorted_hs_recall_parts),
-            pgv_p50=median_ms(pgv_ms),
-            pgv_avg=avg_ms(pgv_ms),
-            pgv_recall=avg_ms(pgv_recall_parts),
+            pgv_p50=median_ms(pgv_ms) if pgv_ms else None,
+            pgv_avg=avg_ms(pgv_ms) if pgv_ms else None,
+            pgv_recall=avg_ms(pgv_recall_parts) if pgv_recall_parts else None,
             exact_ids=exact_ids,
             query_literals=query_literals,
             sh_index_size=sh_index_size,
@@ -609,10 +644,13 @@ def main() -> int:
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--pgv-ef", type=int, default=64)
     ap.add_argument("--sh-ef", type=int, default=96)
+    ap.add_argument("--pgv-ef-construction", type=int, default=100)
+    ap.add_argument("--sh-ef-construction", type=int, default=64)
     ap.add_argument("--zvec-ef", type=int, default=64)
     ap.add_argument("--zvec-memory-limit-mb", type=int, default=8192)
     ap.add_argument("--qdrant-ef", type=int, default=64)
     ap.add_argument("--install-cmd", default="")
+    ap.add_argument("--skip-pgvector", action="store_true")
     ap.add_argument("--skip-zvec", action="store_true")
     ap.add_argument("--skip-qdrant", action="store_true")
     args = ap.parse_args()
@@ -636,15 +674,27 @@ def main() -> int:
         print(f"k:         {args.k}")
         print(f"pgv_ef:    {args.pgv_ef}")
         print(f"sh_ef:     {args.sh_ef}")
+        print(f"pgv_efc:   {args.pgv_ef_construction}")
+        print(f"sh_efc:    {args.sh_ef_construction}")
         print(f"zvec_ef:   {args.zvec_ef}")
         print(f"qdrant_ef: {args.qdrant_ef}")
         print()
 
-        pg = run_pg_benchmark(tmp, args.port, args.k, args.pgv_ef, args.sh_ef)
+        pg = run_pg_benchmark(
+            tmp,
+            args.port,
+            args.k,
+            args.pgv_ef,
+            args.sh_ef,
+            args.pgv_ef_construction,
+            args.sh_ef_construction,
+            args.skip_pgvector,
+        )
         print_result("exact_heap", pg.exact_p50, pg.exact_avg, 100.0, args.k)
         print_result("sorted_hnsw_svec", pg.sorted_p50, pg.sorted_avg, pg.sorted_recall, args.k, extra=f"index={pg.sh_index_size}")
         print_result("sorted_hnsw_hsvec", pg.sorted_hs_p50, pg.sorted_hs_avg, pg.sorted_hs_recall, args.k, extra=f"index={pg.sh_hs_index_size}")
-        print_result("pgvector_hnsw_halfvec", pg.pgv_p50, pg.pgv_avg, pg.pgv_recall, args.k, extra=f"index={pg.pgv_index_size}")
+        if pg.pgv_p50 is not None and pg.pgv_avg is not None and pg.pgv_recall is not None:
+            print_result("pgvector_hnsw_halfvec", pg.pgv_p50, pg.pgv_avg, pg.pgv_recall, args.k, extra=f"index={pg.pgv_index_size}")
         print(
             f"pg_sizes|sorted_hnsw_svec_index={pg.sh_index_size}|sorted_hnsw_hsvec_index={pg.sh_hs_index_size}"
             f"|pgvector_index={pg.pgv_index_size}|bench_sh_total={pg.sh_total_size}"
