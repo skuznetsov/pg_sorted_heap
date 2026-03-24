@@ -29,6 +29,7 @@ def run_same_session_repro(
     sh_ef_search: int,
     include_svec: bool,
     include_hsvec: bool,
+    verbose_queries: bool,
 ) -> int:
     conn = psycopg2.connect(host=str(tmp), port=port, dbname="cogniformerus")
     conn.autocommit = True
@@ -85,9 +86,13 @@ def run_same_session_repro(
                         f"WHERE id <> %s ORDER BY embedding <=> %s::{cast_name} LIMIT {k}"
                     )
                     params = (source_id, lit)
+                if verbose_queries:
+                    print(f"phase={label}|status=query_start|qi={qi}", flush=True)
                 cur.execute(sql, params)
-                if qi == 1:
-                    print(f"phase={label}|status=first_query_ok")
+                if verbose_queries:
+                    print(f"phase={label}|status=query_ok|qi={qi}", flush=True)
+                elif qi == 1:
+                    print(f"phase={label}|status=first_query_ok", flush=True)
             print(f"phase={label}|status=all_queries_ok|count={len(query_specs)}")
 
         return 0
@@ -112,6 +117,8 @@ def main() -> int:
     ap.add_argument("--sh-ef-search", type=int, default=32)
     ap.add_argument("--skip-svec", action="store_true")
     ap.add_argument("--skip-hsvec", action="store_true")
+    ap.add_argument("--keep-temp", action="store_true")
+    ap.add_argument("--verbose-queries", action="store_true")
     ap.add_argument("--install-cmd", default="")
     global args
     args = ap.parse_args()
@@ -129,6 +136,8 @@ def main() -> int:
     tmp_root = Path(args.tmp_root).resolve()
 
     tmp, pg_bindir = fixed.init_temp_cluster(root_dir, port, tmp_root, install_cmd)
+    print(f"tmp:               {tmp}", flush=True)
+    print(f"port:              {port}", flush=True)
     try:
         fixed.restore_subset(tmp, pg_bindir, port, dump_path)
         return run_same_session_repro(
@@ -142,9 +151,13 @@ def main() -> int:
             args.sh_ef_search,
             include_svec=not args.skip_svec,
             include_hsvec=not args.skip_hsvec,
+            verbose_queries=args.verbose_queries,
         )
     finally:
-        fixed.stop_temp_cluster(tmp, pg_bindir)
+        if args.keep_temp:
+            print(f"keep_temp:         {tmp}", flush=True)
+        else:
+            fixed.stop_temp_cluster(tmp, pg_bindir)
 
 
 if __name__ == "__main__":

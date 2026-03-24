@@ -45,7 +45,7 @@ echo "== aws fixed-graph preflight =="
 ssh "${SSH_OPTS[@]}" "$HOST" "sudo -n true >/dev/null && command -v python3 >/dev/null && command -v psql >/dev/null && command -v pg_restore >/dev/null"
 
 echo "== sync repo subset =="
-rsync -az --delete \
+rsync -az --delete --delete-excluded \
   --exclude '.git/' \
   --exclude '.claude/' \
   --exclude '.crystal_ball/' \

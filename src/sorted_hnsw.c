@@ -2985,10 +2985,39 @@ struct ScanResult
 static int
 cmp_result_asc(const void *a, const void *b)
 {
-	float8 da = ((const ScanResult *)a)->exact_dist;
-	float8 db = ((const ScanResult *)b)->exact_dist;
-	if (da < db) return -1;
-	if (da > db) return 1;
+	const ScanResult *ra = (const ScanResult *) a;
+	const ScanResult *rb = (const ScanResult *) b;
+	float8 da = ra->exact_dist;
+	float8 db = rb->exact_dist;
+	bool a_nan = isnan(da);
+	bool b_nan = isnan(db);
+
+	/*
+	 * Keep qsort's comparator a total order. PostgreSQL float ordering treats
+	 * NaN as larger than any finite value, so match that here instead of
+	 * collapsing NaN comparisons to equality.
+	 */
+	if (a_nan || b_nan)
+	{
+		if (a_nan != b_nan)
+			return a_nan ? 1 : -1;
+	}
+	else
+	{
+		if (da < db)
+			return -1;
+		if (da > db)
+			return 1;
+	}
+
+	if (ItemPointerGetBlockNumber(&ra->tid) < ItemPointerGetBlockNumber(&rb->tid))
+		return -1;
+	if (ItemPointerGetBlockNumber(&ra->tid) > ItemPointerGetBlockNumber(&rb->tid))
+		return 1;
+	if (ItemPointerGetOffsetNumber(&ra->tid) < ItemPointerGetOffsetNumber(&rb->tid))
+		return -1;
+	if (ItemPointerGetOffsetNumber(&ra->tid) > ItemPointerGetOffsetNumber(&rb->tid))
+		return 1;
 	return 0;
 }
 
@@ -3130,6 +3159,8 @@ shnsw_beginscan(Relation index, int nkeys, int norderbys)
 	ShnswScanOpaque so;
 
 	scan = RelationGetIndexScan(index, nkeys, norderbys);
+	scan->xs_recheck = false;
+	scan->xs_recheckorderby = false;
 
 	/*
 	 * Ordered scans write xs_orderbyvals/xs_orderbynulls on every returned
@@ -3164,6 +3195,8 @@ shnsw_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 
 	so->first_call = true;
 	shnsw_reset_scan_state(so);
+	scan->xs_recheck = false;
+	scan->xs_recheckorderby = false;
 
 	if (norderbys > 0 && orderbys)
 	{
@@ -3245,7 +3278,7 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 		elog(DEBUG1, "sorted_hnsw scan: cache loaded, %d nodes, entry=%d, max_level=%d",
 			 cache->n_nodes, cache->entry_nid, cache->max_level);
 
-		ef = cache->ef_search;
+		ef = Min(Max(sorted_hnsw_ef_search, 1), cache->n_nodes);
 		ep_nid = cache->entry_nid;
 
 		/* Navigate upper levels (ef=1, greedy) */
@@ -3356,6 +3389,7 @@ done_search:
 	{
 		scan->xs_heaptid = so->result_tids[so->result_idx];
 		scan->xs_recheck = false;
+		scan->xs_recheckorderby = false;
 
 		if (scan->numberOfOrderBys > 0 &&
 			scan->xs_orderbyvals != NULL &&
