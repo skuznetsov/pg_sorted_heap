@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Reproducible Gutenberg fixed-graph benchmark runner for the AWS Ubuntu host.
+# Reproducible Gutenberg fixed-graph benchmark runner for a user-provided AWS host.
 #
 # It syncs the current repo subset, ensures the Gutenberg dump exists remotely,
 # then restores/builds the graph once and measures multiple ef_search points on
 # that same fixed on-disk graph.
 
-HOST="${1:-ubuntu@dev.rigelstar.com}"
-REMOTE_DIR="${2:-/home/ubuntu/clustered_pg}"
-REMOTE_DUMP="${3:-/home/ubuntu/cogniformerus_backup.dump}"
-PORT="${4:-65479}"
+HOST="${1:-${AWS_HOST:-}}"
+REMOTE_DIR="${2:-${AWS_REMOTE_DIR:-}}"
+REMOTE_DUMP="${3:-${AWS_REMOTE_DUMP:-}}"
+PORT="${4:-${AWS_PORT:-65479}}"
 REMOTE_PYTHON="${REMOTE_PYTHON:-python3}"
 
 LOCAL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,6 +26,11 @@ EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 if [[ ! -f "$LOCAL_DUMP" ]]; then
   echo "Local dump not found: $LOCAL_DUMP" >&2
+  exit 2
+fi
+
+if [[ -z "$HOST" || -z "$REMOTE_DIR" || -z "$REMOTE_DUMP" ]]; then
+  echo "Usage: AWS_HOST=<user@host> AWS_REMOTE_DIR=/path/to/repo AWS_REMOTE_DUMP=/path/to/dump $0 [host] [remote_dir] [remote_dump] [port]" >&2
   exit 2
 fi
 

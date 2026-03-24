@@ -21,6 +21,9 @@ from pathlib import Path
 import psycopg2
 
 
+QuerySpec = tuple[str | None, str]
+
+
 WANTED_RESTORE_OBJECTS = {
     "_ivf_meta",
     "_ivf_centroids",
@@ -195,30 +198,59 @@ def restore_subset(tmp: Path, pg_bindir: str, port: int, dump_path: Path) -> Non
     )
 
 
-def load_query_literals(cur: psycopg2.extensions.cursor, query_count: int) -> list[str]:
-    cur.execute(
-        """
-        SELECT q.qvec::text
-        FROM public.bench_gptoss_queries q
-        JOIN public.bench_hnsw_gt gt USING (qid)
-        ORDER BY q.qid
-        LIMIT %s
-        """,
-        (query_count,),
-    )
-    return [row[0] for row in cur.fetchall()]
+def load_query_specs(
+    cur: psycopg2.extensions.cursor,
+    query_count: int,
+    query_source: str,
+    sample_seed: str,
+) -> list[QuerySpec]:
+    if query_source == "bench":
+        cur.execute(
+            """
+            SELECT q.qvec::text
+            FROM public.bench_gptoss_queries q
+            JOIN public.bench_hnsw_gt gt USING (qid)
+            ORDER BY q.qid
+            LIMIT %s
+            """,
+            (query_count,),
+        )
+        return [(None, row[0]) for row in cur.fetchall()]
+
+    if query_source == "sample":
+        cur.execute(
+            """
+            SELECT id, embedding::text
+            FROM public.gutenberg_gptoss_sh
+            ORDER BY md5(id || %s)
+            LIMIT %s
+            """,
+            (sample_seed, query_count),
+        )
+        return [(row[0], row[1]) for row in cur.fetchall()]
+
+    raise ValueError(f"unknown query source: {query_source}")
 
 
-def compute_exact_gt(cur: psycopg2.extensions.cursor, query_literals: list[str], k: int) -> tuple[float, float, list[list[str]]]:
+def compute_exact_gt(cur: psycopg2.extensions.cursor, query_specs: list[QuerySpec], k: int) -> tuple[float, float, list[list[str]]]:
     exact_ms: list[float] = []
     exact_ids: list[list[str]] = []
     cur.execute("SET enable_seqscan = on")
     cur.execute("SET enable_indexscan = off")
     cur.execute("SET enable_bitmapscan = off")
-    for lit in query_literals:
-        cur.execute(f"SELECT id FROM public.gutenberg_gptoss_sh ORDER BY embedding <=> %s::svec LIMIT {k}", (lit,))
+    for source_id, lit in query_specs:
+        if source_id is None:
+            sql = f"SELECT id FROM public.gutenberg_gptoss_sh ORDER BY embedding <=> %s::svec LIMIT {k}"
+            params = (lit,)
+        else:
+            sql = (
+                f"SELECT id FROM public.gutenberg_gptoss_sh "
+                f"WHERE id <> %s ORDER BY embedding <=> %s::svec LIMIT {k}"
+            )
+            params = (source_id, lit)
+        cur.execute(sql, params)
         t0 = time.perf_counter()
-        cur.execute(f"SELECT id FROM public.gutenberg_gptoss_sh ORDER BY embedding <=> %s::svec LIMIT {k}", (lit,))
+        cur.execute(sql, params)
         exact_ids.append([row[0] for row in cur.fetchall()])
         exact_ms.append((time.perf_counter() - t0) * 1000.0)
     return median_ms(exact_ms), avg_ms(exact_ms), exact_ids
@@ -272,7 +304,7 @@ def measure_sorted_hnsw_pass(
     conn: psycopg2.extensions.connection,
     table_name: str,
     cast_name: str,
-    query_literals: list[str],
+    query_specs: list[QuerySpec],
     exact_ids: list[list[str]],
     k: int,
     ef_search: int,
@@ -287,14 +319,22 @@ def measure_sorted_hnsw_pass(
         cur.execute(f"SET sorted_hnsw.shared_cache = {'on' if shared_cache else 'off'}")
         cur.execute(f"SET sorted_hnsw.ef_search = {ef_search}")
 
-        sql = f"SELECT id FROM {table_name} ORDER BY embedding <=> %s::{cast_name} LIMIT {k}"
         ms: list[float] = []
         recall_parts: list[float] = []
 
-        for qi, lit in enumerate(query_literals):
-            cur.execute(sql, (lit,))
+        for qi, (source_id, lit) in enumerate(query_specs):
+            if source_id is None:
+                sql = f"SELECT id FROM {table_name} ORDER BY embedding <=> %s::{cast_name} LIMIT {k}"
+                params = (lit,)
+            else:
+                sql = (
+                    f"SELECT id FROM {table_name} "
+                    f"WHERE id <> %s ORDER BY embedding <=> %s::{cast_name} LIMIT {k}"
+                )
+                params = (source_id, lit)
+            cur.execute(sql, params)
             t0 = time.perf_counter()
-            cur.execute(sql, (lit,))
+            cur.execute(sql, params)
             ids = [row[0] for row in cur.fetchall()]
             ms.append((time.perf_counter() - t0) * 1000.0)
             recall_parts.append(recall_at_k(ids, exact_ids[qi], k))
@@ -309,7 +349,7 @@ def measure_fixed_graph(
     port: int,
     table_name: str,
     cast_name: str,
-    query_literals: list[str],
+    query_specs: list[QuerySpec],
     exact_ids: list[list[str]],
     k: int,
     ef_search: int,
@@ -327,7 +367,7 @@ def measure_fixed_graph(
         try:
             for _ in range(repeats):
                 p50, avg, recall = measure_sorted_hnsw_pass(
-                    conn, table_name, cast_name, query_literals, exact_ids,
+                    conn, table_name, cast_name, query_specs, exact_ids,
                     k, ef_search, shared_cache
                 )
                 p50s.append(p50)
@@ -341,7 +381,7 @@ def measure_fixed_graph(
             conn.autocommit = True
             try:
                 p50, avg, recall = measure_sorted_hnsw_pass(
-                    conn, table_name, cast_name, query_literals, exact_ids,
+                    conn, table_name, cast_name, query_specs, exact_ids,
                     k, ef_search, shared_cache
                 )
                 p50s.append(p50)
@@ -367,6 +407,8 @@ def main() -> int:
     ap.add_argument("--efs", default="32,48,64,96", help="comma-separated sorted_hnsw ef_search values")
     ap.add_argument("--sh-ef-construction", type=int, default=64)
     ap.add_argument("--query-count", type=int, default=50)
+    ap.add_argument("--query-source", choices=("bench", "sample"), default="bench")
+    ap.add_argument("--sample-seed", default="gutenberg-fixed-1")
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--backend-mode", choices=("fresh", "reuse"), default="reuse")
     ap.add_argument("--shared-cache", choices=("on", "off"), default="on")
@@ -395,8 +437,8 @@ def main() -> int:
         conn.autocommit = True
         cur = conn.cursor()
         try:
-            query_literals = load_query_literals(cur, args.query_count)
-            exact_p50, exact_avg, exact_ids = compute_exact_gt(cur, query_literals, args.k)
+            query_specs = load_query_specs(cur, args.query_count, args.query_source, args.sample_seed)
+            exact_p50, exact_avg, exact_ids = compute_exact_gt(cur, query_specs, args.k)
             prepare_hs_table(cur)
             svec_index_size, hsvec_index_size = build_sorted_hnsw_indexes(
                 cur,
@@ -415,6 +457,9 @@ def main() -> int:
         print(f"port:              {port}")
         print(f"k:                 {args.k}")
         print(f"query_count:       {args.query_count}")
+        print(f"query_source:      {args.query_source}")
+        if args.query_source == "sample":
+            print(f"sample_seed:       {args.sample_seed}")
         print(f"sh_ef_construction:{args.sh_ef_construction}")
         print(f"efs:               {','.join(str(v) for v in efs)}")
         print(f"backend_mode:      {args.backend_mode}")
@@ -430,7 +475,7 @@ def main() -> int:
                     port,
                     "public.gutenberg_gptoss_sh",
                     "svec",
-                    query_literals,
+                    query_specs,
                     exact_ids,
                     args.k,
                     ef,
@@ -453,7 +498,7 @@ def main() -> int:
                     port,
                     "public.gutenberg_gptoss_hs",
                     "hsvec",
-                    query_literals,
+                    query_specs,
                     exact_ids,
                     args.k,
                     ef,
