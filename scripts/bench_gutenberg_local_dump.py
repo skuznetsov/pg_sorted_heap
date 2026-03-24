@@ -336,6 +336,19 @@ def run_pg_benchmark(
             f"USING sorted_hnsw (embedding hsvec_cosine_ops) WITH (m=16, ef_construction={sh_ef_construction})"
         )
         cur.execute("ANALYZE public.gutenberg_gptoss_hs")
+    finally:
+        cur.close()
+        conn.close()
+
+    # Measure in a fresh backend after build. The fixed-graph harness already
+    # uses this contract, and it avoids planner/executor state carried across
+    # exact scans, table rewrites, and CREATE INDEX in the same session.
+    conn = psycopg2.connect(host=str(tmp), port=port, dbname="cogniformerus")
+    conn.autocommit = True
+    conn.set_client_encoding("UTF8")
+    cur = conn.cursor()
+    try:
+        cur.execute("SET jit = off")
 
         sorted_ms: list[float] = []
         sorted_recall_parts: list[float] = []
