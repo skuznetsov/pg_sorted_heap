@@ -104,7 +104,7 @@ heap-without-index -- roughly 30% less than heap + btree at scale.
 Repo-owned harnesses:
 
 - `python3 scripts/bench_gutenberg_local_dump.py --dump /tmp/cogniformerus_backup/cogniformerus_backup.dump --port 65473`
-- `REMOTE_PYTHON=/home/ubuntu/.venvs/zvec-bench/bin/python SH_EF=32 EXTRA_ARGS='--sh-ef-construction 200' ./scripts/bench_gutenberg_aws.sh ubuntu@dev.rigelstar.com /home/ubuntu/clustered_pg /home/ubuntu/cogniformerus_backup.dump 65485`
+- `REMOTE_PYTHON=/path/to/python SH_EF=32 EXTRA_ARGS='--sh-ef-construction 200' ./scripts/bench_gutenberg_aws.sh <aws-host> /path/to/repo /path/to/dump 65485`
 - `scripts/bench_sorted_hnsw_vs_pgvector.sh /tmp 65485 10000 20 384 10 vector 64 96`
 - `python3 scripts/bench_ann_real_dataset.py --dataset nytimes-256 --sample-size 10000 --queries 20 --k 10 --pgv-ef 64 --sh-ef 96 --zvec-ef 64 --qdrant-ef 64`
 - `python3 scripts/bench_qdrant_synthetic.py --rows 10000 --queries 20 --dim 384 --k 10 --ef 64`
@@ -112,7 +112,7 @@ Repo-owned harnesses:
 
 ### Current AWS restored-corpus benchmark (`~104K x 2880D`, Gutenberg dump)
 
-AWS ARM64 host `ubuntu@dev.rigelstar.com` (4 CPU, 7.6 GiB RAM), top-10,
+AWS ARM64 host (4 CPU, 7.6 GiB RAM), top-10,
 restored PostgreSQL custom dump. Ground truth is recomputed by exact heap
 search on the restored `svec` table. In the current rerun the stored
 `bench_hnsw_gt` table matched the exact heap GT on 100% of the 50 benchmark

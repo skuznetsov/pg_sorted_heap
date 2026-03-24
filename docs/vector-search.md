@@ -295,14 +295,14 @@ and IVF routing are. This confirms hsvec is a safe storage choice for ANN.
 Current repo-owned harnesses:
 
 - `python3 scripts/bench_gutenberg_local_dump.py --dump /tmp/cogniformerus_backup/cogniformerus_backup.dump --port 65473`
-- `REMOTE_PYTHON=/home/ubuntu/.venvs/zvec-bench/bin/python SH_EF=32 EXTRA_ARGS='--sh-ef-construction 200' ./scripts/bench_gutenberg_aws.sh ubuntu@dev.rigelstar.com /home/ubuntu/clustered_pg /home/ubuntu/cogniformerus_backup.dump 65485`
+- `REMOTE_PYTHON=/path/to/python SH_EF=32 EXTRA_ARGS='--sh-ef-construction 200' ./scripts/bench_gutenberg_aws.sh <aws-host> /path/to/repo /path/to/dump 65485`
 - `scripts/bench_sorted_hnsw_vs_pgvector.sh /tmp 65485 10000 20 384 10 vector 64 96`
 - `python3 scripts/bench_ann_real_dataset.py --dataset nytimes-256 --sample-size 10000 --queries 20 --k 10 --pgv-ef 64 --sh-ef 96 --zvec-ef 64 --qdrant-ef 64`
 - `python3 scripts/bench_qdrant_synthetic.py --rows 10000 --queries 20 --dim 384 --k 10 --ef 64`
 - `python3 scripts/bench_zvec_synthetic.py --rows 10000 --queries 20 --dim 384 --k 10 --ef 64`
 
 AWS restored Gutenberg dump (`~104K x 2880D`, top-10, exact heap GT on the
-restored `svec` table). Host: AWS ARM64 `ubuntu@dev.rigelstar.com`, 4 CPU,
+restored `svec` table). Host: AWS ARM64, 4 CPU,
 7.6 GiB RAM. In the current rerun the stored `bench_hnsw_gt` table matched the
 recomputed exact GT on 100% of the 50 benchmark queries after restore, so the
 fresh exact heap GT and the historical GT table agree. This rerun uses
