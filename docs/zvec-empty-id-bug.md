@@ -162,6 +162,33 @@ That does not prove which codepath is at fault, but it makes the working
 component hypothesis narrower: the failure is plausibly in forward-store chunk
 lookup or chunk materialization rather than in HNSW distance ranking itself.
 
+Debug file logging on the compact synthetic case adds one more strong clue.
+With `log_level=DEBUG`, `query_threads=1`, and the same `4950 / topk=7` repro,
+`zvec` reports:
+
+```text
+Opened IPC with 4950 rows, 2 cols, 2 chunks, is_fixed_batch_size[1] fixed_batch_size[2432]
+...
+Failed to find target chunk for index 4945
+...
+Record batch: _zvec_uid_: [
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null
+]
+```
+
+So the strongest current reading is:
+
+- the forward store opens successfully
+- the query reaches the recall/output stage
+- metadata resolution for `_zvec_uid_` fails and the returned batch carries
+  null ids even though scores are still present
+
 ## Why this matters
 
 For the `pg_sorted_heap` GraphRAG benchmark harness, this bug currently blocks a
