@@ -208,12 +208,12 @@ def load_data(cur: Cursor, csv_path: Path) -> None:
     cur.execute("ANALYZE facts_sh")
 
 
-def build_indexes(cur: Cursor, ef_construction: int) -> None:
+def build_indexes(cur: Cursor, ef_construction: int, m: int = 16) -> None:
     cur.execute(
-        f"CREATE INDEX facts_heap_ann_idx ON facts_heap USING sorted_hnsw (embedding) WITH (m = 16, ef_construction = {ef_construction})"
+        f"CREATE INDEX facts_heap_ann_idx ON facts_heap USING sorted_hnsw (embedding) WITH (m = {m}, ef_construction = {ef_construction})"
     )
     cur.execute(
-        f"CREATE INDEX facts_sh_ann_idx ON facts_sh USING sorted_hnsw (embedding) WITH (m = 16, ef_construction = {ef_construction})"
+        f"CREATE INDEX facts_sh_ann_idx ON facts_sh USING sorted_hnsw (embedding) WITH (m = {m}, ef_construction = {ef_construction})"
     )
     cur.execute("ANALYZE facts_heap")
     cur.execute("ANALYZE facts_sh")
@@ -575,6 +575,7 @@ def main() -> int:
     ap.add_argument("--top-k", type=int, default=10)
     ap.add_argument("--ef-search", type=int, default=32)
     ap.add_argument("--ef-construction", type=int, default=64)
+    ap.add_argument("--m", type=int, default=16)
     ap.add_argument("--shared-buffers-mb", type=int, default=512)
     ap.add_argument("--backend-mode", choices=("fresh", "reuse"), default="fresh")
     ap.add_argument("--keep-temp", action="store_true")
@@ -596,7 +597,7 @@ def main() -> int:
             cur.execute(f"SET sorted_hnsw.ef_search = {args.ef_search}")
             bootstrap_schema(cur, args.dim)
             load_data(cur, csv_path)
-            build_indexes(cur, args.ef_construction)
+            build_indexes(cur, args.ef_construction, m=args.m)
             queries = load_queries(cur, args.query_count)
 
             cases = [
@@ -889,6 +890,7 @@ def main() -> int:
             print(f"top_k:            {args.top_k}")
             print(f"ef_search:        {args.ef_search}")
             print(f"ef_construction:  {args.ef_construction}")
+            print(f"m:                {args.m}")
             print(f"shared_buffers:   {args.shared_buffers_mb}MB")
             print(f"backend_mode:     {args.backend_mode}")
             print()

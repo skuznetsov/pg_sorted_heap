@@ -70,6 +70,7 @@ def main() -> int:
     ap.add_argument("--ann-ks", default="64,96,128")
     ap.add_argument("--ef-searches", default="64,96,128")
     ap.add_argument("--ef-constructions", default="200")
+    ap.add_argument("--ms", default="16")
     ap.add_argument("--shared-buffers-mb", type=int, default=64)
     ap.add_argument("--backend-mode", choices=("fresh", "reuse"), default="fresh")
     ap.add_argument("--verify-first", action="store_true")
@@ -79,6 +80,7 @@ def main() -> int:
     ann_ks = parse_int_list(args.ann_ks)
     ef_searches = parse_int_list(args.ef_searches)
     ef_constructions = parse_int_list(args.ef_constructions)
+    ms = parse_int_list(args.ms)
 
     root_dir = Path(__file__).resolve().parent.parent
     tmp_root = Path(args.tmp_root).resolve()
@@ -101,133 +103,135 @@ def main() -> int:
         print(f"ann_ks:           {','.join(str(v) for v in ann_ks)}")
         print(f"ef_searches:      {','.join(str(v) for v in ef_searches)}")
         print(f"ef_constructions: {','.join(str(v) for v in ef_constructions)}")
+        print(f"ms:               {','.join(str(v) for v in ms)}")
         print(f"shared_buffers:   {args.shared_buffers_mb}MB")
         print(f"backend_mode:     {args.backend_mode}")
         print()
-        print("ef_construction|ef_search|ann_k|table|case|p50_ms|avg_ms|hit1_pct|hitk_pct|avg_rows")
+        print("m|ef_construction|ef_search|ann_k|table|case|p50_ms|avg_ms|hit1_pct|hitk_pct|avg_rows")
 
-        for ef_construction in ef_constructions:
-            conn = base.connect(tmp, port)
-            cur = conn.cursor()
-            try:
-                cur.execute("CREATE EXTENSION IF NOT EXISTS pg_sorted_heap")
-                cur.execute("DROP TABLE IF EXISTS facts_pgv")
-                cur.execute("DROP TABLE IF EXISTS facts_sh")
-                cur.execute("DROP TABLE IF EXISTS facts_heap")
-
-                cur.execute("SET jit = off")
-                cur.execute("SET sorted_hnsw.shared_cache = off")
-                bootstrap_schema_noext(cur, args.dim)
-                base.load_data(cur, csv_path)
-                base.build_indexes(cur, ef_construction)
-
-                for ef_search in ef_searches:
-                    if args.backend_mode == "fresh":
-                        cur.close()
-                        conn.close()
-                        conn = base.connect(tmp, port)
-                        cur = conn.cursor()
+        for m in ms:
+            for ef_construction in ef_constructions:
+                conn = base.connect(tmp, port)
+                cur = conn.cursor()
+                try:
+                    cur.execute("CREATE EXTENSION IF NOT EXISTS pg_sorted_heap")
+                    cur.execute("DROP TABLE IF EXISTS facts_pgv")
+                    cur.execute("DROP TABLE IF EXISTS facts_sh")
+                    cur.execute("DROP TABLE IF EXISTS facts_heap")
 
                     cur.execute("SET jit = off")
                     cur.execute("SET sorted_hnsw.shared_cache = off")
-                    cur.execute(f"SET sorted_hnsw.ef_search = {ef_search}")
+                    bootstrap_schema_noext(cur, args.dim)
+                    base.load_data(cur, csv_path)
+                    base.build_indexes(cur, ef_construction, m=m)
 
-                    for ann_k in ann_ks:
-                        sql_twohop = base.QueryCase(
-                            "seed_expand2_rerank_rel_in",
-                            f"""
-                            WITH ann AS MATERIALIZED (
-                                SELECT entity_id
-                                FROM {{table}}
-                                ORDER BY embedding <=> %s::svec
-                                LIMIT {ann_k}
-                            ),
-                            seeds AS MATERIALIZED (
-                                SELECT DISTINCT entity_id FROM ann
-                            ),
-                            hop1 AS MATERIALIZED (
-                                SELECT DISTINCT target_id
-                                FROM {{table}}
-                                WHERE entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
-                                  AND relation_id = {mh.REL_PARENT}
-                            ),
-                            expanded AS MATERIALIZED (
+                    for ef_search in ef_searches:
+                        if args.backend_mode == "fresh":
+                            cur.close()
+                            conn.close()
+                            conn = base.connect(tmp, port)
+                            cur = conn.cursor()
+
+                        cur.execute("SET jit = off")
+                        cur.execute("SET sorted_hnsw.shared_cache = off")
+                        cur.execute(f"SET sorted_hnsw.ef_search = {ef_search}")
+
+                        for ann_k in ann_ks:
+                            sql_twohop = base.QueryCase(
+                                "seed_expand2_rerank_rel_in",
+                                f"""
+                                WITH ann AS MATERIALIZED (
+                                    SELECT entity_id
+                                    FROM {{table}}
+                                    ORDER BY embedding <=> %s::svec
+                                    LIMIT {ann_k}
+                                ),
+                                seeds AS MATERIALIZED (
+                                    SELECT DISTINCT entity_id FROM ann
+                                ),
+                                hop1 AS MATERIALIZED (
+                                    SELECT DISTINCT target_id
+                                    FROM {{table}}
+                                    WHERE entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+                                      AND relation_id = {mh.REL_PARENT}
+                                ),
+                                expanded AS MATERIALIZED (
+                                    SELECT *
+                                    FROM {{table}}
+                                    WHERE entity_id = ANY (ARRAY(SELECT target_id FROM hop1))
+                                      AND relation_id = {mh.REL_CITY}
+                                )
                                 SELECT *
-                                FROM {{table}}
-                                WHERE entity_id = ANY (ARRAY(SELECT target_id FROM hop1))
-                                  AND relation_id = {mh.REL_CITY}
-                            )
-                            SELECT *
-                            FROM expanded
-                            ORDER BY embedding <=> %s::svec
-                            LIMIT {args.top_k}
-                            """,
-                            lambda q: (q.query_vec, q.query_vec),
-                        )
-                        helper_twohop = base.QueryCase(
-                            "seed_expand2_rerank_rel_twohop_fn",
-                            f"""
-                            WITH ann AS MATERIALIZED (
-                                SELECT entity_id
-                                FROM {{table}}
+                                FROM expanded
                                 ORDER BY embedding <=> %s::svec
-                                LIMIT {ann_k}
-                            ),
-                            seeds AS MATERIALIZED (
-                                SELECT DISTINCT entity_id FROM ann
+                                LIMIT {args.top_k}
+                                """,
+                                lambda q: (q.query_vec, q.query_vec),
                             )
-                            SELECT *
-                            FROM sorted_heap_expand_twohop_rerank(
-                                '{{table}}'::regclass,
-                                ARRAY(SELECT entity_id FROM seeds),
-                                %s::svec,
-                                {args.top_k},
-                                {mh.REL_PARENT},
-                                {mh.REL_CITY},
-                                0
+                            helper_twohop = base.QueryCase(
+                                "seed_expand2_rerank_rel_twohop_fn",
+                                f"""
+                                WITH ann AS MATERIALIZED (
+                                    SELECT entity_id
+                                    FROM {{table}}
+                                    ORDER BY embedding <=> %s::svec
+                                    LIMIT {ann_k}
+                                ),
+                                seeds AS MATERIALIZED (
+                                    SELECT DISTINCT entity_id FROM ann
+                                )
+                                SELECT *
+                                FROM sorted_heap_expand_twohop_rerank(
+                                    '{{table}}'::regclass,
+                                    ARRAY(SELECT entity_id FROM seeds),
+                                    %s::svec,
+                                    {args.top_k},
+                                    {mh.REL_PARENT},
+                                    {mh.REL_CITY},
+                                    0
+                                )
+                                """,
+                                lambda q: (q.query_vec, q.query_vec),
                             )
-                            """,
-                            lambda q: (q.query_vec, q.query_vec),
-                        )
-                        wrapper_twohop = base.QueryCase(
-                            "seed_graph_rag_twohop_scan_fn",
-                            f"""
-                            SELECT *
-                            FROM sorted_heap_graph_rag_twohop_scan(
-                                '{{table}}'::regclass,
-                                %s::svec,
-                                {ann_k},
-                                {args.top_k},
-                                {mh.REL_PARENT},
-                                {mh.REL_CITY},
-                                0
+                            wrapper_twohop = base.QueryCase(
+                                "seed_graph_rag_twohop_scan_fn",
+                                f"""
+                                SELECT *
+                                FROM sorted_heap_graph_rag_twohop_scan(
+                                    '{{table}}'::regclass,
+                                    %s::svec,
+                                    {ann_k},
+                                    {args.top_k},
+                                    {mh.REL_PARENT},
+                                    {mh.REL_CITY},
+                                    0
+                                )
+                                """,
+                                lambda q: (q.query_vec,),
                             )
-                            """,
-                            lambda q: (q.query_vec,),
-                        )
 
-                        if args.verify_first and ef_search == ef_searches[0] and ann_k == ann_ks[0]:
-                            mh.verify_helper_twohop_equivalence(cur, "facts_sh", queries, ann_k, args.top_k)
-                            mh.verify_graph_rag_twohop_scan_equivalence(cur, "facts_sh", queries, ann_k, args.top_k)
+                            if args.verify_first and m == ms[0] and ef_construction == ef_constructions[0] and ef_search == ef_searches[0] and ann_k == ann_ks[0]:
+                                mh.verify_helper_twohop_equivalence(cur, "facts_sh", queries, ann_k, args.top_k)
+                                mh.verify_graph_rag_twohop_scan_equivalence(cur, "facts_sh", queries, ann_k, args.top_k)
 
-                        cases: list[tuple[str, str, base.QueryCase]] = [
-                            ("facts_heap", "facts_heap", sql_twohop),
-                            ("facts_sh", "facts_sh", helper_twohop),
-                            ("facts_sh", "facts_sh", wrapper_twohop),
-                        ]
+                            cases: list[tuple[str, str, base.QueryCase]] = [
+                                ("facts_heap", "facts_heap", sql_twohop),
+                                ("facts_sh", "facts_sh", helper_twohop),
+                                ("facts_sh", "facts_sh", wrapper_twohop),
+                            ]
 
-                        for label, table, case in cases:
-                            p50, avg, _hits, _reads, _root, _rowcount = base.measure_case(
-                                cur, table, case, queries, args.runs
-                            )
-                            hit1, hitk, avg_rows = mh.measure_quality(cur, table, case, queries)
-                            print(
-                                f"{ef_construction}|{ef_search}|{ann_k}|{label}|{case.name}|"
-                                f"{p50:.3f}|{avg:.3f}|{hit1:.1f}|{hitk:.1f}|{avg_rows:.2f}"
-                            )
-            finally:
-                cur.close()
-                conn.close()
+                            for label, table, case in cases:
+                                p50, avg, _hits, _reads, _root, _rowcount = base.measure_case(
+                                    cur, table, case, queries, args.runs
+                                )
+                                hit1, hitk, avg_rows = mh.measure_quality(cur, table, case, queries)
+                                print(
+                                    f"{m}|{ef_construction}|{ef_search}|{ann_k}|{label}|{case.name}|"
+                                    f"{p50:.3f}|{avg:.3f}|{hit1:.1f}|{hitk:.1f}|{avg_rows:.2f}"
+                                )
+                finally:
+                    cur.close()
+                    conn.close()
 
         return 0
     finally:

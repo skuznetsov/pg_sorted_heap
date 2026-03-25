@@ -1001,6 +1001,7 @@ measured directly by:
 
 This harness keeps the corpus fixed per `ef_construction` and sweeps:
 
+- `m`
 - `ann_k`
 - `sorted_hnsw.ef_search`
 - `ef_construction`
@@ -1058,6 +1059,66 @@ So the current recommendation is:
 
 - default to `ef_construction=200`
 - treat `ef_construction=400` as a niche `hit@1` knob, not the new default
+
+### `m` frontier on the same multihop benchmark
+
+The next useful falsifier was whether graph degree buys more than another
+`ef_construction` increase.
+
+Keeping:
+
+- `ef_construction=200`
+- `ann_k=64`
+- `64` queries
+- `3` runs
+- fresh backend
+
+the `m` sweep came out as:
+
+- `m=16`, `ef_search=64`
+  - `0.405 ms`
+  - `hit@1 = 71.9%`
+  - `hit@k = 87.5%`
+- `m=24`, `ef_search=64`
+  - `0.466 ms`
+  - `hit@1 = 75.0%`
+  - `hit@k = 93.8%`
+- `m=32`, `ef_search=64`
+  - `0.491 ms`
+  - `hit@1 = 78.1%`
+  - `hit@k = 93.8%`
+- `m=16`, `ef_search=128`
+  - `0.672 ms`
+  - `hit@1 = 73.4%`
+  - `hit@k = 95.3%`
+- `m=24`, `ef_search=128`
+  - `0.738 ms`
+  - `hit@1 = 75.0%`
+  - `hit@k = 96.9%`
+- `m=32`, `ef_search=128`
+  - `0.771 ms`
+  - `hit@1 = 76.6%`
+  - `hit@k = 96.9%`
+
+The one-off build-cost probe for the same `10K x 384D` graph was:
+
+- `m=16`, `ef_construction=200`: `79.425 s`
+- `m=24`, `ef_construction=200`: `86.562 s`
+- `m=32`, `ef_construction=200`: `75.404 s`
+
+That last `m=32` build number should be treated cautiously; it was a single
+one-off probe and is likely noisy enough that only the query-time frontier is
+trustworthy here.
+
+The stable conclusion is still clear:
+
+- `m=24` is the best current quality-per-latency tradeoff we measured
+- `m=32` buys a little more `hit@1`, but no additional `hit@k`
+- so for fact-shaped multihop GraphRAG, the best current balanced point is:
+  - `m=24`
+  - `ef_construction=200`
+  - `ann_k=64`
+  - `sorted_hnsw.ef_search=128`
 
 So the honest story on this fact benchmark is a latency/quality frontier:
 

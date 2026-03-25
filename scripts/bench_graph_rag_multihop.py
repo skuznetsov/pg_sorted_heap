@@ -478,6 +478,7 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--ef-search", type=int, default=32)
     ap.add_argument("--ef-construction", type=int, default=64)
+    ap.add_argument("--m", type=int, default=16)
     ap.add_argument("--pgv-ef-search", type=int, default=64)
     ap.add_argument("--skip-pgvector", action="store_true")
     ap.add_argument("--zvec-ef", type=int, default=64)
@@ -511,7 +512,7 @@ def main() -> int:
             cur.execute(f"SET sorted_hnsw.ef_search = {args.ef_search}")
             base.bootstrap_schema(cur, args.dim)
             base.load_data(cur, csv_path)
-            base.build_indexes(cur, args.ef_construction)
+            base.build_indexes(cur, args.ef_construction, m=args.m)
             if not args.skip_pgvector:
                 gut.bootstrap_pgvector(cur, csv_path, args.dim, args.ef_construction)
 
@@ -704,6 +705,7 @@ def main() -> int:
             print(f"top_k:            {args.top_k}")
             print(f"ef_search:        {args.ef_search}")
             print(f"ef_construction:  {args.ef_construction}")
+            print(f"m:                {args.m}")
             print(f"pgv_ef_search:    {args.pgv_ef_search}")
             print(f"pgvector:         {'off' if args.skip_pgvector else 'on'}")
             print(f"zvec:             {'off' if args.skip_zvec else 'on'}")
