@@ -136,6 +136,38 @@ def load_relation_queries(cur, query_count: int, relation_id: int) -> list[tuple
     return [(row[0], row[1], row[2]) for row in cur.fetchall()]
 
 
+def bootstrap_pgvector(cur, csv_path: Path, dim: int, ef_construction: int) -> None:
+    cur.execute("CREATE EXTENSION vector")
+    cur.execute(
+        f"""
+        CREATE TABLE facts_pgv (
+            entity_id   int4 NOT NULL,
+            relation_id int2 NOT NULL,
+            target_id   int4 NOT NULL,
+            embedding   vector({dim}) NOT NULL,
+            payload     text NOT NULL,
+            PRIMARY KEY (entity_id, relation_id, target_id)
+        )
+        """
+    )
+    with open(csv_path, "r", encoding="utf-8") as f:
+        cur.copy_expert(
+            """
+            COPY facts_pgv (entity_id, relation_id, target_id, embedding, payload)
+            FROM STDIN WITH (FORMAT csv)
+            """,
+            f,
+        )
+    cur.execute(
+        f"""
+        CREATE INDEX facts_pgv_ann_idx
+        ON facts_pgv USING hnsw (embedding vector_cosine_ops)
+        WITH (m = 16, ef_construction = {ef_construction})
+        """
+    )
+    cur.execute("ANALYZE facts_pgv")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gutenberg-path", default=str(Path.home() / "Projects/ML/cogniversum_v2/gutenberg_cache"))
@@ -151,6 +183,8 @@ def main() -> int:
     ap.add_argument("--top-k", type=int, default=10)
     ap.add_argument("--ef-search", type=int, default=32)
     ap.add_argument("--ef-construction", type=int, default=64)
+    ap.add_argument("--pgv-ef-search", type=int, default=64)
+    ap.add_argument("--skip-pgvector", action="store_true")
     ap.add_argument("--shared-buffers-mb", type=int, default=64)
     ap.add_argument("--backend-mode", choices=("fresh", "reuse"), default="fresh")
     ap.add_argument("--keep-temp", action="store_true")
@@ -184,6 +218,8 @@ def main() -> int:
             base.bootstrap_schema(cur, args.dim)
             base.load_data(cur, csv_path)
             base.build_indexes(cur, args.ef_construction)
+            if not args.skip_pgvector:
+                bootstrap_pgvector(cur, csv_path, args.dim, args.ef_construction)
             queries = load_relation_queries(cur, args.query_count, 2)
             if len(queries) < args.query_count:
                 raise RuntimeError(f"not enough relation=2 query rows: got {len(queries)}")
@@ -278,6 +314,52 @@ def main() -> int:
                     lambda q: (q[2], q[1]),
                 ),
             ]
+            pgvector_cases = [
+                base.QueryCase(
+                    "seed_expand_rel_pgv",
+                    f"""
+                    WITH ann AS MATERIALIZED (
+                        SELECT target_id
+                        FROM facts_pgv
+                        ORDER BY embedding <=> %s::vector({args.dim})
+                        LIMIT {args.ann_k}
+                    ),
+                    seeds AS MATERIALIZED (
+                        SELECT DISTINCT target_id FROM ann
+                    )
+                    SELECT *
+                    FROM facts_heap
+                    WHERE entity_id = ANY (ARRAY(SELECT target_id FROM seeds))
+                      AND relation_id = %s
+                    """,
+                    lambda q: (q[2], q[1]),
+                ),
+                base.QueryCase(
+                    "seed_expand_rerank_rel_pgv",
+                    f"""
+                    WITH ann AS MATERIALIZED (
+                        SELECT target_id
+                        FROM facts_pgv
+                        ORDER BY embedding <=> %s::vector({args.dim})
+                        LIMIT {args.ann_k}
+                    ),
+                    seeds AS MATERIALIZED (
+                        SELECT DISTINCT target_id FROM ann
+                    ),
+                    expanded AS MATERIALIZED (
+                        SELECT *
+                        FROM facts_heap
+                        WHERE entity_id = ANY (ARRAY(SELECT target_id FROM seeds))
+                          AND relation_id = %s
+                    )
+                    SELECT *
+                    FROM expanded
+                    ORDER BY embedding <=> %s::svec
+                    LIMIT {args.top_k}
+                    """,
+                    lambda q: (q[2], q[1], q[2]),
+                ),
+            ]
 
             print("============================================================")
             print("graph rag Gutenberg benchmark")
@@ -297,6 +379,8 @@ def main() -> int:
             print(f"top_k:            {args.top_k}")
             print(f"ef_search:        {args.ef_search}")
             print(f"ef_construction:  {args.ef_construction}")
+            print(f"pgv_ef_search:    {args.pgv_ef_search}")
+            print(f"pgvector:         {'off' if args.skip_pgvector else 'on'}")
             print(f"shared_buffers:   {args.shared_buffers_mb}MB")
             print(f"backend_mode:     {args.backend_mode}")
             print()
@@ -324,6 +408,13 @@ def main() -> int:
                         print(f"running|table={table}|case={case.name}", flush=True)
                         p50, avg, hits, reads, root, rowcount = base.measure_case(cur, table, case, queries, args.runs)
                         base.print_result(table, case.name, p50, avg, hits, reads, root, rowcount)
+
+            if not args.skip_pgvector:
+                cur.execute(f"SET hnsw.ef_search = {args.pgv_ef_search}")
+                for case in pgvector_cases:
+                    print(f"running|table=facts_pgv|case={case.name}", flush=True)
+                    p50, avg, hits, reads, root, rowcount = base.measure_case(cur, "facts_pgv", case, queries, args.runs)
+                    base.print_result("facts_pgv", case.name, p50, avg, hits, reads, root, rowcount)
         finally:
             cur.close()
             conn.close()

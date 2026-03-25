@@ -403,6 +403,47 @@ This is the first non-synthetic result that materially weakens the earlier
 So the narrow-helper direction survives the real-text falsifier better than the
 short-payload synthetic benchmark suggested.
 
+## pgvector parity on the real-text graph
+
+The Gutenberg harness also now supports a comparable `pgvector` path on the
+same graph:
+
+- ANN seeds come from a `facts_pgv` table with `vector(dim)` + HNSW
+- graph expansion and exact rerank still happen in PostgreSQL over the fact
+  rows, which is the relevant GraphRAG shape
+
+This is important because a pure ANN benchmark would miss the real product
+question: how expensive is "ANN seed + graph expansion + exact rerank" as one
+workflow?
+
+On fresh-backend runs with `shared_buffers=64MB`:
+
+`64 books x 128 paragraphs/book` (`14,549` rows):
+
+- heap rerank baseline: `0.064 ms`
+- `sorted_heap_expand_rerank(... relation=2)`: `0.060 ms`
+- `sorted_heap_graph_rag_scan(... relation=2)`: `0.075 ms`
+- `pgvector ANN -> heap expansion -> exact rerank`: `0.180 ms`
+
+`128 books x 256 paragraphs/book` (`58,954` rows):
+
+- heap rerank baseline: `0.085 ms`
+- `sorted_heap_expand_rerank(... relation=2)`: `0.071 ms`
+- `sorted_heap_graph_rag_scan(... relation=2)`: `0.087 ms`
+- `pgvector ANN -> heap expansion -> exact rerank`: `0.295 ms`
+
+The buffer footprint matches the latency story:
+
+- `sorted_heap` helper path stays around hundreds of shared-buffer hits
+- the `pgvector` path needs several thousands of shared-buffer hits before the
+  same exact rerank step
+
+This does **not** mean `pgvector` is bad at pure ANN. It means that for this
+GraphRAG workload shape, once the seed stage is followed by relational graph
+expansion and exact rerank, the narrow `sorted_heap` helper path is materially
+better aligned with the whole workflow than an external ANN seed on a separate
+table.
+
 One important measurement caveat was also discovered and fixed during this
 work:
 
