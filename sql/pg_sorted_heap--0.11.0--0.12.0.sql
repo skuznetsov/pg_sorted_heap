@@ -61,3 +61,20 @@ CREATE FUNCTION @extschema@.sorted_heap_expand_rerank(
 )
 AS '$libdir/pg_sorted_heap', 'sorted_heap_expand_rerank'
 LANGUAGE C STABLE;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_rag_scan(
+  rel regclass,
+  query @extschema@.svec,
+  ann_k int4,
+  top_k int4,
+  relation_filter int4 DEFAULT NULL,
+  limit_rows int4 DEFAULT 0
+) RETURNS TABLE (
+  entity_id int4,
+  relation_id int2,
+  target_id int4,
+  payload text,
+  distance float8
+)
+AS '$libdir/pg_sorted_heap', 'sorted_heap_graph_rag_scan'
+LANGUAGE C STABLE;

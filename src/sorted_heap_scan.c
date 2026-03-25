@@ -18,10 +18,12 @@
 #include "catalog/pg_opclass.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
+#include "commands/extension.h"
 #if PG_VERSION_NUM >= 180000
 #include "commands/explain_format.h"
 #endif
 #include "executor/executor.h"
+#include "executor/spi.h"
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
 #include "nodes/pathnodes.h"
@@ -154,6 +156,7 @@ static bool sorted_heap_zone_overlaps(SortedHeapZoneMapEntry *e,
 static bool zone_overlaps_in_values(SortedHeapZoneMapEntry *e,
 									int64 *values, int nvalues);
 static bool sorted_heap_value_in_set(int64 value, int64 *values, int nvalues);
+static const char *sorted_heap_get_ext_schema(void);
 
 typedef struct GraphRagTopKEntry
 {
@@ -2620,6 +2623,14 @@ graph_rag_topk_insert(GraphRagTopKEntry *heap, int *heap_size,
 		pfree(DatumGetPointer(candidate.payload));
 }
 
+static const char *
+sorted_heap_get_ext_schema(void)
+{
+	Oid		ext_oid = get_extension_oid("pg_sorted_heap", false);
+
+	return quote_identifier(get_namespace_name(get_extension_schema(ext_oid)));
+}
+
 /* ----------------------------------------------------------------
  *  Narrow GraphRAG primitive: expand known entity IDs on sorted_heap.
  *
@@ -2928,6 +2939,7 @@ done:
  *  in C, avoiding SQL materialization + sort of the entire expanded set.
  * ---------------------------------------------------------------- */
 PG_FUNCTION_INFO_V1(sorted_heap_expand_rerank);
+PG_FUNCTION_INFO_V1(sorted_heap_graph_rag_scan);
 
 Datum
 sorted_heap_expand_rerank(PG_FUNCTION_ARGS)
@@ -3235,6 +3247,206 @@ emit_results:
 		ExecDropSingleTupleTableSlot(slot);
 	if (scan)
 		table_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	PG_RETURN_NULL();
+}
+
+/* ----------------------------------------------------------------
+ *  GraphRAG convenience wrapper: ANN seed + expand + rerank in one call.
+ *
+ *  This is intentionally a narrow API wrapper. It uses SPI to collect ANN
+ *  seed IDs from the base relation, then delegates the expansion+rereank
+ *  step to sorted_heap_expand_rerank(...), which already owns the verified
+ *  zone-map-driven implementation.
+ * ---------------------------------------------------------------- */
+Datum
+sorted_heap_graph_rag_scan(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo	   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Oid					rel_oid;
+	Svec			   *query;
+	int32				ann_k;
+	int32				top_k;
+	bool				has_relation_filter;
+	int32				relation_filter = 0;
+	int32				limit_rows;
+	Relation			rel;
+	AttrNumber			embedding_att;
+	Oid					embedding_typid;
+	char			   *schema_name;
+	char			   *relname;
+	const char		   *quoted_schema;
+	const char		   *quoted_relname;
+	const char		   *quoted_ext_schema;
+	StringInfoData		seed_sql;
+	StringInfoData		helper_sql;
+	Oid					argtypes[6];
+	Datum				values[6];
+	char				nulls[6] = {' ', ' ', ' ', ' ', ' ', ' '};
+	int					ret;
+	ArrayType		   *seed_arr = NULL;
+	bool				isnull;
+	HeapTuple			tuple;
+	TupleDesc			tupdesc;
+	uint64				row_idx;
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("sorted_heap_graph_rag_scan must be called in a set-returning context")));
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+	{
+		InitMaterializedSRF(fcinfo, 0);
+		PG_RETURN_NULL();
+	}
+
+	rel_oid = PG_GETARG_OID(0);
+	query = PG_GETARG_SVEC_P(1);
+	ann_k = PG_GETARG_INT32(2);
+	top_k = PG_GETARG_INT32(3);
+	has_relation_filter = !PG_ARGISNULL(4);
+	if (has_relation_filter)
+		relation_filter = PG_GETARG_INT32(4);
+	limit_rows = PG_ARGISNULL(5) ? 0 : PG_GETARG_INT32(5);
+
+	if (ann_k < 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("sorted_heap_graph_rag_scan: ann_k must be >= 1")));
+	if (top_k < 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("sorted_heap_graph_rag_scan: top_k must be >= 1")));
+	if (limit_rows < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("sorted_heap_graph_rag_scan: limit_rows must be >= 0")));
+	if (has_relation_filter &&
+		(relation_filter < PG_INT16_MIN || relation_filter > PG_INT16_MAX))
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("sorted_heap_graph_rag_scan: relation_filter %d is outside int2 range",
+						relation_filter)));
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	rel = table_open(rel_oid, AccessShareLock);
+	relname = pstrdup(RelationGetRelationName(rel));
+	if (rel->rd_tableam != &sorted_heap_am_routine)
+	{
+		table_close(rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("sorted_heap_graph_rag_scan: relation \"%s\" is not a sorted_heap table",
+						relname)));
+	}
+
+	embedding_att = get_attnum(rel_oid, "embedding");
+	if (embedding_att == InvalidAttrNumber)
+	{
+		table_close(rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("sorted_heap_graph_rag_scan: relation \"%s\" must have an embedding column",
+						relname)));
+	}
+	embedding_typid = TupleDescAttr(RelationGetDescr(rel), embedding_att - 1)->atttypid;
+
+	schema_name = get_namespace_name(get_rel_namespace(rel_oid));
+	quoted_schema = quote_identifier(schema_name);
+	quoted_relname = quote_identifier(relname);
+	quoted_ext_schema = sorted_heap_get_ext_schema();
+
+	ret = SPI_connect();
+	if (ret != SPI_OK_CONNECT)
+	{
+		table_close(rel, AccessShareLock);
+		elog(ERROR, "sorted_heap_graph_rag_scan: SPI_connect failed: %d", ret);
+	}
+
+	initStringInfo(&seed_sql);
+	appendStringInfo(&seed_sql,
+					 "SELECT array_agg(target_id::int4) "
+					 "FROM (SELECT DISTINCT target_id "
+					 "      FROM (SELECT target_id "
+					 "            FROM %s.%s "
+					 "            ORDER BY embedding <=> $1 LIMIT %d) ann) seeds",
+					 quoted_schema, quoted_relname, ann_k);
+
+	argtypes[0] = embedding_typid;
+	values[0] = PointerGetDatum(query);
+	ret = SPI_execute_with_args(seed_sql.data, 1, argtypes, values, nulls,
+								true, 1);
+	if (ret != SPI_OK_SELECT)
+	{
+		SPI_finish();
+		table_close(rel, AccessShareLock);
+		elog(ERROR, "sorted_heap_graph_rag_scan: seed query failed: %d", ret);
+	}
+
+	if (SPI_processed > 0)
+	{
+		tuple = SPI_tuptable->vals[0];
+		tupdesc = SPI_tuptable->tupdesc;
+		values[0] = SPI_getbinval(tuple, tupdesc, 1, &isnull);
+		if (!isnull)
+			seed_arr = DatumGetArrayTypePCopy(values[0]);
+		SPI_freetuptable(SPI_tuptable);
+	}
+
+	if (seed_arr == NULL)
+	{
+		SPI_finish();
+		table_close(rel, AccessShareLock);
+		PG_RETURN_NULL();
+	}
+
+	initStringInfo(&helper_sql);
+	appendStringInfo(&helper_sql,
+					 "SELECT entity_id, relation_id, target_id, payload, distance "
+					 "FROM %s.sorted_heap_expand_rerank($1::regclass, $2::int4[], $3, $4::int4, $5::int4, $6::int4)",
+					 quoted_ext_schema);
+
+	argtypes[0] = REGCLASSOID;
+	values[0] = ObjectIdGetDatum(rel_oid);
+	argtypes[1] = INT4ARRAYOID;
+	values[1] = PointerGetDatum(seed_arr);
+	argtypes[2] = embedding_typid;
+	values[2] = PointerGetDatum(query);
+	argtypes[3] = INT4OID;
+	values[3] = Int32GetDatum(top_k);
+	argtypes[4] = INT4OID;
+	values[4] = Int32GetDatum(relation_filter);
+	nulls[4] = has_relation_filter ? ' ' : 'n';
+	argtypes[5] = INT4OID;
+	values[5] = Int32GetDatum(limit_rows);
+
+	ret = SPI_execute_with_args(helper_sql.data, 6, argtypes, values, nulls,
+								true, 0);
+	if (ret != SPI_OK_SELECT)
+	{
+		SPI_finish();
+		table_close(rel, AccessShareLock);
+		elog(ERROR, "sorted_heap_graph_rag_scan: helper query failed: %d", ret);
+	}
+
+	tupdesc = SPI_tuptable->tupdesc;
+	for (row_idx = 0; row_idx < SPI_processed; row_idx++)
+	{
+		Datum out_values[5];
+		bool out_nulls[5];
+		int col;
+
+		tuple = SPI_tuptable->vals[row_idx];
+		for (col = 0; col < 5; col++)
+			out_values[col] = SPI_getbinval(tuple, tupdesc, col + 1, &out_nulls[col]);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+							 out_values, out_nulls);
+	}
+	SPI_freetuptable(SPI_tuptable);
+	SPI_finish();
 	table_close(rel, AccessShareLock);
 
 	PG_RETURN_NULL();

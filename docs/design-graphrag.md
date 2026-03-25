@@ -15,6 +15,8 @@ The conclusion so far is:
 - Narrow C helpers for expansion and fused top-K rerank now exist as:
   - `sorted_heap_expand_ids(...)`
   - `sorted_heap_expand_rerank(...)`
+- A one-call convenience wrapper now exists as:
+  - `sorted_heap_graph_rag_scan(...)`
 - Those helpers materially improve the `sorted_heap` path on the synthetic
   GraphRAG benchmark, though pure heap+btree expansion is still faster on
   this synthetic workload.
@@ -87,6 +89,7 @@ Benchmark harness:
   - `seed_expand_fn`
   - `seed_expand_rerank_fn`
   - `seed_expand_rerank_topk_fn`
+  - `seed_graph_rag_scan_fn`
 
 The key comparison is between:
 
@@ -247,6 +250,26 @@ RETURNS TABLE (
 )
 ```
 
+and:
+
+```sql
+sorted_heap_graph_rag_scan(
+    rel regclass,
+    query svec,
+    ann_k int4,
+    top_k int4,
+    relation_filter int4 DEFAULT NULL,
+    limit_rows int4 DEFAULT 0
+)
+RETURNS TABLE (
+    entity_id int4,
+    relation_id int2,
+    target_id int4,
+    payload text,
+    distance float8
+)
+```
+
 Their current contract is intentionally narrow:
 
 - relation must be a `sorted_heap` table
@@ -269,6 +292,7 @@ produced:
 - `facts_sh seed_expand_rerank_in`: `0.369 ms`
 - `facts_sh seed_expand_rerank_fn`: `0.234 ms`
 - `facts_sh seed_expand_rerank_topk_fn`: `0.139 ms`
+- `facts_sh seed_graph_rag_scan_fn`: `0.144 ms`
 
 Interpretation:
 
@@ -277,6 +301,9 @@ Interpretation:
 - `sorted_heap_expand_rerank()` removes most of the remaining rerank overhead
   and is now materially faster than the current `sorted_heap` SQL rerank path
   (`0.139 ms` vs `0.369 ms`)
+- `sorted_heap_graph_rag_scan()` is only slightly slower than the direct fused
+  helper composition (`0.144 ms` vs `0.139 ms`), so the convenience API does
+  not erase the win
 - pure heap+btree expansion is still faster on this synthetic workload
   (`0.123 ms` vs `0.165 ms`)
 
@@ -331,7 +358,12 @@ Add GraphRAG composition query:
 
 ### Phase 4
 
-Only if Phase 2 still shows SQL overhead:
+`sorted_heap_graph_rag_scan()` is now implemented as the narrow one-call
+composition wrapper.
+
+### Phase 5
+
+Only if the current wrapper still shows too much overhead:
 
 - consider a fused helper for:
   - ANN seed IDs
@@ -349,6 +381,8 @@ What is now true:
 - `sorted_heap_expand_ids()` is enough to recover a large part of that gap
 - `sorted_heap_expand_rerank()` recovers most of the rerank overhead on the
   current `sorted_heap` path
+- `sorted_heap_graph_rag_scan()` makes the composition available as a single
+  SQL call without giving back much latency
 - the narrow-helper direction is a justified building block
 
 What is not yet true:

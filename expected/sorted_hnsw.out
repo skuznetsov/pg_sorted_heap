@@ -83,26 +83,80 @@ SELECT id FROM hnsw_test ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec;
    ->  Seq Scan on hnsw_test
 (3 rows)
 
-EXPLAIN (COSTS OFF)
+EXPLAIN (COSTS OFF, FORMAT JSON)
 SELECT id FROM hnsw_test ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec LIMIT 40;
-                      QUERY PLAN
--------------------------------------------------------
- Limit
-   ->  Sort
-         Sort Key: ((v <=> '[0.8,0.6,0.9,0.1]'::svec))
-         ->  Seq Scan on hnsw_test
-(4 rows)
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ [                                                             +
+   {                                                           +
+     "Plan": {                                                 +
+       "Node Type": "Limit",                                   +
+       "Parallel Aware": false,                                +
+       "Async Capable": false,                                 +
+       "Disabled": false,                                      +
+       "Plans": [                                              +
+         {                                                     +
+           "Node Type": "Sort",                                +
+           "Parent Relationship": "Outer",                     +
+           "Parallel Aware": false,                            +
+           "Async Capable": false,                             +
+           "Disabled": false,                                  +
+           "Sort Key": ["((v <=> '[0.8,0.6,0.9,0.1]'::svec))"],+
+           "Plans": [                                          +
+             {                                                 +
+               "Node Type": "Seq Scan",                        +
+               "Parent Relationship": "Outer",                 +
+               "Parallel Aware": false,                        +
+               "Async Capable": false,                         +
+               "Relation Name": "hnsw_test",                   +
+               "Alias": "hnsw_test",                           +
+               "Disabled": false                               +
+             }                                                 +
+           ]                                                   +
+         }                                                     +
+       ]                                                       +
+     }                                                         +
+   }                                                           +
+ ]
+(1 row)
 
-EXPLAIN (COSTS OFF)
+EXPLAIN (COSTS OFF, FORMAT JSON)
 SELECT id FROM hnsw_test WHERE id > 10 ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec LIMIT 5;
-                      QUERY PLAN
--------------------------------------------------------
- Limit
-   ->  Sort
-         Sort Key: ((v <=> '[0.8,0.6,0.9,0.1]'::svec))
-         ->  Seq Scan on hnsw_test
-               Filter: (id > 10)
-(5 rows)
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ [                                                             +
+   {                                                           +
+     "Plan": {                                                 +
+       "Node Type": "Limit",                                   +
+       "Parallel Aware": false,                                +
+       "Async Capable": false,                                 +
+       "Disabled": false,                                      +
+       "Plans": [                                              +
+         {                                                     +
+           "Node Type": "Sort",                                +
+           "Parent Relationship": "Outer",                     +
+           "Parallel Aware": false,                            +
+           "Async Capable": false,                             +
+           "Disabled": false,                                  +
+           "Sort Key": ["((v <=> '[0.8,0.6,0.9,0.1]'::svec))"],+
+           "Plans": [                                          +
+             {                                                 +
+               "Node Type": "Seq Scan",                        +
+               "Parent Relationship": "Outer",                 +
+               "Parallel Aware": false,                        +
+               "Async Capable": false,                         +
+               "Relation Name": "hnsw_test",                   +
+               "Alias": "hnsw_test",                           +
+               "Disabled": false,                              +
+               "Filter": "(id > 10)"                           +
+             }                                                 +
+           ]                                                   +
+         }                                                     +
+       ]                                                       +
+     }                                                         +
+   }                                                           +
+ ]
+(1 row)
 
 SET enable_seqscan = off;
 -- Dead heap tuples before VACUUM: top-up must still fill LIMIT K

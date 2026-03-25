@@ -325,6 +325,51 @@ def verify_helper_rerank_equivalence(
             )
 
 
+def verify_graph_rag_scan_equivalence(
+    cur: Cursor, table_name: str, queries: list[tuple[int, int, str]], ann_k: int, top_k: int
+) -> None:
+    sql = f"""
+    WITH helper AS (
+        SELECT entity_id, relation_id, target_id, round(distance::numeric, 6) AS distance
+        FROM sorted_heap_graph_rag_scan('{table_name}'::regclass, %s::svec, {ann_k}, {top_k}, NULL, 0)
+    ),
+    ann AS MATERIALIZED (
+        SELECT target_id
+        FROM {table_name}
+        ORDER BY embedding <=> %s::svec
+        LIMIT {ann_k}
+    ),
+    seeds AS MATERIALIZED (
+        SELECT DISTINCT target_id FROM ann
+    ),
+    expanded AS MATERIALIZED (
+        SELECT *
+        FROM {table_name}
+        WHERE entity_id = ANY (ARRAY(SELECT target_id FROM seeds))
+    ),
+    sql_baseline AS (
+        SELECT entity_id, relation_id, target_id,
+               round((embedding <=> %s::svec)::numeric, 6) AS distance
+        FROM expanded
+        ORDER BY embedding <=> %s::svec, entity_id, relation_id, target_id
+        LIMIT {top_k}
+    )
+    SELECT count(*) FROM (
+        (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
+        UNION ALL
+        (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
+    ) diff
+    """
+
+    for idx, query in enumerate(queries, start=1):
+        cur.execute(sql, (query[2], query[2], query[2], query[2]))
+        diff_rows = cur.fetchone()[0]
+        if diff_rows != 0:
+            raise RuntimeError(
+                f"sorted_heap_graph_rag_scan mismatch on {table_name} query#{idx}: diff_rows={diff_rows}"
+            )
+
+
 def measure_case(
     cur: Cursor,
     table_name: str,
@@ -582,6 +627,14 @@ def main() -> int:
                     """,
                     lambda q: (q[2], q[2]),
                 ),
+                QueryCase(
+                    "seed_graph_rag_scan_fn",
+                    f"""
+                    SELECT *
+                    FROM sorted_heap_graph_rag_scan('{{table}}'::regclass, %s::svec, {args.ann_k}, {args.top_k}, NULL, 0)
+                    """,
+                    lambda q: (q[2],),
+                ),
             ]
 
             print("============================================================")
@@ -614,6 +667,7 @@ def main() -> int:
             cur.execute(f"SET sorted_hnsw.ef_search = {args.ef_search}")
             verify_helper_equivalence(cur, "facts_sh", queries, args.ann_k)
             verify_helper_rerank_equivalence(cur, "facts_sh", queries, args.ann_k, args.top_k)
+            verify_graph_rag_scan_equivalence(cur, "facts_sh", queries, args.ann_k, args.top_k)
 
             for table in ("facts_heap", "facts_sh"):
                 for case in cases:

@@ -170,6 +170,7 @@ extern Datum sorted_heap_scan_stats(PG_FUNCTION_ARGS);
 extern Datum sorted_heap_reset_stats(PG_FUNCTION_ARGS);
 extern Datum sorted_heap_expand_ids(PG_FUNCTION_ARGS);
 extern Datum sorted_heap_expand_rerank(PG_FUNCTION_ARGS);
+extern Datum sorted_heap_graph_rag_scan(PG_FUNCTION_ARGS);
 extern Datum sorted_heap_compact_trigger(PG_FUNCTION_ARGS);
 extern Datum sorted_heap_compact_online(PG_FUNCTION_ARGS);
 extern Datum sorted_heap_merge(PG_FUNCTION_ARGS);
