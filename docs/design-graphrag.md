@@ -307,6 +307,21 @@ Interpretation:
 - pure heap+btree expansion is still faster on this synthetic workload
   (`0.123 ms` vs `0.165 ms`)
 
+Relation-filtered probes narrow that gap further:
+
+- `facts_heap seed_expand_rel_in`: `0.074 ms`
+- `facts_sh seed_expand_rel_in`: `0.151 ms`
+- `facts_sh seed_expand_rel_fn`: `0.108 ms`
+- `facts_heap seed_expand_rerank_rel_in`: `0.087 ms`
+- `facts_sh seed_expand_rerank_rel_in`: `0.167 ms`
+- `facts_sh seed_expand_rerank_rel_topk_fn`: `0.104 ms`
+- `facts_sh seed_graph_rag_rel_scan_fn`: `0.120 ms`
+
+So the relation-filtered GraphRAG path is materially better than the current
+SQL + `CustomScan` form, but it still does not clearly beat heap+btree on this
+synthetic corpus. The filtered helper path is nevertheless close enough that a
+real fact graph, wider payloads, or colder cache state may flip the comparison.
+
 One important measurement caveat was also discovered and fixed during this
 work:
 
@@ -389,6 +404,8 @@ What is not yet true:
 
 - `sorted_heap` is not yet clearly better than heap+btree on pure expansion
   latency for this synthetic workload
+- even the relation-filtered GraphRAG path still trails heap+btree slightly on
+  this synthetic benchmark
 
 The correct next step is therefore:
 
