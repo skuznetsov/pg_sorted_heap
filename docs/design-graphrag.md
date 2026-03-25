@@ -559,6 +559,45 @@ So the current GraphRAG conclusion is no longer resting on one short probe set.
 At least on this real-text Gutenberg workflow, the fused `sorted_heap` helper
 still has the best end-to-end latency profile after the query set is expanded.
 
+## Higher-dimension rerun
+
+The same medium Gutenberg slice (`64 books x 128 paragraphs/book`) was then
+rerun at higher lexical-hash embedding dimensions to test whether the earlier
+result depended too heavily on the cheap `32D` setting.
+
+At `128D` (`query_count=64`, `runs=3`):
+
+- heap rerank baseline: `0.107 ms`
+- `sorted_heap_expand_rerank(... relation=2)`: `0.090 ms`
+- `sorted_heap_graph_rag_scan(... relation=2)`: `0.097 ms`
+- `pgvector ANN -> heap expansion -> exact rerank`: `0.386 ms`
+- `zvec ANN -> heap expansion -> exact rerank`: `0.518 ms`
+- `Qdrant ANN -> heap expansion -> exact rerank`: `1.732 ms`
+
+At `384D` on the same slice:
+
+- heap rerank baseline: `0.185 ms`
+- `sorted_heap_expand_rerank(... relation=2)`: `0.186 ms`
+- `sorted_heap_graph_rag_scan(... relation=2)`: `0.203 ms`
+- `pgvector ANN -> heap expansion -> exact rerank`: `0.815 ms`
+- `zvec ANN -> heap expansion -> exact rerank`: `1.101 ms`
+- `Qdrant ANN -> heap expansion -> exact rerank`: `2.275 ms`
+
+This changes the interpretation in one important way:
+
+- the `sorted_heap` helper remains clearly best-aligned with the full
+  GraphRAG workflow versus the external ANN paths
+- but the win over the pure heap rerank baseline is **dimension-sensitive**
+- by `384D`, exact rerank cost dominates enough that the fused helper is only
+  at parity with heap+btree rather than clearly ahead
+
+So the current evidence supports a narrower claim than "sorted_heap always wins
+GraphRAG":
+
+> the fused `sorted_heap` helper is the best end-to-end path among the tested
+> in-PG and external ANN competitors on this workflow shape, but its advantage
+> over heap+btree narrows substantially as exact rerank dimension grows
+
 One important measurement caveat was also discovered and fixed during this
 work:
 
