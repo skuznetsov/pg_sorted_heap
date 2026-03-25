@@ -550,6 +550,22 @@ So the stronger objective conclusion is:
 - the current evidence points to a broader `zvec` retrieval defect around
   forward-store / chunk lookup, not to PostgreSQL GraphRAG expansion logic
 
+Two more diagnostic observations make that conclusion sharper:
+
+- when the synthetic bug triggers, the ANN scores still come back while
+  `doc.id` is empty for the whole result set
+  - `4,950 rows`, `topk=6`: valid ids
+  - `4,950 rows`, `topk=7`: same score bands, but every `doc.id` is `''`
+- on a larger synthetic case (`16,000` rows), exact cosine inspection shows
+  the best-score bucket spans `1000, 2000, ..., 16000`, and `zvec` already
+  returns empty ids at `topk=5`
+
+That does not prove the internal root cause, but it strongly suggests the ANN
+ranking stage is still producing plausible scores while the forward-store
+document lookup stage is failing. A reasonable working hypothesis is that some
+tied-score / candidate-materialization paths touch unresolved high indexes and
+poison metadata resolution for the whole returned batch.
+
 ## Qdrant parity on the real-text graph
 
 The Gutenberg harness now also supports a comparable `Qdrant` path:

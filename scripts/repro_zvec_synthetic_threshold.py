@@ -13,6 +13,7 @@ Current observed signature:
   - topk=7 already sufficient to trigger the bug
   - a compact failing case exists at 4,950 rows
   - failures are non-monotonic with row count
+  - when the bug triggers, scores still come back but doc ids are empty
 """
 
 from __future__ import annotations
