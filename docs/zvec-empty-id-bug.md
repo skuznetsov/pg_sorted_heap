@@ -72,6 +72,20 @@ The compact repro also survives simple runtime knob changes:
 So the current minimal case does not look like a trivial thread-count or
 memory-budget artifact.
 
+It also survives broad HNSW parameter changes on the same compact case:
+
+- `ef_search=16`, `ef_construction=16`, `m=8`: `bad`
+- `ef_search=16`, `ef_construction=64`, `m=16`: `bad`
+- `ef_search=32`, `ef_construction=64`, `m=16`: `bad`
+- `ef_search=64`, `ef_construction=64`, `m=16`: `bad`
+- `ef_search=128`, `ef_construction=64`, `m=16`: `bad`
+- `ef_search=64`, `ef_construction=128`, `m=16`: `bad`
+- `ef_search=64`, `ef_construction=64`, `m=8`: `bad`
+- `ef_search=64`, `ef_construction=64`, `m=32`: `bad`
+
+So the compact failing case does not look like a fragile HNSW tuning artifact
+either.
+
 ## Stronger diagnostics
 
 On the compact synthetic case:
