@@ -1257,9 +1257,29 @@ That is a useful but incomplete recovery:
 - it does **not** recover the earlier `96.9% hit@k` local point
 - so the larger-graph gap is not purely a beam-width problem
 
-The current best explanation is that larger local multihop graphs will need
-additional graph-quality tuning beyond the `5K`-chain defaults, likely around
-`ef_construction`, `m`, or both.
+The next falsifier after that was stronger graph construction. On the same
+`10K`-chain graph, keeping `m=32`, `ann_k=64`, and comparing
+`ef_construction=200` vs `400` gave:
+
+- at `ef_search=128`
+  - `ef_construction=200` -> `0.976 ms`, `hit@1 = 75.0%`, `hit@k = 93.8%`
+  - `ef_construction=400` -> `1.094 ms`, `hit@1 = 75.0%`, `hit@k = 93.8%`
+- at `ef_search=192`
+  - `ef_construction=200` -> `1.357 ms`, `hit@1 = 76.6%`, `hit@k = 95.3%`
+  - `ef_construction=400` -> `1.381 ms`, `hit@1 = 76.6%`, `hit@k = 95.3%`
+
+So this larger-graph gap is not fixed by a simple `ef_construction=400` bump
+either.
+
+The current best explanation is therefore narrower:
+
+- the verified `5K`-chain local frontier is real
+- the same operating points do not carry forward unchanged to `10K` chains
+- and the obvious local rescue knobs (`ef_search`, `ef_construction`) only
+  recover part of the drop
+
+That is enough to stop local knob-turning for this pass. The next useful step
+would be a different class of experiment, not more of the same sweep.
 
 So the honest story on this fact benchmark is a latency/quality frontier:
 
