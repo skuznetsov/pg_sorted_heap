@@ -514,6 +514,30 @@ So the current failure signature is not just "large-ish GraphRAG benchmark".
 It looks more like a size-thresholded `zvec` retrieval bug on this corpus
 shape.
 
+That theory is now falsified by a second repo-owned reproducer on a plain
+synthetic FP32 corpus:
+
+- [`scripts/repro_zvec_synthetic_threshold.py`](/Users/sergey/Projects/C/clustered_pg/scripts/repro_zvec_synthetic_threshold.py)
+
+Current synthetic signature:
+
+- `dim=32`, `ef_search=64`
+- `topk=8` already reproduces the issue
+- failures are non-monotonic by row count
+  - bad: `16,000`, `20,000`, `28,000`, `30,000`, `45,000`, `60,000`
+  - ok: `24,000`, `29,000`, `75,000` (`100` probe queries still clean at `75k`)
+- representative stderr lines:
+  - `Failed to find target chunk for index 14999`
+  - `Failed to find target chunk for index 29999`
+  - `Failed to find target chunk for index 59999`
+
+So the stronger objective conclusion is:
+
+- the failure is not Gutenberg-specific
+- it is not a simple monotonic "too many rows" threshold either
+- the current evidence points to a broader `zvec` retrieval defect around
+  forward-store / chunk lookup, not to PostgreSQL GraphRAG expansion logic
+
 ## Qdrant parity on the real-text graph
 
 The Gutenberg harness now also supports a comparable `Qdrant` path:
