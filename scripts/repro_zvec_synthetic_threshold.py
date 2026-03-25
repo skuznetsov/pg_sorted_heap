@@ -20,14 +20,24 @@ from __future__ import annotations
 
 import argparse
 import shutil
-import sys
 import tempfile
 from pathlib import Path
 
 import zvec
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import bench_zvec_synthetic as synth  # noqa: E402
+
+def vec_for(g: int, dim: int) -> list[float]:
+    return [
+        (((g * (((d * 17) % 97) + 1)) + (d * 13)) % 1000) / 1000.0
+        for d in range(1, dim + 1)
+    ]
+
+
+def qvec_for(qid: int, rows: int, dim: int) -> list[float]:
+    return [
+        (((((qid + rows) * (((d * 19) % 89) + 3)) + (d * 29)) % 1000) / 1000.0)
+        for d in range(1, dim + 1)
+    ]
 
 
 def run_one(
@@ -62,7 +72,7 @@ def run_one(
         batch: list[zvec.Doc] = []
         idmap: set[str] = set()
         for i in range(1, rows + 1):
-            batch.append(zvec.Doc(id=str(i), vectors={"embedding": synth.vec_for(i, dim)}))
+            batch.append(zvec.Doc(id=str(i), vectors={"embedding": vec_for(i, dim)}))
             idmap.add(str(i))
             if len(batch) == 128:
                 coll.insert(batch)
@@ -73,7 +83,7 @@ def run_one(
 
         param = zvec.HnswQueryParam(ef=ef_search)
         for qi in range(1, query_count + 1):
-            qvec = synth.qvec_for(qi, rows, dim)
+            qvec = qvec_for(qi, rows, dim)
             res = coll.query(zvec.VectorQuery("embedding", vector=qvec, param=param), topk=topk)
             ids = [doc.id for doc in res]
             bad = [doc_id for doc_id in ids if doc_id not in idmap]
