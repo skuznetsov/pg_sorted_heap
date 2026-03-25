@@ -523,10 +523,21 @@ Current synthetic signature:
 
 - `dim=32`, `ef_search=64`
 - `topk=8` already reproduces the issue
+- a compact failing case exists at `4,950` rows
+  - nearby controls:
+    - `4,900` rows: ok
+    - `4,950` rows: bad
+    - `5,000` rows: bad
 - failures are non-monotonic by row count
   - bad: `16,000`, `20,000`, `28,000`, `30,000`, `45,000`, `60,000`
   - ok: `24,000`, `29,000`, `75,000` (`100` probe queries still clean at `75k`)
+- another local non-monotonic pocket exists around `7k-8k`
+  - `7,000`: ok
+  - `7,500`: bad
+  - `7,800`: ok
+  - `7,900`: bad
 - representative stderr lines:
+  - `Failed to find target chunk for index 4945`
   - `Failed to find target chunk for index 14999`
   - `Failed to find target chunk for index 29999`
   - `Failed to find target chunk for index 59999`

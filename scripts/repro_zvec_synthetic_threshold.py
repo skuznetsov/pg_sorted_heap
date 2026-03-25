@@ -11,6 +11,7 @@ Current observed signature:
   - dim=32
   - ef_search=64
   - topk=8 already sufficient to trigger the bug
+  - a compact failing case exists at 4,950 rows
   - failures are non-monotonic with row count
 """
 
@@ -94,7 +95,7 @@ def main() -> int:
     ap.add_argument("--memory-limit-mb", type=int, default=8192)
     ap.add_argument(
         "--rows",
-        default="16000,24000,28000,29000,30000,45000,60000,75000",
+        default="4900,4950,5000,7000,7500,7800,7900,24000,30000",
         help="Comma-separated synthetic row counts",
     )
     args = ap.parse_args()
