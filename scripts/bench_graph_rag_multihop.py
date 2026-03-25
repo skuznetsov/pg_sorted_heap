@@ -380,6 +380,22 @@ def measure_external_case(cur, queries: list[MultiHopQuery], runs: int, seed_fn,
     )
 
 
+def build_exact_seed_fn(cur, ann_k: int, dim: int):
+    sql = f"""
+        SELECT entity_id
+        FROM facts_heap
+        ORDER BY embedding <=> %s::svec
+        LIMIT {ann_k}
+    """
+
+    def exact_seed_fn(qvec: list[float]) -> list[int]:
+        lit = "[" + ",".join(f"{v:.6f}" for v in qvec[:dim]) + "]"
+        cur.execute(sql, (lit,))
+        return gut.unique_ints_in_order([int(row[0]) for row in cur.fetchall()])
+
+    return exact_seed_fn
+
+
 def build_zvec_collection_entity_seed(
     csv_path: Path,
     dim: int,
@@ -489,6 +505,7 @@ def main() -> int:
     ap.add_argument("--skip-qdrant", action="store_true")
     ap.add_argument("--shared-buffers-mb", type=int, default=64)
     ap.add_argument("--backend-mode", choices=("fresh", "reuse"), default="fresh")
+    ap.add_argument("--exact-seed-diagnostics", action="store_true")
     ap.add_argument("--install-cmd", default="")
     ap.add_argument("--keep-temp", action="store_true")
     args = ap.parse_args()
@@ -694,6 +711,18 @@ def main() -> int:
                 ORDER BY embedding <=> %s::svec
                 LIMIT {args.top_k}
             """
+            helper_rerank_2hop = f"""
+                SELECT *
+                FROM sorted_heap_expand_twohop_rerank(
+                    'facts_sh'::regclass,
+                    %s::int4[],
+                    %s::svec,
+                    {args.top_k},
+                    {REL_PARENT},
+                    {REL_CITY},
+                    0
+                )
+            """
 
             print("============================================================")
             print("graph rag multihop fact benchmark")
@@ -715,6 +744,7 @@ def main() -> int:
             print(f"qdrant:           {'off' if args.skip_qdrant else 'on'}")
             print(f"shared_buffers:   {args.shared_buffers_mb}MB")
             print(f"backend_mode:     {args.backend_mode}")
+            print(f"exact_seed_diag:  {'on' if args.exact_seed_diagnostics else 'off'}")
             print(f"sample_city:      {next(iter(city_names.values())) if city_names else 'n/a'}")
             print()
 
@@ -727,6 +757,7 @@ def main() -> int:
             cur.execute("SET jit = off")
             cur.execute("SET sorted_hnsw.shared_cache = off")
             cur.execute(f"SET sorted_hnsw.ef_search = {args.ef_search}")
+            exact_seed_fn = build_exact_seed_fn(cur, args.ann_k, args.dim)
             verify_helper_twohop_equivalence(cur, "facts_sh", queries, args.ann_k, args.top_k)
             verify_graph_rag_twohop_scan_equivalence(cur, "facts_sh", queries, args.ann_k, args.top_k)
 
@@ -743,6 +774,63 @@ def main() -> int:
                 p50, avg, hits, reads, root, rowcount = base.measure_case(cur, table, case, queries, args.runs)
                 hit1, hitk, avg_rows = measure_quality(cur, table, case, queries)
                 print_result(label, case.name, p50, avg, hits, reads, root, rowcount, hit1, hitk, avg_rows)
+
+            if args.exact_seed_diagnostics:
+                print("running|table=facts_heap|case=seed_expand2_rerank_rel_exact_seed", flush=True)
+                p50, avg, hits, reads, root, rowcount = measure_external_case(
+                    cur,
+                    queries,
+                    args.runs,
+                    exact_seed_fn,
+                    lambda q, seeds: (sql_rerank_2hop, (seeds, q.query_vec)),
+                )
+                hit1, hitk, avg_rows = measure_external_quality(
+                    cur,
+                    queries,
+                    exact_seed_fn,
+                    lambda q, seeds: (sql_rerank_2hop, (seeds, q.query_vec)),
+                )
+                print_result(
+                    "facts_heap",
+                    "seed_expand2_rerank_rel_exact_seed",
+                    p50,
+                    avg,
+                    hits,
+                    reads,
+                    root,
+                    rowcount,
+                    hit1,
+                    hitk,
+                    avg_rows,
+                )
+
+                print("running|table=facts_sh|case=seed_expand2_rerank_rel_twohop_exact_seed", flush=True)
+                p50, avg, hits, reads, root, rowcount = measure_external_case(
+                    cur,
+                    queries,
+                    args.runs,
+                    exact_seed_fn,
+                    lambda q, seeds: (helper_rerank_2hop, (seeds, q.query_vec)),
+                )
+                hit1, hitk, avg_rows = measure_external_quality(
+                    cur,
+                    queries,
+                    exact_seed_fn,
+                    lambda q, seeds: (helper_rerank_2hop, (seeds, q.query_vec)),
+                )
+                print_result(
+                    "facts_sh",
+                    "seed_expand2_rerank_rel_twohop_exact_seed",
+                    p50,
+                    avg,
+                    hits,
+                    reads,
+                    root,
+                    rowcount,
+                    hit1,
+                    hitk,
+                    avg_rows,
+                )
 
             if not args.skip_pgvector:
                 cur.execute(f"SET hnsw.ef_search = {args.pgv_ef_search}")

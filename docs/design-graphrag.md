@@ -1418,6 +1418,66 @@ So the larger-scale picture is now materially stronger:
 - so the remaining gap is unlikely to be solved by another trivial
   `ef_search` or `m` tweak alone
 
+### Exact-seed upper-bound diagnostic
+
+The next root-cause check was to remove ANN approximation from the seed stage
+entirely. The multihop harness now supports an `--exact-seed-diagnostics`
+mode, which replaces ANN seed retrieval with exact brute-force top-K seeds on
+`facts_heap`, then reuses the same graph expansion/rerank path.
+
+This matters because it separates two very different explanations:
+
+- "the remaining gap is caused by approximate ANN seeds"
+- "the remaining gap is already in the benchmark/query/task shape"
+
+On the `5K`-chain balanced local point:
+
+- `m=24`
+- `ef_construction=200`
+- `ann_k=64`
+- `sorted_hnsw.ef_search=128`
+
+the exact-seed diagnostic did **not** improve quality:
+
+- ANN-seeded `sorted_heap_expand_twohop_rerank()`
+  - `0.702 ms`
+  - `hit@1 = 75.0%`
+  - `hit@k = 96.9%`
+- exact-seeded `sorted_heap_expand_twohop_rerank()`
+  - `0.811 ms`
+  - `hit@1 = 75.0%`
+  - `hit@k = 96.9%`
+
+On the `10K`-chain balanced local point:
+
+- `m=24`
+- `ef_construction=200`
+- `ann_k=64`
+- `sorted_hnsw.ef_search=128`
+
+the exact-seed diagnostic again did **not** improve quality:
+
+- ANN-seeded `sorted_heap_expand_twohop_rerank()`
+  - `0.839 ms`
+  - `hit@1 = 71.9%`
+  - `hit@k = 92.2%`
+- exact-seeded `sorted_heap_expand_twohop_rerank()`
+  - `0.947 ms`
+  - `hit@1 = 71.9%`
+  - `hit@k = 92.2%`
+
+This is a strong falsifier:
+
+- on this synthetic fact benchmark, the current `5K` and `10K` frontiers are
+  **not** ANN-approximation limited at the tested operating points
+- exact seeds cost extra latency but do not recover answer quality
+- so the next meaningful gain is unlikely to come from more seed-ANN tuning
+  alone
+
+The remaining gap now looks more like a property of the task construction,
+query embedding, or graph benchmark semantics than of `sorted_hnsw`
+approximation itself.
+
 So the honest story on this fact benchmark is a latency/quality frontier:
 
 - `sorted_heap_expand_twohop_rerank()` leads on latency

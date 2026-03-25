@@ -232,6 +232,10 @@ measured `1.248 ms`, `hit@1 71.9%`, `hit@k 92.2%`. The best verified AWS
 recovery point there is `m=32`, `ef_search=192`, which moved it to
 `1.687 ms`, `hit@1 76.6%`, `hit@k 95.3%`.
 
+An exact-seed diagnostic on the local `5K` and `10K` points did not improve
+`hit@1` or `hit@k` versus the ANN-seeded `sorted_heap` helper. So on this
+benchmark shape, the remaining gap is not explained by ANN approximation alone.
+
 ### Legacy/manual IVF-PQ benchmark
 
 The sections below are still useful for the explicit IVF-PQ API
