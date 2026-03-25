@@ -235,6 +235,9 @@ recovery point there is `m=32`, `ef_search=192`, which moved it to
 An exact-seed diagnostic on the local `5K` and `10K` points did not improve
 `hit@1` or `hit@k` versus the ANN-seeded `sorted_heap` helper. So on this
 benchmark shape, the remaining gap is not explained by ANN approximation alone.
+The stronger result is that seed coverage itself was identical for ANN and
+exact seeds: `98.4%` at `5K` and `96.9%` at `10K`. So the remaining loss is
+downstream of seeding.
 
 ### Legacy/manual IVF-PQ benchmark
 

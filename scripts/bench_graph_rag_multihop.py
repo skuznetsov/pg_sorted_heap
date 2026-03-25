@@ -393,7 +393,71 @@ def build_exact_seed_fn(cur, ann_k: int, dim: int):
         cur.execute(sql, (lit,))
         return gut.unique_ints_in_order([int(row[0]) for row in cur.fetchall()])
 
+    exact_seed_fn.expects_vector_list = True
     return exact_seed_fn
+
+
+def build_ann_seed_fn(cur, ann_k: int, table_name: str):
+    sql = f"""
+        SELECT entity_id
+        FROM {table_name}
+        ORDER BY embedding <=> %s::svec
+        LIMIT {ann_k}
+    """
+
+    def ann_seed_fn(qvec_literal: str) -> list[int]:
+        cur.execute(sql, (qvec_literal,))
+        return gut.unique_ints_in_order([int(row[0]) for row in cur.fetchall()])
+
+    ann_seed_fn.expects_vector_list = False
+    return ann_seed_fn
+
+
+def measure_seed_diagnostics(cur, queries: list[MultiHopQuery], seed_fn, ann_k: int) -> tuple[float, float, float]:
+    seed_person_hits = 0
+    expanded_city_hits = 0
+    rank_sum = 0.0
+    rank_count = 0
+
+    expanded_sql = f"""
+        WITH seeds AS MATERIALIZED (
+            SELECT DISTINCT unnest(%s::int4[]) AS entity_id
+        ),
+        hop1 AS MATERIALIZED (
+            SELECT DISTINCT target_id
+            FROM facts_heap
+            WHERE entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+              AND relation_id = {REL_PARENT}
+        )
+        SELECT EXISTS (
+            SELECT 1
+            FROM facts_heap
+            WHERE entity_id = ANY (ARRAY(SELECT target_id FROM hop1))
+              AND relation_id = {REL_CITY}
+              AND target_id = %s
+        )
+    """
+
+    for query in queries:
+        seed_arg = query.query_vec
+        if getattr(seed_fn, "expects_vector_list", False):
+            seed_arg = gut.vector_list_from_literal(query.query_vec)
+        seeds = seed_fn(seed_arg)
+        if query.person_id in seeds:
+            seed_person_hits += 1
+            rank_sum += seeds.index(query.person_id) + 1
+            rank_count += 1
+
+        cur.execute(expanded_sql, (seeds, query.city_id))
+        if bool(cur.fetchone()[0]):
+            expanded_city_hits += 1
+
+    n = len(queries)
+    return (
+        (seed_person_hits * 100.0) / n if n else 0.0,
+        (expanded_city_hits * 100.0) / n if n else 0.0,
+        (rank_sum / rank_count) if rank_count else float(ann_k + 1),
+    )
 
 
 def build_zvec_collection_entity_seed(
@@ -757,6 +821,7 @@ def main() -> int:
             cur.execute("SET jit = off")
             cur.execute("SET sorted_hnsw.shared_cache = off")
             cur.execute(f"SET sorted_hnsw.ef_search = {args.ef_search}")
+            ann_seed_fn = build_ann_seed_fn(cur, args.ann_k, "facts_sh")
             exact_seed_fn = build_exact_seed_fn(cur, args.ann_k, args.dim)
             verify_helper_twohop_equivalence(cur, "facts_sh", queries, args.ann_k, args.top_k)
             verify_graph_rag_twohop_scan_equivalence(cur, "facts_sh", queries, args.ann_k, args.top_k)
@@ -830,6 +895,27 @@ def main() -> int:
                     hit1,
                     hitk,
                     avg_rows,
+                )
+
+                ann_seed_person, ann_expanded_city, ann_avg_rank = measure_seed_diagnostics(
+                    cur,
+                    queries,
+                    ann_seed_fn,
+                    args.ann_k,
+                )
+                print(
+                    f"diagnostic|seed_mode=ann|seed_person_pct={ann_seed_person:.1f}|"
+                    f"expanded_city_pct={ann_expanded_city:.1f}|avg_person_rank={ann_avg_rank:.2f}"
+                )
+                exact_seed_person, exact_expanded_city, exact_avg_rank = measure_seed_diagnostics(
+                    cur,
+                    queries,
+                    exact_seed_fn,
+                    args.ann_k,
+                )
+                print(
+                    f"diagnostic|seed_mode=exact|seed_person_pct={exact_seed_person:.1f}|"
+                    f"expanded_city_pct={exact_expanded_city:.1f}|avg_person_rank={exact_avg_rank:.2f}"
                 )
 
             if not args.skip_pgvector:

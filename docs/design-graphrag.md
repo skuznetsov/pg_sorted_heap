@@ -1448,6 +1448,20 @@ the exact-seed diagnostic did **not** improve quality:
   - `hit@1 = 75.0%`
   - `hit@k = 96.9%`
 
+And the seed-stage diagnostic showed no hidden ANN loss there either:
+
+- ANN seeds
+  - `seed_person_pct = 98.4%`
+  - `expanded_city_pct = 98.4%`
+  - `avg_person_rank = 1.00`
+- exact seeds
+  - `seed_person_pct = 98.4%`
+  - `expanded_city_pct = 98.4%`
+  - `avg_person_rank = 1.00`
+
+So even at `5K`, the final `96.9% hit@k` is already below seed coverage.
+The remaining miss rate is downstream of seed retrieval.
+
 On the `10K`-chain balanced local point:
 
 - `m=24`
@@ -1466,17 +1480,35 @@ the exact-seed diagnostic again did **not** improve quality:
   - `hit@1 = 71.9%`
   - `hit@k = 92.2%`
 
+The seed-stage diagnostic was even more revealing on `10K`:
+
+- ANN seeds
+  - `seed_person_pct = 96.9%`
+  - `expanded_city_pct = 96.9%`
+  - `avg_person_rank = 1.00`
+- exact seeds
+  - `seed_person_pct = 96.9%`
+  - `expanded_city_pct = 96.9%`
+  - `avg_person_rank = 1.00`
+
+So the larger-graph gap is **not** coming from missing the correct seed fact.
+At `10K`, seed coverage stays at `96.9%`, but final `hit@k` drops to `92.2%`.
+That loss is happening after seeding, inside the expansion/rerank/task
+semantics.
+
 This is a strong falsifier:
 
 - on this synthetic fact benchmark, the current `5K` and `10K` frontiers are
   **not** ANN-approximation limited at the tested operating points
+- ANN and exact seeds have identical seed coverage on both scales
 - exact seeds cost extra latency but do not recover answer quality
 - so the next meaningful gain is unlikely to come from more seed-ANN tuning
   alone
 
 The remaining gap now looks more like a property of the task construction,
 query embedding, or graph benchmark semantics than of `sorted_hnsw`
-approximation itself.
+approximation itself. More specifically: the dominant remaining loss now looks
+downstream of seed retrieval, not inside it.
 
 So the honest story on this fact benchmark is a latency/quality frontier:
 
