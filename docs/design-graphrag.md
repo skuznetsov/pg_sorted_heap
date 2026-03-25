@@ -322,6 +322,39 @@ SQL + `CustomScan` form, but it still does not clearly beat heap+btree on this
 synthetic corpus. The filtered helper path is nevertheless close enough that a
 real fact graph, wider payloads, or colder cache state may flip the comparison.
 
+Payload-width sensitivity does matter, but not monotonically.
+
+The benchmark harness now supports `--payload-bytes` to widen synthetic fact
+rows and test the claim that locality should matter more once facts stop being
+tiny strings. On the same medium-pressure setup (`20K` entities, degree `16`,
+`320K` rows, `shared_buffers=64MB`, fresh backend):
+
+- with `payload_bytes=1024`
+  - `facts_heap seed_expand_in`: `0.188 ms`
+  - `facts_sh seed_expand_in`: `0.185 ms`
+  - `facts_heap seed_expand_rerank_rel_in`: `0.120 ms`
+  - `facts_sh seed_expand_rerank_rel_topk_fn`: `0.100 ms`
+  - `facts_sh seed_graph_rag_rel_scan_fn`: `0.125 ms`
+
+- with `payload_bytes=2048`
+  - `facts_heap seed_expand_in`: `0.113 ms`
+  - `facts_sh seed_expand_in`: `0.208 ms`
+  - `facts_heap seed_expand_rerank_rel_in`: `0.090 ms`
+  - `facts_sh seed_expand_rerank_rel_topk_fn`: `0.122 ms`
+  - `facts_sh seed_graph_rag_rel_scan_fn`: `0.127 ms`
+
+Interpretation:
+
+- a wider inline payload can make `sorted_heap` competitive or slightly better
+  on seed expansion
+- but the effect is not monotonic, so "wider payload always helps sorted_heap"
+  is false on this synthetic generator
+- this synthetic text filler is still a weak proxy for real fact payloads
+  because compression/TOAST behavior can change the balance again
+
+So the next falsifier should be a real-dataset GraphRAG harness or a more
+realistic payload model, not another synthetic-only extrapolation.
+
 One important measurement caveat was also discovered and fixed during this
 work:
 

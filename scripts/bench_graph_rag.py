@@ -31,6 +31,8 @@ from pathlib import Path
 import psycopg2
 from psycopg2.extensions import cursor as Cursor
 
+PAYLOAD_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
+
 
 @dataclass
 class QueryCase:
@@ -126,7 +128,23 @@ def vec_literal(entity_id: int, relation_id: int, target_id: int, dim: int) -> s
     return "[" + ",".join(vals) + "]"
 
 
-def generate_csv(path: Path, entities: int, degree: int, relations: int, dim: int) -> int:
+def payload_text(entity_id: int, relation_id: int, target_id: int, payload_bytes: int) -> str:
+    base = f"fact:{entity_id}:{relation_id}:{target_id}"
+    if payload_bytes <= 0 or len(base) >= payload_bytes:
+        return base
+
+    remaining = payload_bytes - len(base) - 1
+    seed = ((entity_id * 48271) ^ (relation_id * 997) ^ (target_id * 811)) & 0xFFFFFFFF
+    chunk = []
+    for i in range(64):
+        seed = (seed * 1664525 + 1013904223 + i) & 0xFFFFFFFF
+        chunk.append(PAYLOAD_ALPHABET[seed % len(PAYLOAD_ALPHABET)])
+    filler = "".join(chunk)
+    repeats = (remaining + len(filler) - 1) // len(filler)
+    return base + "|" + (filler * repeats)[:remaining]
+
+
+def generate_csv(path: Path, entities: int, degree: int, relations: int, dim: int, payload_bytes: int) -> int:
     rows = 0
     with open(path, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
@@ -134,7 +152,7 @@ def generate_csv(path: Path, entities: int, degree: int, relations: int, dim: in
             for slot in range(degree):
                 relation_id = (slot % relations) + 1
                 target_id = ((entity_id * 48271 + relation_id * 997 + slot * 811) % entities) + 1
-                payload = f"fact:{entity_id}:{relation_id}:{target_id}"
+                payload = payload_text(entity_id, relation_id, target_id, payload_bytes)
                 w.writerow([entity_id, relation_id, target_id, vec_literal(entity_id, relation_id, target_id, dim), payload])
                 rows += 1
     return rows
@@ -550,6 +568,7 @@ def main() -> int:
     ap.add_argument("--degree", type=int, default=8)
     ap.add_argument("--relations", type=int, default=4)
     ap.add_argument("--dim", type=int, default=32)
+    ap.add_argument("--payload-bytes", type=int, default=0)
     ap.add_argument("--query-count", type=int, default=16)
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--ann-k", type=int, default=16)
@@ -568,7 +587,7 @@ def main() -> int:
     csv_path = tmp / "facts.csv"
 
     try:
-        rows = generate_csv(csv_path, args.entities, args.degree, args.relations, args.dim)
+        rows = generate_csv(csv_path, args.entities, args.degree, args.relations, args.dim, args.payload_bytes)
         conn = connect(tmp, port)
         cur = conn.cursor()
         try:
@@ -862,6 +881,7 @@ def main() -> int:
             print(f"degree:           {args.degree}")
             print(f"relations:        {args.relations}")
             print(f"dim:              {args.dim}")
+            print(f"payload_bytes:    {args.payload_bytes}")
             print(f"rows:             {rows}")
             print(f"query_count:      {args.query_count}")
             print(f"runs:             {args.runs}")
