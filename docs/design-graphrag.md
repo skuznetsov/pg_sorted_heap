@@ -495,6 +495,25 @@ So the objective conclusion today is narrower than for `pgvector`:
 - on the larger slice, the current blocker is `zvec` ANN seed instability, not
   PostgreSQL expansion/rerank overhead
 
+That instability is now isolated more sharply by the repo-owned reproducer:
+
+- [`scripts/repro_zvec_gutenberg_threshold.py`](/Users/sergey/Projects/C/clustered_pg/scripts/repro_zvec_gutenberg_threshold.py)
+
+Current threshold signature on the lexical-hash Gutenberg corpus:
+
+- `topk=16`, `dim=32`
+- `64x256`, `80x256`, `96x256`, `112x256` slices are stable
+  - `28,661`, `36,064`, `43,684`, `51,166` rows
+- `128x256` fails
+  - `58,954` rows
+  - first bad probe: `query #10`
+  - returned ids are empty strings after
+    `Failed to find target chunk for index 58379`
+
+So the current failure signature is not just "large-ish GraphRAG benchmark".
+It looks more like a size-thresholded `zvec` retrieval bug on this corpus
+shape.
+
 ## Qdrant parity on the real-text graph
 
 The Gutenberg harness now also supports a comparable `Qdrant` path:
