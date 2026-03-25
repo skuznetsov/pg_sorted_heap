@@ -340,6 +340,65 @@ def measure_external_graph_rag_case(
     )
 
 
+def verify_helper_filtered_2hop_rerank_equivalence(
+    cur, table_name: str, queries: list[tuple[int, int, str]], ann_k: int, top_k: int
+) -> None:
+    sql = f"""
+    WITH ann AS MATERIALIZED (
+        SELECT target_id
+        FROM {table_name}
+        ORDER BY embedding <=> %s::svec
+        LIMIT {ann_k}
+    ),
+    seeds AS MATERIALIZED (
+        SELECT DISTINCT target_id FROM ann
+    ),
+    helper AS (
+        WITH hop1 AS MATERIALIZED (
+            SELECT DISTINCT target_id
+            FROM sorted_heap_expand_ids('{table_name}'::regclass, ARRAY(SELECT target_id FROM seeds), %s::int4, 0)
+        )
+        SELECT entity_id, relation_id, target_id, round(distance::numeric, 6) AS distance
+        FROM sorted_heap_expand_rerank('{table_name}'::regclass, ARRAY(SELECT target_id FROM hop1), %s::svec, {top_k}, %s::int4, 0)
+    ),
+    hop1_sql AS MATERIALIZED (
+        SELECT DISTINCT target_id
+        FROM {table_name}
+        WHERE entity_id = ANY (ARRAY(SELECT target_id FROM seeds))
+          AND relation_id = %s
+    ),
+    expanded AS MATERIALIZED (
+        SELECT *
+        FROM {table_name}
+        WHERE entity_id = ANY (ARRAY(SELECT target_id FROM hop1_sql))
+          AND relation_id = %s
+    ),
+    sql_baseline AS (
+        SELECT entity_id, relation_id, target_id,
+               round((embedding <=> %s::svec)::numeric, 6) AS distance
+        FROM expanded
+        ORDER BY embedding <=> %s::svec, entity_id, relation_id, target_id
+        LIMIT {top_k}
+    )
+    SELECT count(*) FROM (
+        (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
+        UNION ALL
+        (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
+    ) diff
+    """
+
+    for idx, query in enumerate(queries, start=1):
+        cur.execute(
+            sql,
+            (query[2], query[1], query[2], query[1], query[1], query[1], query[2], query[2]),
+        )
+        diff_rows = cur.fetchone()[0]
+        if diff_rows != 0:
+            raise RuntimeError(
+                f"sorted_heap_expand_rerank(2hop filtered) mismatch on {table_name} query#{idx}: diff_rows={diff_rows}"
+            )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gutenberg-path", default=str(Path.home() / "Projects/ML/cogniversum_v2/gutenberg_cache"))
@@ -466,6 +525,37 @@ def main() -> int:
                     """,
                     lambda q: (q[2], q[1], q[2]),
                 ),
+                base.QueryCase(
+                    "seed_expand2_rerank_rel_in",
+                    f"""
+                    WITH ann AS MATERIALIZED (
+                        SELECT target_id
+                        FROM {{table}}
+                        ORDER BY embedding <=> %s::svec
+                        LIMIT {args.ann_k}
+                    ),
+                    seeds AS MATERIALIZED (
+                        SELECT DISTINCT target_id FROM ann
+                    ),
+                    hop1 AS MATERIALIZED (
+                        SELECT DISTINCT target_id
+                        FROM {{table}}
+                        WHERE entity_id = ANY (ARRAY(SELECT target_id FROM seeds))
+                          AND relation_id = %s
+                    ),
+                    expanded AS MATERIALIZED (
+                        SELECT *
+                        FROM {{table}}
+                        WHERE entity_id = ANY (ARRAY(SELECT target_id FROM hop1))
+                          AND relation_id = %s
+                    )
+                    SELECT *
+                    FROM expanded
+                    ORDER BY embedding <=> %s::svec
+                    LIMIT {args.top_k}
+                    """,
+                    lambda q: (q[2], q[1], q[1], q[2]),
+                ),
             ]
             helper_cases = [
                 base.QueryCase(
@@ -509,6 +599,27 @@ def main() -> int:
                     FROM sorted_heap_graph_rag_scan('{{table}}'::regclass, %s::svec, {args.ann_k}, {args.top_k}, %s::int4, 0)
                     """,
                     lambda q: (q[2], q[1]),
+                ),
+                base.QueryCase(
+                    "seed_expand2_rerank_rel_topk_fn",
+                    f"""
+                    WITH ann AS MATERIALIZED (
+                        SELECT target_id
+                        FROM {{table}}
+                        ORDER BY embedding <=> %s::svec
+                        LIMIT {args.ann_k}
+                    ),
+                    seeds AS MATERIALIZED (
+                        SELECT DISTINCT target_id FROM ann
+                    ),
+                    hop1 AS MATERIALIZED (
+                        SELECT DISTINCT target_id
+                        FROM sorted_heap_expand_ids('{{table}}'::regclass, ARRAY(SELECT target_id FROM seeds), %s::int4, 0)
+                    )
+                    SELECT *
+                    FROM sorted_heap_expand_rerank('{{table}}'::regclass, ARRAY(SELECT target_id FROM hop1), %s::svec, {args.top_k}, %s::int4, 0)
+                    """,
+                    lambda q: (q[2], q[1], q[2], q[1]),
                 ),
             ]
             pgvector_cases = [
@@ -556,6 +667,37 @@ def main() -> int:
                     """,
                     lambda q: (q[2], q[1], q[2]),
                 ),
+                base.QueryCase(
+                    "seed_expand2_rerank_rel_pgv",
+                    f"""
+                    WITH ann AS MATERIALIZED (
+                        SELECT target_id
+                        FROM facts_pgv
+                        ORDER BY embedding <=> %s::vector({args.dim})
+                        LIMIT {args.ann_k}
+                    ),
+                    seeds AS MATERIALIZED (
+                        SELECT DISTINCT target_id FROM ann
+                    ),
+                    hop1 AS MATERIALIZED (
+                        SELECT DISTINCT target_id
+                        FROM facts_heap
+                        WHERE entity_id = ANY (ARRAY(SELECT target_id FROM seeds))
+                          AND relation_id = %s
+                    ),
+                    expanded AS MATERIALIZED (
+                        SELECT *
+                        FROM facts_heap
+                        WHERE entity_id = ANY (ARRAY(SELECT target_id FROM hop1))
+                          AND relation_id = %s
+                    )
+                    SELECT *
+                    FROM expanded
+                    ORDER BY embedding <=> %s::svec
+                    LIMIT {args.top_k}
+                    """,
+                    lambda q: (q[2], q[1], q[1], q[2]),
+                ),
             ]
 
             print("============================================================")
@@ -598,6 +740,7 @@ def main() -> int:
             base.verify_helper_filtered_equivalence(cur, "facts_sh", queries, args.ann_k)
             base.verify_helper_filtered_rerank_equivalence(cur, "facts_sh", queries, args.ann_k, args.top_k)
             base.verify_graph_rag_scan_filtered_equivalence(cur, "facts_sh", queries, args.ann_k, args.top_k)
+            verify_helper_filtered_2hop_rerank_equivalence(cur, "facts_sh", queries, args.ann_k, args.top_k)
 
             for table in ("facts_heap", "facts_sh"):
                 for case in cases:
@@ -627,6 +770,27 @@ def main() -> int:
                     SELECT *
                     FROM facts_heap
                     WHERE entity_id = ANY (ARRAY(SELECT target_id FROM seeds))
+                      AND relation_id = %s
+                )
+                SELECT *
+                FROM expanded
+                ORDER BY embedding <=> %s::svec
+                LIMIT {args.top_k}
+            """
+            sql_rerank_2hop = f"""
+                WITH seeds AS MATERIALIZED (
+                    SELECT DISTINCT unnest(%s::int4[]) AS target_id
+                ),
+                hop1 AS MATERIALIZED (
+                    SELECT DISTINCT target_id
+                    FROM facts_heap
+                    WHERE entity_id = ANY (ARRAY(SELECT target_id FROM seeds))
+                      AND relation_id = %s
+                ),
+                expanded AS MATERIALIZED (
+                    SELECT *
+                    FROM facts_heap
+                    WHERE entity_id = ANY (ARRAY(SELECT target_id FROM hop1))
                       AND relation_id = %s
                 )
                 SELECT *
@@ -673,6 +837,18 @@ def main() -> int:
                 )
                 base.print_result("facts_zvec", "seed_expand_rerank_rel_zvec", p50, avg, hits, reads, root, rowcount)
 
+                print("running|table=facts_zvec|case=seed_expand2_rerank_rel_zvec", flush=True)
+                p50, avg, hits, reads, root, rowcount = measure_external_graph_rag_case(
+                    cur,
+                    "seed_expand2_rerank_rel_zvec",
+                    queries,
+                    args.runs,
+                    zvec_seed_fn,
+                    sql_rerank_2hop,
+                    lambda q, seeds: (sql_rerank_2hop, (seeds, q[1], q[1], q[2])),
+                )
+                base.print_result("facts_zvec", "seed_expand2_rerank_rel_zvec", p50, avg, hits, reads, root, rowcount)
+
             if not args.skip_qdrant and qdrant_client is not None and qdrant_name is not None:
                 params = SearchParams(hnsw_ef=args.qdrant_ef, exact=False)
 
@@ -708,6 +884,18 @@ def main() -> int:
                     lambda q, seeds: (sql_rerank, (seeds, q[1], q[2])),
                 )
                 base.print_result("facts_qdrant", "seed_expand_rerank_rel_qdrant", p50, avg, hits, reads, root, rowcount)
+
+                print("running|table=facts_qdrant|case=seed_expand2_rerank_rel_qdrant", flush=True)
+                p50, avg, hits, reads, root, rowcount = measure_external_graph_rag_case(
+                    cur,
+                    "seed_expand2_rerank_rel_qdrant",
+                    queries,
+                    args.runs,
+                    qdrant_seed_fn,
+                    sql_rerank_2hop,
+                    lambda q, seeds: (sql_rerank_2hop, (seeds, q[1], q[1], q[2])),
+                )
+                base.print_result("facts_qdrant", "seed_expand2_rerank_rel_qdrant", p50, avg, hits, reads, root, rowcount)
         finally:
             cur.close()
             conn.close()
