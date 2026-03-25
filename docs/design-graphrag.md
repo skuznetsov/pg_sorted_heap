@@ -1221,6 +1221,46 @@ So the current picture is now more precise:
   than both external paths
 - pgvector remains behind on both latency and answer quality on this workload
 
+### Larger local scale check (`10K` chains)
+
+The next adversary check was whether the `5K`-chain tuning carried forward to a
+larger local fact graph without retuning.
+
+On `10K` chains (`20K` rows total), `64` queries, `384D`, fresh backend:
+
+- `m=24`, `ef_construction=200`, `ann_k=64`, `ef_search=128`
+  - `sorted_heap_graph_rag_twohop_scan()` -> `0.885 ms`
+  - `hit@1 = 71.9%`
+  - `hit@k = 92.2%`
+- `m=32`, `ef_construction=200`, `ann_k=64`, `ef_search=128`
+  - `sorted_heap_graph_rag_twohop_scan()` -> `0.972 ms`
+  - `hit@1 = 73.4%`
+  - `hit@k = 93.8%`
+
+So the `5K`-chain operating point does **not** generalize unchanged.
+
+The next narrow falsifier was whether this larger-graph drop was just a search
+beam issue. Sweeping `ef_search` upward at `m=32` gave:
+
+- `ef_search=192`
+  - `1.310 ms`
+  - `hit@1 = 76.6%`
+  - `hit@k = 95.3%`
+- `ef_search=256`
+  - `1.734 ms`
+  - `hit@1 = 78.1%`
+  - `hit@k = 95.3%`
+
+That is a useful but incomplete recovery:
+
+- higher `ef_search` does recover part of the quality loss
+- it does **not** recover the earlier `96.9% hit@k` local point
+- so the larger-graph gap is not purely a beam-width problem
+
+The current best explanation is that larger local multihop graphs will need
+additional graph-quality tuning beyond the `5K`-chain defaults, likely around
+`ef_construction`, `m`, or both.
+
 So the honest story on this fact benchmark is a latency/quality frontier:
 
 - `sorted_heap_expand_twohop_rerank()` leads on latency
