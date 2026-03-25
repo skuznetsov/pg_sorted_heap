@@ -880,6 +880,115 @@ headroom:
   - rerank
 - or tune candidate count / rerank workload rather than broadening the API
 
+## Cogniformerus-style multihop facts
+
+The real missing falsifier was not another paragraph graph slice. It was a
+benchmark that matches the current `cogniformerus` multihop question shape:
+
+- fact `1`: `person -> parent`
+- fact `2`: `parent -> city`
+- query: `Where does the parent of Person_i live?`
+
+That now exists in:
+
+- [`scripts/bench_graph_rag_multihop.py`](/Users/sergey/Projects/C/clustered_pg/scripts/bench_graph_rag_multihop.py)
+
+The benchmark builds a deterministic fact graph and measures:
+
+- latency
+- `hit@1`
+- `hit@k`
+
+for the expected final `city` fact after two-hop expansion and rerank.
+
+### Important contract discovery
+
+This benchmark immediately exposed a semantic limitation in the current
+convenience wrapper:
+
+- `sorted_heap_graph_rag_scan()` seeds expansion from ANN `target_id`
+- that is a good fit for the Gutenberg `paragraph -> next_paragraph` graph
+- it is **not** the right seed contract for the fact benchmark above
+- the fact benchmark needs ANN seeds based on `entity_id`, then:
+  - hop 1 on relation `1`
+  - hop 2 on relation `2`
+
+So the current one-call wrapper is still too specialized for this workload
+shape. The lower-level helper family is fine; the wrapper contract is the
+narrow part.
+
+### Early failure that mattered
+
+At `32D`, the fact benchmark initially produced very poor answer retrieval.
+That was a benchmark-quality failure, not a helper failure:
+
+- the first draft seeded on `target_id`, which was the wrong graph contract
+- after fixing that, the deterministic query embedding was still too weak
+  at low dimension to make the question reliably retrievable
+
+So the publishable multihop results start at `384D`, where the question shape
+becomes stable enough that latency numbers mean something.
+
+### Tuned 384D result
+
+On `5K` multihop chains (`10K` rows total), `64` queries, `3` runs,
+`shared_buffers=64MB`, fresh backend, with:
+
+- `ann_k=64`
+- `sorted_hnsw.ef_search=64`
+- `ef_construction=200`
+
+the current frontier is:
+
+- heap composed two-hop SQL
+  - `0.515 ms`
+  - `hit@1 = 71.9%`
+  - `hit@k = 85.9%`
+- `sorted_heap` composed two-hop helper
+  - `0.471 ms`
+  - `hit@1 = 70.3%`
+  - `hit@k = 82.8%`
+- `sorted_heap_expand_twohop_rerank()`
+  - `0.442 ms`
+  - `hit@1 = 70.3%`
+  - `hit@k = 82.8%`
+- pgvector
+  - `1.397 ms`
+  - `hit@1 = 70.3%`
+  - `hit@k = 87.5%`
+- zvec
+  - `1.076 ms`
+  - `hit@1 = 76.6%`
+  - `hit@k = 96.9%`
+- Qdrant
+  - `2.921 ms`
+  - `hit@1 = 76.6%`
+  - `hit@k = 96.9%`
+
+Interpretation:
+
+- the fused two-hop helper is now the **fastest PostgreSQL path** on this
+  fact-shaped workload
+- it remains materially faster than pgvector on the same workflow
+- it is **not** the quality leader at this operating point
+- zvec and Qdrant still win on answer retrieval quality here, but at much
+  higher latency
+
+So the honest story on this fact benchmark is a latency/quality frontier:
+
+- `sorted_heap_expand_twohop_rerank()` leads on latency
+- `zvec` / `Qdrant` lead on `hit@k`
+- pgvector sits between them on quality but is slower than the fused
+  `sorted_heap` helper
+
+This also falsifies one tempting but wrong simplification:
+
+> once the helper is fast, the remaining GraphRAG problem is solved
+
+Not quite. On fact-shaped multihop queries, seed ANN quality still matters
+enough that `ann_k`, `ef_search`, and graph build quality remain first-class
+tuning knobs.
+
 ## Current verdict
 
 `sorted_heap` already has a plausible GraphRAG foundation, and the new helper
@@ -895,6 +1004,8 @@ What is now true:
   SQL call without giving back much latency
 - `sorted_heap_expand_twohop_rerank()` turns the earlier two-hop composition
   evidence into a real latency win on the real-text Gutenberg slices we tested
+- on the cogniformerus-style `person -> parent -> city` benchmark, the fused
+  two-hop helper is the fastest PostgreSQL path we tested
 - the narrow-helper direction is a justified building block
 - the current helper model already composes into a competitive two-hop
   real-text GraphRAG path on Gutenberg without requiring a new graph API
@@ -914,6 +1025,10 @@ What is not yet true:
 - two-hop helper composition is not yet a universal latency win; at higher
   rerank dimensions it narrows to parity with heap+btree rather than staying
   clearly ahead
+- the current one-call wrapper still bakes in a `target_id` seed contract,
+  which is wrong for the current fact-shaped multihop workload
+- on the cogniformerus-style fact benchmark, the fused helper is a latency
+  leader but not yet the answer-quality leader
 
 The correct next step is therefore:
 
