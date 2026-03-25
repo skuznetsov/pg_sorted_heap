@@ -173,6 +173,35 @@ This corpus is materially harder than the deterministic synthetic one. It is a
 better signal for default-parameter recall, while the synthetic table remains
 useful for controlled same-host engine comparisons and regression tracking.
 
+### Current local GraphRAG multihop benchmark (`person -> parent -> city`)
+
+Repo-owned harness:
+
+- `python3 scripts/bench_graph_rag_multihop.py --num-pairs 5000 --query-count 64 --runs 3 --dim 384 --ann-k 64 --top-k 10 --ef-search 128 --ef-construction 200 --m 24 --pgv-ef-search 64 --zvec-ef 64 --qdrant-ef 64 --shared-buffers-mb 64 --backend-mode fresh`
+
+Deterministic fact graph, `5K` chains / `10K` rows total, `384D`, top-10.
+This is the current balanced GraphRAG point for the fact-shaped workload.
+
+| Method | p50 latency | hit@1 | hit@k | Notes |
+|--------|:-----------:|:-----:|:-----:|-------|
+| Heap two-hop SQL | 0.762 ms | 75.0% | 96.9% | exact rerank over expanded heap set |
+| **sorted_heap_graph_rag_twohop_scan()** | **0.727 ms** | **75.0%** | **96.9%** | `m=24`, `ef_construction=200`, `ann_k=64`, `ef_search=128` |
+| sorted_heap_expand_twohop_rerank() | 0.726 ms | 75.0% | 96.9% | same seed point, composed helper path |
+| pgvector HNSW + heap expansion | 1.244 ms | 70.3% | 85.9% | `ef_search=64` |
+| zvec HNSW + heap expansion | 0.927 ms | 76.6% | 96.9% | `ef=64` |
+| Qdrant HNSW + heap expansion | 2.417 ms | 76.6% | 96.9% | `hnsw_ef=64` |
+
+The higher-quality local point is now:
+
+- `m=32`
+- `ef_construction=200`
+- `ann_k=64`
+- `sorted_hnsw.ef_search=128`
+
+At that setting, `sorted_heap_graph_rag_twohop_scan()` measured `0.786 ms`
+with `hit@1 76.6%` and `hit@k 96.9%`, matching `zvec` and Qdrant on both
+quality metrics while remaining faster than both.
+
 ### Legacy/manual IVF-PQ benchmark
 
 The sections below are still useful for the explicit IVF-PQ API

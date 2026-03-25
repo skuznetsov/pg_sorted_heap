@@ -99,6 +99,43 @@ ON documents_compact USING sorted_hnsw (embedding hsvec_cosine_ops)
 WITH (m = 16, ef_construction = 64);
 ```
 
+### GraphRAG and fact graphs
+
+`pg_sorted_heap` now also has a narrow GraphRAG path for fact-shaped multihop
+queries. The intended workload is:
+
+- ANN seed retrieval on `entity_id`
+- 1-hop or 2-hop expansion over facts clustered by `(entity_id, relation_id, target_id)`
+- exact rerank of the expanded candidates
+
+The current helpers are:
+
+- `sorted_heap_expand_rerank(...)`
+- `sorted_heap_expand_twohop_rerank(...)`
+- `sorted_heap_graph_rag_twohop_scan(...)`
+
+On the local `5K`-chain / `10K`-row / `384D` multihop benchmark, the current
+balanced point:
+
+- `m=24`
+- `ef_construction=200`
+- `ann_k=64`
+- `sorted_hnsw.ef_search=128`
+
+gives:
+
+- `sorted_heap_graph_rag_twohop_scan()` -> `0.727 ms`, `hit@1 75.0%`, `hit@k 96.9%`
+- `zvec` -> `0.927 ms`, `hit@1 76.6%`, `hit@k 96.9%`
+- `Qdrant` -> `2.417 ms`, `hit@1 76.6%`, `hit@k 96.9%`
+- `pgvector` -> `1.244 ms`, `hit@k 85.9%`
+
+At the slightly heavier `m=32` point, the `sorted_heap` helper reaches full
+observed parity with `zvec` and Qdrant on both `hit@1` and `hit@k`, while
+staying faster than both on this benchmark.
+
+The full reasoning, caveats, and tuning frontier live in
+[docs/design-graphrag.md](/Users/sergey/Projects/C/clustered_pg/docs/design-graphrag.md).
+
 ### Legacy/manual ANN paths
 
 The older explicit ANN paths are still available when you want manual control
