@@ -1527,6 +1527,51 @@ set of bad cases rather than a general degradation across the query set.
 So the honest story on this fact benchmark is a latency/quality frontier:
 
 - `sorted_heap_expand_twohop_rerank()` leads on latency
+
+### Path-aware rerank diagnostic
+
+The next falsifier was to keep the same ANN seeds and the same two-hop
+expansion, but change only the final scorer. The current multihop helper
+reranks on the hop-2 city fact embedding alone. A path-aware SQL baseline was
+added to the harness that scores each candidate as:
+
+- `path_distance = (hop1_embedding <=> query) + (hop2_embedding <=> query)`
+
+That simple change materially improved answer quality on the same balanced
+points:
+
+- `5K` chains, `m=24`, `ef_construction=200`, `ann_k=64`,
+  `sorted_hnsw.ef_search=128`
+  - city-only `sorted_heap_graph_rag_twohop_scan()`
+    - `0.762 ms`
+    - `hit@1 = 75.0%`
+    - `hit@k = 96.9%`
+  - path-aware SQL rerank on `facts_sh`
+    - `0.957 ms`
+    - `hit@1 = 98.4%`
+    - `hit@k = 98.4%`
+
+- `10K` chains, same knobs
+  - city-only `sorted_heap_graph_rag_twohop_scan()`
+    - `0.937 ms`
+    - `hit@1 = 71.9%`
+    - `hit@k = 92.2%`
+  - path-aware SQL rerank on `facts_sh`
+    - `1.179 ms`
+    - `hit@1 = 95.3%`
+    - `hit@k = 96.9%`
+
+This is the strongest current architectural signal on the fact-shaped
+benchmark:
+
+- the remaining quality gap is not well explained by seed recall
+- it is also not well explained by broad rerank collapse
+- a simple path-aware scorer recovers most of the lost quality with only a
+  modest latency increase
+
+So for multihop fact retrieval, the next serious product branch is not more
+`sorted_hnsw` tuning. It is a fused path-aware rerank helper that can use hop-1
+and hop-2 evidence together instead of ranking hop-2 facts in isolation.
 - at the balanced `m=24` point, `sorted_heap` matches `zvec` / `Qdrant` on
   `hit@k` and trails only slightly on `hit@1`
 - at the higher-quality `m=32` point, `sorted_heap` reaches parity with

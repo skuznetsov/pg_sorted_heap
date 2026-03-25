@@ -731,6 +731,41 @@ def main() -> int:
                 """,
                 lambda q: (q.query_vec, q.query_vec),
             )
+            pathsum_twohop = base.QueryCase(
+                "seed_expand2_rerank_rel_pathsum_in",
+                f"""
+                WITH ann AS MATERIALIZED (
+                    SELECT entity_id
+                    FROM {{table}}
+                    ORDER BY embedding <=> %s::svec
+                    LIMIT {args.ann_k}
+                ),
+                seeds AS MATERIALIZED (
+                    SELECT DISTINCT entity_id FROM ann
+                ),
+                hop1 AS MATERIALIZED (
+                    SELECT DISTINCT ON (target_id)
+                           target_id AS parent_id,
+                           (embedding <=> %s::svec) AS hop1_distance
+                    FROM {{table}}
+                    WHERE entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+                      AND relation_id = {REL_PARENT}
+                    ORDER BY target_id, embedding <=> %s::svec, entity_id
+                ),
+                expanded AS MATERIALIZED (
+                    SELECT city.*,
+                           ((city.embedding <=> %s::svec) + hop1.hop1_distance) AS path_distance
+                    FROM {{table}} city
+                    JOIN hop1 ON hop1.parent_id = city.entity_id
+                    WHERE city.relation_id = {REL_CITY}
+                )
+                SELECT *
+                FROM expanded
+                ORDER BY path_distance, target_id
+                LIMIT {args.top_k}
+                """,
+                lambda q: (q.query_vec, q.query_vec, q.query_vec, q.query_vec),
+            )
             composed_twohop = base.QueryCase(
                 "seed_expand2_rerank_rel_topk_fn",
                 f"""
@@ -882,6 +917,7 @@ def main() -> int:
             cases: list[tuple[str, str, base.QueryCase]] = [
                 ("facts_heap", "facts_heap", sql_twohop),
                 ("facts_sh", "facts_sh", sql_twohop),
+                ("facts_sh", "facts_sh", pathsum_twohop),
                 ("facts_sh", "facts_sh", composed_twohop),
                 ("facts_sh", "facts_sh", helper_twohop),
                 ("facts_sh", "facts_sh", wrapper_twohop),

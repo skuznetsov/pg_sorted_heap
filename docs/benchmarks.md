@@ -243,6 +243,15 @@ queries, and at `10K` it is still within the top 3 for 95% of reachable
 queries. The quality drop is therefore driven by a few severe outliers
 (`max rank 17` at `5K`, `20` at `10K`), not by a broad collapse.
 
+A path-aware SQL rerank baseline then changed the picture materially. Keeping
+the same ANN seeds and the same two-hop expansion, but scoring candidates as
+`hop1_distance + hop2_distance`, moved the local balanced points to:
+- `5K`: `0.957 ms`, `hit@1 98.4%`, `hit@k 98.4%`
+- `10K`: `1.179 ms`, `hit@1 95.3%`, `hit@k 96.9%`
+
+That is the current strongest sign that fact-shaped multihop quality is mostly
+limited by the city-only rerank contract, not by seed ANN quality.
+
 ### Legacy/manual IVF-PQ benchmark
 
 The sections below are still useful for the explicit IVF-PQ API
