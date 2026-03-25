@@ -495,6 +495,43 @@ So the objective conclusion today is narrower than for `pgvector`:
 - on the larger slice, the current blocker is `zvec` ANN seed instability, not
   PostgreSQL expansion/rerank overhead
 
+## Qdrant parity on the real-text graph
+
+The Gutenberg harness now also supports a comparable `Qdrant` path:
+
+- ANN seeds come from a local Qdrant HNSW collection built from the same fact
+  rows
+- graph expansion and exact rerank still happen in PostgreSQL over `facts_heap`
+
+Unlike `zvec`, this path stayed stable on both the medium and larger real-text
+slices. The result is simpler:
+
+`64 books x 128 paragraphs/book` (`14,549` rows):
+
+- heap rerank baseline: `0.074 ms`
+- `sorted_heap_expand_rerank(... relation=2)`: `0.062 ms`
+- `sorted_heap_graph_rag_scan(... relation=2)`: `0.083 ms`
+- `Qdrant ANN -> heap expansion -> exact rerank`: `1.535 ms`
+
+`128 books x 256 paragraphs/book` (`58,954` rows):
+
+- heap rerank baseline: `0.081 ms`
+- `sorted_heap_expand_rerank(... relation=2)`: `0.083 ms`
+- `sorted_heap_graph_rag_scan(... relation=2)`: `0.085 ms`
+- `Qdrant ANN -> heap expansion -> exact rerank`: `1.769 ms`
+
+So on this GraphRAG workflow shape:
+
+- Qdrant is robust on the real-text benchmark
+- but its external ANN seed stage dominates end-to-end latency
+- the fused `sorted_heap` helper remains roughly an order of magnitude faster
+  on the rerank path
+
+That again does **not** mean Qdrant is a bad vector engine in isolation. It
+means that when the workflow is "external ANN seed + relational graph
+expansion + exact rerank inside PostgreSQL", the narrow in-engine helper path
+is much better aligned with the total job than a remote vector service.
+
 One important measurement caveat was also discovered and fixed during this
 work:
 
@@ -576,6 +613,8 @@ What is now true:
   worse end-to-end than the fused `sorted_heap` helper path
 - `zvec` is stable on the medium slice but currently not robust on the larger
   real-text slice at `ann_k=32`
+- `Qdrant` is robust on both real-text slices but materially slower than the
+  fused `sorted_heap` helper on the same workflow
 
 What is not yet true:
 

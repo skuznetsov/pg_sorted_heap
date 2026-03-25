@@ -20,13 +20,21 @@ import hashlib
 import math
 import re
 import shutil
+import subprocess
 import statistics
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 import bench_graph_rag as base
 import zvec
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Distance
+from qdrant_client.http.models import HnswConfigDiff
+from qdrant_client.http.models import PointStruct
+from qdrant_client.http.models import SearchParams
+from qdrant_client.http.models import VectorParams
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9']+")
 
@@ -240,6 +248,57 @@ def map_zvec_results_to_targets(results, id_to_target: dict[str, int]) -> list[i
     return unique_ints_in_order([id_to_target[doc.id] for doc in results])
 
 
+def ensure_qdrant() -> tuple[QdrantClient, bool]:
+    client = QdrantClient(url="http://127.0.0.1:6333", timeout=60, check_compatibility=False)
+    started = False
+    try:
+        client.get_collections()
+        return client, started
+    except Exception:
+        subprocess.run(
+            ["docker", "run", "-d", "--rm", "--name", "qdrant-bench", "-p", "6333:6333", "qdrant/qdrant:v1.13.2"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        for _ in range(30):
+            try:
+                client = QdrantClient(url="http://127.0.0.1:6333", timeout=60, check_compatibility=False)
+                client.get_collections()
+                started = True
+                return client, started
+            except Exception:
+                time.sleep(1.0)
+        raise RuntimeError("failed to start/connect to Qdrant on 127.0.0.1:6333")
+
+
+def build_qdrant_collection(
+    csv_path: Path,
+    dim: int,
+    ef_construction: int,
+) -> tuple[QdrantClient, bool, str, dict[int, int]]:
+    client, started = ensure_qdrant()
+    name = "graph_rag_gutenberg_" + uuid.uuid4().hex[:8]
+    client.create_collection(
+        collection_name=name,
+        vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+        hnsw_config=HnswConfigDiff(m=16, ef_construct=ef_construction),
+    )
+    batch: list[PointStruct] = []
+    id_to_target: dict[int, int] = {}
+    with open(csv_path, "r", encoding="utf-8", newline="") as f:
+        for idx, row in enumerate(csv.reader(f), start=1):
+            target_id = int(row[2])
+            id_to_target[idx] = target_id
+            batch.append(PointStruct(id=idx, vector=vector_list_from_literal(row[3]), payload={"target_id": target_id}))
+            if len(batch) == 64:
+                client.upsert(collection_name=name, points=batch, wait=True)
+                batch = []
+    if batch:
+        client.upsert(collection_name=name, points=batch, wait=True)
+    return client, started, name, id_to_target
+
+
 def measure_external_graph_rag_case(
     cur,
     case_name: str,
@@ -301,6 +360,8 @@ def main() -> int:
     ap.add_argument("--zvec-ef", type=int, default=64)
     ap.add_argument("--zvec-memory-limit-mb", type=int, default=8192)
     ap.add_argument("--skip-zvec", action="store_true")
+    ap.add_argument("--qdrant-ef", type=int, default=64)
+    ap.add_argument("--skip-qdrant", action="store_true")
     ap.add_argument("--shared-buffers-mb", type=int, default=64)
     ap.add_argument("--backend-mode", choices=("fresh", "reuse"), default="fresh")
     ap.add_argument("--keep-temp", action="store_true")
@@ -316,6 +377,9 @@ def main() -> int:
     tmp, pg_bindir = base.init_temp_cluster(root_dir, port, tmp_root, args.shared_buffers_mb)
     csv_path = tmp / "facts_gutenberg.csv"
     zvec_dir: str | None = None
+    qdrant_client: QdrantClient | None = None
+    qdrant_started = False
+    qdrant_name: str | None = None
 
     try:
         rows, book_count, contains_rows, next_rows = generate_csv_from_gutenberg(
@@ -345,6 +409,13 @@ def main() -> int:
                     args.dim,
                     args.ef_construction,
                     args.zvec_memory_limit_mb,
+                )
+            qdrant_target_map: dict[int, int] = {}
+            if not args.skip_qdrant:
+                qdrant_client, qdrant_started, qdrant_name, qdrant_target_map = build_qdrant_collection(
+                    csv_path,
+                    args.dim,
+                    args.ef_construction,
                 )
             queries = load_relation_queries(cur, args.query_count, 2)
             if len(queries) < args.query_count:
@@ -509,6 +580,8 @@ def main() -> int:
             print(f"pgvector:         {'off' if args.skip_pgvector else 'on'}")
             print(f"zvec_ef:          {args.zvec_ef}")
             print(f"zvec:             {'off' if args.skip_zvec else 'on'}")
+            print(f"qdrant_ef:        {args.qdrant_ef}")
+            print(f"qdrant:           {'off' if args.skip_qdrant else 'on'}")
             print(f"shared_buffers:   {args.shared_buffers_mb}MB")
             print(f"backend_mode:     {args.backend_mode}")
             print()
@@ -537,6 +610,31 @@ def main() -> int:
                         p50, avg, hits, reads, root, rowcount = base.measure_case(cur, table, case, queries, args.runs)
                         base.print_result(table, case.name, p50, avg, hits, reads, root, rowcount)
 
+            sql_expand = """
+                WITH seeds AS MATERIALIZED (
+                    SELECT DISTINCT unnest(%s::int4[]) AS target_id
+                )
+                SELECT *
+                FROM facts_heap
+                WHERE entity_id = ANY (ARRAY(SELECT target_id FROM seeds))
+                  AND relation_id = %s
+            """
+            sql_rerank = f"""
+                WITH seeds AS MATERIALIZED (
+                    SELECT DISTINCT unnest(%s::int4[]) AS target_id
+                ),
+                expanded AS MATERIALIZED (
+                    SELECT *
+                    FROM facts_heap
+                    WHERE entity_id = ANY (ARRAY(SELECT target_id FROM seeds))
+                      AND relation_id = %s
+                )
+                SELECT *
+                FROM expanded
+                ORDER BY embedding <=> %s::svec
+                LIMIT {args.top_k}
+            """
+
             if not args.skip_pgvector:
                 cur.execute(f"SET hnsw.ef_search = {args.pgv_ef_search}")
                 for case in pgvector_cases:
@@ -550,31 +648,6 @@ def main() -> int:
                 def zvec_seed_fn(qvec: list[float]) -> list[int]:
                     res = zvec_coll.query(zvec.VectorQuery("embedding", vector=qvec, param=param), topk=args.ann_k)
                     return map_zvec_results_to_targets(res, zvec_target_map)
-
-                sql_expand = f"""
-                    WITH seeds AS MATERIALIZED (
-                        SELECT DISTINCT unnest(%s::int4[]) AS target_id
-                    )
-                    SELECT *
-                    FROM facts_heap
-                    WHERE entity_id = ANY (ARRAY(SELECT target_id FROM seeds))
-                      AND relation_id = %s
-                """
-                sql_rerank = f"""
-                    WITH seeds AS MATERIALIZED (
-                        SELECT DISTINCT unnest(%s::int4[]) AS target_id
-                    ),
-                    expanded AS MATERIALIZED (
-                        SELECT *
-                        FROM facts_heap
-                        WHERE entity_id = ANY (ARRAY(SELECT target_id FROM seeds))
-                          AND relation_id = %s
-                    )
-                    SELECT *
-                    FROM expanded
-                    ORDER BY embedding <=> %s::svec
-                    LIMIT {args.top_k}
-                """
 
                 print("running|table=facts_zvec|case=seed_expand_rel_zvec", flush=True)
                 p50, avg, hits, reads, root, rowcount = measure_external_graph_rag_case(
@@ -599,11 +672,54 @@ def main() -> int:
                     lambda q, seeds: (sql_rerank, (seeds, q[1], q[2])),
                 )
                 base.print_result("facts_zvec", "seed_expand_rerank_rel_zvec", p50, avg, hits, reads, root, rowcount)
+
+            if not args.skip_qdrant and qdrant_client is not None and qdrant_name is not None:
+                params = SearchParams(hnsw_ef=args.qdrant_ef, exact=False)
+
+                def qdrant_seed_fn(qvec: list[float]) -> list[int]:
+                    res = qdrant_client.query_points(
+                        collection_name=qdrant_name,
+                        query=qvec,
+                        limit=args.ann_k,
+                        search_params=params,
+                    ).points
+                    return unique_ints_in_order([qdrant_target_map[int(p.id)] for p in res])
+
+                print("running|table=facts_qdrant|case=seed_expand_rel_qdrant", flush=True)
+                p50, avg, hits, reads, root, rowcount = measure_external_graph_rag_case(
+                    cur,
+                    "seed_expand_rel_qdrant",
+                    queries,
+                    args.runs,
+                    qdrant_seed_fn,
+                    sql_expand,
+                    lambda q, seeds: (sql_expand, (seeds, q[1])),
+                )
+                base.print_result("facts_qdrant", "seed_expand_rel_qdrant", p50, avg, hits, reads, root, rowcount)
+
+                print("running|table=facts_qdrant|case=seed_expand_rerank_rel_qdrant", flush=True)
+                p50, avg, hits, reads, root, rowcount = measure_external_graph_rag_case(
+                    cur,
+                    "seed_expand_rerank_rel_qdrant",
+                    queries,
+                    args.runs,
+                    qdrant_seed_fn,
+                    sql_rerank,
+                    lambda q, seeds: (sql_rerank, (seeds, q[1], q[2])),
+                )
+                base.print_result("facts_qdrant", "seed_expand_rerank_rel_qdrant", p50, avg, hits, reads, root, rowcount)
         finally:
             cur.close()
             conn.close()
         return 0
     finally:
+        if qdrant_client is not None and qdrant_name is not None:
+            try:
+                qdrant_client.delete_collection(qdrant_name)
+            except Exception:
+                pass
+        if qdrant_started:
+            subprocess.run(["docker", "stop", "qdrant-bench"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if zvec_dir is not None:
             shutil.rmtree(zvec_dir, ignore_errors=True)
         if args.keep_temp:
