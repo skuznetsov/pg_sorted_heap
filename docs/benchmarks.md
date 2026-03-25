@@ -226,6 +226,12 @@ Re-running the same AWS point at `m=32` did not improve the frontier:
 `hit@1 76.6%` and `hit@k 96.9%`. So the locally observed `m=32` parity point
 does not transfer unchanged to this ARM64 environment.
 
+The larger `10K`-chain AWS rerun reproduced the local scale caveat almost
+exactly: at the same portable point, `sorted_heap_graph_rag_twohop_scan()`
+measured `1.248 ms`, `hit@1 71.9%`, `hit@k 92.2%`. The best verified AWS
+recovery point there is `m=32`, `ef_search=192`, which moved it to
+`1.687 ms`, `hit@1 76.6%`, `hit@k 95.3%`.
+
 ### Legacy/manual IVF-PQ benchmark
 
 The sections below are still useful for the explicit IVF-PQ API

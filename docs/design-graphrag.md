@@ -1356,6 +1356,68 @@ The current best explanation is therefore narrower:
 That is enough to stop local knob-turning for this pass. The next useful step
 would be a different class of experiment, not more of the same sweep.
 
+The next adversary check after that was whether this larger-graph caveat was
+just a local-machine artifact. Re-running the `10K`-chain benchmark on the
+same AWS ARM64 host (`4 vCPU`, `8 GiB RAM`) showed that it is not.
+
+At the same balanced portable point:
+
+- `m=24`
+- `ef_construction=200`
+- `ann_k=64`
+- `sorted_hnsw.ef_search=128`
+
+the AWS rerun produced:
+
+- heap two-hop SQL
+  - `1.389 ms`
+  - `hit@1 = 71.9%`
+  - `hit@k = 92.2%`
+- `sorted_heap_expand_twohop_rerank()`
+  - `1.190 ms`
+  - `hit@1 = 71.9%`
+  - `hit@k = 92.2%`
+- `sorted_heap_graph_rag_twohop_scan()`
+  - `1.248 ms`
+  - `hit@1 = 71.9%`
+  - `hit@k = 92.2%`
+
+That essentially matches the larger local result. So the `10K`-chain drop is
+cross-environment robust, not just a local Apple/M-series artifact.
+
+The one meaningful local rescue point transferred cleanly to AWS too.
+Re-running the `10K`-chain benchmark at:
+
+- `m=32`
+- `ef_construction=200`
+- `ann_k=64`
+- `sorted_hnsw.ef_search=192`
+
+produced:
+
+- heap two-hop SQL
+  - `1.896 ms`
+  - `hit@1 = 76.6%`
+  - `hit@k = 95.3%`
+- `sorted_heap_expand_twohop_rerank()`
+  - `1.617 ms`
+  - `hit@1 = 76.6%`
+  - `hit@k = 95.3%`
+- `sorted_heap_graph_rag_twohop_scan()`
+  - `1.687 ms`
+  - `hit@1 = 76.6%`
+  - `hit@k = 95.3%`
+
+So the larger-scale picture is now materially stronger:
+
+- the `10K`-chain quality drop is cross-environment robust
+- the best current larger-graph recovery point is also cross-environment
+  robust: `m=32 / ef_search=192`
+- but even that recovery point does **not** restore the earlier `5K`-chain
+  `98.4% hit@k` AWS frontier
+- so the remaining gap is unlikely to be solved by another trivial
+  `ef_search` or `m` tweak alone
+
 So the honest story on this fact benchmark is a latency/quality frontier:
 
 - `sorted_heap_expand_twohop_rerank()` leads on latency
