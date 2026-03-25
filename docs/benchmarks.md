@@ -237,7 +237,11 @@ An exact-seed diagnostic on the local `5K` and `10K` points did not improve
 benchmark shape, the remaining gap is not explained by ANN approximation alone.
 The stronger result is that seed coverage itself was identical for ANN and
 exact seeds: `98.4%` at `5K` and `96.9%` at `10K`. So the remaining loss is
-downstream of seeding.
+downstream of seeding. The new rerank-rank diagnostic narrows that further:
+at `5K`, the correct city is still within the top 6 for 95% of reachable
+queries, and at `10K` it is still within the top 3 for 95% of reachable
+queries. The quality drop is therefore driven by a few severe outliers
+(`max rank 17` at `5K`, `20` at `10K`), not by a broad collapse.
 
 ### Legacy/manual IVF-PQ benchmark
 

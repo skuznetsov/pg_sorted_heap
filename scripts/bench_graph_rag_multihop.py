@@ -460,6 +460,59 @@ def measure_seed_diagnostics(cur, queries: list[MultiHopQuery], seed_fn, ann_k: 
     )
 
 
+def percentile(sorted_values: list[float], pct: float) -> float:
+    if not sorted_values:
+        return 0.0
+    idx = max(0, min(len(sorted_values) - 1, math.ceil((pct / 100.0) * len(sorted_values)) - 1))
+    return sorted_values[idx]
+
+
+def measure_rerank_diagnostics(cur, queries: list[MultiHopQuery], seed_fn, ann_k: int) -> tuple[float, float, float, float]:
+    city_ranks: list[float] = []
+
+    rank_sql = f"""
+        WITH seeds AS MATERIALIZED (
+            SELECT DISTINCT unnest(%s::int4[]) AS entity_id
+        ),
+        hop1 AS MATERIALIZED (
+            SELECT DISTINCT target_id
+            FROM facts_heap
+            WHERE entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+              AND relation_id = {REL_PARENT}
+        ),
+        expanded AS MATERIALIZED (
+            SELECT target_id, embedding
+            FROM facts_heap
+            WHERE entity_id = ANY (ARRAY(SELECT target_id FROM hop1))
+              AND relation_id = {REL_CITY}
+        )
+        SELECT target_id
+        FROM expanded
+        ORDER BY embedding <=> %s::svec, target_id
+    """
+
+    for query in queries:
+        seed_arg = query.query_vec
+        if getattr(seed_fn, "expects_vector_list", False):
+            seed_arg = gut.vector_list_from_literal(query.query_vec)
+        seeds = seed_fn(seed_arg)
+        cur.execute(rank_sql, (seeds, query.query_vec))
+        targets = [int(row[0]) for row in cur.fetchall()]
+        if query.city_id in targets:
+            city_ranks.append(float(targets.index(query.city_id) + 1))
+
+    city_ranks.sort()
+    if not city_ranks:
+        fallback = float(ann_k + 1)
+        return fallback, fallback, fallback, fallback
+    return (
+        statistics.fmean(city_ranks),
+        percentile(city_ranks, 50.0),
+        percentile(city_ranks, 95.0),
+        city_ranks[-1],
+    )
+
+
 def build_zvec_collection_entity_seed(
     csv_path: Path,
     dim: int,
@@ -907,6 +960,17 @@ def main() -> int:
                     f"diagnostic|seed_mode=ann|seed_person_pct={ann_seed_person:.1f}|"
                     f"expanded_city_pct={ann_expanded_city:.1f}|avg_person_rank={ann_avg_rank:.2f}"
                 )
+                ann_city_rank_avg, ann_city_rank_p50, ann_city_rank_p95, ann_city_rank_max = measure_rerank_diagnostics(
+                    cur,
+                    queries,
+                    ann_seed_fn,
+                    args.ann_k,
+                )
+                print(
+                    f"diagnostic|rerank_mode=ann|city_rank_avg={ann_city_rank_avg:.2f}|"
+                    f"city_rank_p50={ann_city_rank_p50:.1f}|city_rank_p95={ann_city_rank_p95:.1f}|"
+                    f"city_rank_max={ann_city_rank_max:.1f}"
+                )
                 exact_seed_person, exact_expanded_city, exact_avg_rank = measure_seed_diagnostics(
                     cur,
                     queries,
@@ -916,6 +980,17 @@ def main() -> int:
                 print(
                     f"diagnostic|seed_mode=exact|seed_person_pct={exact_seed_person:.1f}|"
                     f"expanded_city_pct={exact_expanded_city:.1f}|avg_person_rank={exact_avg_rank:.2f}"
+                )
+                exact_city_rank_avg, exact_city_rank_p50, exact_city_rank_p95, exact_city_rank_max = measure_rerank_diagnostics(
+                    cur,
+                    queries,
+                    exact_seed_fn,
+                    args.ann_k,
+                )
+                print(
+                    f"diagnostic|rerank_mode=exact|city_rank_avg={exact_city_rank_avg:.2f}|"
+                    f"city_rank_p50={exact_city_rank_p50:.1f}|city_rank_p95={exact_city_rank_p95:.1f}|"
+                    f"city_rank_max={exact_city_rank_max:.1f}"
                 )
 
             if not args.skip_pgvector:

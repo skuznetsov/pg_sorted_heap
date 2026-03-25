@@ -1454,13 +1454,19 @@ And the seed-stage diagnostic showed no hidden ANN loss there either:
   - `seed_person_pct = 98.4%`
   - `expanded_city_pct = 98.4%`
   - `avg_person_rank = 1.00`
+  - `city_rank_p95 = 6`
+  - `city_rank_max = 17`
 - exact seeds
   - `seed_person_pct = 98.4%`
   - `expanded_city_pct = 98.4%`
   - `avg_person_rank = 1.00`
+  - `city_rank_p95 = 6`
+  - `city_rank_max = 17`
 
 So even at `5K`, the final `96.9% hit@k` is already below seed coverage.
-The remaining miss rate is downstream of seed retrieval.
+But the rerank distribution is still concentrated: the correct city stays
+within the top 6 for 95% of reachable queries, and the miss comes from a
+small number of sharper outliers.
 
 On the `10K`-chain balanced local point:
 
@@ -1486,21 +1492,28 @@ The seed-stage diagnostic was even more revealing on `10K`:
   - `seed_person_pct = 96.9%`
   - `expanded_city_pct = 96.9%`
   - `avg_person_rank = 1.00`
+  - `city_rank_p95 = 3`
+  - `city_rank_max = 20`
 - exact seeds
   - `seed_person_pct = 96.9%`
   - `expanded_city_pct = 96.9%`
   - `avg_person_rank = 1.00`
+  - `city_rank_p95 = 3`
+  - `city_rank_max = 19`
 
 So the larger-graph gap is **not** coming from missing the correct seed fact.
 At `10K`, seed coverage stays at `96.9%`, but final `hit@k` drops to `92.2%`.
-That loss is happening after seeding, inside the expansion/rerank/task
-semantics.
+And it is not a broad rerank collapse either: for 95% of reachable queries the
+correct city still ranks in the top 3, but a few outliers fall as far as
+rank `19-20`, which is enough to miss `top_k = 10`.
 
 This is a strong falsifier:
 
 - on this synthetic fact benchmark, the current `5K` and `10K` frontiers are
   **not** ANN-approximation limited at the tested operating points
 - ANN and exact seeds have identical seed coverage on both scales
+- the remaining gap is mostly an outlier-ranking problem, not a broad seed or
+  rerank failure
 - exact seeds cost extra latency but do not recover answer quality
 - so the next meaningful gain is unlikely to come from more seed-ANN tuning
   alone
@@ -1508,7 +1521,8 @@ This is a strong falsifier:
 The remaining gap now looks more like a property of the task construction,
 query embedding, or graph benchmark semantics than of `sorted_hnsw`
 approximation itself. More specifically: the dominant remaining loss now looks
-downstream of seed retrieval, not inside it.
+downstream of seed retrieval, not inside it, and it is concentrated in a small
+set of bad cases rather than a general degradation across the query set.
 
 So the honest story on this fact benchmark is a latency/quality frontier:
 
