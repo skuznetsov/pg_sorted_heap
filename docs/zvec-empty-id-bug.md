@@ -60,6 +60,18 @@ Neighbor controls:
 - `rows=4950`, `topk<=6`: `ok`
 - `rows=4950`, `topk>=7`: `bad`
 
+The compact repro also survives simple runtime knob changes:
+
+- `memory_limit_mb=8192`: `bad`
+- `memory_limit_mb=1024`: `bad`
+- `memory_limit_mb=256`: `bad`
+- `query_threads=1`, `optimize_threads=1`: `bad`
+- `query_threads=2`, `optimize_threads=2`: `bad`
+- `query_threads=4`, `optimize_threads=4`: `bad`
+
+So the current minimal case does not look like a trivial thread-count or
+memory-budget artifact.
+
 ## Stronger diagnostics
 
 On the compact synthetic case:

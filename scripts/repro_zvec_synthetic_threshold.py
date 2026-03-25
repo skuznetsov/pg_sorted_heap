@@ -49,6 +49,8 @@ def run_one(
     m: int,
     query_count: int,
     memory_limit_mb: int,
+    query_threads: int | None,
+    optimize_threads: int | None,
 ) -> tuple[int | None, list[str] | None]:
     tmpdir = Path(tempfile.mkdtemp(prefix="zvec_synth_repro_", dir="/tmp"))
     path = tmpdir / "bench"
@@ -104,6 +106,8 @@ def main() -> int:
     ap.add_argument("--m", type=int, default=16)
     ap.add_argument("--query-count", type=int, default=20)
     ap.add_argument("--memory-limit-mb", type=int, default=8192)
+    ap.add_argument("--query-threads", type=int)
+    ap.add_argument("--optimize-threads", type=int)
     ap.add_argument(
         "--rows",
         default="4900,4950,5000,7000,7500,7800,7900,24000,30000",
@@ -111,7 +115,12 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    zvec.init(memory_limit_mb=args.memory_limit_mb)
+    init_kwargs = {"memory_limit_mb": args.memory_limit_mb}
+    if args.query_threads is not None:
+        init_kwargs["query_threads"] = args.query_threads
+    if args.optimize_threads is not None:
+        init_kwargs["optimize_threads"] = args.optimize_threads
+    zvec.init(**init_kwargs)
 
     print("============================================================")
     print("zvec synthetic threshold repro")
@@ -123,6 +132,8 @@ def main() -> int:
     print(f"m:                {args.m}")
     print(f"query_count:      {args.query_count}")
     print(f"memory_limit_mb:  {args.memory_limit_mb}")
+    print(f"query_threads:    {args.query_threads}")
+    print(f"optimize_threads: {args.optimize_threads}")
 
     for item in args.rows.split(","):
         item = item.strip()
@@ -138,6 +149,8 @@ def main() -> int:
             args.m,
             args.query_count,
             args.memory_limit_mb,
+            args.query_threads,
+            args.optimize_threads,
         )
         status = "ok" if bad_query is None else "bad"
         print(
