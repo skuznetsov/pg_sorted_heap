@@ -10,7 +10,7 @@ empty/unmapped document ids on a plain synthetic collection too.
 Current observed signature:
   - dim=32
   - ef_search=64
-  - topk=8 already sufficient to trigger the bug
+  - topk=7 already sufficient to trigger the bug
   - a compact failing case exists at 4,950 rows
   - failures are non-monotonic with row count
 """
@@ -87,7 +87,7 @@ def run_one(
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dim", type=int, default=32)
-    ap.add_argument("--topk", type=int, default=8)
+    ap.add_argument("--topk", type=int, default=7)
     ap.add_argument("--ef-search", type=int, default=64)
     ap.add_argument("--ef-construction", type=int, default=64)
     ap.add_argument("--m", type=int, default=16)

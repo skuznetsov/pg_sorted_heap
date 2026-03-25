@@ -522,12 +522,13 @@ synthetic FP32 corpus:
 Current synthetic signature:
 
 - `dim=32`, `ef_search=64`
-- `topk=8` already reproduces the issue
+- `topk=7` already reproduces the issue
 - a compact failing case exists at `4,950` rows
   - nearby controls:
     - `4,900` rows: ok
     - `4,950` rows: bad
     - `5,000` rows: bad
+  - `topk<=6` is clean on the `4,950`-row case
 - failures are non-monotonic by row count
   - bad: `16,000`, `20,000`, `28,000`, `30,000`, `45,000`, `60,000`
   - ok: `24,000`, `29,000`, `75,000` (`100` probe queries still clean at `75k`)
