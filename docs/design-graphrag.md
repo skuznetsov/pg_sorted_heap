@@ -598,6 +598,17 @@ GraphRAG":
 > in-PG and external ANN competitors on this workflow shape, but its advantage
 > over heap+btree narrows substantially as exact rerank dimension grows
 
+One more tuning falsifier was useful here:
+
+- dropping `ann_k` from `32` to `24` on the `384D` medium slice does reduce
+  latency
+- but it is **not** a free operating-point improvement
+- a direct result-set comparison for `sorted_heap_graph_rag_scan(...)` on the
+  `64`-query probe set showed mismatches on `62/64` queries versus `ann_k=32`
+
+So the current faster-than-`ann_k=32` settings should be treated as a
+quality/latency tradeoff, not as a no-regression default recommendation.
+
 One important measurement caveat was also discovered and fixed during this
 work:
 
