@@ -399,6 +399,61 @@ def verify_helper_filtered_2hop_rerank_equivalence(
             )
 
 
+def verify_helper_filtered_2hop_fused_equivalence(
+    cur, table_name: str, queries: list[tuple[int, int, str]], ann_k: int, top_k: int
+) -> None:
+    sql = f"""
+    WITH ann AS MATERIALIZED (
+        SELECT target_id
+        FROM {table_name}
+        ORDER BY embedding <=> %s::svec
+        LIMIT {ann_k}
+    ),
+    seeds AS MATERIALIZED (
+        SELECT DISTINCT target_id FROM ann
+    ),
+    helper AS (
+        SELECT entity_id, relation_id, target_id, round(distance::numeric, 6) AS distance
+        FROM sorted_heap_expand_twohop_rerank('{table_name}'::regclass, ARRAY(SELECT target_id FROM seeds), %s::svec, {top_k}, %s::int4, %s::int4, 0)
+    ),
+    hop1_sql AS MATERIALIZED (
+        SELECT DISTINCT target_id
+        FROM {table_name}
+        WHERE entity_id = ANY (ARRAY(SELECT target_id FROM seeds))
+          AND relation_id = %s
+    ),
+    expanded AS MATERIALIZED (
+        SELECT *
+        FROM {table_name}
+        WHERE entity_id = ANY (ARRAY(SELECT target_id FROM hop1_sql))
+          AND relation_id = %s
+    ),
+    sql_baseline AS (
+        SELECT entity_id, relation_id, target_id,
+               round((embedding <=> %s::svec)::numeric, 6) AS distance
+        FROM expanded
+        ORDER BY embedding <=> %s::svec, entity_id, relation_id, target_id
+        LIMIT {top_k}
+    )
+    SELECT count(*) FROM (
+        (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
+        UNION ALL
+        (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
+    ) diff
+    """
+
+    for idx, query in enumerate(queries, start=1):
+        cur.execute(
+            sql,
+            (query[2], query[2], query[1], query[1], query[1], query[1], query[2], query[2]),
+        )
+        diff_rows = cur.fetchone()[0]
+        if diff_rows != 0:
+            raise RuntimeError(
+                f"sorted_heap_expand_twohop_rerank mismatch on {table_name} query#{idx}: diff_rows={diff_rows}"
+            )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gutenberg-path", default=str(Path.home() / "Projects/ML/cogniversum_v2/gutenberg_cache"))
@@ -621,6 +676,23 @@ def main() -> int:
                     """,
                     lambda q: (q[2], q[1], q[2], q[1]),
                 ),
+                base.QueryCase(
+                    "seed_expand2_rerank_rel_twohop_fn",
+                    f"""
+                    WITH ann AS MATERIALIZED (
+                        SELECT target_id
+                        FROM {{table}}
+                        ORDER BY embedding <=> %s::svec
+                        LIMIT {args.ann_k}
+                    ),
+                    seeds AS MATERIALIZED (
+                        SELECT DISTINCT target_id FROM ann
+                    )
+                    SELECT *
+                    FROM sorted_heap_expand_twohop_rerank('{{table}}'::regclass, ARRAY(SELECT target_id FROM seeds), %s::svec, {args.top_k}, %s::int4, %s::int4, 0)
+                    """,
+                    lambda q: (q[2], q[2], q[1], q[1]),
+                ),
             ]
             pgvector_cases = [
                 base.QueryCase(
@@ -741,6 +813,7 @@ def main() -> int:
             base.verify_helper_filtered_rerank_equivalence(cur, "facts_sh", queries, args.ann_k, args.top_k)
             base.verify_graph_rag_scan_filtered_equivalence(cur, "facts_sh", queries, args.ann_k, args.top_k)
             verify_helper_filtered_2hop_rerank_equivalence(cur, "facts_sh", queries, args.ann_k, args.top_k)
+            verify_helper_filtered_2hop_fused_equivalence(cur, "facts_sh", queries, args.ann_k, args.top_k)
 
             for table in ("facts_heap", "facts_sh"):
                 for case in cases:

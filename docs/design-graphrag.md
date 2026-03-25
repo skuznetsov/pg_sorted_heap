@@ -253,6 +253,27 @@ RETURNS TABLE (
 and:
 
 ```sql
+sorted_heap_expand_twohop_rerank(
+    rel regclass,
+    seed_ids int4[],
+    query svec,
+    top_k int4,
+    hop1_relation_filter int4 DEFAULT NULL,
+    hop2_relation_filter int4 DEFAULT NULL,
+    limit_rows int4 DEFAULT 0
+)
+RETURNS TABLE (
+    entity_id int4,
+    relation_id int2,
+    target_id int4,
+    payload text,
+    distance float8
+)
+```
+
+and:
+
+```sql
 sorted_heap_graph_rag_scan(
     rel regclass,
     query svec,
@@ -640,80 +661,94 @@ The next adversarial question was whether the current helper story survives a
 real **two-hop** workflow, not just the earlier "ANN seeds -> one filtered
 expansion -> rerank" shape.
 
-The Gutenberg harness now composes a two-hop path from the existing narrow
-primitives without adding a new C API:
+The initial Gutenberg falsifier first used a composed path from the existing
+narrow primitives:
 
 1. ANN seeds from the fact table
 2. first hop via `sorted_heap_expand_ids(..., relation=2)`
 3. second hop via `sorted_heap_expand_rerank(..., relation=2)`
 
-That is intentionally a harsher test than the existing one-hop helper story,
-because it asks whether the current primitives are already enough to make
-multi-hop GraphRAG plausible before inventing a dedicated two-hop helper.
+That composition benchmark was intentionally a harsher test than the earlier
+one-hop helper story, because it asked whether the current primitives were
+already enough to make multi-hop GraphRAG plausible before inventing a
+dedicated two-hop helper.
+
+The answer was "yes, barely enough". That justified one narrow extra helper,
+not a new storage engine:
+
+```sql
+sorted_heap_expand_twohop_rerank(...)
+```
+
+This fused helper keeps the same contract shape as the earlier rerank helper,
+but removes the intermediate SQL/materialization boundary between hop1 and the
+second-hop rerank.
 
 On the medium real-text slice (`64 books x 128 paragraphs/book`, `14,549` rows,
 `32D`, `query_count=64`, `runs=3`, fresh backend, `shared_buffers=64MB`):
 
-- heap baseline, `seed_expand2_rerank_rel_in`: `0.088 ms`
-- plain `sorted_heap` SQL, `seed_expand2_rerank_rel_in`: `0.121 ms`
-- helper-composed `sorted_heap`, `seed_expand2_rerank_rel_topk_fn`: `0.099 ms`
+- heap baseline, `seed_expand2_rerank_rel_in`: `0.102 ms`
+- plain `sorted_heap` SQL, `seed_expand2_rerank_rel_in`: `0.136 ms`
+- helper-composed `sorted_heap`, `seed_expand2_rerank_rel_topk_fn`: `0.105 ms`
+- fused `sorted_heap_expand_twohop_rerank(...)`: `0.081 ms`
 
-So on the medium slice:
+So on the medium slice, the dedicated helper now does what the composed path
+only hinted at:
 
-- the current helpers do **not** make two-hop `sorted_heap` clearly faster than
-  heap+btree on latency yet
-- but they recover most of the gap versus the plain `sorted_heap` SQL path
-  (`0.099 ms` vs `0.121 ms`)
-- and they still cut shared-buffer hits materially (`662` vs `1295` on the
-  same probe set)
+- it beats heap+btree on latency
+- it materially beats the composed two-hop helper path
+- it also cuts shared-buffer hits strongly (`421` vs `1298` for the heap
+  baseline, and `421` vs `662` for the composed helper)
 
 On the larger real-text slice (`128 books x 256 paragraphs/book`, `58,954`
 rows, same settings except the larger corpus):
 
-- heap baseline, `seed_expand2_rerank_rel_in`: `0.120 ms`
-- plain `sorted_heap` SQL, `seed_expand2_rerank_rel_in`: `0.146 ms`
-- helper-composed `sorted_heap`, `seed_expand2_rerank_rel_topk_fn`: `0.107 ms`
+- heap baseline, `seed_expand2_rerank_rel_in`: `0.114 ms`
+- plain `sorted_heap` SQL, `seed_expand2_rerank_rel_in`: `0.153 ms`
+- helper-composed `sorted_heap`, `seed_expand2_rerank_rel_topk_fn`: `0.111 ms`
+- fused `sorted_heap_expand_twohop_rerank(...)`: `0.092 ms`
 
-This is the first clean real-text signal that current helper composition is
-already enough to beat heap+btree on a two-hop path, even without a dedicated
-two-hop C primitive.
+So the larger slice confirms the same shape: the dedicated two-hop helper is
+not a tiny micro-win on one probe set; it keeps the lead over both heap+btree
+and the composed helper.
 
 The same medium two-hop slice was also benchmarked against the external ANN
 seed paths:
 
-- `pgvector ANN -> heap 2-hop expansion -> exact rerank`: `0.242 ms`
-- `zvec ANN -> heap 2-hop expansion -> exact rerank`: `0.354 ms`
-- `Qdrant ANN -> heap 2-hop expansion -> exact rerank`: `1.771 ms`
+- `pgvector ANN -> heap 2-hop expansion -> exact rerank`: `0.253 ms`
+- `zvec ANN -> heap 2-hop expansion -> exact rerank`: `0.374 ms`
+- `Qdrant ANN -> heap 2-hop expansion -> exact rerank`: `1.789 ms`
 
 So the product-level conclusion stays consistent in the two-hop case as well:
-the narrow in-engine `sorted_heap` helper composition remains the fastest
-end-to-end GraphRAG path among the tested competitors on this real-text slice.
+the narrow in-engine `sorted_heap` helper remains the fastest end-to-end
+GraphRAG path among the tested competitors on this real-text slice.
 
 At higher exact-rerank dimension, the advantage narrows again rather than
 disappearing:
 
 `64 books x 128 paragraphs/book`, `384D`, `query_count=64`, `runs=3`:
 
-- heap baseline, `seed_expand2_rerank_rel_in`: `0.232 ms`
-- plain `sorted_heap` SQL, `seed_expand2_rerank_rel_in`: `0.257 ms`
-- helper-composed `sorted_heap`, `seed_expand2_rerank_rel_topk_fn`: `0.230 ms`
+- heap baseline, `seed_expand2_rerank_rel_in`: `0.225 ms`
+- plain `sorted_heap` SQL, `seed_expand2_rerank_rel_in`: `0.266 ms`
+- helper-composed `sorted_heap`, `seed_expand2_rerank_rel_topk_fn`: `0.258 ms`
+- fused `sorted_heap_expand_twohop_rerank(...)`: `0.236 ms`
 
 Interpretation:
 
-- current one-hop helpers already compose into a credible two-hop GraphRAG path
-- the latency win is not universal; at higher dimensions it collapses toward
-  parity with heap+btree
+- the dedicated helper makes two-hop GraphRAG clearly viable on the real-text
+  Gutenberg path
+- the latency win is still not universal; at higher dimensions it narrows
+  toward parity with heap+btree
 - but the locality signal remains stronger than latency alone suggests
-  (`1902` shared hits for the helper path vs `3161` for the heap baseline on
+  (`1264` shared hits for the fused helper vs `3155` for the heap baseline on
   the `384D` medium run)
 
 So the correct next inference is narrower than "we need a graph storage
-engine" and also narrower than "we now need a monolithic two-hop API":
+engine" and also narrower than "we need a broad graph query layer":
 
-> the existing narrow helper model already scales to a useful two-hop
-> real-text GraphRAG workflow, and any future fused two-hop primitive should be
-> justified as an optimization of that proven path, not as a speculative new
-> architecture.
+> a dedicated but still narrow two-hop helper is justified; anything broader
+> should now be treated as product/API design, not as a prerequisite for making
+> two-hop GraphRAG fast enough to matter.
 
 ## Higher-dimension rerun
 
@@ -814,19 +849,36 @@ Add GraphRAG composition query:
 - expansion via `sorted_heap_expand_ids()`
 - rerank via `sorted_heap_expand_rerank()` or SQL over materialized expansion
 
-### Phase 4
+### Phase 4 — current
 
 `sorted_heap_graph_rag_scan()` is now implemented as the narrow one-call
 composition wrapper.
 
-### Phase 5
+### Phase 5 — current
 
-Only if the current wrapper still shows too much overhead:
+`sorted_heap_expand_twohop_rerank()` is now implemented as the narrow fused
+two-hop helper.
 
-- consider a fused helper for:
+Current success criterion that was met:
+
+- beats the previous composed two-hop helper on the real-text Gutenberg graph
+- beats heap+btree on the medium and larger `32D` two-hop slices
+
+Current gap that remains:
+
+- at `384D`, the fused two-hop helper narrows to near-parity with heap+btree
+  rather than keeping a clear lead
+
+### Phase 6 — next
+
+Only if the current two-hop and one-call wrappers still leave meaningful
+headroom:
+
+- consider a broader wrapper for:
   - ANN seed IDs
-  - expansion
+  - two-hop expansion
   - rerank
+- or tune candidate count / rerank workload rather than broadening the API
 
 ## Current verdict
 
@@ -841,6 +893,8 @@ What is now true:
   current `sorted_heap` path
 - `sorted_heap_graph_rag_scan()` makes the composition available as a single
   SQL call without giving back much latency
+- `sorted_heap_expand_twohop_rerank()` turns the earlier two-hop composition
+  evidence into a real latency win on the real-text Gutenberg slices we tested
 - the narrow-helper direction is a justified building block
 - the current helper model already composes into a competitive two-hop
   real-text GraphRAG path on Gutenberg without requiring a new graph API
@@ -863,7 +917,7 @@ What is not yet true:
 
 The correct next step is therefore:
 
-> **tune or extend the narrow helper composition before considering a bigger
+> **tune the current narrow helper family before considering a bigger
 > graph-specific subsystem**
 
 That remains the smallest change that can still convert the observed

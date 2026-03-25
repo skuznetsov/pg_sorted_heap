@@ -56,6 +56,12 @@ COPY (
 
 COPY (
   SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+  FROM sorted_heap_expand_twohop_rerank('facts_sh'::regclass, ARRAY[1,3], '[1,0,0,0]'::svec, 2, 1, 1, 0)
+  ORDER BY distance, entity_id, relation_id, target_id
+) TO STDOUT;
+
+COPY (
+  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
   FROM sorted_heap_graph_rag_scan('facts_sh'::regclass, '[1,0,0,0]'::svec, 2, 2, 2, 0)
   ORDER BY distance, entity_id, relation_id, target_id
 ) TO STDOUT;
@@ -94,6 +100,34 @@ FROM (
   UNION ALL
   (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
 ) diff;
+
+COPY (
+  WITH helper AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_expand_twohop_rerank('facts_sh'::regclass, ARRAY[1,3], '[1,0,0,0]'::svec, 2, 1, 1, 0)
+  ),
+  hop1 AS MATERIALIZED (
+    SELECT DISTINCT target_id
+    FROM facts_sh
+    WHERE entity_id = ANY (ARRAY[1,3]::int4[])
+      AND relation_id = 1
+  ),
+  sql_baseline AS (
+    SELECT entity_id, relation_id, target_id, payload,
+           round((embedding <=> '[1,0,0,0]'::svec)::numeric, 6) AS distance
+    FROM facts_sh
+    WHERE entity_id = ANY (ARRAY(SELECT target_id FROM hop1))
+      AND relation_id = 1
+    ORDER BY embedding <=> '[1,0,0,0]'::svec, entity_id, relation_id, target_id
+    LIMIT 2
+  )
+  SELECT count(*) AS twohop_rerank_diff_rows
+  FROM (
+    (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
+    UNION ALL
+    (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
+  ) diff
+) TO STDOUT;
 
 WITH helper AS (
   SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
