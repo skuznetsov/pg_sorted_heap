@@ -28,3 +28,19 @@ CREATE OPERATOR CLASS hsvec_cosine_ops
 DEFAULT FOR TYPE @extschema@.hsvec USING sorted_hnsw AS
     OPERATOR 1 @extschema@.<=> (@extschema@.hsvec, @extschema@.hsvec) FOR ORDER BY float_ops,
     FUNCTION 1 @extschema@.hsvec_cosine_distance(@extschema@.hsvec, @extschema@.hsvec);
+
+-- Narrow GraphRAG helper for expanding known source entity IDs on sorted_heap.
+CREATE FUNCTION @extschema@.sorted_heap_expand_ids(
+  rel regclass,
+  seed_ids int4[],
+  relation_filter int4 DEFAULT NULL,
+  limit_rows int4 DEFAULT 0
+) RETURNS TABLE (
+  entity_id int4,
+  relation_id int2,
+  target_id int4,
+  embedding @extschema@.svec,
+  payload text
+)
+AS '$libdir/pg_sorted_heap', 'sorted_heap_expand_ids'
+LANGUAGE C STABLE;

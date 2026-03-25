@@ -12,9 +12,14 @@ The conclusion so far is:
 - **`ANY(array_of_seed_ids)` expansion does trigger `SortedHeapScan`, but on
   warm and medium-scale local benchmarks it still loses to heap+btree on
   end-to-end latency despite reading fewer blocks.**
-- Therefore the next promising primitive is **a narrow C helper for expanding
-  known seed IDs**, not a new graph storage engine and not a giant
-  monolithic `graph_rag_scan()` API.
+- A narrow C helper for expanding known seed IDs is now implemented as
+  `sorted_heap_expand_ids(...)`.
+- That helper materially improves the `sorted_heap` path on the synthetic
+  GraphRAG benchmark, though it still does not beat heap+btree on pure
+  expansion latency.
+- Therefore the next promising primitive was correctly **a narrow C helper**,
+  not a new graph storage engine and not a giant monolithic
+  `graph_rag_scan()` API.
 
 ## Existing anchors
 
@@ -198,6 +203,60 @@ That primitive can later be composed into:
 2. a higher-level helper
 3. maybe a monolithic API if the narrow primitive proves valuable
 
+## Helper result
+
+The helper now exists:
+
+```sql
+sorted_heap_expand_ids(
+    rel regclass,
+    seed_ids int4[],
+    relation_filter int4 DEFAULT NULL,
+    limit_rows int4 DEFAULT 0
+)
+RETURNS TABLE (
+    entity_id int4,
+    relation_id int2,
+    target_id int4,
+    embedding svec,
+    payload text
+)
+```
+
+Its current contract is intentionally narrow:
+
+- relation must be a `sorted_heap` table
+- relation must expose the columns:
+  - `entity_id int4`
+  - `relation_id int2`
+  - `target_id int4`
+  - `embedding svec`
+  - `payload text`
+- the function reuses the zone-map range builder directly
+- it emits fact rows for known source entity IDs
+
+On the medium-pressure benchmark (`20K` entities, `16` edges/entity,
+`320K` rows, `shared_buffers=64MB`, fresh backend), the helper produced:
+
+- `facts_sh seed_expand_in`: `0.260 ms`
+- `facts_sh seed_expand_fn`: `0.159 ms`
+- `facts_sh seed_expand_rerank_in`: `0.357 ms`
+- `facts_sh seed_expand_rerank_fn`: `0.223 ms`
+
+Interpretation:
+
+- the helper converts the observed block-pruning/locality advantage into a
+  **real latency win over the current SQL + CustomScan path**
+- the helper is now close to heap+btree on expansion+rereank
+- pure heap+btree expansion is still faster on this synthetic workload
+  (`0.113 ms` vs `0.159 ms`)
+
+This is enough to falsify the pessimistic branch:
+
+> the next useful GraphRAG step is not necessarily a new storage engine; a
+> carefully scoped C primitive can already recover a substantial part of the
+> lost latency
+
 ## Recommended roadmap
 
 ### Phase 0 — completed
@@ -205,20 +264,20 @@ That primitive can later be composed into:
 - Build local prototype benchmark
 - Falsify naive SQL assumptions
 
-### Phase 1 — next
+### Phase 1 — current
 
-Implement **`sorted_heap_expand_ids()`**:
+`sorted_heap_expand_ids()` is implemented and regression-covered.
 
-- input: array of source entity IDs
-- optional relation filter
-- direct zone-map/range expansion in C
-- return rows or TIDs
+Current success criterion that was met:
 
-Success criterion:
+- beats the current `sorted_heap` SQL `seed_expand_in` / `seed_expand_rerank_in`
+  patterns at medium scale
 
-- beats heap+btree on the `seed_expand_in` pattern at medium scale
+Current gap that remains:
 
-### Phase 2
+- pure heap+btree expansion is still faster on this synthetic benchmark
+
+### Phase 2 — next
 
 Add GraphRAG composition query:
 
@@ -237,13 +296,24 @@ Only if Phase 2 still shows SQL overhead:
 
 ## Current verdict
 
-`sorted_heap` already has a plausible GraphRAG foundation, but the present
-SQL-only prototype does **not** yet prove a compelling latency win for
-multi-hop/seeded expansion.
+`sorted_heap` already has a plausible GraphRAG foundation, and the new helper
+proves that a narrow C primitive can materially improve the GraphRAG path.
+
+What is now true:
+
+- SQL-only GraphRAG composition was not enough
+- `sorted_heap_expand_ids()` is enough to recover a large part of that gap
+- the helper is a justified building block
+
+What is not yet true:
+
+- `sorted_heap` is not yet clearly better than heap+btree on pure expansion
+  latency for this synthetic workload
 
 The correct next step is therefore:
 
-> **build a narrow expansion primitive, not a new graph engine**
+> **tune or extend the narrow expansion primitive before considering a bigger
+> graph-specific subsystem**
 
-That is the smallest change that can still convert the observed block-pruning
-advantage into an end-to-end query win.
+That remains the smallest change that can still convert the observed
+block-pruning advantage into an end-to-end query win.

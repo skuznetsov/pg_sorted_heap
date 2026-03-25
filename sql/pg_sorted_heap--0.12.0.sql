@@ -423,6 +423,21 @@ CREATE CAST (@extschema@.svec AS @extschema@.hsvec)
 	WITH FUNCTION @extschema@.svec_to_hsvec(@extschema@.svec)
 	AS ASSIGNMENT;
 
+CREATE FUNCTION @extschema@.sorted_heap_expand_ids(
+  rel regclass,
+  seed_ids int4[],
+  relation_filter int4 DEFAULT NULL,
+  limit_rows int4 DEFAULT 0
+) RETURNS TABLE (
+  entity_id int4,
+  relation_id int2,
+  target_id int4,
+  embedding @extschema@.svec,
+  payload text
+)
+AS '$libdir/pg_sorted_heap', 'sorted_heap_expand_ids'
+LANGUAGE C STABLE;
+
 -- ----------------------------------------------------------------
 -- SimHash: 12-bit locality-sensitive hash for svec columns
 -- ----------------------------------------------------------------

@@ -241,6 +241,42 @@ def explain_json(cur: Cursor, sql: str, params: tuple) -> tuple[float, int, int,
     return exec_ms, hit, read, root
 
 
+def verify_helper_equivalence(cur: Cursor, table_name: str, queries: list[tuple[int, int, str]], ann_k: int) -> None:
+    sql = f"""
+    WITH ann AS MATERIALIZED (
+        SELECT target_id
+        FROM {table_name}
+        ORDER BY embedding <=> %s::svec
+        LIMIT {ann_k}
+    ),
+    seeds AS MATERIALIZED (
+        SELECT DISTINCT target_id FROM ann
+    ),
+    helper AS (
+        SELECT entity_id, relation_id, target_id
+        FROM sorted_heap_expand_ids('{table_name}'::regclass, ARRAY(SELECT target_id FROM seeds), NULL, 0)
+    ),
+    sql_baseline AS (
+        SELECT entity_id, relation_id, target_id
+        FROM {table_name}
+        WHERE entity_id = ANY (ARRAY(SELECT target_id FROM seeds))
+    )
+    SELECT count(*) FROM (
+        (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
+        UNION ALL
+        (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
+    ) diff
+    """
+
+    for idx, query in enumerate(queries, start=1):
+        cur.execute(sql, (query[2],))
+        diff_rows = cur.fetchone()[0]
+        if diff_rows != 0:
+            raise RuntimeError(
+                f"sorted_heap_expand_ids mismatch on {table_name} query#{idx}: diff_rows={diff_rows}"
+            )
+
+
 def measure_case(
     cur: Cursor,
     table_name: str,
@@ -444,6 +480,44 @@ def main() -> int:
                     lambda q: (q[2], q[2]),
                 ),
             ]
+            helper_cases = [
+                QueryCase(
+                    "seed_expand_fn",
+                    f"""
+                    WITH ann AS MATERIALIZED (
+                        SELECT target_id
+                        FROM {{table}}
+                        ORDER BY embedding <=> %s::svec
+                        LIMIT {args.ann_k}
+                    ),
+                    seeds AS MATERIALIZED (
+                        SELECT DISTINCT target_id FROM ann
+                    )
+                    SELECT *
+                    FROM sorted_heap_expand_ids('{{table}}'::regclass, ARRAY(SELECT target_id FROM seeds), NULL, 0)
+                    """,
+                    lambda q: (q[2],),
+                ),
+                QueryCase(
+                    "seed_expand_rerank_fn",
+                    f"""
+                    WITH ann AS MATERIALIZED (
+                        SELECT target_id
+                        FROM {{table}}
+                        ORDER BY embedding <=> %s::svec
+                        LIMIT {args.ann_k}
+                    ),
+                    seeds AS MATERIALIZED (
+                        SELECT DISTINCT target_id FROM ann
+                    )
+                    SELECT *
+                    FROM sorted_heap_expand_ids('{{table}}'::regclass, ARRAY(SELECT target_id FROM seeds), NULL, 0)
+                    ORDER BY embedding <=> %s::svec
+                    LIMIT {args.top_k}
+                    """,
+                    lambda q: (q[2], q[2]),
+                ),
+            ]
 
             print("============================================================")
             print("graph rag prototype benchmark")
@@ -473,12 +547,18 @@ def main() -> int:
             cur.execute("SET jit = off")
             cur.execute("SET sorted_hnsw.shared_cache = off")
             cur.execute(f"SET sorted_hnsw.ef_search = {args.ef_search}")
+            verify_helper_equivalence(cur, "facts_sh", queries, args.ann_k)
 
             for table in ("facts_heap", "facts_sh"):
                 for case in cases:
                     print(f"running|table={table}|case={case.name}", flush=True)
                     p50, avg, hits, reads, root, rowcount = measure_case(cur, table, case, queries, args.runs)
                     print_result(table, case.name, p50, avg, hits, reads, root, rowcount)
+                if table == "facts_sh":
+                    for case in helper_cases:
+                        print(f"running|table={table}|case={case.name}", flush=True)
+                        p50, avg, hits, reads, root, rowcount = measure_case(cur, table, case, queries, args.runs)
+                        print_result(table, case.name, p50, avg, hits, reads, root, rowcount)
         finally:
             cur.close()
             conn.close()

@@ -15,7 +15,7 @@ DATA = sql/pg_sorted_heap--0.12.0.sql sql/pg_sorted_heap--0.11.0--0.12.0.sql \
        sql/pg_sorted_heap--0.9.8.sql sql/pg_sorted_heap--0.9.7--0.9.8.sql \
        sql/pg_sorted_heap--0.9.7.sql
 DOCS =
-REGRESS = pg_sorted_heap sorted_hnsw
+REGRESS = pg_sorted_heap sorted_hnsw graph_rag
 
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
