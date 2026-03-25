@@ -1120,6 +1120,13 @@ The stable conclusion is still clear:
   - `ann_k=64`
   - `sorted_hnsw.ef_search=128`
 
+One more ann_k falsifier matters here too:
+
+- increasing `ann_k` above `64` at this `m=24 / ef_construction=200 / ef_search=128`
+  point did **not** help
+- `ann_k=80/96/128` all increased latency and reduced `hit@k`
+- so `ann_k=64` remains the current sweet spot, not just a legacy default
+
 ### Full parity rerun at the balanced point
 
 Re-running the full multihop parity benchmark on that exact setting:
@@ -1167,12 +1174,60 @@ That is a materially stronger result than the earlier `m=16` baseline:
 - `zvec` and `Qdrant` still keep a small `hit@1` edge, so the answer-quality
   story is now about `hit@1`, not `hit@k`
 
+### Full parity rerun at the higher-quality point
+
+The next question was whether that remaining `hit@1` gap could be closed
+without giving back the latency lead. Re-running the same full parity benchmark
+at:
+
+- `m=32`
+- `ef_construction=200`
+- `ann_k=64`
+- `sorted_hnsw.ef_search=128`
+
+produced:
+
+- heap two-hop SQL
+  - `0.810 ms`
+  - `hit@1 = 76.6%`
+  - `hit@k = 96.9%`
+- `sorted_heap_expand_twohop_rerank()`
+  - `0.774 ms`
+  - `hit@1 = 76.6%`
+  - `hit@k = 96.9%`
+- `sorted_heap_graph_rag_twohop_scan()`
+  - `0.786 ms`
+  - `hit@1 = 76.6%`
+  - `hit@k = 96.9%`
+- pgvector
+  - `1.220 ms`
+  - `hit@1 = 70.3%`
+  - `hit@k = 84.4%`
+- zvec
+  - `0.874 ms`
+  - `hit@1 = 76.6%`
+  - `hit@k = 96.9%`
+- Qdrant
+  - `2.487 ms`
+  - `hit@1 = 76.6%`
+  - `hit@k = 96.9%`
+
+So the current picture is now more precise:
+
+- `m=24` is still the better quality-per-latency recommendation
+- `m=32` is the point where `sorted_heap` reaches full observed parity with
+  `zvec` and Qdrant on both `hit@1` and `hit@k`
+- even at that higher-quality point, the `sorted_heap` helper remains faster
+  than both external paths
+- pgvector remains behind on both latency and answer quality on this workload
+
 So the honest story on this fact benchmark is a latency/quality frontier:
 
 - `sorted_heap_expand_twohop_rerank()` leads on latency
 - at the balanced `m=24` point, `sorted_heap` matches `zvec` / `Qdrant` on
-  `hit@k`
-- `zvec` / `Qdrant` still lead slightly on `hit@1`
+  `hit@k` and trails only slightly on `hit@1`
+- at the higher-quality `m=32` point, `sorted_heap` reaches parity with
+  `zvec` / `Qdrant` on both `hit@1` and `hit@k`
 - pgvector is slower and weaker on answer quality than the tuned
   `sorted_heap` helper on this workload
 
@@ -1225,8 +1280,8 @@ What is not yet true:
 - the current one-call wrapper still bakes in a `target_id` seed contract,
   which is wrong for the current fact-shaped multihop workload
 - on the cogniformerus-style fact benchmark, the tuned helper is now a
-  latency leader and reaches `hit@k` parity with the strongest external paths
-  we tested, though not `hit@1` parity
+  latency leader and can reach full observed parity with the strongest
+  external paths we tested when moved to the `m=32 / ef_search=128` point
 
 The correct next step is therefore:
 
