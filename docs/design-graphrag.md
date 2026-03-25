@@ -355,6 +355,54 @@ Interpretation:
 So the next falsifier should be a real-dataset GraphRAG harness or a more
 realistic payload model, not another synthetic-only extrapolation.
 
+## Real-text Gutenberg graph
+
+A better falsifier now exists in:
+
+- [`scripts/bench_graph_rag_gutenberg.py`](/Users/sergey/Projects/C/clustered_pg/scripts/bench_graph_rag_gutenberg.py)
+
+This harness uses real Gutenberg paragraphs instead of synthetic payload text.
+It builds a small text graph:
+
+- relation `1`: `book -> paragraph` (`contains`)
+- relation `2`: `paragraph -> next_paragraph` (`next`)
+
+Embeddings are still deterministic lexical hash vectors, not external model
+embeddings. That means this harness is good for measuring graph-expansion
+latency on real text payloads and a real graph topology, but it is not a
+semantic-quality benchmark.
+
+Two useful runs on `shared_buffers=64MB`, fresh backend:
+
+`64 books x 128 paragraphs/book` (`14,549` rows):
+
+- `facts_heap seed_expand_rerank_rel_in`: `0.071 ms`
+- `facts_sh seed_expand_rerank_rel_in`: `0.088 ms`
+- `facts_sh seed_expand_rerank_rel_topk_fn`: `0.061 ms`
+- `facts_sh seed_graph_rag_rel_scan_fn`: `0.084 ms`
+
+`128 books x 256 paragraphs/book` (`58,954` rows):
+
+- `facts_heap seed_expand_rel_in`: `0.073 ms`
+- `facts_sh seed_expand_rel_in`: `0.078 ms`
+- `facts_sh seed_expand_rel_fn`: `0.069 ms`
+- `facts_heap seed_expand_rerank_rel_in`: `0.079 ms`
+- `facts_sh seed_expand_rerank_rel_in`: `0.101 ms`
+- `facts_sh seed_expand_rerank_rel_topk_fn`: `0.063 ms`
+- `facts_sh seed_graph_rag_rel_scan_fn`: `0.089 ms`
+
+This is the first non-synthetic result that materially weakens the earlier
+"heap+btree simply wins" story:
+
+- the plain `sorted_heap` SQL path is still worse than heap+btree
+- but the fused filtered helper on the real-text Gutenberg graph is already
+  at parity or slightly better than heap+btree on the rerank path
+- the one-call wrapper is close enough that its overhead is visible but not
+  disqualifying
+
+So the narrow-helper direction survives the real-text falsifier better than the
+short-payload synthetic benchmark suggested.
+
 One important measurement caveat was also discovered and fixed during this
 work:
 
