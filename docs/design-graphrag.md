@@ -444,6 +444,57 @@ expansion and exact rerank, the narrow `sorted_heap` helper path is materially
 better aligned with the whole workflow than an external ANN seed on a separate
 table.
 
+## zvec parity on the real-text graph
+
+The same Gutenberg harness now also supports a comparable `zvec` path:
+
+- ANN seeds come from a temporary `zvec` HNSW collection built from the same
+  fact rows
+- graph expansion and exact rerank still happen in PostgreSQL over `facts_heap`
+
+This produced a mixed but useful result.
+
+On the medium real-text slice (`64 books x 128 paragraphs/book`, `14,549` rows,
+fresh backend, `shared_buffers=64MB`):
+
+- heap rerank baseline: `0.068 ms`
+- `sorted_heap_expand_rerank(... relation=2)`: `0.066 ms`
+- `sorted_heap_graph_rag_scan(... relation=2)`: `0.082 ms`
+- `zvec ANN -> heap expansion -> exact rerank`: `0.322 ms`
+
+So on the medium slice, the `zvec` path is stable but materially slower than
+the fused `sorted_heap` helper. The SQL-side buffer footprint is not the
+bottleneck there; the external ANN seed stage dominates the total latency.
+
+On the larger real-text slice (`128 books x 256 paragraphs/book`, `58,954`
+rows), the result is currently **not publishable as a clean latency row**:
+
+- the `sorted_heap` helper path remains stable:
+  - `sorted_heap_expand_rerank(... relation=2)`: `0.070 ms`
+  - `sorted_heap_graph_rag_scan(... relation=2)`: `0.084 ms`
+- the `zvec` path fails during ANN seed retrieval at `ann_k=32`
+
+The failure is not coming from PostgreSQL or from the GraphRAG SQL wrapper.
+A pure `zvec`-only reproduction on the same `58,954`-row lexical-hash corpus
+shows the same failure mode:
+
+- for one probe query, `topk=8` and `topk=10` return valid document IDs
+- `topk>=16` returns empty `doc.id` values after:
+  - `Failed to find target chunk for index 58379`
+
+The Gutenberg GraphRAG harness now turns that into an explicit benchmark error:
+
+- `RuntimeError: zvec returned unmapped doc ids (...)`
+
+So the objective conclusion today is narrower than for `pgvector`:
+
+- `zvec` does not currently provide a robust large-slice GraphRAG parity row on
+  this real-text workflow at `ann_k=32`
+- on the medium slice where it does run, it is materially slower than the
+  fused `sorted_heap` helper path
+- on the larger slice, the current blocker is `zvec` ANN seed instability, not
+  PostgreSQL expansion/rerank overhead
+
 One important measurement caveat was also discovered and fixed during this
 work:
 
@@ -521,6 +572,10 @@ What is now true:
 - `sorted_heap_graph_rag_scan()` makes the composition available as a single
   SQL call without giving back much latency
 - the narrow-helper direction is a justified building block
+- on the real-text GraphRAG shape, `pgvector` parity is already materially
+  worse end-to-end than the fused `sorted_heap` helper path
+- `zvec` is stable on the medium slice but currently not robust on the larger
+  real-text slice at `ann_k=32`
 
 What is not yet true:
 
