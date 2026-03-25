@@ -112,7 +112,7 @@ Repo-owned harnesses:
 
 ### Current AWS restored-corpus benchmark (`~104K x 2880D`, Gutenberg dump)
 
-AWS ARM64 host (4 CPU, 7.6 GiB RAM), top-10,
+AWS ARM64 host (4 vCPU, 8 GiB RAM), top-10,
 restored PostgreSQL custom dump. Ground truth is recomputed by exact heap
 search on the restored `svec` table. In the current rerun the stored
 `bench_hnsw_gt` table matched the exact heap GT on 100% of the 50 benchmark
@@ -201,6 +201,30 @@ The higher-quality local point is now:
 At that setting, `sorted_heap_graph_rag_twohop_scan()` measured `0.786 ms`
 with `hit@1 76.6%` and `hit@k 96.9%`, matching `zvec` and Qdrant on both
 quality metrics while remaining faster than both.
+
+### Current AWS GraphRAG multihop benchmark (`person -> parent -> city`)
+
+Repo-owned harness:
+
+- `REMOTE_PYTHON=/path/to/python QUERY_COUNT=64 RUNS=3 NUM_PAIRS=5000 DIM=384 ANN_K=64 TOP_K=10 EF_SEARCH=128 EF_CONSTRUCTION=200 M=24 PGV_EF_SEARCH=64 ZVEC_EF=64 QDRANT_EF=64 SHARED_BUFFERS_MB=64 BACKEND_MODE=fresh ./scripts/bench_graph_rag_multihop_aws.sh <aws-host> /path/to/repo 65492`
+
+AWS ARM64 host (`4 vCPU`, `8 GiB RAM`), deterministic fact graph,
+`5K` chains / `10K` rows total, `384D`, top-10, `64` queries, `3` runs.
+This is the current portable multihop GraphRAG point.
+
+| Method | p50 latency | hit@1 | hit@k | Notes |
+|--------|:-----------:|:-----:|:-----:|-------|
+| Heap two-hop SQL | 1.087 ms | 75.0% | 96.9% | exact rerank over expanded heap set |
+| sorted_heap_expand_twohop_rerank() | 0.947 ms | 76.6% | 98.4% | `m=24`, `ef_construction=200`, `ann_k=64`, `ef_search=128` |
+| **sorted_heap_graph_rag_twohop_scan()** | **1.004 ms** | **76.6%** | **98.4%** | same portable point, one-call wrapper |
+| pgvector HNSW + heap expansion | 1.296 ms | 70.3% | 85.9% | `ef_search=64` |
+| zvec HNSW + heap expansion | 1.646 ms | 76.6% | 96.9% | `ef=64` |
+| Qdrant HNSW + heap expansion | 3.396 ms | 76.6% | 96.9% | `hnsw_ef=64` |
+
+Re-running the same AWS point at `m=32` did not improve the frontier:
+`sorted_heap_graph_rag_twohop_scan()` moved to `1.066 ms` with
+`hit@1 76.6%` and `hit@k 96.9%`. So the locally observed `m=32` parity point
+does not transfer unchanged to this ARM64 environment.
 
 ### Legacy/manual IVF-PQ benchmark
 

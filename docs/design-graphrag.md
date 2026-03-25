@@ -1221,6 +1221,81 @@ So the current picture is now more precise:
   than both external paths
 - pgvector remains behind on both latency and answer quality on this workload
 
+### AWS ARM64 parity rerun (`5K` chains)
+
+The next environment-variance adversary check was to rerun the same
+`5K`-chain / `10K`-row / `384D` fact benchmark on an AWS ARM64 host
+(`4 vCPU`, `8 GiB RAM`) using the repo-owned wrapper:
+
+- [`scripts/bench_graph_rag_multihop_aws.sh`](/Users/sergey/Projects/C/clustered_pg/scripts/bench_graph_rag_multihop_aws.sh)
+
+At the previously recommended local balanced point:
+
+- `m=24`
+- `ef_construction=200`
+- `ann_k=64`
+- `sorted_hnsw.ef_search=128`
+- `64` queries
+- `3` runs
+- fresh backend
+
+the AWS rerun produced:
+
+- heap two-hop SQL
+  - `1.087 ms`
+  - `hit@1 = 75.0%`
+  - `hit@k = 96.9%`
+- `sorted_heap_expand_twohop_rerank()`
+  - `0.947 ms`
+  - `hit@1 = 76.6%`
+  - `hit@k = 98.4%`
+- `sorted_heap_graph_rag_twohop_scan()`
+  - `1.004 ms`
+  - `hit@1 = 76.6%`
+  - `hit@k = 98.4%`
+- pgvector
+  - `1.296 ms`
+  - `hit@1 = 70.3%`
+  - `hit@k = 85.9%`
+- zvec
+  - `1.646 ms`
+  - `hit@1 = 76.6%`
+  - `hit@k = 96.9%`
+- Qdrant
+  - `3.396 ms`
+  - `hit@1 = 76.6%`
+  - `hit@k = 96.9%`
+
+That is stronger than the local balanced point in one important way:
+
+- on this AWS rerun, `sorted_heap` does not just match `zvec` and Qdrant on
+  `hit@k`; it exceeds them (`98.4%` vs `96.9%`) while staying faster than both
+
+But the second half of the adversary check matters too. Re-running the same
+AWS benchmark at the local higher-quality point:
+
+- `m=32`
+- `ef_construction=200`
+- `ann_k=64`
+- `sorted_hnsw.ef_search=128`
+
+produced:
+
+- `sorted_heap_graph_rag_twohop_scan()`
+  - `1.066 ms`
+  - `hit@1 = 76.6%`
+  - `hit@k = 96.9%`
+
+So the local `m=32` parity story does **not** carry over unchanged to this
+AWS ARM64 environment. The portable conclusion is therefore narrower:
+
+- `m=24 / ef_construction=200 / ann_k=64 / ef_search=128` is the current
+  best verified cross-environment point
+- local and AWS frontiers are directionally consistent, but not numerically
+  identical
+- this is exactly why the AWS rerun is worth keeping as a separate falsifier,
+  not merging blindly into the local tuning story
+
 ### Larger local scale check (`10K` chains)
 
 The next adversary check was whether the `5K`-chain tuning carried forward to a

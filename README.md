@@ -114,26 +114,25 @@ The current helpers are:
 - `sorted_heap_expand_twohop_rerank(...)`
 - `sorted_heap_graph_rag_twohop_scan(...)`
 
-On the local `5K`-chain / `10K`-row / `384D` multihop benchmark, the current
-balanced point:
+On the current AWS ARM64 rerun (`4 vCPU`, `8 GiB RAM`), `5K` chains / `10K`
+rows / `384D`, the current portable point is:
 
 - `m=24`
 - `ef_construction=200`
 - `ann_k=64`
 - `sorted_hnsw.ef_search=128`
 
-gives:
+which gives:
 
-- `sorted_heap_graph_rag_twohop_scan()` -> `0.727 ms`, `hit@1 75.0%`, `hit@k 96.9%`
-- `zvec` -> `0.927 ms`, `hit@1 76.6%`, `hit@k 96.9%`
-- `Qdrant` -> `2.417 ms`, `hit@1 76.6%`, `hit@k 96.9%`
-- `pgvector` -> `1.244 ms`, `hit@k 85.9%`
+- `sorted_heap_graph_rag_twohop_scan()` -> `1.004 ms`, `hit@1 76.6%`, `hit@k 98.4%`
+- `sorted_heap_expand_twohop_rerank()` -> `0.947 ms`, `hit@1 76.6%`, `hit@k 98.4%`
+- `pgvector` -> `1.296 ms`, `hit@1 70.3%`, `hit@k 85.9%`
+- `zvec` -> `1.646 ms`, `hit@1 76.6%`, `hit@k 96.9%`
+- `Qdrant` -> `3.396 ms`, `hit@1 76.6%`, `hit@k 96.9%`
 
-At the slightly heavier `m=32` point, the `sorted_heap` helper reaches full
-observed parity with `zvec` and Qdrant on both `hit@1` and `hit@k`, while
-staying faster than both on this benchmark.
-
-The full reasoning, caveats, and tuning frontier live in
+The local M-series tuning run found a slightly different frontier, and on the
+same AWS rerun `m=32` did not improve over `m=24` (`1.066 ms`, `hit@k 96.9%`).
+The full tuning history, reasoning, and caveats live in
 [docs/design-graphrag.md](/Users/sergey/Projects/C/clustered_pg/docs/design-graphrag.md).
 
 ### Legacy/manual ANN paths
@@ -317,8 +316,8 @@ Current repo-owned harnesses:
 - `python3 scripts/bench_qdrant_synthetic.py --rows 10000 --queries 20 --dim 384 --k 10 --ef 64`
 - `python3 scripts/bench_zvec_synthetic.py --rows 10000 --queries 20 --dim 384 --k 10 --ef 64`
 
-Restored Gutenberg dump on an AWS ARM64 host (4 CPU,
-7.6 GiB RAM), top-10. Ground truth is recomputed by exact PostgreSQL heap
+Restored Gutenberg dump on an AWS ARM64 host (4 vCPU,
+8 GiB RAM), top-10. Ground truth is recomputed by exact PostgreSQL heap
 search on the restored `svec` table; in the current rerun the stored
 `bench_hnsw_gt` table matched that exact GT on 100% of the 50 benchmark
 queries, so the fresh heap GT and the historical GT table agree. This rerun

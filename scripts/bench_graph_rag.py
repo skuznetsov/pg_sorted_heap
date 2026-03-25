@@ -20,6 +20,7 @@ import csv
 import json
 import math
 import os
+import shlex
 import shutil
 import socket
 import statistics
@@ -47,12 +48,21 @@ def pick_port() -> int:
         return int(s.getsockname()[1])
 
 
-def init_temp_cluster(root_dir: Path, port: int, tmp_root: Path, shared_buffers_mb: int) -> tuple[Path, str]:
+def init_temp_cluster(
+    root_dir: Path,
+    port: int,
+    tmp_root: Path,
+    shared_buffers_mb: int,
+    install_cmd: list[str] | None = None,
+) -> tuple[Path, str]:
     pg_bindir = subprocess.check_output(["pg_config", "--bindir"], text=True).strip()
     tmp = Path(tempfile.mkdtemp(prefix="graph_rag_", dir=str(tmp_root)))
 
+    if install_cmd is None:
+        install_cmd = ["make", "-C", str(root_dir), "install"]
+
     subprocess.run(
-        ["make", "-C", str(root_dir), "install"],
+        install_cmd,
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -578,13 +588,15 @@ def main() -> int:
     ap.add_argument("--m", type=int, default=16)
     ap.add_argument("--shared-buffers-mb", type=int, default=512)
     ap.add_argument("--backend-mode", choices=("fresh", "reuse"), default="fresh")
+    ap.add_argument("--install-cmd", default="")
     ap.add_argument("--keep-temp", action="store_true")
     args = ap.parse_args()
 
     root_dir = Path(__file__).resolve().parent.parent
     tmp_root = Path(args.tmp_root).resolve()
     port = args.port or pick_port()
-    tmp, pg_bindir = init_temp_cluster(root_dir, port, tmp_root, args.shared_buffers_mb)
+    install_cmd = shlex.split(args.install_cmd) if args.install_cmd else None
+    tmp, pg_bindir = init_temp_cluster(root_dir, port, tmp_root, args.shared_buffers_mb, install_cmd)
     csv_path = tmp / "facts.csv"
 
     try:

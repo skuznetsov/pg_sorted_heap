@@ -19,6 +19,7 @@ import csv
 import hashlib
 import math
 import re
+import shlex
 import shutil
 import subprocess
 import statistics
@@ -478,6 +479,7 @@ def main() -> int:
     ap.add_argument("--skip-qdrant", action="store_true")
     ap.add_argument("--shared-buffers-mb", type=int, default=64)
     ap.add_argument("--backend-mode", choices=("fresh", "reuse"), default="fresh")
+    ap.add_argument("--install-cmd", default="")
     ap.add_argument("--keep-temp", action="store_true")
     args = ap.parse_args()
 
@@ -488,7 +490,8 @@ def main() -> int:
     root_dir = Path(__file__).resolve().parent.parent
     tmp_root = Path(args.tmp_root).resolve()
     port = args.port or base.pick_port()
-    tmp, pg_bindir = base.init_temp_cluster(root_dir, port, tmp_root, args.shared_buffers_mb)
+    install_cmd = shlex.split(args.install_cmd) if args.install_cmd else None
+    tmp, pg_bindir = base.init_temp_cluster(root_dir, port, tmp_root, args.shared_buffers_mb, install_cmd)
     csv_path = tmp / "facts_gutenberg.csv"
     zvec_dir: str | None = None
     qdrant_client: QdrantClient | None = None

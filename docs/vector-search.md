@@ -302,8 +302,8 @@ Current repo-owned harnesses:
 - `python3 scripts/bench_zvec_synthetic.py --rows 10000 --queries 20 --dim 384 --k 10 --ef 64`
 
 AWS restored Gutenberg dump (`~104K x 2880D`, top-10, exact heap GT on the
-restored `svec` table). Host: AWS ARM64, 4 CPU,
-7.6 GiB RAM. In the current rerun the stored `bench_hnsw_gt` table matched the
+restored `svec` table). Host: AWS ARM64, 4 vCPU,
+8 GiB RAM. In the current rerun the stored `bench_hnsw_gt` table matched the
 recomputed exact GT on 100% of the 50 benchmark queries after restore, so the
 fresh exact heap GT and the historical GT table agree. This rerun uses
 `sorted_hnsw` `ef_construction=200` and `ef_search=32`, and the benchmark
