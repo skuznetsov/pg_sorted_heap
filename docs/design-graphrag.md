@@ -532,6 +532,33 @@ means that when the workflow is "external ANN seed + relational graph
 expansion + exact rerank inside PostgreSQL", the narrow in-engine helper path
 is much better aligned with the total job than a remote vector service.
 
+## Robustness rerun
+
+The same real-text Gutenberg harness was then rerun with a larger query set
+(`query_count=64`, `runs=3`) to check whether the earlier `16`-query results
+were just small-sample noise.
+
+The ranking stayed the same on both slices:
+
+- medium slice (`64 x 128`):
+  - `sorted_heap_expand_rerank(... relation=2)`: `0.062 ms`
+  - `sorted_heap_graph_rag_scan(... relation=2)`: `0.081 ms`
+  - `pgvector ANN -> heap expansion -> exact rerank`: `0.219 ms`
+  - `zvec ANN -> heap expansion -> exact rerank`: `0.342 ms`
+  - `Qdrant ANN -> heap expansion -> exact rerank`: `1.567 ms`
+
+- larger slice (`128 x 256`):
+  - `sorted_heap_expand_rerank(... relation=2)`: `0.067 ms`
+  - `sorted_heap_graph_rag_scan(... relation=2)`: `0.088 ms`
+  - `pgvector ANN -> heap expansion -> exact rerank`: `0.309 ms`
+  - `Qdrant ANN -> heap expansion -> exact rerank`: `1.911 ms`
+  - `zvec` remains excluded from this large-slice rerun because the
+    previously observed `ann_k=32` instability is still the blocker
+
+So the current GraphRAG conclusion is no longer resting on one short probe set.
+At least on this real-text Gutenberg workflow, the fused `sorted_heap` helper
+still has the best end-to-end latency profile after the query set is expanded.
+
 One important measurement caveat was also discovered and fixed during this
 work:
 
