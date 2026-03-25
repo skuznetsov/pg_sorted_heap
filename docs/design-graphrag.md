@@ -1120,12 +1120,61 @@ The stable conclusion is still clear:
   - `ann_k=64`
   - `sorted_hnsw.ef_search=128`
 
+### Full parity rerun at the balanced point
+
+Re-running the full multihop parity benchmark on that exact setting:
+
+- `m=24`
+- `ef_construction=200`
+- `ann_k=64`
+- `sorted_hnsw.ef_search=128`
+- `64` queries
+- `3` runs
+- `384D`
+
+produced:
+
+- heap two-hop SQL
+  - `0.762 ms`
+  - `hit@1 = 75.0%`
+  - `hit@k = 96.9%`
+- `sorted_heap_expand_twohop_rerank()`
+  - `0.726 ms`
+  - `hit@1 = 75.0%`
+  - `hit@k = 96.9%`
+- `sorted_heap_graph_rag_twohop_scan()`
+  - `0.727 ms`
+  - `hit@1 = 75.0%`
+  - `hit@k = 96.9%`
+- pgvector
+  - `1.244 ms`
+  - `hit@1 = 70.3%`
+  - `hit@k = 85.9%`
+- zvec
+  - `0.927 ms`
+  - `hit@1 = 76.6%`
+  - `hit@k = 96.9%`
+- Qdrant
+  - `2.417 ms`
+  - `hit@1 = 76.6%`
+  - `hit@k = 96.9%`
+
+That is a materially stronger result than the earlier `m=16` baseline:
+
+- the fused `sorted_heap` path now matches `zvec` and `Qdrant` on `hit@k`
+- it stays faster than both external paths
+- it also beats pgvector on both latency and answer quality on this workload
+- `zvec` and `Qdrant` still keep a small `hit@1` edge, so the answer-quality
+  story is now about `hit@1`, not `hit@k`
+
 So the honest story on this fact benchmark is a latency/quality frontier:
 
 - `sorted_heap_expand_twohop_rerank()` leads on latency
-- `zvec` / `Qdrant` lead on `hit@k`
-- pgvector sits between them on quality but is slower than the fused
-  `sorted_heap` helper
+- at the balanced `m=24` point, `sorted_heap` matches `zvec` / `Qdrant` on
+  `hit@k`
+- `zvec` / `Qdrant` still lead slightly on `hit@1`
+- pgvector is slower and weaker on answer quality than the tuned
+  `sorted_heap` helper on this workload
 
 This also falsifies one tempting but wrong simplification:
 
@@ -1175,8 +1224,9 @@ What is not yet true:
   clearly ahead
 - the current one-call wrapper still bakes in a `target_id` seed contract,
   which is wrong for the current fact-shaped multihop workload
-- on the cogniformerus-style fact benchmark, the fused helper is a latency
-  leader but not yet the answer-quality leader
+- on the cogniformerus-style fact benchmark, the tuned helper is now a
+  latency leader and reaches `hit@k` parity with the strongest external paths
+  we tested, though not `hit@1` parity
 
 The correct next step is therefore:
 
