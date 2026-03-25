@@ -892,6 +892,7 @@ benchmark that matches the current `cogniformerus` multihop question shape:
 That now exists in:
 
 - [`scripts/bench_graph_rag_multihop.py`](/Users/sergey/Projects/C/clustered_pg/scripts/bench_graph_rag_multihop.py)
+- [`scripts/sweep_graph_rag_multihop.py`](/Users/sergey/Projects/C/clustered_pg/scripts/sweep_graph_rag_multihop.py)
 
 The benchmark builds a deterministic fact graph and measures:
 
@@ -990,6 +991,73 @@ Interpretation:
 - it is **not** the quality leader at this operating point
 - zvec and Qdrant still win on answer retrieval quality here, but at much
   higher latency
+
+### Seed frontier after the wrapper fix
+
+The next honest question was not API shape but ANN seed quality. That is now
+measured directly by:
+
+- [`scripts/sweep_graph_rag_multihop.py`](/Users/sergey/Projects/C/clustered_pg/scripts/sweep_graph_rag_multihop.py)
+
+This harness keeps the corpus fixed per `ef_construction` and sweeps:
+
+- `ann_k`
+- `sorted_hnsw.ef_search`
+- `ef_construction`
+
+without paying a full temp-cluster and schema rewrite for every single probe
+point.
+
+On the same `5K` chains / `10K` rows / `384D` / `64` queries / fresh-backend
+benchmark, the stable wrapper frontier is now:
+
+- `ef_construction=64`, `ann_k=64`, `ef_search=64`
+  - `0.386 ms`
+  - `hit@1 = 70.3%`
+  - `hit@k = 82.8%`
+- `ef_construction=200`, `ann_k=64`, `ef_search=64`
+  - `0.393 ms`
+  - `hit@1 = 71.9%`
+  - `hit@k = 84.4%`
+- `ef_construction=400`, `ann_k=64`, `ef_search=64`
+  - `0.421 ms`
+  - `hit@1 = 70.3%`
+  - `hit@k = 85.9%`
+- `ef_construction=200`, `ann_k=64`, `ef_search=128`
+  - `0.651 ms`
+  - `hit@1 = 73.4%`
+  - `hit@k = 95.3%`
+- `ef_construction=400`, `ann_k=64`, `ef_search=128`
+  - `0.663 ms`
+  - `hit@1 = 75.0%`
+  - `hit@k = 95.3%`
+
+For a higher-quality but much slower seed tier:
+
+- `ann_k=96`, `ef_search=64` lands around `2.2-2.4 ms`
+  with `hit@k = 96.9%`
+
+That leads to a narrower, more honest recommendation:
+
+- if latency is the hard constraint, keep the fast tier near
+  `ef_construction=200`, `ann_k=64`, `ef_search=64`
+- if answer quality matters more, the best balanced point we measured is
+  `ef_construction=200`, `ann_k=64`, `ef_search=128`
+- `ef_construction=400` does improve `hit@1` slightly at the same `95.3%`
+  `hit@k`, but it does not improve `hit@k` over `200`, so it should not be
+  the default recommendation without a separate build-cost justification
+
+That build-cost justification now exists too on this exact `10K x 384D`
+multihop benchmark:
+
+- `ef_construction=64`: `43.716 s` to build both ANN indexes
+- `ef_construction=200`: `80.046 s`
+- `ef_construction=400`: `91.352 s`
+
+So the current recommendation is:
+
+- default to `ef_construction=200`
+- treat `ef_construction=400` as a niche `hit@1` knob, not the new default
 
 So the honest story on this fact benchmark is a latency/quality frontier:
 
