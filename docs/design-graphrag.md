@@ -550,6 +550,10 @@ So the stronger objective conclusion is:
 - the current evidence points to a broader `zvec` retrieval defect around
   forward-store / chunk lookup, not to PostgreSQL GraphRAG expansion logic
 
+For an upstream-ready summary of the current evidence, see:
+
+- [`docs/zvec-empty-id-bug.md`](/Users/sergey/Projects/C/clustered_pg/docs/zvec-empty-id-bug.md)
+
 Two more diagnostic observations make that conclusion sharper:
 
 - when the synthetic bug triggers, the ANN scores still come back while
