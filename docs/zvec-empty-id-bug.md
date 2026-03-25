@@ -13,6 +13,14 @@ The short version:
 
 So this does **not** look like a PostgreSQL expansion/rerank bug.
 
+Environment used for the verified local repro:
+
+- `zvec 0.2.0`
+- Python package at:
+  - `/opt/homebrew/Caskroom/miniconda/base/lib/python3.12/site-packages/zvec`
+- native extension:
+  - `/opt/homebrew/Caskroom/miniconda/base/lib/python3.12/site-packages/_zvec.cpython-312-darwin.so`
+
 ## Minimal synthetic reproducer
 
 Repo-owned script:
@@ -113,6 +121,20 @@ One larger synthetic case gives another useful hint:
 This does not prove the internal root cause, but it suggests the failure may
 depend on candidate-materialization / metadata-fetch paths rather than on the
 ANN score computation itself.
+
+The shipped native binary also contains the exact failing message plus nearby
+storage component paths:
+
+```text
+/Users/cuiys/workspace/zvec/src/db/index/storage/mmap_forward_store.cc
+/Users/cuiys/workspace/zvec/src/db/index/storage/bufferpool_forward_store.cc
+Failed to find target chunk for index %d
+Encountered empty chunk at index %d
+```
+
+That does not prove which codepath is at fault, but it makes the working
+component hypothesis narrower: the failure is plausibly in forward-store chunk
+lookup or chunk materialization rather than in HNSW distance ranking itself.
 
 ## Why this matters
 
