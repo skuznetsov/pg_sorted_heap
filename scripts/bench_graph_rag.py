@@ -277,6 +277,54 @@ def verify_helper_equivalence(cur: Cursor, table_name: str, queries: list[tuple[
             )
 
 
+def verify_helper_rerank_equivalence(
+    cur: Cursor, table_name: str, queries: list[tuple[int, int, str]], ann_k: int, top_k: int
+) -> None:
+    # Compare against a materialized expanded baseline, not a direct
+    # filtered ORDER BY <=> LIMIT query on the base table. sorted_hnsw's
+    # automatic ordered path is intentionally costed out for extra base quals.
+    sql = f"""
+    WITH ann AS MATERIALIZED (
+        SELECT target_id
+        FROM {table_name}
+        ORDER BY embedding <=> %s::svec
+        LIMIT {ann_k}
+    ),
+    seeds AS MATERIALIZED (
+        SELECT DISTINCT target_id FROM ann
+    ),
+    helper AS (
+        SELECT entity_id, relation_id, target_id, round(distance::numeric, 6) AS distance
+        FROM sorted_heap_expand_rerank('{table_name}'::regclass, ARRAY(SELECT target_id FROM seeds), %s::svec, {top_k}, NULL, 0)
+    ),
+    expanded AS MATERIALIZED (
+        SELECT *
+        FROM {table_name}
+        WHERE entity_id = ANY (ARRAY(SELECT target_id FROM seeds))
+    ),
+    sql_baseline AS (
+        SELECT entity_id, relation_id, target_id,
+               round((embedding <=> %s::svec)::numeric, 6) AS distance
+        FROM expanded
+        ORDER BY embedding <=> %s::svec, entity_id, relation_id, target_id
+        LIMIT {top_k}
+    )
+    SELECT count(*) FROM (
+        (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
+        UNION ALL
+        (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
+    ) diff
+    """
+
+    for idx, query in enumerate(queries, start=1):
+        cur.execute(sql, (query[2], query[2], query[2], query[2]))
+        diff_rows = cur.fetchone()[0]
+        if diff_rows != 0:
+            raise RuntimeError(
+                f"sorted_heap_expand_rerank mismatch on {table_name} query#{idx}: diff_rows={diff_rows}"
+            )
+
+
 def measure_case(
     cur: Cursor,
     table_name: str,
@@ -517,6 +565,23 @@ def main() -> int:
                     """,
                     lambda q: (q[2], q[2]),
                 ),
+                QueryCase(
+                    "seed_expand_rerank_topk_fn",
+                    f"""
+                    WITH ann AS MATERIALIZED (
+                        SELECT target_id
+                        FROM {{table}}
+                        ORDER BY embedding <=> %s::svec
+                        LIMIT {args.ann_k}
+                    ),
+                    seeds AS MATERIALIZED (
+                        SELECT DISTINCT target_id FROM ann
+                    )
+                    SELECT *
+                    FROM sorted_heap_expand_rerank('{{table}}'::regclass, ARRAY(SELECT target_id FROM seeds), %s::svec, {args.top_k}, NULL, 0)
+                    """,
+                    lambda q: (q[2], q[2]),
+                ),
             ]
 
             print("============================================================")
@@ -548,6 +613,7 @@ def main() -> int:
             cur.execute("SET sorted_hnsw.shared_cache = off")
             cur.execute(f"SET sorted_hnsw.ef_search = {args.ef_search}")
             verify_helper_equivalence(cur, "facts_sh", queries, args.ann_k)
+            verify_helper_rerank_equivalence(cur, "facts_sh", queries, args.ann_k, args.top_k)
 
             for table in ("facts_heap", "facts_sh"):
                 for case in cases:

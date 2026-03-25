@@ -54,6 +54,8 @@ EXPLAIN (COSTS OFF)
 SELECT id FROM hnsw_test ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec;
 EXPLAIN (COSTS OFF)
 SELECT id FROM hnsw_test ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec LIMIT 40;
+EXPLAIN (COSTS OFF)
+SELECT id FROM hnsw_test WHERE id > 10 ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec LIMIT 5;
 SET enable_seqscan = off;
 
 -- Dead heap tuples before VACUUM: top-up must still fill LIMIT K

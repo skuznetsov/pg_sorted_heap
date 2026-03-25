@@ -3467,6 +3467,22 @@ shnsw_costestimate(PlannerInfo *root, IndexPath *path,
 	}
 
 	/*
+	 * Phase 1 sorted_hnsw only guarantees pure ordered KNN scans over the
+	 * whole relation. Do not let the planner combine it with extra base
+	 * quals or parameterized paths, because the AM currently materializes
+	 * only a bounded ANN candidate set before executor filtering.
+	 */
+	if (rel->baserestrictinfo != NIL || path->path.param_info != NULL)
+	{
+		*indexStartupCost = 1.0e12;
+		*indexTotalCost = 1.0e12;
+		*indexSelectivity = 1.0;
+		*indexCorrelation = 0.0;
+		*indexPages = 0;
+		return;
+	}
+
+	/*
 	 * Phase 1 sorted_hnsw only produces up to ef_search ordered candidates
 	 * per scan. Do not let the planner treat it as a general ORDER BY path
 	 * when the query has no LIMIT or asks for more rows than the AM can

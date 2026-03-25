@@ -12,11 +12,12 @@ The conclusion so far is:
 - **`ANY(array_of_seed_ids)` expansion does trigger `SortedHeapScan`, but on
   warm and medium-scale local benchmarks it still loses to heap+btree on
   end-to-end latency despite reading fewer blocks.**
-- A narrow C helper for expanding known seed IDs is now implemented as
-  `sorted_heap_expand_ids(...)`.
-- That helper materially improves the `sorted_heap` path on the synthetic
-  GraphRAG benchmark, though it still does not beat heap+btree on pure
-  expansion latency.
+- Narrow C helpers for expansion and fused top-K rerank now exist as:
+  - `sorted_heap_expand_ids(...)`
+  - `sorted_heap_expand_rerank(...)`
+- Those helpers materially improve the `sorted_heap` path on the synthetic
+  GraphRAG benchmark, though pure heap+btree expansion is still faster on
+  this synthetic workload.
 - Therefore the next promising primitive was correctly **a narrow C helper**,
   not a new graph storage engine and not a giant monolithic
   `graph_rag_scan()` API.
@@ -83,6 +84,9 @@ Benchmark harness:
   - `seed_expand_in`
   - `seed_expand_rerank_join`
   - `seed_expand_rerank_in`
+  - `seed_expand_fn`
+  - `seed_expand_rerank_fn`
+  - `seed_expand_rerank_topk_fn`
 
 The key comparison is between:
 
@@ -205,7 +209,7 @@ That primitive can later be composed into:
 
 ## Helper result
 
-The helper now exists:
+The narrow helpers now exist:
 
 ```sql
 sorted_heap_expand_ids(
@@ -223,7 +227,27 @@ RETURNS TABLE (
 )
 ```
 
-Its current contract is intentionally narrow:
+and:
+
+```sql
+sorted_heap_expand_rerank(
+    rel regclass,
+    seed_ids int4[],
+    query svec,
+    top_k int4,
+    relation_filter int4 DEFAULT NULL,
+    limit_rows int4 DEFAULT 0
+)
+RETURNS TABLE (
+    entity_id int4,
+    relation_id int2,
+    target_id int4,
+    payload text,
+    distance float8
+)
+```
+
+Their current contract is intentionally narrow:
 
 - relation must be a `sorted_heap` table
 - relation must expose the columns:
@@ -236,20 +260,36 @@ Its current contract is intentionally narrow:
 - it emits fact rows for known source entity IDs
 
 On the medium-pressure benchmark (`20K` entities, `16` edges/entity,
-`320K` rows, `shared_buffers=64MB`, fresh backend), the helper produced:
+`320K` rows, `shared_buffers=64MB`, fresh backend, `runs=3`), the helpers
+produced:
 
-- `facts_sh seed_expand_in`: `0.260 ms`
-- `facts_sh seed_expand_fn`: `0.159 ms`
-- `facts_sh seed_expand_rerank_in`: `0.357 ms`
-- `facts_sh seed_expand_rerank_fn`: `0.223 ms`
+- `facts_heap seed_expand_in`: `0.123 ms`
+- `facts_sh seed_expand_in`: `0.285 ms`
+- `facts_sh seed_expand_fn`: `0.165 ms`
+- `facts_sh seed_expand_rerank_in`: `0.369 ms`
+- `facts_sh seed_expand_rerank_fn`: `0.234 ms`
+- `facts_sh seed_expand_rerank_topk_fn`: `0.139 ms`
 
 Interpretation:
 
-- the helper converts the observed block-pruning/locality advantage into a
-  **real latency win over the current SQL + CustomScan path**
-- the helper is now close to heap+btree on expansion+rereank
+- `sorted_heap_expand_ids()` converts the observed block-pruning/locality
+  advantage into a **real latency win over the current SQL + CustomScan path**
+- `sorted_heap_expand_rerank()` removes most of the remaining rerank overhead
+  and is now materially faster than the current `sorted_heap` SQL rerank path
+  (`0.139 ms` vs `0.369 ms`)
 - pure heap+btree expansion is still faster on this synthetic workload
-  (`0.113 ms` vs `0.159 ms`)
+  (`0.123 ms` vs `0.165 ms`)
+
+One important measurement caveat was also discovered and fixed during this
+work:
+
+- direct filtered `ORDER BY embedding <=> $query LIMIT K` on a base table with
+  a `sorted_hnsw` index is **not** a valid GraphRAG baseline for current
+  Phase 1 semantics
+- the automatic `sorted_hnsw` path is now explicitly costed out when extra
+  base-relation quals are present
+- GraphRAG rerank baselines must therefore materialize the expanded set first,
+  then rerank it
 
 This is enough to falsify the pessimistic branch:
 
@@ -268,6 +308,10 @@ This is enough to falsify the pessimistic branch:
 
 `sorted_heap_expand_ids()` is implemented and regression-covered.
 
+### Phase 2 — current
+
+`sorted_heap_expand_rerank()` is implemented and regression-covered.
+
 Current success criterion that was met:
 
 - beats the current `sorted_heap` SQL `seed_expand_in` / `seed_expand_rerank_in`
@@ -277,15 +321,15 @@ Current gap that remains:
 
 - pure heap+btree expansion is still faster on this synthetic benchmark
 
-### Phase 2 — next
+### Phase 3 — next
 
 Add GraphRAG composition query:
 
 - ANN seed in SQL via `sorted_hnsw`
 - expansion via `sorted_heap_expand_ids()`
-- rerank in SQL or narrow helper
+- rerank via `sorted_heap_expand_rerank()` or SQL over materialized expansion
 
-### Phase 3
+### Phase 4
 
 Only if Phase 2 still shows SQL overhead:
 
@@ -303,7 +347,9 @@ What is now true:
 
 - SQL-only GraphRAG composition was not enough
 - `sorted_heap_expand_ids()` is enough to recover a large part of that gap
-- the helper is a justified building block
+- `sorted_heap_expand_rerank()` recovers most of the rerank overhead on the
+  current `sorted_heap` path
+- the narrow-helper direction is a justified building block
 
 What is not yet true:
 

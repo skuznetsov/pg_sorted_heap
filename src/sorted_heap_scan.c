@@ -42,6 +42,7 @@
 #include "access/parallel.h"
 
 #include "sorted_heap.h"
+#include "svec.h"
 
 /* Marker strategy for runtime IN-list array (Param) in runtime_meta */
 #define SH_RUNTIME_IN_ARRAY  (-1)
@@ -153,6 +154,25 @@ static bool sorted_heap_zone_overlaps(SortedHeapZoneMapEntry *e,
 static bool zone_overlaps_in_values(SortedHeapZoneMapEntry *e,
 									int64 *values, int nvalues);
 static bool sorted_heap_value_in_set(int64 value, int64 *values, int nvalues);
+
+typedef struct GraphRagTopKEntry
+{
+	float8		dist;
+	int32		entity_id;
+	int16		relation_id;
+	int32		target_id;
+	Datum		payload;
+	bool		payload_isnull;
+} GraphRagTopKEntry;
+
+static int graph_rag_topk_cmp(const void *a, const void *b);
+static void graph_rag_topk_siftdown(GraphRagTopKEntry *heap, int n, int i);
+static void graph_rag_topk_siftup(GraphRagTopKEntry *heap, int i);
+static void graph_rag_topk_insert(GraphRagTopKEntry *heap, int *heap_size,
+								  int max_k, float8 dist,
+								  int32 entity_id, int16 relation_id,
+								  int32 target_id, Datum payload,
+								  bool payload_isnull);
 static bool sorted_heap_exprs_need_deferred_runtime_resolve(List *exprs);
 static void sorted_heap_set_parallel_fallback_span(SortedHeapScanState *shstate);
 
@@ -2495,6 +2515,111 @@ sorted_heap_value_in_set(int64 value, int64 *values, int nvalues)
 	return (lo < nvalues && values[lo] == value);
 }
 
+static int
+graph_rag_topk_cmp(const void *a, const void *b)
+{
+	const GraphRagTopKEntry *ga = (const GraphRagTopKEntry *) a;
+	const GraphRagTopKEntry *gb = (const GraphRagTopKEntry *) b;
+
+	if (ga->dist < gb->dist)
+		return -1;
+	if (ga->dist > gb->dist)
+		return 1;
+	if (ga->entity_id < gb->entity_id)
+		return -1;
+	if (ga->entity_id > gb->entity_id)
+		return 1;
+	if (ga->relation_id < gb->relation_id)
+		return -1;
+	if (ga->relation_id > gb->relation_id)
+		return 1;
+	if (ga->target_id < gb->target_id)
+		return -1;
+	if (ga->target_id > gb->target_id)
+		return 1;
+	return 0;
+}
+
+static void
+graph_rag_topk_siftdown(GraphRagTopKEntry *heap, int n, int i)
+{
+	for (;;)
+	{
+		int largest = i;
+		int left = 2 * i + 1;
+		int right = 2 * i + 2;
+		GraphRagTopKEntry tmp;
+
+		if (left < n && graph_rag_topk_cmp(&heap[left], &heap[largest]) > 0)
+			largest = left;
+		if (right < n && graph_rag_topk_cmp(&heap[right], &heap[largest]) > 0)
+			largest = right;
+		if (largest == i)
+			break;
+
+		tmp = heap[i];
+		heap[i] = heap[largest];
+		heap[largest] = tmp;
+		i = largest;
+	}
+}
+
+static void
+graph_rag_topk_siftup(GraphRagTopKEntry *heap, int i)
+{
+	while (i > 0)
+	{
+		int parent = (i - 1) / 2;
+		GraphRagTopKEntry tmp;
+
+		if (graph_rag_topk_cmp(&heap[i], &heap[parent]) <= 0)
+			break;
+
+		tmp = heap[i];
+		heap[i] = heap[parent];
+		heap[parent] = tmp;
+		i = parent;
+	}
+}
+
+static void
+graph_rag_topk_insert(GraphRagTopKEntry *heap, int *heap_size,
+					  int max_k, float8 dist,
+					  int32 entity_id, int16 relation_id,
+					  int32 target_id, Datum payload,
+					  bool payload_isnull)
+{
+	GraphRagTopKEntry candidate;
+
+	candidate.dist = dist;
+	candidate.entity_id = entity_id;
+	candidate.relation_id = relation_id;
+	candidate.target_id = target_id;
+	candidate.payload_isnull = payload_isnull;
+	candidate.payload = payload_isnull ? (Datum) 0 :
+		PointerGetDatum(PG_DETOAST_DATUM_COPY(payload));
+
+	if (*heap_size < max_k)
+	{
+		heap[*heap_size] = candidate;
+		(*heap_size)++;
+		graph_rag_topk_siftup(heap, *heap_size - 1);
+		return;
+	}
+
+	if (graph_rag_topk_cmp(&candidate, &heap[0]) < 0)
+	{
+		if (!heap[0].payload_isnull)
+			pfree(DatumGetPointer(heap[0].payload));
+		heap[0] = candidate;
+		graph_rag_topk_siftdown(heap, *heap_size, 0);
+		return;
+	}
+
+	if (!candidate.payload_isnull)
+		pfree(DatumGetPointer(candidate.payload));
+}
+
 /* ----------------------------------------------------------------
  *  Narrow GraphRAG primitive: expand known entity IDs on sorted_heap.
  *
@@ -2785,6 +2910,323 @@ sorted_heap_expand_ids(PG_FUNCTION_ARGS)
 	}
 
 done:
+	if (ranges)
+		pfree(ranges);
+	if (seed_values)
+		pfree(seed_values);
+	if (slot)
+		ExecDropSingleTupleTableSlot(slot);
+	if (scan)
+		table_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	PG_RETURN_NULL();
+}
+
+/* ----------------------------------------------------------------
+ *  Narrow GraphRAG primitive: expand known entity IDs and rerank top-K
+ *  in C, avoiding SQL materialization + sort of the entire expanded set.
+ * ---------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(sorted_heap_expand_rerank);
+
+Datum
+sorted_heap_expand_rerank(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo	   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Oid					rel_oid;
+	ArrayType		   *seed_arr;
+	Svec			   *query;
+	int32				top_k;
+	bool				has_relation_filter;
+	int32				relation_filter = 0;
+	int32				limit_rows;
+	Relation			rel;
+	SortedHeapRelInfo  *info;
+	AttrNumber			entity_att;
+	AttrNumber			relation_att;
+	AttrNumber			target_att;
+	AttrNumber			embedding_att;
+	AttrNumber			payload_att;
+	Oid					entity_typid;
+	Oid					relation_typid;
+	Oid					target_typid;
+	const char		   *relname;
+	Datum			   *seed_datums = NULL;
+	bool			   *seed_nulls = NULL;
+	int					nseed = 0;
+	int64			   *seed_values = NULL;
+	int					nseed_values = 0;
+	SortedHeapScanBounds bounds;
+	BlockNumber			total_blocks;
+	SortedHeapScanRange *ranges = NULL;
+	int					nranges = 0;
+	BlockNumber			range_total = 0;
+	TableScanDesc		scan;
+	TupleTableSlot	   *slot;
+	int					range_idx;
+	int32				n_scanned = 0;
+	GraphRagTopKEntry  *heap = NULL;
+	int					heap_size = 0;
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("sorted_heap_expand_rerank must be called in a set-returning context")));
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
+	{
+		InitMaterializedSRF(fcinfo, 0);
+		PG_RETURN_NULL();
+	}
+
+	rel_oid = PG_GETARG_OID(0);
+	seed_arr = PG_GETARG_ARRAYTYPE_P(1);
+	query = PG_GETARG_SVEC_P(2);
+	top_k = PG_GETARG_INT32(3);
+	has_relation_filter = !PG_ARGISNULL(4);
+	if (has_relation_filter)
+		relation_filter = PG_GETARG_INT32(4);
+	limit_rows = PG_ARGISNULL(5) ? 0 : PG_GETARG_INT32(5);
+
+	if (top_k < 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("sorted_heap_expand_rerank: top_k must be >= 1")));
+	if (limit_rows < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("sorted_heap_expand_rerank: limit_rows must be >= 0")));
+	if (has_relation_filter &&
+		(relation_filter < PG_INT16_MIN || relation_filter > PG_INT16_MAX))
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("sorted_heap_expand_rerank: relation_filter %d is outside int2 range",
+						relation_filter)));
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	if (ARR_NDIM(seed_arr) == 0 || ArrayGetNItems(ARR_NDIM(seed_arr), ARR_DIMS(seed_arr)) == 0)
+		PG_RETURN_NULL();
+	if (ARR_NDIM(seed_arr) != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+				 errmsg("sorted_heap_expand_rerank: seed_ids must be a one-dimensional int4[]")));
+	if (ARR_ELEMTYPE(seed_arr) != INT4OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("sorted_heap_expand_rerank: seed_ids must be int4[]")));
+
+	rel = table_open(rel_oid, AccessShareLock);
+	relname = pstrdup(RelationGetRelationName(rel));
+	if (rel->rd_tableam != &sorted_heap_am_routine)
+	{
+		table_close(rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("sorted_heap_expand_rerank: relation \"%s\" is not a sorted_heap table",
+						relname)));
+	}
+
+	entity_att = get_attnum(rel_oid, "entity_id");
+	relation_att = get_attnum(rel_oid, "relation_id");
+	target_att = get_attnum(rel_oid, "target_id");
+	embedding_att = get_attnum(rel_oid, "embedding");
+	payload_att = get_attnum(rel_oid, "payload");
+	if (entity_att == InvalidAttrNumber ||
+		relation_att == InvalidAttrNumber ||
+		target_att == InvalidAttrNumber ||
+		embedding_att == InvalidAttrNumber ||
+		payload_att == InvalidAttrNumber)
+	{
+		table_close(rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("sorted_heap_expand_rerank: relation \"%s\" must have entity_id, relation_id, target_id, embedding, and payload columns",
+						relname)));
+	}
+
+	entity_typid = TupleDescAttr(RelationGetDescr(rel), entity_att - 1)->atttypid;
+	relation_typid = TupleDescAttr(RelationGetDescr(rel), relation_att - 1)->atttypid;
+	target_typid = TupleDescAttr(RelationGetDescr(rel), target_att - 1)->atttypid;
+	if (entity_typid != INT4OID || relation_typid != INT2OID || target_typid != INT4OID)
+	{
+		table_close(rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("sorted_heap_expand_rerank: relation \"%s\" must use entity_id int4, relation_id int2, target_id int4",
+						relname)));
+	}
+
+	info = sorted_heap_get_relinfo(rel);
+
+	deconstruct_array(seed_arr, INT4OID, 4, true, TYPALIGN_INT,
+					  &seed_datums, &seed_nulls, &nseed);
+	if (nseed <= 0)
+	{
+		table_close(rel, AccessShareLock);
+		PG_RETURN_NULL();
+	}
+
+	seed_values = palloc(sizeof(int64) * nseed);
+	for (int i = 0; i < nseed; i++)
+	{
+		if (seed_nulls[i])
+			continue;
+		seed_values[nseed_values++] = (int64) DatumGetInt32(seed_datums[i]);
+	}
+	if (nseed_values == 0)
+	{
+		table_close(rel, AccessShareLock);
+		pfree(seed_values);
+		PG_RETURN_NULL();
+	}
+	qsort(seed_values, nseed_values, sizeof(int64), sorted_heap_int64_cmp);
+
+	memset(&bounds, 0, sizeof(bounds));
+	bounds.has_lo = true;
+	bounds.has_hi = true;
+	bounds.lo_inclusive = true;
+	bounds.hi_inclusive = true;
+	bounds.lo = seed_values[0];
+	bounds.hi = seed_values[nseed_values - 1];
+	if (has_relation_filter)
+	{
+		bounds.has_lo2 = true;
+		bounds.has_hi2 = true;
+		bounds.lo2_inclusive = true;
+		bounds.hi2_inclusive = true;
+		bounds.lo2 = relation_filter;
+		bounds.hi2 = relation_filter;
+	}
+
+	total_blocks = RelationGetNumberOfBlocks(rel);
+	if (info->zm_usable && info->zm_loaded && info->zm_total_entries > 0)
+		sorted_heap_compute_scan_ranges(info, &bounds,
+										seed_values, nseed_values,
+										total_blocks,
+										&ranges, &nranges, &range_total);
+
+	scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
+	slot = table_slot_create(rel, NULL);
+	heap = palloc(sizeof(GraphRagTopKEntry) * top_k);
+
+	if (nranges == 0)
+	{
+		heap_setscanlimits(scan, 1, total_blocks > 0 ? total_blocks - 1 : 0);
+		nranges = 1;
+	}
+
+	for (range_idx = 0; range_idx < nranges; range_idx++)
+	{
+		BlockNumber range_start;
+		BlockNumber range_nblocks;
+		bool		range_sorted;
+		BlockNumber last_blk = InvalidBlockNumber;
+
+		if (ranges)
+		{
+			range_start = ranges[range_idx].start;
+			range_nblocks = ranges[range_idx].nblocks;
+			range_sorted = ranges[range_idx].sorted_prefix;
+		}
+		else
+		{
+			range_start = 1;
+			range_nblocks = total_blocks > 0 ? total_blocks - 1 : 0;
+			range_sorted = false;
+		}
+
+		table_rescan(scan, NULL);
+		heap_setscanlimits(scan, range_start, range_nblocks);
+
+		while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+		{
+			BlockNumber	blk = ItemPointerGetBlockNumber(&slot->tts_tid);
+			bool		isnull;
+			Datum		entity_datum;
+			int32		entity_id;
+			int16		relation_id;
+			int32		target_id;
+			bool		zone_checked = false;
+			Svec	   *candidate;
+			float8		dist;
+			Datum		payload_datum;
+			bool		payload_isnull;
+
+			if (blk != last_blk && info->zm_loaded &&
+				blk >= 1 && (blk - 1) < info->zm_total_entries)
+			{
+				SortedHeapZoneMapEntry *e =
+					sorted_heap_get_zm_entry(info, blk - 1);
+
+				if (!zone_overlaps_in_values(e, seed_values, nseed_values))
+				{
+					last_blk = blk;
+					continue;
+				}
+				if (has_relation_filter && !sorted_heap_zone_overlaps(e, &bounds))
+				{
+					last_blk = blk;
+					continue;
+				}
+				zone_checked = true;
+				last_blk = blk;
+			}
+
+			entity_datum = slot_getattr(slot, entity_att, &isnull);
+			if (isnull)
+				continue;
+			entity_id = DatumGetInt32(entity_datum);
+			if (!sorted_heap_value_in_set((int64) entity_id, seed_values, nseed_values))
+				continue;
+
+			relation_id = DatumGetInt16(slot_getattr(slot, relation_att, &isnull));
+			if (isnull)
+				continue;
+			if (has_relation_filter && relation_id != relation_filter)
+				continue;
+
+			if (range_sorted && zone_checked && entity_id > bounds.hi)
+				break;
+
+			target_id = DatumGetInt32(slot_getattr(slot, target_att, &isnull));
+			if (isnull)
+				continue;
+
+			candidate = DatumGetSvecP(slot_getattr(slot, embedding_att, &isnull));
+			if (isnull)
+				continue;
+			dist = svec_cosine_distance_internal(query, candidate);
+
+			payload_datum = slot_getattr(slot, payload_att, &payload_isnull);
+			graph_rag_topk_insert(heap, &heap_size, top_k,
+								  dist, entity_id, relation_id, target_id,
+								  payload_datum, payload_isnull);
+
+			n_scanned++;
+			if (limit_rows > 0 && n_scanned >= limit_rows)
+				goto emit_results;
+		}
+	}
+
+emit_results:
+	if (heap_size > 1)
+		qsort(heap, heap_size, sizeof(GraphRagTopKEntry), graph_rag_topk_cmp);
+
+	for (int i = 0; i < heap_size; i++)
+	{
+		Datum values[5];
+		bool nulls[5] = {false, false, false, false, false};
+
+		values[0] = Int32GetDatum(heap[i].entity_id);
+		values[1] = Int16GetDatum(heap[i].relation_id);
+		values[2] = Int32GetDatum(heap[i].target_id);
+		values[3] = heap[i].payload;
+		nulls[3] = heap[i].payload_isnull;
+		values[4] = Float8GetDatum(heap[i].dist);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+
 	if (ranges)
 		pfree(ranges);
 	if (seed_values)

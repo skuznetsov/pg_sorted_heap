@@ -34,6 +34,10 @@ SELECT entity_id, relation_id, target_id, payload
 FROM sorted_heap_expand_ids('facts_sh'::regclass, ARRAY[1,3], NULL, 2)
 ORDER BY entity_id, relation_id, target_id;
 
+SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+FROM sorted_heap_expand_rerank('facts_sh'::regclass, ARRAY[1,3], '[1,0,0,0]'::svec, 2, NULL, 0)
+ORDER BY distance, entity_id, relation_id, target_id;
+
 WITH helper AS (
   SELECT entity_id, relation_id, target_id, payload
   FROM sorted_heap_expand_ids('facts_sh'::regclass, ARRAY[1,3], NULL, 0)
@@ -44,6 +48,25 @@ sql_baseline AS (
   WHERE entity_id = ANY (ARRAY[1,3]::int4[])
 )
 SELECT count(*) AS diff_rows
+FROM (
+  (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
+  UNION ALL
+  (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
+) diff;
+
+WITH helper AS (
+  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+  FROM sorted_heap_expand_rerank('facts_sh'::regclass, ARRAY[1,3], '[1,0,0,0]'::svec, 2, NULL, 0)
+),
+sql_baseline AS (
+  SELECT entity_id, relation_id, target_id, payload,
+         round((embedding <=> '[1,0,0,0]'::svec)::numeric, 6) AS distance
+  FROM facts_sh
+  WHERE entity_id = ANY (ARRAY[1,3]::int4[])
+  ORDER BY embedding <=> '[1,0,0,0]'::svec, entity_id, relation_id, target_id
+  LIMIT 2
+)
+SELECT count(*) AS rerank_diff_rows
 FROM (
   (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
   UNION ALL
