@@ -917,6 +917,17 @@ So the current one-call wrapper is still too specialized for this workload
 shape. The lower-level helper family is fine; the wrapper contract is the
 narrow part.
 
+That gap is now closed by:
+
+- `sorted_heap_graph_rag_twohop_scan(...)`
+
+This wrapper keeps the fact-shaped contract narrow:
+
+- ANN seed on `entity_id`
+- hop 1 relation filter
+- hop 2 relation filter
+- final rerank delegated to `sorted_heap_expand_twohop_rerank(...)`
+
 ### Early failure that mattered
 
 At `32D`, the fact benchmark initially produced very poor answer retrieval.
@@ -952,6 +963,10 @@ the current frontier is:
   - `0.442 ms`
   - `hit@1 = 70.3%`
   - `hit@k = 82.8%`
+- `sorted_heap_graph_rag_twohop_scan()`
+  - `0.417 ms`
+  - `hit@1 = 71.9%`
+  - `hit@k = 84.4%`
 - pgvector
   - `1.397 ms`
   - `hit@1 = 70.3%`
@@ -969,6 +984,8 @@ Interpretation:
 
 - the fused two-hop helper is now the **fastest PostgreSQL path** on this
   fact-shaped workload
+- the new fact-shaped one-call wrapper stays effectively at parity with the
+  fused helper, so this time the convenience API does **not** erase the win
 - it remains materially faster than pgvector on the same workflow
 - it is **not** the quality leader at this operating point
 - zvec and Qdrant still win on answer retrieval quality here, but at much
@@ -1006,6 +1023,8 @@ What is now true:
   evidence into a real latency win on the real-text Gutenberg slices we tested
 - on the cogniformerus-style `person -> parent -> city` benchmark, the fused
   two-hop helper is the fastest PostgreSQL path we tested
+- `sorted_heap_graph_rag_twohop_scan()` closes the current fact-shaped wrapper
+  gap without materially giving back latency
 - the narrow-helper direction is a justified building block
 - the current helper model already composes into a competitive two-hop
   real-text GraphRAG path on Gutenberg without requiring a new graph API

@@ -3336,6 +3336,7 @@ done:
 PG_FUNCTION_INFO_V1(sorted_heap_expand_rerank);
 PG_FUNCTION_INFO_V1(sorted_heap_expand_twohop_rerank);
 PG_FUNCTION_INFO_V1(sorted_heap_graph_rag_scan);
+PG_FUNCTION_INFO_V1(sorted_heap_graph_rag_twohop_scan);
 
 Datum
 sorted_heap_expand_rerank(PG_FUNCTION_ARGS)
@@ -3860,6 +3861,217 @@ sorted_heap_graph_rag_scan(PG_FUNCTION_ARGS)
 		SPI_finish();
 		table_close(rel, AccessShareLock);
 		elog(ERROR, "sorted_heap_graph_rag_scan: helper query failed: %d", ret);
+	}
+
+	tupdesc = SPI_tuptable->tupdesc;
+	for (row_idx = 0; row_idx < SPI_processed; row_idx++)
+	{
+		Datum out_values[5];
+		bool out_nulls[5];
+		int col;
+
+		tuple = SPI_tuptable->vals[row_idx];
+		for (col = 0; col < 5; col++)
+			out_values[col] = SPI_getbinval(tuple, tupdesc, col + 1, &out_nulls[col]);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+							 out_values, out_nulls);
+	}
+	SPI_freetuptable(SPI_tuptable);
+	SPI_finish();
+	table_close(rel, AccessShareLock);
+
+	PG_RETURN_NULL();
+}
+
+/* ----------------------------------------------------------------
+ *  GraphRAG convenience wrapper for fact-shaped two-hop expansion:
+ *  ANN seed on entity_id, hop1 expansion, then hop2 rerank in one call.
+ * ---------------------------------------------------------------- */
+Datum
+sorted_heap_graph_rag_twohop_scan(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo	   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Oid					rel_oid;
+	Svec			   *query;
+	int32				ann_k;
+	int32				top_k;
+	bool				has_hop1_filter;
+	int32				hop1_filter = 0;
+	bool				has_hop2_filter;
+	int32				hop2_filter = 0;
+	int32				limit_rows;
+	Relation			rel;
+	AttrNumber			embedding_att;
+	Oid					embedding_typid;
+	char			   *schema_name;
+	char			   *relname;
+	const char		   *quoted_schema;
+	const char		   *quoted_relname;
+	const char		   *quoted_ext_schema;
+	StringInfoData		seed_sql;
+	StringInfoData		helper_sql;
+	Oid					argtypes[7];
+	Datum				values[7];
+	char				nulls[7] = {' ', ' ', ' ', ' ', ' ', ' ', ' '};
+	int					ret;
+	ArrayType		   *seed_arr = NULL;
+	bool				isnull;
+	HeapTuple			tuple;
+	TupleDesc			tupdesc;
+	uint64				row_idx;
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("sorted_heap_graph_rag_twohop_scan must be called in a set-returning context")));
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+	{
+		InitMaterializedSRF(fcinfo, 0);
+		PG_RETURN_NULL();
+	}
+
+	rel_oid = PG_GETARG_OID(0);
+	query = PG_GETARG_SVEC_P(1);
+	ann_k = PG_GETARG_INT32(2);
+	top_k = PG_GETARG_INT32(3);
+	has_hop1_filter = !PG_ARGISNULL(4);
+	if (has_hop1_filter)
+		hop1_filter = PG_GETARG_INT32(4);
+	has_hop2_filter = !PG_ARGISNULL(5);
+	if (has_hop2_filter)
+		hop2_filter = PG_GETARG_INT32(5);
+	limit_rows = PG_ARGISNULL(6) ? 0 : PG_GETARG_INT32(6);
+
+	if (ann_k < 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("sorted_heap_graph_rag_twohop_scan: ann_k must be >= 1")));
+	if (top_k < 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("sorted_heap_graph_rag_twohop_scan: top_k must be >= 1")));
+	if (limit_rows < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("sorted_heap_graph_rag_twohop_scan: limit_rows must be >= 0")));
+	if (has_hop1_filter &&
+		(hop1_filter < PG_INT16_MIN || hop1_filter > PG_INT16_MAX))
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("sorted_heap_graph_rag_twohop_scan: hop1_relation_filter %d is outside int2 range",
+						hop1_filter)));
+	if (has_hop2_filter &&
+		(hop2_filter < PG_INT16_MIN || hop2_filter > PG_INT16_MAX))
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("sorted_heap_graph_rag_twohop_scan: hop2_relation_filter %d is outside int2 range",
+						hop2_filter)));
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	rel = table_open(rel_oid, AccessShareLock);
+	relname = pstrdup(RelationGetRelationName(rel));
+	if (rel->rd_tableam != &sorted_heap_am_routine)
+	{
+		table_close(rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("sorted_heap_graph_rag_twohop_scan: relation \"%s\" is not a sorted_heap table",
+						relname)));
+	}
+
+	embedding_att = get_attnum(rel_oid, "embedding");
+	if (embedding_att == InvalidAttrNumber)
+	{
+		table_close(rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("sorted_heap_graph_rag_twohop_scan: relation \"%s\" must have an embedding column",
+						relname)));
+	}
+	embedding_typid = TupleDescAttr(RelationGetDescr(rel), embedding_att - 1)->atttypid;
+
+	schema_name = get_namespace_name(get_rel_namespace(rel_oid));
+	quoted_schema = quote_identifier(schema_name);
+	quoted_relname = quote_identifier(relname);
+	quoted_ext_schema = sorted_heap_get_ext_schema();
+
+	ret = SPI_connect();
+	if (ret != SPI_OK_CONNECT)
+	{
+		table_close(rel, AccessShareLock);
+		elog(ERROR, "sorted_heap_graph_rag_twohop_scan: SPI_connect failed: %d", ret);
+	}
+
+	initStringInfo(&seed_sql);
+	appendStringInfo(&seed_sql,
+					 "SELECT array_agg(entity_id::int4) "
+					 "FROM (SELECT DISTINCT entity_id "
+					 "      FROM (SELECT entity_id "
+					 "            FROM %s.%s "
+					 "            ORDER BY embedding <=> $1 LIMIT %d) ann) seeds",
+					 quoted_schema, quoted_relname, ann_k);
+
+	argtypes[0] = embedding_typid;
+	values[0] = PointerGetDatum(query);
+	ret = SPI_execute_with_args(seed_sql.data, 1, argtypes, values, nulls,
+								true, 1);
+	if (ret != SPI_OK_SELECT)
+	{
+		SPI_finish();
+		table_close(rel, AccessShareLock);
+		elog(ERROR, "sorted_heap_graph_rag_twohop_scan: seed query failed: %d", ret);
+	}
+
+	if (SPI_processed > 0)
+	{
+		tuple = SPI_tuptable->vals[0];
+		tupdesc = SPI_tuptable->tupdesc;
+		values[0] = SPI_getbinval(tuple, tupdesc, 1, &isnull);
+		if (!isnull)
+			seed_arr = DatumGetArrayTypePCopy(values[0]);
+		SPI_freetuptable(SPI_tuptable);
+	}
+
+	if (seed_arr == NULL)
+	{
+		SPI_finish();
+		table_close(rel, AccessShareLock);
+		PG_RETURN_NULL();
+	}
+
+	initStringInfo(&helper_sql);
+	appendStringInfo(&helper_sql,
+					 "SELECT entity_id, relation_id, target_id, payload, distance "
+					 "FROM %s.sorted_heap_expand_twohop_rerank("
+					 "$1::regclass, $2::int4[], $3, $4::int4, $5::int4, $6::int4, $7::int4)",
+					 quoted_ext_schema);
+
+	argtypes[0] = REGCLASSOID;
+	values[0] = ObjectIdGetDatum(rel_oid);
+	argtypes[1] = INT4ARRAYOID;
+	values[1] = PointerGetDatum(seed_arr);
+	argtypes[2] = embedding_typid;
+	values[2] = PointerGetDatum(query);
+	argtypes[3] = INT4OID;
+	values[3] = Int32GetDatum(top_k);
+	argtypes[4] = INT4OID;
+	values[4] = Int32GetDatum(hop1_filter);
+	nulls[4] = has_hop1_filter ? ' ' : 'n';
+	argtypes[5] = INT4OID;
+	values[5] = Int32GetDatum(hop2_filter);
+	nulls[5] = has_hop2_filter ? ' ' : 'n';
+	argtypes[6] = INT4OID;
+	values[6] = Int32GetDatum(limit_rows);
+
+	ret = SPI_execute_with_args(helper_sql.data, 7, argtypes, values, nulls,
+								true, 0);
+	if (ret != SPI_OK_SELECT)
+	{
+		SPI_finish();
+		table_close(rel, AccessShareLock);
+		elog(ERROR, "sorted_heap_graph_rag_twohop_scan: helper query failed: %d", ret);
 	}
 
 	tupdesc = SPI_tuptable->tupdesc;

@@ -237,6 +237,64 @@ def verify_helper_twohop_equivalence(cur, table_name: str, queries: list[MultiHo
             )
 
 
+def verify_graph_rag_twohop_scan_equivalence(cur, table_name: str, queries: list[MultiHopQuery], ann_k: int, top_k: int) -> None:
+    sql = f"""
+    WITH helper AS (
+        SELECT entity_id, relation_id, target_id, round(distance::numeric, 6) AS distance
+        FROM sorted_heap_graph_rag_twohop_scan(
+            '{table_name}'::regclass,
+            %s::svec,
+            {ann_k},
+            {top_k},
+            {REL_PARENT},
+            {REL_CITY},
+            0
+        )
+    ),
+    ann AS MATERIALIZED (
+        SELECT entity_id
+        FROM {table_name}
+        ORDER BY embedding <=> %s::svec
+        LIMIT {ann_k}
+    ),
+    seeds AS MATERIALIZED (
+        SELECT DISTINCT entity_id FROM ann
+    ),
+    hop1_sql AS MATERIALIZED (
+        SELECT DISTINCT target_id
+        FROM {table_name}
+        WHERE entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+          AND relation_id = {REL_PARENT}
+    ),
+    expanded AS MATERIALIZED (
+        SELECT *
+        FROM {table_name}
+        WHERE entity_id = ANY (ARRAY(SELECT target_id FROM hop1_sql))
+          AND relation_id = {REL_CITY}
+    ),
+    sql_baseline AS (
+        SELECT entity_id, relation_id, target_id,
+               round((embedding <=> %s::svec)::numeric, 6) AS distance
+        FROM expanded
+        ORDER BY embedding <=> %s::svec, entity_id, relation_id, target_id
+        LIMIT {top_k}
+    )
+    SELECT count(*) FROM (
+        (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
+        UNION ALL
+        (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
+    ) diff
+    """
+
+    for idx, query in enumerate(queries, start=1):
+        cur.execute(sql, (query.query_vec, query.query_vec, query.query_vec, query.query_vec))
+        diff_rows = cur.fetchone()[0]
+        if diff_rows != 0:
+            raise RuntimeError(
+                f"sorted_heap_graph_rag_twohop_scan mismatch on {table_name} query#{idx}: diff_rows={diff_rows}"
+            )
+
+
 def measure_quality(cur, table_name: str, case: base.QueryCase, queries: list[MultiHopQuery]) -> tuple[float, float, float]:
     sql = case.sql_template.format(table=table_name)
     hit1 = 0
@@ -563,6 +621,22 @@ def main() -> int:
                 """,
                 lambda q: (q.query_vec, q.query_vec),
             )
+            wrapper_twohop = base.QueryCase(
+                "seed_graph_rag_twohop_scan_fn",
+                f"""
+                SELECT *
+                FROM sorted_heap_graph_rag_twohop_scan(
+                    '{{table}}'::regclass,
+                    %s::svec,
+                    {args.ann_k},
+                    {args.top_k},
+                    {REL_PARENT},
+                    {REL_CITY},
+                    0
+                )
+                """,
+                lambda q: (q.query_vec,),
+            )
             pgvector_twohop = base.QueryCase(
                 "seed_expand2_rerank_rel_pgv",
                 f"""
@@ -649,12 +723,14 @@ def main() -> int:
             cur.execute("SET sorted_hnsw.shared_cache = off")
             cur.execute(f"SET sorted_hnsw.ef_search = {args.ef_search}")
             verify_helper_twohop_equivalence(cur, "facts_sh", queries, args.ann_k, args.top_k)
+            verify_graph_rag_twohop_scan_equivalence(cur, "facts_sh", queries, args.ann_k, args.top_k)
 
             cases: list[tuple[str, str, base.QueryCase]] = [
                 ("facts_heap", "facts_heap", sql_twohop),
                 ("facts_sh", "facts_sh", sql_twohop),
                 ("facts_sh", "facts_sh", composed_twohop),
                 ("facts_sh", "facts_sh", helper_twohop),
+                ("facts_sh", "facts_sh", wrapper_twohop),
             ]
 
             for label, table, case in cases:
