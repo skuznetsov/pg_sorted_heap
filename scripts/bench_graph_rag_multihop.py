@@ -1018,6 +1018,41 @@ def main() -> int:
                 """,
                 lambda q: (q.query_vec, q.query_vec),
             )
+            pgvector_path_twohop = base.QueryCase(
+                "seed_expand2_rerank_rel_pathsum_pgv",
+                f"""
+                WITH ann AS MATERIALIZED (
+                    SELECT entity_id
+                    FROM facts_pgv
+                    ORDER BY embedding <=> %s::vector({args.dim})
+                    LIMIT {args.ann_k}
+                ),
+                seeds AS MATERIALIZED (
+                    SELECT DISTINCT entity_id FROM ann
+                ),
+                hop1 AS MATERIALIZED (
+                    SELECT DISTINCT ON (target_id)
+                           target_id AS parent_id,
+                           (embedding <=> %s::svec) AS hop1_distance
+                    FROM facts_heap
+                    WHERE entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+                      AND relation_id = {REL_PARENT}
+                    ORDER BY target_id, embedding <=> %s::svec, entity_id
+                ),
+                expanded AS MATERIALIZED (
+                    SELECT city.*,
+                           ((city.embedding <=> %s::svec) + hop1.hop1_distance) AS path_distance
+                    FROM facts_heap city
+                    JOIN hop1 ON hop1.parent_id = city.entity_id
+                    WHERE city.relation_id = {REL_CITY}
+                )
+                SELECT *
+                FROM expanded
+                ORDER BY path_distance, entity_id, relation_id, target_id
+                LIMIT {args.top_k}
+                """,
+                lambda q: (q.query_vec, q.query_vec, q.query_vec, q.query_vec),
+            )
 
             sql_rerank_2hop = f"""
                 WITH seeds AS MATERIALIZED (
@@ -1038,6 +1073,31 @@ def main() -> int:
                 SELECT *
                 FROM expanded
                 ORDER BY embedding <=> %s::svec
+                LIMIT {args.top_k}
+            """
+            sql_pathsum_2hop = f"""
+                WITH seeds AS MATERIALIZED (
+                    SELECT DISTINCT unnest(%s::int4[]) AS entity_id
+                ),
+                hop1 AS MATERIALIZED (
+                    SELECT DISTINCT ON (target_id)
+                           target_id AS parent_id,
+                           (embedding <=> %s::svec) AS hop1_distance
+                    FROM facts_heap
+                    WHERE entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+                      AND relation_id = {REL_PARENT}
+                    ORDER BY target_id, embedding <=> %s::svec, entity_id
+                ),
+                expanded AS MATERIALIZED (
+                    SELECT city.*,
+                           ((city.embedding <=> %s::svec) + hop1.hop1_distance) AS path_distance
+                    FROM facts_heap city
+                    JOIN hop1 ON hop1.parent_id = city.entity_id
+                    WHERE city.relation_id = {REL_CITY}
+                )
+                SELECT *
+                FROM expanded
+                ORDER BY path_distance, entity_id, relation_id, target_id
                 LIMIT {args.top_k}
             """
             helper_rerank_2hop = f"""
@@ -1218,6 +1278,12 @@ def main() -> int:
                 )
                 hit1, hitk, avg_rows = measure_quality(cur, "facts_pgv", pgvector_twohop, queries)
                 print_result("facts_pgv", pgvector_twohop.name, p50, avg, hits, reads, root, rowcount, hit1, hitk, avg_rows)
+                print(f"running|table=facts_pgv|case={pgvector_path_twohop.name}", flush=True)
+                p50, avg, hits, reads, root, rowcount = base.measure_case(
+                    cur, "facts_pgv", pgvector_path_twohop, queries, args.runs
+                )
+                hit1, hitk, avg_rows = measure_quality(cur, "facts_pgv", pgvector_path_twohop, queries)
+                print_result("facts_pgv", pgvector_path_twohop.name, p50, avg, hits, reads, root, rowcount, hit1, hitk, avg_rows)
 
             if not args.skip_zvec and zvec_coll is not None:
                 param = gut.zvec.HnswQueryParam(ef=args.zvec_ef)
@@ -1241,6 +1307,33 @@ def main() -> int:
                     lambda q, seeds: (sql_rerank_2hop, (seeds, q.query_vec)),
                 )
                 print_result("facts_zvec", "seed_expand2_rerank_rel_zvec", p50, avg, hits, reads, root, rowcount, hit1, hitk, avg_rows)
+                print("running|table=facts_zvec|case=seed_expand2_rerank_rel_pathsum_zvec", flush=True)
+                p50, avg, hits, reads, root, rowcount = measure_external_case(
+                    cur,
+                    queries,
+                    args.runs,
+                    zvec_seed_fn,
+                    lambda q, seeds: (sql_pathsum_2hop, (seeds, q.query_vec, q.query_vec, q.query_vec)),
+                )
+                hit1, hitk, avg_rows = measure_external_quality(
+                    cur,
+                    queries,
+                    zvec_seed_fn,
+                    lambda q, seeds: (sql_pathsum_2hop, (seeds, q.query_vec, q.query_vec, q.query_vec)),
+                )
+                print_result(
+                    "facts_zvec",
+                    "seed_expand2_rerank_rel_pathsum_zvec",
+                    p50,
+                    avg,
+                    hits,
+                    reads,
+                    root,
+                    rowcount,
+                    hit1,
+                    hitk,
+                    avg_rows,
+                )
 
             if not args.skip_qdrant and qdrant_client is not None and qdrant_name is not None:
                 params = gut.SearchParams(hnsw_ef=args.qdrant_ef, exact=False)
@@ -1271,6 +1364,33 @@ def main() -> int:
                 print_result(
                     "facts_qdrant",
                     "seed_expand2_rerank_rel_qdrant",
+                    p50,
+                    avg,
+                    hits,
+                    reads,
+                    root,
+                    rowcount,
+                    hit1,
+                    hitk,
+                    avg_rows,
+                )
+                print("running|table=facts_qdrant|case=seed_expand2_rerank_rel_pathsum_qdrant", flush=True)
+                p50, avg, hits, reads, root, rowcount = measure_external_case(
+                    cur,
+                    queries,
+                    args.runs,
+                    qdrant_seed_fn,
+                    lambda q, seeds: (sql_pathsum_2hop, (seeds, q.query_vec, q.query_vec, q.query_vec)),
+                )
+                hit1, hitk, avg_rows = measure_external_quality(
+                    cur,
+                    queries,
+                    qdrant_seed_fn,
+                    lambda q, seeds: (sql_pathsum_2hop, (seeds, q.query_vec, q.query_vec, q.query_vec)),
+                )
+                print_result(
+                    "facts_qdrant",
+                    "seed_expand2_rerank_rel_pathsum_qdrant",
                     p50,
                     avg,
                     hits,

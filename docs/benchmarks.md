@@ -190,9 +190,9 @@ This is the current balanced GraphRAG point for the fact-shaped workload.
 | sorted_heap SQL `pathsum` baseline | 0.847 ms | 98.4% | 98.4% | `hop1_distance + hop2_distance` in SQL |
 | sorted_heap_graph_rag_twohop_path_scan() | 0.739 ms | 98.4% | 98.4% | fused path-aware wrapper |
 | **sorted_heap_expand_twohop_path_rerank()** | **0.726 ms** | **98.4%** | **98.4%** | same knobs, fused path-aware helper |
-| pgvector HNSW + heap expansion | 1.244 ms | 70.3% | 85.9% | `ef_search=64` |
-| zvec HNSW + heap expansion | 0.927 ms | 76.6% | 96.9% | `ef=64` |
-| Qdrant HNSW + heap expansion | 2.417 ms | 76.6% | 96.9% | `hnsw_ef=64` |
+| pgvector HNSW + heap expansion | 2.588 ms | 90.6% | 90.6% | path-aware rerank, `ef_search=64` |
+| zvec HNSW + heap expansion | 2.507 ms | 100.0% | 100.0% | path-aware rerank, `ef=64` |
+| Qdrant HNSW + heap expansion | 4.947 ms | 100.0% | 100.0% | path-aware rerank, `hnsw_ef=64` |
 
 The path-aware helper changes the local conclusion materially: the dominant
 quality issue on this fact-shaped workload was the old hop-2-only rerank
@@ -200,10 +200,9 @@ contract, not seed ANN quality. The fused path-aware helper now gives the best
 local latency/quality point at the same `m=24`, `ef_construction=200`,
 `ann_k=64`, `ef_search=128` operating point.
 
-The external engine rows above are still on the older city-only rerank shape.
-So they remain useful as repository-owned baseline numbers, but they are not a
-strict apples-to-apples comparison against the new path-aware `sorted_heap`
-rows yet.
+Under the same path-aware scorer contract, the current local conclusion gets
+sharper: `sorted_heap` keeps the latency lead, while `zvec` and Qdrant reach
+the strongest observed answer quality on this deterministic fact graph.
 
 ### Current AWS GraphRAG multihop benchmark (`person -> parent -> city`)
 
@@ -223,21 +222,25 @@ This is the current portable multihop GraphRAG point.
 | sorted_heap SQL `pathsum` baseline | 1.204 ms | 98.4% | 98.4% | same ANN seeds, `hop1_distance + hop2_distance` |
 | **sorted_heap_expand_twohop_path_rerank()** | **0.955 ms** | **98.4%** | **98.4%** | fused path-aware helper |
 | sorted_heap_graph_rag_twohop_path_scan() | 1.018 ms | 98.4% | 98.4% | fused path-aware wrapper |
+| pgvector HNSW + heap expansion | 1.422 ms | 85.9% | 85.9% | path-aware rerank, `ef_search=64` |
+| zvec HNSW + heap expansion | 1.720 ms | 100.0% | 100.0% | path-aware rerank, `ef=64` |
+| Qdrant HNSW + heap expansion | 3.435 ms | 100.0% | 100.0% | path-aware rerank, `hnsw_ef=64` |
 
 The new AWS result matches the local diagnostic cleanly: the dominant quality
 loss on this workload was the old hop-2-only rerank contract, not the seed ANN
 frontier. The path-aware helper preserves the quality gain on ARM64 with only
 trivial latency cost versus the older helper.
 
-The external engine rows below are still on the older city-only rerank shape,
-so they remain a baseline for the previous contract rather than a strict
-apples-to-apples comparison against the new path-aware `sorted_heap` rows:
+On the apples-to-apples path-aware contract, the portable frontier is now:
+- `sorted_heap` fastest
+- `zvec` and Qdrant strongest on answer quality
+- `pgvector` still behind on both latency and quality at this operating point
 
-| Method | p50 latency | hit@1 | hit@k | Notes |
-|--------|:-----------:|:-----:|:-----:|-------|
-| pgvector HNSW + heap expansion | 1.323 ms | 70.3% | 85.9% | `ef_search=64`, city-only rerank |
-| zvec HNSW + heap expansion | 1.629 ms | 76.6% | 96.9% | `ef=64`, city-only rerank |
-| Qdrant HNSW + heap expansion | 3.330 ms | 76.6% | 96.9% | `hnsw_ef=64`, city-only rerank |
+One intermediate AWS all-engines rerun temporarily dropped the `sorted_heap`
+path-aware rows to `96.9%` / `96.9%`. An immediate `sorted_heap`-only control
+and a second full all-engines rerun both returned the stable `98.4% / 98.4%`
+point above, so the published table uses the confirmed rerun rather than the
+single outlier.
 
 The larger `10K`-chain AWS rerun now tells a different story than the older
 city-only benchmark. At the same portable point:

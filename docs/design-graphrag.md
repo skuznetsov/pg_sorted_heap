@@ -1602,6 +1602,12 @@ point:
   - SQL path-aware baseline: `1.204 ms`, `hit@1 = 98.4%`, `hit@k = 98.4%`
   - fused helper: `0.955 ms`, `hit@1 = 98.4%`, `hit@k = 98.4%`
   - one-call path-aware wrapper: `1.018 ms`, `hit@1 = 98.4%`, `hit@k = 98.4%`
+  - pgvector + heap expansion, same path-aware scorer: `1.422 ms`,
+    `hit@1 = 85.9%`, `hit@k = 85.9%`
+  - zvec + heap expansion, same path-aware scorer: `1.720 ms`,
+    `hit@1 = 100.0%`, `hit@k = 100.0%`
+  - Qdrant + heap expansion, same path-aware scorer: `3.435 ms`,
+    `hit@1 = 100.0%`, `hit@k = 100.0%`
 
 - `10K` chains, same knobs
   - heap two-hop SQL: `1.319 ms`, `hit@1 = 71.9%`, `hit@k = 92.2%`
@@ -1613,6 +1619,20 @@ point:
 So the answer to the transfer question is now yes: the path-aware helper and
 wrapper survive the AWS move cleanly, and the old larger-scale caveat narrows
 substantially once the rerank contract is fixed.
+
+This also closes the earlier apples-to-apples gap. Once all engines are scored
+under the same path-aware contract:
+
+- `sorted_heap` is the latency leader
+- `zvec` and Qdrant hold the strongest observed answer quality
+- `pgvector` remains behind on both latency and quality at this operating point
+
+One AWS all-engines rerun briefly dropped the `sorted_heap` path-aware rows to
+`96.9% / 96.9%`, but an immediate `sorted_heap`-only control and a second
+full rerun both returned `98.4% / 98.4%`. So the portable parity story now has
+one verified outlier plus two confirming reruns, which is strong enough for a
+benchmark note but still argues for a future repeated-build protocol if we
+want tighter confidence intervals.
 
 This also falsifies one tempting but wrong simplification:
 
@@ -1655,6 +1675,9 @@ What is now true:
   real-text GraphRAG path on Gutenberg without requiring a new graph API
 - on the real-text GraphRAG shape, `pgvector` parity is already materially
   worse end-to-end than the fused `sorted_heap` helper path
+- on the fact-shaped AWS path-aware benchmark, `sorted_heap` is now the
+  fastest verified end-to-end path, while `zvec` and Qdrant remain the answer
+  quality leaders
 - `zvec` is stable on the medium slice but currently not robust on the larger
   real-text slice at `ann_k=32`
 - `Qdrant` is robust on both real-text slices but materially slower than the
@@ -1669,9 +1692,9 @@ What is not yet true:
 - two-hop helper composition is not yet a universal latency win; at higher
   rerank dimensions it narrows to parity with heap+btree rather than staying
   clearly ahead
-- the current repository-owned external parity rows are still on the older
-  city-only rerank contract, so external engine comparisons are not yet
-  apples-to-apples against the new path-aware helper/wrapper
+- the current parity numbers still come from per-build reruns rather than a
+  fixed-graph or repeated-build median protocol, so build-variance confidence
+  bounds are still looser than ideal
 - transfer to a real `cogniformerus` corpus is still unverified; the current
   fact-shaped benchmark is deterministic and synthetic even though it matches
   the intended multihop query shape

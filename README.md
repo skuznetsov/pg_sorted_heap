@@ -128,10 +128,16 @@ which gives, on the current path-aware two-hop contract:
 
 - `sorted_heap_expand_twohop_path_rerank()` -> `0.955 ms`, `hit@1 98.4%`, `hit@k 98.4%`
 - `sorted_heap_graph_rag_twohop_path_scan()` -> `1.018 ms`, `hit@1 98.4%`, `hit@k 98.4%`
+- `pgvector` + heap expansion -> `1.422 ms`, `hit@1 85.9%`, `hit@k 85.9%`
+- `zvec` + heap expansion -> `1.720 ms`, `hit@1 100.0%`, `hit@k 100.0%`
+- `Qdrant` + heap expansion -> `3.435 ms`, `hit@1 100.0%`, `hit@k 100.0%`
 
 At the same knobs, the older city-only contract stays around `0.95-1.01 ms`
 but drops to `hit@1 75.0%` / `hit@k 96.9%`, so the main quality gain is now
 coming from the scorer contract rather than from a slower seed frontier.
+On the apples-to-apples path-aware contract, `sorted_heap` is the latency
+leader, while `zvec` and Qdrant still hold the strongest observed answer
+quality.
 
 The local M-series tuning run found a slightly different frontier, but the new
 path-aware helper transferred cleanly to AWS at both `5K` and `10K` chains.
