@@ -133,11 +133,18 @@ Done in this branch:
 
 ### Phase 2: hardening
 
-Needed next:
+Implemented in this branch:
 
-- lifecycle regression coverage
+- dump/restore coverage for registered GraphRAG alias mappings
+- extension upgrade coverage for `0.12.0 -> 0.13.0`
+- persistence coverage for `sorted_heap_graph_registry` across pg_dump/restore
+
+Still needed:
+
 - larger real-corpus repeated-build gates
 - observability across seed / expand / rerank stages
+- crash recovery coverage
+- concurrent DML/compact interaction checks on GraphRAG-shaped tables
 
 ### Phase 3: schema registration
 

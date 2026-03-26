@@ -35,6 +35,18 @@
   - `vec`
   - `body`
 
+### GraphRAG lifecycle hardening
+
+- Added `pg_extension_config_dump(...)` coverage for
+  `sorted_heap_graph_registry`, so registered GraphRAG mappings survive
+  `pg_dump` / `pg_restore`.
+- Added `scripts/test_graph_rag_lifecycle.sh` and `make test-graphrag-lifecycle`
+  to verify:
+  - `0.12.0 -> 0.13.0` extension upgrade
+  - alias-schema registration
+  - registry persistence across dump/restore
+  - post-restore GraphRAG query correctness on registered alias schemas
+
 ## 0.12.0 (2026-03-26)
 
 ### Release documentation pass

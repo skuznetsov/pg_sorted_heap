@@ -49,6 +49,7 @@ TEST_CONCURRENT_PORT ?= 65490
 TEST_CRASH_PORT ?= 65491
 TEST_TOAST_PORT ?= 65492
 TEST_ALTER_PORT ?= 65493
+TEST_GRAPHRAG_PORT ?= 65494
 TEST_DUMP_PORT ?= 65495
 TEST_GRAPH_PORT ?= 65489
 BENCH_PORT ?= 65494
@@ -470,6 +471,9 @@ test-alter-table:
 test-dump-restore:
 	./scripts/test_dump_restore.sh $(TMP_SELFTEST_ROOT) $(TEST_DUMP_PORT)
 
+test-graphrag-lifecycle:
+	./scripts/test_graph_rag_lifecycle.sh $(TMP_SELFTEST_ROOT) $(TEST_GRAPHRAG_PORT)
+
 test-graph-builder:
 	./scripts/test_graph_builder.sh $(TMP_SELFTEST_ROOT) $(TEST_GRAPH_PORT)
 
@@ -595,6 +599,7 @@ help:
 	@echo "  make test-crash-recovery TEST_CRASH_PORT=<base_port>"
 	@echo "  make test-toast TEST_TOAST_PORT=<port>"
 	@echo "  make test-alter-table TEST_ALTER_PORT=<port>"
+	@echo "  make test-graphrag-lifecycle TEST_GRAPHRAG_PORT=<port>"
 	@echo "  make test-graph-builder TEST_GRAPH_PORT=<port>"
 	@echo "  make build-graph-bench-nomic VECTOR_BENCH_DSN='<dsn>' VECTOR_GRAPH_TABLE=<graph_table> VECTOR_ENTRY_TABLE=<entry_table>"
 	@echo "  make build-hnsw-bench-nomic VECTOR_BENCH_DSN='<dsn>' HNSW_SOURCE_TABLE=<graph_table> HNSW_PREFIX=<prefix>"

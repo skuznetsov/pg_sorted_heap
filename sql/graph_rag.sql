@@ -19,28 +19,41 @@ INSERT INTO facts_sh VALUES
   (3, 2, 5, '[0,0,0.9,0.1]'::svec, 'e'),
   (4, 1, 6, '[0,0,0,1]'::svec, 'f');
 
-SELECT sorted_heap_compact('facts_sh'::regclass);
+COPY (
+  SELECT 'ok'
+  FROM (SELECT sorted_heap_compact('facts_sh'::regclass)) s
+) TO STDOUT;
 ANALYZE facts_sh;
 
-SELECT entity_id, relation_id, target_id, payload
-FROM sorted_heap_expand_ids('facts_sh'::regclass, ARRAY[1,3], NULL, 0)
-ORDER BY entity_id, relation_id, target_id;
+COPY (
+  SELECT entity_id, relation_id, target_id, payload
+  FROM sorted_heap_expand_ids('facts_sh'::regclass, ARRAY[1,3], NULL, 0)
+  ORDER BY entity_id, relation_id, target_id
+) TO STDOUT;
 
-SELECT entity_id, relation_id, target_id, payload
-FROM sorted_heap_expand_ids('facts_sh'::regclass, ARRAY[1,3], 1, 0)
-ORDER BY entity_id, relation_id, target_id;
+COPY (
+  SELECT entity_id, relation_id, target_id, payload
+  FROM sorted_heap_expand_ids('facts_sh'::regclass, ARRAY[1,3], 1, 0)
+  ORDER BY entity_id, relation_id, target_id
+) TO STDOUT;
 
-SELECT entity_id, relation_id, target_id, payload
-FROM sorted_heap_expand_ids('facts_sh'::regclass, ARRAY[1,3], NULL, 2)
-ORDER BY entity_id, relation_id, target_id;
+COPY (
+  SELECT entity_id, relation_id, target_id, payload
+  FROM sorted_heap_expand_ids('facts_sh'::regclass, ARRAY[1,3], NULL, 2)
+  ORDER BY entity_id, relation_id, target_id
+) TO STDOUT;
 
-SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
-FROM sorted_heap_expand_rerank('facts_sh'::regclass, ARRAY[1,3], '[1,0,0,0]'::svec, 2, NULL, 0)
-ORDER BY distance, entity_id, relation_id, target_id;
+COPY (
+  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+  FROM sorted_heap_expand_rerank('facts_sh'::regclass, ARRAY[1,3], '[1,0,0,0]'::svec, 2, NULL, 0)
+  ORDER BY distance, entity_id, relation_id, target_id
+) TO STDOUT;
 
-SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
-FROM sorted_heap_graph_rag_scan('facts_sh'::regclass, '[1,0,0,0]'::svec, 2, 2, NULL, 0)
-ORDER BY distance, entity_id, relation_id, target_id;
+COPY (
+  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+  FROM sorted_heap_graph_rag_scan('facts_sh'::regclass, '[1,0,0,0]'::svec, 2, 2, NULL, 0)
+  ORDER BY distance, entity_id, relation_id, target_id
+) TO STDOUT;
 
 COPY (
   SELECT entity_id, relation_id, target_id, payload
@@ -126,40 +139,44 @@ COPY (
   ORDER BY distance, entity_id, relation_id, target_id
 ) TO STDOUT;
 
-WITH helper AS (
-  SELECT entity_id, relation_id, target_id, payload
-  FROM sorted_heap_expand_ids('facts_sh'::regclass, ARRAY[1,3], NULL, 0)
-),
-sql_baseline AS (
-  SELECT entity_id, relation_id, target_id, payload
-  FROM facts_sh
-  WHERE entity_id = ANY (ARRAY[1,3]::int4[])
-)
-SELECT count(*) AS diff_rows
-FROM (
-  (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
-  UNION ALL
-  (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
-) diff;
+COPY (
+  WITH helper AS (
+    SELECT entity_id, relation_id, target_id, payload
+    FROM sorted_heap_expand_ids('facts_sh'::regclass, ARRAY[1,3], NULL, 0)
+  ),
+  sql_baseline AS (
+    SELECT entity_id, relation_id, target_id, payload
+    FROM facts_sh
+    WHERE entity_id = ANY (ARRAY[1,3]::int4[])
+  )
+  SELECT count(*) AS diff_rows
+  FROM (
+    (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
+    UNION ALL
+    (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
+  ) diff
+) TO STDOUT;
 
-WITH helper AS (
-  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
-  FROM sorted_heap_expand_rerank('facts_sh'::regclass, ARRAY[1,3], '[1,0,0,0]'::svec, 2, NULL, 0)
-),
-sql_baseline AS (
-  SELECT entity_id, relation_id, target_id, payload,
-         round((embedding <=> '[1,0,0,0]'::svec)::numeric, 6) AS distance
-  FROM facts_sh
-  WHERE entity_id = ANY (ARRAY[1,3]::int4[])
-  ORDER BY embedding <=> '[1,0,0,0]'::svec, entity_id, relation_id, target_id
-  LIMIT 2
-)
-SELECT count(*) AS rerank_diff_rows
-FROM (
-  (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
-  UNION ALL
-  (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
-) diff;
+COPY (
+  WITH helper AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_expand_rerank('facts_sh'::regclass, ARRAY[1,3], '[1,0,0,0]'::svec, 2, NULL, 0)
+  ),
+  sql_baseline AS (
+    SELECT entity_id, relation_id, target_id, payload,
+           round((embedding <=> '[1,0,0,0]'::svec)::numeric, 6) AS distance
+    FROM facts_sh
+    WHERE entity_id = ANY (ARRAY[1,3]::int4[])
+    ORDER BY embedding <=> '[1,0,0,0]'::svec, entity_id, relation_id, target_id
+    LIMIT 2
+  )
+  SELECT count(*) AS rerank_diff_rows
+  FROM (
+    (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
+    UNION ALL
+    (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
+  ) diff
+) TO STDOUT;
 
 COPY (
   WITH helper AS (
@@ -221,37 +238,39 @@ COPY (
   ) diff
 ) TO STDOUT;
 
-WITH helper AS (
-  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
-  FROM sorted_heap_graph_rag_scan('facts_sh'::regclass, '[1,0,0,0]'::svec, 2, 2, NULL, 0)
-),
-ann AS MATERIALIZED (
-  SELECT target_id
-  FROM facts_sh
-  ORDER BY embedding <=> '[1,0,0,0]'::svec
-  LIMIT 2
-),
-seeds AS MATERIALIZED (
-  SELECT DISTINCT target_id FROM ann
-),
-expanded AS MATERIALIZED (
-  SELECT *
-  FROM facts_sh
-  WHERE entity_id = ANY (ARRAY(SELECT target_id FROM seeds))
-),
-sql_baseline AS (
-  SELECT entity_id, relation_id, target_id, payload,
-         round((embedding <=> '[1,0,0,0]'::svec)::numeric, 6) AS distance
-  FROM expanded
-  ORDER BY embedding <=> '[1,0,0,0]'::svec, entity_id, relation_id, target_id
-  LIMIT 2
-)
-SELECT count(*) AS graph_rag_diff_rows
-FROM (
-  (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
-  UNION ALL
-  (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
-) diff;
+COPY (
+  WITH helper AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_graph_rag_scan('facts_sh'::regclass, '[1,0,0,0]'::svec, 2, 2, NULL, 0)
+  ),
+  ann AS MATERIALIZED (
+    SELECT target_id
+    FROM facts_sh
+    ORDER BY embedding <=> '[1,0,0,0]'::svec
+    LIMIT 2
+  ),
+  seeds AS MATERIALIZED (
+    SELECT DISTINCT target_id FROM ann
+  ),
+  expanded AS MATERIALIZED (
+    SELECT *
+    FROM facts_sh
+    WHERE entity_id = ANY (ARRAY(SELECT target_id FROM seeds))
+  ),
+  sql_baseline AS (
+    SELECT entity_id, relation_id, target_id, payload,
+           round((embedding <=> '[1,0,0,0]'::svec)::numeric, 6) AS distance
+    FROM expanded
+    ORDER BY embedding <=> '[1,0,0,0]'::svec, entity_id, relation_id, target_id
+    LIMIT 2
+  )
+  SELECT count(*) AS graph_rag_diff_rows
+  FROM (
+    (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
+    UNION ALL
+    (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
+  ) diff
+) TO STDOUT;
 
 COPY (
   WITH helper AS (
@@ -513,16 +532,24 @@ INSERT INTO facts_alias VALUES
   (3, 2, 5, '[0,0,0.9,0.1]'::svec, 'e'),
   (4, 1, 6, '[0,0,0,1]'::svec, 'f');
 
-SELECT sorted_heap_compact('facts_alias'::regclass);
+COPY (
+  SELECT 'ok'
+  FROM (SELECT sorted_heap_compact('facts_alias'::regclass)) s
+) TO STDOUT;
 
-SELECT sorted_heap_graph_register(
-  'facts_alias'::regclass,
-  entity_column := 'src_id',
-  relation_column := 'edge_type',
-  target_column := 'dst_id',
-  embedding_column := 'vec',
-  payload_column := 'body'
-);
+COPY (
+  SELECT 'ok'
+  FROM (
+    SELECT sorted_heap_graph_register(
+      'facts_alias'::regclass,
+      entity_column := 'src_id',
+      relation_column := 'edge_type',
+      target_column := 'dst_id',
+      embedding_column := 'vec',
+      payload_column := 'body'
+    )
+  ) s
+) TO STDOUT;
 
 COPY (
   SELECT entity_column::text, relation_column::text, target_column::text,
@@ -556,7 +583,9 @@ COPY (
   ORDER BY distance, entity_id, relation_id, target_id
 ) TO STDOUT;
 
-SELECT sorted_heap_graph_unregister('facts_alias'::regclass);
+COPY (
+  SELECT sorted_heap_graph_unregister('facts_alias'::regclass)
+) TO STDOUT;
 
 COPY (
   SELECT entity_column::text, relation_column::text, target_column::text,

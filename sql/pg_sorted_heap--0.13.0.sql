@@ -432,6 +432,8 @@ CREATE TABLE @extschema@.sorted_heap_graph_registry (
   payload_column name NOT NULL
 );
 
+SELECT pg_catalog.pg_extension_config_dump('@extschema@.sorted_heap_graph_registry', '');
+
 CREATE FUNCTION @extschema@.sorted_heap_graph_register(
   rel regclass,
   entity_column name DEFAULT 'entity_id',
