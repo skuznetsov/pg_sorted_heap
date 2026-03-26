@@ -22,6 +22,12 @@
   - `sorted_heap_graph_rag_twohop_path_scan(...)`
 - Code-corpus snippet/symbol/lexical retrieval contracts remain
   benchmark/reference logic, not the stable SQL surface.
+- Added `make test-graphrag-release` to run the full GraphRAG release-candidate
+  bundle:
+  - SQL regression
+  - lifecycle
+  - crash recovery
+  - concurrent online-operation coverage
 
 ### GraphRAG syntax unification
 

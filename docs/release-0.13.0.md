@@ -128,22 +128,22 @@ ALTER EXTENSION pg_sorted_heap UPDATE TO '0.13.0';
 ## Recommended verification after upgrade
 
 ```bash
-make installcheck REGRESS='pg_sorted_heap sorted_hnsw graph_rag'
-make test-graphrag-lifecycle
-make test-graphrag-crash
-make test-graphrag-concurrent
+make test-graphrag-release
 ```
+
+This wrapper target runs the full narrow GraphRAG release bundle:
+
+- SQL regression (`pg_sorted_heap`, `sorted_hnsw`, `graph_rag`)
+- lifecycle
+- crash recovery
+- concurrent online-operation coverage
 
 ## Release-candidate verification
 
 Fresh `0.13.0` release-candidate checks run on `2026-03-26`:
 
 ```bash
-make installcheck REGRESS='pg_sorted_heap sorted_hnsw graph_rag' \
-  REGRESS_OPTS='--temp-instance=/tmp/pg_regress.codex.release013_rc1'
-make test-graphrag-lifecycle
-make test-graphrag-crash
-make test-graphrag-concurrent
+make test-graphrag-release
 ```
 
 Observed signals:
@@ -152,6 +152,8 @@ Observed signals:
 - `make test-graphrag-lifecycle` -> `status=ok pass=20 fail=0 total=20`
 - `make test-graphrag-crash` -> `status=ok pass=22 fail=0 total=22`
 - `make test-graphrag-concurrent` -> `status=ok pass=40 fail=0 total=40`
+- `make test-graphrag-release` -> wrapper target verified end-to-end with the
+  same pass signals above
 
 This bundle covers the narrow stable GraphRAG surface directly:
 

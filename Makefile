@@ -53,6 +53,7 @@ TEST_GRAPHRAG_PORT ?= 65494
 TEST_DUMP_PORT ?= 65495
 TEST_GRAPHRAG_CRASH_PORT ?= 65498
 TEST_GRAPHRAG_CONCURRENT_PORT ?= 65499
+TEST_GRAPHRAG_RELEASE_TMP ?= $(TMP_SELFTEST_ROOT)/pg_regress.codex.graphrag_release
 TEST_GRAPH_PORT ?= 65489
 BENCH_PORT ?= 65494
 BENCH_SCALES ?= 1000000,10000000
@@ -482,6 +483,12 @@ test-dump-restore:
 test-graphrag-lifecycle:
 	./scripts/test_graph_rag_lifecycle.sh $(TMP_SELFTEST_ROOT) $(TEST_GRAPHRAG_PORT)
 
+test-graphrag-release:
+	$(MAKE) installcheck REGRESS='pg_sorted_heap sorted_hnsw graph_rag' REGRESS_OPTS="--temp-instance=$(TEST_GRAPHRAG_RELEASE_TMP)"
+	$(MAKE) test-graphrag-lifecycle
+	$(MAKE) test-graphrag-crash
+	$(MAKE) test-graphrag-concurrent
+
 test-graph-builder:
 	./scripts/test_graph_builder.sh $(TMP_SELFTEST_ROOT) $(TEST_GRAPH_PORT)
 
@@ -610,6 +617,7 @@ help:
 	@echo "  make test-toast TEST_TOAST_PORT=<port>"
 	@echo "  make test-alter-table TEST_ALTER_PORT=<port>"
 	@echo "  make test-graphrag-lifecycle TEST_GRAPHRAG_PORT=<port>"
+	@echo "  make test-graphrag-release TMP_SELFTEST_ROOT=<abs_tmp_dir>"
 	@echo "  make test-graph-builder TEST_GRAPH_PORT=<port>"
 	@echo "  make build-graph-bench-nomic VECTOR_BENCH_DSN='<dsn>' VECTOR_GRAPH_TABLE=<graph_table> VECTOR_ENTRY_TABLE=<entry_table>"
 	@echo "  make build-hnsw-bench-nomic VECTOR_BENCH_DSN='<dsn>' HNSW_SOURCE_TABLE=<graph_table> HNSW_PREFIX=<prefix>"
