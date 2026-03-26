@@ -145,6 +145,28 @@ The full tuning history, reasoning, external-engine caveats, and larger-scale
 results live in
 [docs/design-graphrag.md](/Users/sergey/Projects/C/clustered_pg/docs/design-graphrag.md).
 
+There is now also a **real code-corpus** GraphRAG benchmark using the actual
+`cogniformerus` source tree plus the real CrossFile prompts from
+`butler_code_test.cr`. On that corpus, the current result is not one universal
+winner but a split frontier:
+
+- generic embedding mode:
+  - `prompt_summary_snippet_py`
+  - local repeated-build median `0.613 ms`, AWS repeated-build median `0.955 ms`
+  - stable `100.0%` keyword coverage / `100.0%` full hits
+- code-aware embedding mode:
+  - `prompt_symbol_summary_snippet_py`
+  - local repeated-build median `0.963 ms`, AWS repeated-build median `1.541 ms`
+  - stable `100.0%` keyword coverage / `100.0%` full hits
+
+The key correction is that the code-aware path needed exact prompt-symbol
+rescue (`HierarchicalMemory`, `TwoStageAnswerer`, `DialogueNLU`, etc.) in the
+summary seed stage; the generic path did not. The repeated-build and AWS
+results are documented in
+[docs/design-graphrag.md](/Users/sergey/Projects/C/clustered_pg/docs/design-graphrag.md)
+and summarized in
+[docs/benchmarks.md](/Users/sergey/Projects/C/clustered_pg/docs/benchmarks.md).
+
 ### Legacy/manual ANN paths
 
 The older explicit ANN paths are still available when you want manual control

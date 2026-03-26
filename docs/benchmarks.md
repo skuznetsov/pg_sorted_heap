@@ -332,6 +332,36 @@ AWS ARM64 runs. The fused path-aware helper measured:
 So the current strongest portable GraphRAG result is no longer the SQL
 baseline or the old city-only helper. It is the fused path-aware helper.
 
+### Current real code-corpus GraphRAG benchmark (`cogniformerus` CrossFile)
+
+Repo-owned harnesses:
+
+- `python3 scripts/bench_graph_rag_code_corpus.py --runs 3 --backend-mode fresh --ann-k 16 --top-k 4`
+- `python3 scripts/repeat_graph_rag_code_corpus_builds.py --repeats 3 --runs 3 --backend-mode fresh`
+- `REMOTE_PYTHON=/path/to/python REPEATS=3 RUNS=3 BACKEND_MODE=fresh bash scripts/repeat_graph_rag_code_corpus_builds_aws.sh <aws-host> /path/to/repo 65320`
+
+This benchmark uses the actual `cogniformerus` source tree (`40` files,
+`840` rows after chunk + summary expansion) and the real CrossFile prompts from
+`butler_code_test.cr`. The current real-corpus conclusion is **not** a single
+universal winner. The frontier splits by embedding mode:
+
+| Mode | Best case | Local repeated-build p50 | AWS repeated-build p50 | Keyword coverage | Full hits | Notes |
+|------|-----------|:------------------------:|:----------------------:|:----------------:|:---------:|-------|
+| generic | `prompt_summary_snippet_py` | `0.613 ms` | `0.955 ms` | `100.0%` | `100.0%` | symbol-aware variant is strictly slower with no quality gain |
+| code-aware | `prompt_symbol_summary_snippet_py` | `0.963 ms` | `1.541 ms` | `100.0%` | `100.0%` | exact prompt-symbol rescue is required in summary seeding |
+
+The most important diagnostic result was the old code-aware miss:
+
+- `prompt_summary_snippet_py` on `facts_sh`
+  - local repeated-build: `97.6%` keyword coverage, `83.3%` full hits
+  - AWS repeated-build: `97.6%`, `83.3%`
+- `prompt_symbol_summary_snippet_py` on `facts_sh`
+  - local repeated-build: `100.0%`, `100.0%`
+  - AWS repeated-build: `100.0%`, `100.0%`
+
+So the code-aware quality win is now both repeated-build stable and
+cross-environment stable. The change in winner is not a local-only artifact.
+
 ### Legacy/manual IVF-PQ benchmark
 
 The sections below are still useful for the explicit IVF-PQ API
