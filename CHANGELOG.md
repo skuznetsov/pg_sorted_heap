@@ -87,6 +87,21 @@
   - `sorted_hnsw` indexes stay valid and usable
   - backend-local GraphRAG observability still reports non-empty stage stats
 
+### GraphRAG larger real-corpus verification
+
+- Refreshed the `0.13` GraphRAG plan and benchmark docs with a larger in-repo
+  `cogniformerus` transfer gate.
+- Verified that the old tiny-budget code-corpus point (`top_k=4`) drifts on
+  the full `183`-file `cogniformerus` repository to about `87%` keyword
+  coverage and `66.7%` full hits.
+- Verified that increasing only the final result budget to `top_k=8` restores
+  repeated-build stable `100.0% / 100.0%` on that larger in-repo Crystal
+  corpus for both:
+  - generic `prompt_summary_snippet_py`
+  - code-aware `prompt_symbol_summary_snippet_py`
+- Narrowed the remaining `0.13` real-corpus gap to mixed-language / archive
+  corpora under `~/Projects/C` and `~/SrcArchives`.
+
 ## 0.12.0 (2026-03-26)
 
 ### Release documentation pass

@@ -2817,6 +2817,72 @@ So the code-aware split is now **cross-environment verified**:
 - code-aware keeps the symbol-aware snippet contract
 - the change in winner is not a local Apple-only artifact
 
+## Larger in-repo `cogniformerus` transfer gate
+
+The previous repeated-build result used the smaller synced
+`cogniformerus/src/cogniformerus` slice (`40` files, `840` rows after summary +
+chunk expansion). That was a good stable benchmark, but it was still fair to
+ask whether the contract would survive a materially larger in-repo code corpus.
+
+The next bounded adversary check therefore reran the same repeated-build
+protocol on the full `cogniformerus` repository:
+
+- source tree: `~/Projects/Crystal/cogniformerus`
+- file count: `183` Crystal files
+- prompt set: the same real `butler_code_test.cr` CrossFile prompts
+- same ANN knobs:
+  - `384D`
+  - `ann_k=16`
+  - `ef_search=64`
+  - `ef_construction=200`
+  - `m=24`
+
+The old tiny-budget point (`top_k=4`) did **not** transfer cleanly:
+
+- generic `prompt_summary_snippet_py`
+  - `p50 0.770 ms`
+  - `87.1%` keyword coverage
+  - `66.7%` full hits
+  - `avg_rows 3.67`
+- code-aware `prompt_symbol_summary_snippet_py`
+  - `p50 1.824 ms`
+  - `87.6%` keyword coverage
+  - `66.7%` full hits
+  - `avg_rows 4.00`
+
+That is a real transfer gap, but it is **not** the same kind of failure as the
+external `folding/src` miss. The next bounded hypothesis was simply to raise
+the final result budget while keeping the same seed contract and the same
+winner cases.
+
+At `top_k=8`, `3` fresh builds gave:
+
+- generic `prompt_summary_snippet_py`
+  - `p50 median 0.819 ms`, range `0.794-0.855 ms`
+  - stable `100.0% / 100.0%`
+  - `avg_rows 6.33`
+- code-aware `prompt_symbol_summary_snippet_py`
+  - `p50 median 1.814 ms`, range `1.669-2.101 ms`
+  - stable `100.0% / 100.0%`
+  - `avg_rows 7.50`
+
+So the larger in-repo Crystal-side transfer gate is now verified.
+
+The honest correction is:
+
+- the current real code-corpus winners are **not** universal at the old
+  `top_k=4` budget
+- on the full in-repo corpus, they need a slightly larger final result budget
+- once that budget moves to `top_k=8`, the current winners recover perfectly
+  without needing a new seed or snippet contract
+
+That narrows the remaining `0.13` real-corpus gap further:
+
+- `~/Projects/Crystal` now has both the small stable slice and a larger
+  full-repo transfer gate
+- the remaining unverified generalization work is the mixed-language /
+  archive side (`~/Projects/C`, `~/SrcArchives`)
+
 ## External folding corpus check
 
 The next adversary check was a second real code corpus outside this repository:

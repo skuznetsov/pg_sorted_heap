@@ -290,6 +290,23 @@ results are documented in
 and summarized in
 [docs/benchmarks.md](/Users/sergey/Projects/C/clustered_pg/docs/benchmarks.md).
 
+A larger in-repo transfer gate now also exists on the full
+`cogniformerus` repository (`183` Crystal files instead of the smaller
+`40`-file synced slice). At the old `top_k=4` budget, both winner contracts
+drift to about `87%` keyword coverage and `66.7%` full hits. Raising only the
+final result budget to `top_k=8` restores repeated-build stable
+`100.0% / 100.0%` on that larger corpus:
+
+- generic `prompt_summary_snippet_py`
+  - local repeated-build median `0.819 ms`
+  - stable `100.0%` keyword coverage / `100.0%` full hits
+- code-aware `prompt_symbol_summary_snippet_py`
+  - local repeated-build median `1.814 ms`
+  - stable `100.0%` keyword coverage / `100.0%` full hits
+
+So the larger in-repo Crystal-side transfer gate is now verified, but it is
+slightly more result-budget-sensitive than the smaller synced slice.
+
 ### Legacy/manual ANN paths
 
 The older explicit ANN paths are still available when you want manual control

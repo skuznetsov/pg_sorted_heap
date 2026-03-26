@@ -363,6 +363,37 @@ The most important diagnostic result was the old code-aware miss:
 So the code-aware quality win is now both repeated-build stable and
 cross-environment stable. The change in winner is not a local-only artifact.
 
+### Larger in-repo `cogniformerus` transfer gate
+
+The smaller `40`-file code-corpus slice above is a useful stable benchmark, but
+it is not the only in-repo transfer check anymore. The same repeated-build
+protocol was rerun on the full `cogniformerus` repository (`183` Crystal
+files), still using the real CrossFile prompts from `butler_code_test.cr`.
+
+Control point at the old tiny-budget contract (`top_k=4`, `1` fresh build):
+
+| Mode | Best case | Local p50 | Keyword coverage | Full hits | Avg returned rows | Notes |
+|------|-----------|:---------:|:----------------:|:---------:|:-----------------:|-------|
+| generic | `prompt_summary_snippet_py` | `0.770 ms` | `87.1%` | `66.7%` | `3.67` | larger corpus exposes a result-budget cliff |
+| code-aware | `prompt_symbol_summary_snippet_py` | `1.824 ms` | `87.6%` | `66.7%` | `4.00` | same cliff under code-aware embeddings |
+
+Bounded recovery point (`top_k=8`, `3` fresh builds):
+
+| Mode | Best case | Local repeated-build p50 | Keyword coverage | Full hits | Avg returned rows | Notes |
+|------|-----------|:------------------------:|:----------------:|:---------:|:-----------------:|-------|
+| generic | `prompt_summary_snippet_py` | `0.819 ms` | `100.0%` | `100.0%` | `6.33` | larger in-repo Crystal transfer now verified |
+| code-aware | `prompt_symbol_summary_snippet_py` | `1.814 ms` | `100.0%` | `100.0%` | `7.50` | same winner, but needs the larger final budget |
+
+Interpretation:
+
+- the current real code-corpus contracts do transfer beyond the tiny `40`-file
+  slice
+- the dominant larger-corpus issue on the in-repo Crystal side is result
+  budget, not a new retrieval failure
+- this larger-corpus gate is now covered locally for `~/Projects/Crystal`;
+  mixed-language transfer from `~/Projects/C` and `~/SrcArchives` is still the
+  remaining unverified part of the `0.13` hardening story
+
 ### External folding stress corpus for GraphRAG beta (`folding/src`)
 
 The same harness was then pointed at a second real code corpus outside this

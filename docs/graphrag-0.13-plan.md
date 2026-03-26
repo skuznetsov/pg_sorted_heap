@@ -113,8 +113,14 @@ The existing beta surface works, but it is a function zoo.
      for release tuning and debugging but not a full tracing system
 
 4. Larger real-corpus verification
-   - current in-repo real code corpus is still small
-   - larger gates should use corpora from:
+   - current progress:
+     - the smaller in-repo `cogniformerus` slice is already repeated-build
+       stable at `100.0% / 100.0%`
+     - a larger in-repo transfer gate on the full
+       `~/Projects/Crystal/cogniformerus` repository now also passes
+       repeated-build verification once the final result budget is raised from
+       `top_k=4` to `top_k=8`
+   - remaining larger-corpus gates should still cover corpora from:
      - `~/Projects/Crystal`
      - `~/Projects/C`
      - `~/SrcArchives`
@@ -150,7 +156,8 @@ Implemented in this branch:
 
 Still needed:
 
-- larger real-corpus repeated-build gates
+- mixed-language / archive repeated-build gates outside the current Crystal
+  corpora (`~/Projects/C`, `~/SrcArchives`)
 
 ### Phase 3: schema registration
 
