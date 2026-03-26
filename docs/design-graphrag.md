@@ -2784,3 +2784,35 @@ Interpretation:
   HNSW construction
 - the generic frontier is also build-stable, and the symbol-aware case remains
   dominated there
+
+That same repeated-build protocol was then rerun on an AWS ARM64 host
+(`4 vCPU`, `8 GiB RAM`) using:
+
+- [`scripts/repeat_graph_rag_code_corpus_builds_aws.sh`](/Users/sergey/Projects/C/clustered_pg/scripts/repeat_graph_rag_code_corpus_builds_aws.sh)
+- the same `3` fresh builds
+- the same minimal synced `cogniformerus` source tree and
+  `butler_code_test.cr` prompt set
+
+Verified AWS repeated-build result:
+
+- generic:
+  - `prompt_summary_snippet_py`
+    - `p50 median 0.955 ms`, range `0.954-0.960 ms`
+    - stable `100.0% / 100.0%`
+  - `prompt_symbol_summary_snippet_py`
+    - `p50 median 1.485 ms`, range `1.473-1.487 ms`
+    - same `100.0% / 100.0%`
+    - still strictly slower on the generic frontier
+- code-aware:
+  - `prompt_summary_snippet_py`
+    - `p50 median 1.008 ms`, range `1.008-1.009 ms`
+    - stable `97.6% / 83.3%`
+  - `prompt_symbol_summary_snippet_py`
+    - `p50 median 1.541 ms`, range `1.537-1.557 ms`
+    - stable `100.0% / 100.0%`
+
+So the code-aware split is now **cross-environment verified**:
+
+- generic keeps the older snippet contract
+- code-aware keeps the symbol-aware snippet contract
+- the change in winner is not a local Apple-only artifact
