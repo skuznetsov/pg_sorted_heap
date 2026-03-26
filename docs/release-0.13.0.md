@@ -134,6 +134,32 @@ make test-graphrag-crash
 make test-graphrag-concurrent
 ```
 
+## Release-candidate verification
+
+Fresh `0.13.0` release-candidate checks run on `2026-03-26`:
+
+```bash
+make installcheck REGRESS='pg_sorted_heap sorted_hnsw graph_rag' \
+  REGRESS_OPTS='--temp-instance=/tmp/pg_regress.codex.release013_rc1'
+make test-graphrag-lifecycle
+make test-graphrag-crash
+make test-graphrag-concurrent
+```
+
+Observed signals:
+
+- `make installcheck ...` -> `All 3 tests passed`
+- `make test-graphrag-lifecycle` -> `status=ok pass=20 fail=0 total=20`
+- `make test-graphrag-crash` -> `status=ok pass=22 fail=0 total=22`
+- `make test-graphrag-concurrent` -> `status=ok pass=40 fail=0 total=40`
+
+This bundle covers the narrow stable GraphRAG surface directly:
+
+- SQL regression coverage for unified syntax, schema registration, and stats
+- upgrade + dump/restore lifecycle for registered fact graphs
+- crash recovery for registered/indexed graph tables
+- concurrent DML with online compact / online merge on registered fact graphs
+
 ## Release positioning
 
 The clean `0.13` split is:
