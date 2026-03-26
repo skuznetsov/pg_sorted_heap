@@ -31,6 +31,7 @@ ZVEC_EF="${ZVEC_EF:-64}"
 ZVEC_MEMORY_LIMIT_MB="${ZVEC_MEMORY_LIMIT_MB:-6144}"
 QDRANT_EF="${QDRANT_EF:-64}"
 SHARED_BUFFERS_MB="${SHARED_BUFFERS_MB:-64}"
+SHARED_CACHE="${SHARED_CACHE:-off}"
 BACKEND_MODE="${BACKEND_MODE:-fresh}"
 CASES="${CASES:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
@@ -96,6 +97,7 @@ cd '$REMOTE_DIR'
   --zvec-memory-limit-mb '$ZVEC_MEMORY_LIMIT_MB' \
   --qdrant-ef '$QDRANT_EF' \
   --shared-buffers-mb '$SHARED_BUFFERS_MB' \
+  --shared-cache '$SHARED_CACHE' \
   --backend-mode '$BACKEND_MODE' \
   --install-cmd "sudo make -C '$REMOTE_DIR' install" \
   $CASE_ARG \

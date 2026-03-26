@@ -757,6 +757,7 @@ def main() -> int:
     ap.add_argument("--qdrant-ef", type=int, default=64)
     ap.add_argument("--skip-qdrant", action="store_true")
     ap.add_argument("--shared-buffers-mb", type=int, default=64)
+    ap.add_argument("--shared-cache", choices=("on", "off"), default="off")
     ap.add_argument("--backend-mode", choices=("fresh", "reuse"), default="fresh")
     ap.add_argument("--exact-seed-diagnostics", action="store_true")
     ap.add_argument("--install-cmd", default="")
@@ -781,7 +782,7 @@ def main() -> int:
         cur = conn.cursor()
         try:
             cur.execute("SET jit = off")
-            cur.execute("SET sorted_hnsw.shared_cache = off")
+            cur.execute(f"SET sorted_hnsw.shared_cache = {args.shared_cache}")
             cur.execute(f"SET sorted_hnsw.ef_search = {args.ef_search}")
             base.bootstrap_schema(cur, args.dim)
             base.load_data(cur, csv_path)
@@ -1132,6 +1133,7 @@ def main() -> int:
             print(f"zvec:             {'off' if args.skip_zvec else 'on'}")
             print(f"qdrant:           {'off' if args.skip_qdrant else 'on'}")
             print(f"shared_buffers:   {args.shared_buffers_mb}MB")
+            print(f"shared_cache:     {args.shared_cache}")
             print(f"backend_mode:     {args.backend_mode}")
             print(f"exact_seed_diag:  {'on' if args.exact_seed_diagnostics else 'off'}")
             print(f"sample_city:      {next(iter(city_names.values())) if city_names else 'n/a'}")
@@ -1144,7 +1146,7 @@ def main() -> int:
                 cur = conn.cursor()
 
             cur.execute("SET jit = off")
-            cur.execute("SET sorted_hnsw.shared_cache = off")
+            cur.execute(f"SET sorted_hnsw.shared_cache = {args.shared_cache}")
             cur.execute(f"SET sorted_hnsw.ef_search = {args.ef_search}")
             ann_seed_fn = build_ann_seed_fn(cur, args.ann_k, "facts_sh")
             exact_seed_fn = build_exact_seed_fn(cur, args.ann_k, args.dim)

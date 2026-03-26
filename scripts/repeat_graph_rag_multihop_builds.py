@@ -91,6 +91,7 @@ def main() -> int:
     ap.add_argument("--zvec-memory-limit-mb", type=int, default=8192)
     ap.add_argument("--qdrant-ef", type=int, default=64)
     ap.add_argument("--shared-buffers-mb", type=int, default=64)
+    ap.add_argument("--shared-cache", choices=("on", "off"), default="off")
     ap.add_argument("--backend-mode", choices=("fresh", "reuse"), default="fresh")
     ap.add_argument("--install-cmd", default="")
     ap.add_argument("--skip-pgvector", action="store_true")
@@ -125,6 +126,7 @@ def main() -> int:
     print(f"ef_search:        {args.ef_search}")
     print(f"ef_construction:  {args.ef_construction}")
     print(f"m:                {args.m}")
+    print(f"shared_cache:     {args.shared_cache}")
     print(f"backend_mode:     {args.backend_mode}")
     print(f"cases:            {','.join(sorted(selected_cases))}")
     print()
@@ -168,6 +170,8 @@ def main() -> int:
             str(args.qdrant_ef),
             "--shared-buffers-mb",
             str(args.shared_buffers_mb),
+            "--shared-cache",
+            args.shared_cache,
             "--backend-mode",
             args.backend_mode,
         ]

@@ -3192,3 +3192,36 @@ summary prefix. On the external corpus:
 So a naive prefix cut is now a documented dead end. The remaining work is not
 "look at less text in the same way"; it needs a different lexical-seed
 representation or a different seed-selection contract altogether.
+
+## March 26, 2026: `sorted_hnsw.shared_cache` GraphRAG branch
+
+A new bounded speed branch looked promising for fact-shaped GraphRAG: turning
+`sorted_hnsw.shared_cache` on for the ANN seed step. A direct local probe on a
+`2K x 384D` multihop graph reduced the path-aware wrapper from roughly
+`0.911 ms` total to `0.623 ms`, with most of the gain in the ANN stage.
+
+That did **not** survive the reliability gate.
+
+On the full local `5K`-pair, `64`-query multihop harness, keeping the same
+quality knobs (`ann_k=64`, `ef_search=128`, `ef_construction=200`, `m=24`)
+but switching only `sorted_hnsw.shared_cache` from `off` to `on` caused all
+`facts_sh` ANN-seeded rows to collapse to `0.0% / 0.0%`, while the `facts_heap`
+baseline stayed correct in the same run.
+
+The strongest evidence from this branch is:
+
+- the simple direct ANN seed query on `facts_sh` still returned the expected
+  top rows with `shared_cache=on`
+- single-query GraphRAG probes could still look correct
+- the failure only showed up on the **full** same-session multihop harness,
+  which points to a cache lifecycle / reuse bug rather than a general GraphRAG
+  scoring bug
+
+So the current honest conclusion is narrow:
+
+- `sorted_hnsw.shared_cache = on` remains a **promising** performance branch for
+  GraphRAG seed scans
+- it is **not** currently safe as the default GraphRAG benchmark or release
+  operating point
+- the benchmark harnesses now expose a `--shared-cache on|off` switch, but the
+  default stays `off` until this correctness issue is debugged and fixed
