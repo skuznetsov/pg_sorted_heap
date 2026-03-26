@@ -76,6 +76,22 @@ on pages outside the bounds.
 
 ---
 
+## `sorted_hnsw` ordered-scan contract
+
+The current planner-integrated `sorted_hnsw` path is intentionally narrow:
+
+- it targets base-relation `ORDER BY embedding <=> query LIMIT k`
+- it is not used when there is no `LIMIT`
+- it is not used when `LIMIT > sorted_hnsw.ef_search`
+- it is not used when extra base-table quals or parameterization would make
+  the current Phase 1 scan under-return candidates
+
+For filtered retrieval flows, materialize/filter first or use the GraphRAG
+helper/wrapper API instead of treating `sorted_hnsw` as a general filtered ANN
+index.
+
+---
+
 ## Locking
 
 | Operation | Lock level |

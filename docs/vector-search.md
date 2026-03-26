@@ -12,6 +12,11 @@ pg_sorted_heap includes two built-in vector types, a planner-integrated
 sorted_hnsw`; the older IVF-PQ and sidecar HNSW APIs remain available when you
 want explicit control over storage or rerank behavior.
 
+Release guidance:
+
+- **Stable:** `sorted_hnsw` on `svec` and `hsvec`
+- **Legacy/manual:** `svec_ann_scan`, `svec_ann_search`, `svec_hnsw_scan`
+
 ---
 
 ## Vector types
@@ -77,7 +82,7 @@ CREATE TABLE items (
 
 CREATE INDEX items_embedding_idx
 ON items USING sorted_hnsw (embedding)
-WITH (m = 16, ef_construction = 64);
+WITH (m = 16, ef_construction = 200);
 
 SET sorted_hnsw.shared_cache = on;
 SET sorted_hnsw.ef_search = 96;
@@ -99,11 +104,26 @@ CREATE TABLE items_compact (
 
 CREATE INDEX items_compact_embedding_idx
 ON items_compact USING sorted_hnsw (embedding hsvec_cosine_ops)
-WITH (m = 16, ef_construction = 64);
+WITH (m = 16, ef_construction = 200);
 ```
 
 This path is planner-integrated and exact-reranks internally. There is no
 sidecar prefix argument and no manual `rerank_topk` in the index-scan path.
+
+Current ordered-scan contract:
+
+- automatic `sorted_hnsw` planning is for base-relation
+  `ORDER BY embedding <=> query LIMIT k`
+- the planner does not use the current Phase 1 path when there is no `LIMIT`,
+  when `LIMIT > sorted_hnsw.ef_search`, or when extra base-table quals would
+  make the index under-return candidates
+- `sorted_hnsw.shared_cache` is most useful when
+  `shared_preload_libraries = 'pg_sorted_heap'`; otherwise scans fall back to
+  backend-local cache builds
+
+For filtered retrieval or expansion workflows, materialize/filter first or use
+the GraphRAG helper API instead of expecting the ordered index scan to serve as
+a general filtered ANN primitive.
 
 ---
 
@@ -256,6 +276,11 @@ Rule of thumb: `nlist ≈ sqrt(N)` where N is dataset size. `M = dim/4` gives
 ---
 
 ## Benchmarks
+
+The tables below mix the current stable Index AM path with the older
+legacy/manual ANN paths. Use the `sorted_hnsw` rows as the release default;
+use the IVF-PQ and sidecar rows only when you explicitly want those manual
+trade-offs.
 
 ### 103K vectors, 2880-dim (Gutenberg corpus)
 

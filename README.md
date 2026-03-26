@@ -4,6 +4,35 @@ A PostgreSQL extension that physically sorts data by primary key, prunes
 irrelevant blocks via per-page zone maps, and includes built-in vector types
 plus planner-integrated HNSW search.
 
+## Release surface
+
+### Stable
+
+- `sorted_heap` table AM: physically sorted storage, zone-map pruning,
+  offline/online compact and merge, scan stats, rebuild helpers, eager/lazy
+  update modes.
+- `sorted_hnsw` Index AM: planner-integrated KNN for `svec` and `hsvec`,
+  shared decoded cache, exact rerank inside the index scan.
+
+### Beta
+
+- GraphRAG helper/wrapper API:
+  - `sorted_heap_expand_ids(...)`
+  - `sorted_heap_expand_rerank(...)`
+  - `sorted_heap_expand_twohop_rerank(...)`
+  - `sorted_heap_expand_twohop_path_rerank(...)`
+  - `sorted_heap_graph_rag_scan(...)`
+  - `sorted_heap_graph_rag_twohop_scan(...)`
+  - `sorted_heap_graph_rag_twohop_path_scan(...)`
+- These functions are usable now and benchmarked repeatedly, but they are
+  still workload-sensitive and should be treated as a beta retrieval surface,
+  not as a general-purpose graph database API.
+
+### Legacy/manual
+
+- IVF-PQ via `svec_ann_scan(...)` / `svec_ann_search(...)`
+- sidecar HNSW via `svec_hnsw_scan(...)`
+
 ## When to use pg_sorted_heap
 
 ### Time-series and event logs
@@ -70,7 +99,7 @@ CREATE TABLE documents (
 
 CREATE INDEX documents_embedding_idx
 ON documents USING sorted_hnsw (embedding)
-WITH (m = 16, ef_construction = 64);
+WITH (m = 16, ef_construction = 200);
 
 SET sorted_hnsw.shared_cache = on;  -- requires shared_preload_libraries='pg_sorted_heap'
 SET sorted_hnsw.ef_search = 96;
@@ -96,10 +125,10 @@ CREATE TABLE documents_compact (
 
 CREATE INDEX documents_compact_embedding_idx
 ON documents_compact USING sorted_hnsw (embedding hsvec_cosine_ops)
-WITH (m = 16, ef_construction = 64);
+WITH (m = 16, ef_construction = 200);
 ```
 
-### GraphRAG and fact graphs
+### GraphRAG and fact graphs (beta)
 
 `pg_sorted_heap` now also has a narrow GraphRAG path for fact-shaped multihop
 queries. The intended workload is:
@@ -115,6 +144,35 @@ The current helpers are:
 - `sorted_heap_expand_twohop_path_rerank(...)`
 - `sorted_heap_graph_rag_twohop_scan(...)`
 - `sorted_heap_graph_rag_twohop_path_scan(...)`
+
+Minimal beta shape:
+
+```sql
+CREATE TABLE facts (
+    entity_id   int4,
+    relation_id int2,
+    target_id   int4,
+    embedding   svec(384),
+    payload     text,
+    PRIMARY KEY (entity_id, relation_id, target_id)
+) USING sorted_heap;
+
+CREATE INDEX facts_embedding_idx
+ON facts USING sorted_hnsw (embedding)
+WITH (m = 24, ef_construction = 200);
+
+SET sorted_hnsw.ef_search = 128;
+
+SELECT *
+FROM sorted_heap_graph_rag_twohop_path_scan(
+    'facts'::regclass,
+    '[0.1,0.2,0.3,...]'::svec,
+    ann_k := 64,
+    top_k := 10,
+    hop1_relation_filter := 1,
+    hop2_relation_filter := 2
+);
+```
 
 On the current AWS ARM64 rerun (`4 vCPU`, `8 GiB RAM`), `5K` chains / `10K`
 rows / `384D`, the current portable point is:
@@ -297,18 +355,25 @@ SELECT WHERE pk op const -> planner hook -> extract bounds
 
 ## Performance
 
-PostgreSQL 18, Apple M-series, `shared_buffers=4GB`. Warm cache, avg 5 runs.
+Use [docs/benchmarks.md](/Users/sergey/Projects/C/clustered_pg/docs/benchmarks.md)
+for the full benchmark matrix and methodology. The summary below keeps only the
+current representative rows and avoids older narrow-range comparisons that no
+longer reflect the release story cleanly.
 
-### Query latency (EXPLAIN ANALYZE)
+### Query latency (representative)
 
-**100M rows** (7.8 GB sorted_heap, 7.8 GB heap+btree):
+PostgreSQL 18, Apple M-series, `shared_buffers=4GB`, warm cache.
+`100M` rows (`7.8 GB` sorted_heap, `7.8 GB` heap+btree):
 
 | Query | sorted_heap | heap+btree | heap seqscan |
 |-------|------------|-----------|-------------|
 | Point (1 row) | 0.045ms / **1 buf** | 0.506ms / 8 bufs | 1,190ms / 519K bufs |
-| Narrow (100) | 0.166ms / 2 bufs | 0.144ms / 9 bufs | 1,325ms / 520K bufs |
 | Medium (5K) | 0.479ms / 38 bufs | 0.812ms / 58 bufs | 1,326ms / 519K bufs |
 | Wide (100K) | 7.9ms / 737 bufs | 10.1ms / 1,017 bufs | 1,405ms / 518K bufs |
+
+For very narrow hot-range queries, btree can still tie or slightly edge out
+`sorted_heap`; the win here is lower I/O and stronger scaling once the working
+set grows. The full benchmark doc keeps those narrower rows for context.
 
 ### Throughput (pgbench, 10s, 1 client, prepared mode)
 
@@ -523,7 +588,7 @@ SELECT * FROM svec_ann_scan('tbl', query, nprobe:=10, lim:=10, rerank_topk:=200,
 ```sql
 CREATE INDEX items_embedding_idx
 ON items USING sorted_hnsw (embedding)
-WITH (m = 16, ef_construction = 64);
+WITH (m = 16, ef_construction = 200);
 
 SET sorted_hnsw.shared_cache = on;
 SET sorted_hnsw.ef_search = 96;
@@ -533,6 +598,16 @@ FROM items
 ORDER BY embedding <=> query
 LIMIT 10;
 ```
+
+Current ordered-scan contract:
+
+- The automatic `sorted_hnsw` path is for base-relation
+  `ORDER BY embedding <=> query LIMIT k` queries.
+- The planner does not use it for the current Phase 1 contract when there is
+  no `LIMIT`, when `LIMIT > sorted_hnsw.ef_search`, or when extra base-table
+  quals would make the index under-return candidates.
+- For filtered expansion workflows, materialize/filter first or use the
+  GraphRAG helper/wrapper API below.
 
 ### HNSW sidecar search (`svec_hnsw_scan`, legacy/manual path)
 
@@ -551,6 +626,50 @@ SELECT * FROM svec_hnsw_scan('tbl', query, 'tbl_hnsw',
 SELECT * FROM svec_hnsw_scan('tbl', query, 'tbl_hnsw',
     ef_search:=96, lim:=10, rerank_topk:=20);
 ```
+
+### GraphRAG (beta)
+
+```sql
+CREATE TABLE facts (
+    entity_id   int4,
+    relation_id int2,
+    target_id   int4,
+    embedding   svec(384),
+    payload     text,
+    PRIMARY KEY (entity_id, relation_id, target_id)
+) USING sorted_heap;
+
+CREATE INDEX facts_embedding_idx
+ON facts USING sorted_hnsw (embedding)
+WITH (m = 24, ef_construction = 200);
+
+SET sorted_hnsw.ef_search = 128;
+
+-- One-hop: expand known entity seeds and exact-rerank by query vector
+SELECT *
+FROM sorted_heap_expand_rerank(
+    'facts'::regclass,
+    ARRAY[101, 202],
+    '[0.1,0.2,0.3,...]'::svec,
+    top_k := 10,
+    relation_filter := 1
+);
+
+-- Two-hop path-aware wrapper: ANN seed -> two-hop expansion -> path-aware rerank
+SELECT *
+FROM sorted_heap_graph_rag_twohop_path_scan(
+    'facts'::regclass,
+    '[0.1,0.2,0.3,...]'::svec,
+    ann_k := 64,
+    top_k := 10,
+    hop1_relation_filter := 1,
+    hop2_relation_filter := 2
+);
+```
+
+Recommended release positioning: ship this API as beta. It is benchmarked and
+useful now, but its best operating point still depends strongly on workload
+shape and scoring contract.
 
 ### Configuration
 
@@ -603,6 +722,9 @@ SET sorted_heap.ann_timing = on;                 -- timing breakdown in DEBUG1
   timestamp(tz), date, uuid, text/varchar (`COLLATE "C"`).
 - Online compact/merge not supported for UUID/text/varchar PKs.
 - UPDATE does not re-sort; use compact/merge periodically.
+- Automatic `sorted_hnsw` ordered scans currently target base-relation
+  `ORDER BY embedding <=> query LIMIT k` queries. Filtered retrieval flows
+  should use explicit materialization or the GraphRAG helper/wrapper surface.
 - `heap_setscanlimits()` only supports contiguous block ranges.
 - pg_dump/restore: compact needed after restore.
 - pg_upgrade 17 to 18: tested and verified.

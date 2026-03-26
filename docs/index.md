@@ -37,10 +37,16 @@ btree-competitive query performance without a separate index structure.
   Works with literal arrays, prepared statements, and LATERAL/NestLoop
   runtime parameters.
 
-- **Vector search** -- Built-in `svec` (float32, up to 16K dim) and `hsvec`
-  (float16, up to 32K dim) vector types with cosine distance, planner-integrated
-  `sorted_hnsw` KNN index scans, and legacy/manual IVF-PQ + sidecar HNSW paths.
-  See [Vector Search](vector-search).
+- **Stable vector search** -- Built-in `svec` (float32, up to 16K dim) and
+  `hsvec` (float16, up to 32K dim) with planner-integrated `sorted_hnsw` KNN
+  index scans. See [Vector Search](vector-search).
+
+- **Beta GraphRAG helpers** -- Narrow one-hop and two-hop expansion+rereank
+  primitives for fact-shaped retrieval workflows. See
+  [SQL API](api) and [Benchmarks](benchmarks).
+
+- **Legacy/manual ANN paths** -- IVF-PQ and sidecar HNSW APIs remain available
+  for manual storage/recall tuning, but they are no longer the default path.
 
 - **Lazy update mode** -- `sorted_heap.lazy_update = on` skips per-UPDATE zone
   map maintenance, reaching heap-parity UPDATE throughput. Compact/merge
@@ -84,3 +90,10 @@ SELECT * FROM events WHERE id BETWEEN 500 AND 600;
 ```
 
 At 100M rows, a point query reads **1 buffer** (vs 8 for btree, 519,906 for seq scan).
+
+## Release surface
+
+- **Stable:** `sorted_heap` table AM, compaction/merge surface, zone-map scan
+  pruning, `sorted_hnsw` Index AM for `svec` and `hsvec`.
+- **Beta:** GraphRAG helper/wrapper API for fact-shaped retrieval.
+- **Legacy/manual:** IVF-PQ and sidecar HNSW paths.

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.12.0 (2026-03-26)
+
+### Release documentation pass
+
+- Public docs now split the surface into:
+  - **stable**: `sorted_heap` table AM and `sorted_hnsw` Index AM
+  - **beta**: GraphRAG helper/wrapper API
+  - **legacy/manual**: IVF-PQ and sidecar HNSW paths
+- README performance summary was narrowed to representative rows and had the
+  stale narrow-range comparison removed.
+- README, `docs/index.md`, `docs/vector-search.md`, and `docs/limitations.md`
+  now document the current `sorted_hnsw` ordered-scan contract:
+  base-relation `ORDER BY embedding <=> query LIMIT k`, with explicit notes
+  about `LIMIT`, `ef_search`, and filtered-query caveats.
+- `docs/api.md` now includes:
+  - `sorted_hnsw.ef_search`
+  - `sorted_hnsw.sq8`
+  - stable `sorted_hnsw` usage examples
+  - beta GraphRAG function reference and usage examples
+- `docs/benchmarks.md` now labels GraphRAG benchmark sections as beta-facing.
+
 ## 0.10.0 (2026-03-14)
 
 Documentation release: comprehensive rewrite of README with use-case examples,

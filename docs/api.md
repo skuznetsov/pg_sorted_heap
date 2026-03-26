@@ -243,6 +243,38 @@ set. `ef_search` becomes the maximum budget.
 SET sorted_heap.hnsw_ef_patience = 20;
 ```
 
+### `sorted_hnsw.ef_search`
+
+| Property | Value |
+|----------|-------|
+| Type | integer |
+| Default | `96` |
+| Context | user (SET) |
+
+Beam width for planner-integrated `sorted_hnsw` ordered index scans.
+Higher values increase candidate exploration and usually improve recall at the
+cost of latency.
+
+```sql
+SET sorted_hnsw.ef_search = 128;
+```
+
+### `sorted_hnsw.sq8`
+
+| Property | Value |
+|----------|-------|
+| Type | boolean |
+| Default | `on` |
+| Context | user (SET) |
+
+Controls SQ8 quantization in `sorted_hnsw` L0 storage and scan distance
+evaluation. Leave this enabled for the current release path unless you are
+doing low-level experiments.
+
+```sql
+SET sorted_hnsw.sq8 = on;
+```
+
 ### `sorted_hnsw.shared_cache`
 
 | Property | Value |
@@ -283,6 +315,54 @@ SET client_min_messages = debug1;
 ## Vector search
 
 See the [Vector Search guide](vector-search) for a full tutorial.
+
+### `sorted_hnsw` Index AM
+
+The stable ANN path in this release is the planner-integrated HNSW access
+method. It supports both `svec` and `hsvec`.
+
+```sql
+CREATE TABLE items (
+    id        bigserial PRIMARY KEY,
+    embedding svec(384),
+    body      text
+);
+
+CREATE INDEX items_embedding_idx
+ON items USING sorted_hnsw (embedding)
+WITH (m = 16, ef_construction = 200);
+
+SET sorted_hnsw.ef_search = 32;
+
+SELECT id, body
+FROM items
+ORDER BY embedding <=> '[0.1,0.2,0.3,...]'::svec
+LIMIT 10;
+```
+
+Compact-storage variant:
+
+```sql
+CREATE TABLE items_compact (
+    id        bigserial PRIMARY KEY,
+    embedding hsvec(384),
+    body      text
+);
+
+CREATE INDEX items_compact_embedding_idx
+ON items_compact USING sorted_hnsw (embedding hsvec_cosine_ops)
+WITH (m = 16, ef_construction = 200);
+```
+
+Current contract:
+
+- planner-integrated ordered scan for base-relation
+  `ORDER BY embedding <=> query LIMIT k`
+- not chosen when there is no `LIMIT`, when `LIMIT > sorted_hnsw.ef_search`,
+  or when extra base-table quals would make the path under-return candidates
+- exact rerank happens inside the index scan
+- `sorted_hnsw.shared_cache = on` is most useful when
+  `shared_preload_libraries = 'pg_sorted_heap'`
 
 ### Training permissions
 
@@ -359,3 +439,107 @@ clauses to filter candidates.
 
 Encode a vector as an M-byte PQ code. The residual variant encodes
 `(vec − centroid)` for use with residual PQ codebooks.
+
+---
+
+## GraphRAG (beta)
+
+These functions are intended for fact-shaped retrieval over a `sorted_heap`
+table clustered by `(entity_id, relation_id, target_id)`. The stable release
+story for GraphRAG is still beta: the API is usable and benchmarked, but the
+best operating point depends on workload shape and scoring contract.
+
+Recommended schema shape:
+
+```sql
+CREATE TABLE facts (
+    entity_id   int4,
+    relation_id int2,
+    target_id   int4,
+    embedding   svec(384),
+    payload     text,
+    PRIMARY KEY (entity_id, relation_id, target_id)
+) USING sorted_heap;
+
+CREATE INDEX facts_embedding_idx
+ON facts USING sorted_hnsw (embedding)
+WITH (m = 24, ef_construction = 200);
+```
+
+### `sorted_heap_expand_ids(rel, seed_ids, relation_filter, limit_rows)`
+
+Expands known entity seeds into fact rows without reranking.
+
+```sql
+SELECT *
+FROM sorted_heap_expand_ids(
+    'facts'::regclass,
+    ARRAY[101, 202],
+    relation_filter := 1
+);
+```
+
+### `sorted_heap_expand_rerank(rel, seed_ids, query, top_k, relation_filter, limit_rows)`
+
+One-hop expansion followed by exact rerank on the expanded candidates.
+
+```sql
+SELECT *
+FROM sorted_heap_expand_rerank(
+    'facts'::regclass,
+    ARRAY[101, 202],
+    '[0.1,0.2,0.3,...]'::svec,
+    top_k := 10,
+    relation_filter := 1
+);
+```
+
+### `sorted_heap_expand_twohop_rerank(rel, seed_ids, query, top_k, hop1_relation_filter, hop2_relation_filter, limit_rows)`
+
+Two-hop expansion with rerank on the final candidate set.
+
+### `sorted_heap_expand_twohop_path_rerank(rel, seed_ids, query, top_k, hop1_relation_filter, hop2_relation_filter, limit_rows)`
+
+Two-hop expansion with path-aware rerank using hop-1 and hop-2 evidence
+together. This is the stronger current contract for fact-shaped multihop
+retrieval.
+
+```sql
+SELECT *
+FROM sorted_heap_expand_twohop_path_rerank(
+    'facts'::regclass,
+    ARRAY[101, 202],
+    '[0.1,0.2,0.3,...]'::svec,
+    top_k := 10,
+    hop1_relation_filter := 1,
+    hop2_relation_filter := 2
+);
+```
+
+### `sorted_heap_graph_rag_scan(rel, query, ann_k, top_k, relation_filter, limit_rows)`
+
+One-call wrapper: ANN seed retrieval on `entity_id`, then one-hop expansion
+and rerank.
+
+### `sorted_heap_graph_rag_twohop_scan(rel, query, ann_k, top_k, hop1_relation_filter, hop2_relation_filter, limit_rows)`
+
+One-call wrapper for ANN seed retrieval plus two-hop expansion.
+
+### `sorted_heap_graph_rag_twohop_path_scan(rel, query, ann_k, top_k, hop1_relation_filter, hop2_relation_filter, limit_rows)`
+
+One-call wrapper for ANN seed retrieval plus two-hop path-aware rerank. This
+is the current default beta entry point for fact-shaped multihop GraphRAG.
+
+```sql
+SET sorted_hnsw.ef_search = 128;
+
+SELECT *
+FROM sorted_heap_graph_rag_twohop_path_scan(
+    'facts'::regclass,
+    '[0.1,0.2,0.3,...]'::svec,
+    ann_k := 64,
+    top_k := 10,
+    hop1_relation_filter := 1,
+    hop2_relation_filter := 2
+);
+```
