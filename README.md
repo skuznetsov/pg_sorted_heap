@@ -835,6 +835,7 @@ SET sorted_heap.ann_timing = on;                 -- timing breakdown in DEBUG1
 - [SQL API](docs/api.md) -- full function reference
 - [Benchmarks](docs/benchmarks.md) -- latency, throughput, vector search
 - [GraphRAG 0.13 Plan](docs/graphrag-0.13-plan.md) -- stable target and hardening gates
+- [Release 0.13.0 Draft](docs/release-0.13.0.md) -- repo-owned GitHub release note draft
 - [Limitations](docs/limitations.md)
 - [Changelog](CHANGELOG.md)
 - [Operations](OPERATIONS.md) -- make targets and diagnostics
