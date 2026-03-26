@@ -55,10 +55,13 @@ PROMPT_TERM_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\d+")
 CODE_TOKEN_RE = re.compile(r"[A-Za-z0-9_']+")
 CAMEL_SPLIT_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z]|\b)|[A-Z]?[a-z]+|\d+")
 FILE_HEADER_RE = re.compile(r"^# File(?: Summary)?: ([^\n]+)")
+CRYSTAL_BLOCK_KEYWORD_RE = re.compile(r"^(?:if|unless|case|begin|while|until|select)\b")
+HELPER_CALL_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*\?)")
 
 PROMPT_STOPWORDS = {
     "a",
     "an",
+    "approach",
     "and",
     "are",
     "between",
@@ -636,6 +639,109 @@ def build_snippet_line_index(content: str) -> list[tuple[str, str, set[str]]]:
     return indexed
 
 
+def is_method_definition(stripped: str) -> bool:
+    return stripped.startswith(("def ", "private def ", "protected def "))
+
+
+def starts_crystal_block(stripped: str) -> bool:
+    if not stripped or stripped.startswith("#"):
+        return False
+    if stripped.startswith(("def ", "private def ", "protected def ", "class ", "struct ", "module ", "enum ")):
+        return True
+    if CRYSTAL_BLOCK_KEYWORD_RE.match(stripped):
+        return True
+    if re.search(r"\bdo\b(?:\s*\|.*\|)?\s*$", stripped):
+        return True
+    return False
+
+
+def is_crystal_block_end(stripped: str) -> bool:
+    return stripped == "end"
+
+
+def method_window_bounds(
+    line_index: list[tuple[str, str, set[str]]],
+    anchor_idx: int,
+) -> tuple[int, int] | None:
+    stripped = line_index[anchor_idx][0]
+    if not is_method_definition(stripped):
+        return None
+
+    depth = 1
+    end_idx = anchor_idx + 1
+    for idx in range(anchor_idx + 1, len(line_index)):
+        current = line_index[idx][0]
+        if not current:
+            end_idx = idx + 1
+            continue
+        if is_crystal_block_end(current):
+            depth -= 1
+            end_idx = idx + 1
+            if depth == 0:
+                return (anchor_idx, end_idx)
+            continue
+        if starts_crystal_block(current):
+            depth += 1
+        end_idx = idx + 1
+
+    return (anchor_idx, end_idx)
+
+
+def expand_method_window(
+    line_index: list[tuple[str, str, set[str]]],
+    anchor_idx: int,
+) -> tuple[int, int] | None:
+    method_window = method_window_bounds(line_index, anchor_idx)
+    if method_window is None:
+        return None
+
+    start_idx, end_idx = method_window
+    nonempty_count = sum(1 for idx in range(start_idx, end_idx) if line_index[idx][0])
+    if nonempty_count > 4 or start_idx <= 0:
+        return method_window
+
+    gap_budget = 4
+    for prev_idx in range(start_idx - 1, -1, -1):
+        prev_stripped = line_index[prev_idx][0]
+        if not prev_stripped:
+            gap_budget -= 1
+            if gap_budget < 0:
+                break
+            continue
+        if prev_stripped == "end" or prev_stripped.startswith("#"):
+            gap_budget -= 1
+            if gap_budget < 0:
+                break
+            continue
+        if not is_method_definition(prev_stripped):
+            break
+        prev_window = method_window_bounds(line_index, prev_idx)
+        if prev_window is None:
+            break
+        prev_start, prev_end = prev_window
+        if start_idx - prev_end <= 2:
+            return (prev_start, end_idx)
+        break
+
+    body_text = "\n".join(line_index[idx][0] for idx in range(start_idx, end_idx))
+    helper_names = {match.group(1) for match in HELPER_CALL_RE.finditer(body_text)}
+    for helper_name in sorted(helper_names):
+        helper_prefixes = (
+            f"def {helper_name}",
+            f"private def {helper_name}",
+            f"protected def {helper_name}",
+        )
+        for prev_idx in range(start_idx - 1, max(-1, start_idx - 40), -1):
+            prev_stripped = line_index[prev_idx][0]
+            if prev_stripped.startswith(helper_prefixes):
+                helper_window = method_window_bounds(line_index, prev_idx)
+                if helper_window is not None and start_idx - helper_window[1] <= 6:
+                    return (helper_window[0], end_idx)
+                break
+
+    return method_window
+
+
 def line_prompt_match_indexes_from_parts(
     stripped: str,
     lowered: str,
@@ -672,7 +778,9 @@ def line_prompt_score_from_parts(
     distinct_hits = len(line_prompt_match_indexes_from_parts(stripped, lowered, tokens, prompt_variants))
 
     code_bonus = 0.0
-    if stripped.startswith(("def ", "private def ", "protected def ", "property ", "getter ", "setter ", "class ", "struct ", "module ")):
+    if is_method_definition(stripped):
+        code_bonus += 10.0
+    elif stripped.startswith(("property ", "getter ", "setter ", "class ", "struct ", "module ")):
         code_bonus += 1.0
     if "_" in stripped or "?" in stripped:
         code_bonus += 0.5
@@ -719,13 +827,16 @@ def prompt_snippet_from_index(
 
     for _ in range(anchor_count):
         best: tuple[int, float, int] | None = None
+        best_method_bonus = 0
         for score, idx, matches in candidates:
             if any(abs(idx - chosen) <= radius for chosen in anchors):
                 continue
             new_hits = len(set(matches) - covered_terms)
-            key = (new_hits, score, -idx)
-            if best is None or key > best:
-                best = key
+            method_bonus = 1 if is_method_definition(line_index[idx][0]) else 0
+            key = (new_hits, method_bonus, score, -idx)
+            if best is None or key > (best[0], best_method_bonus, best[1], best[2]):
+                best = (new_hits, score, -idx)
+                best_method_bonus = method_bonus
                 best_idx = idx
                 best_matches = matches
         if best is None:
@@ -735,7 +846,11 @@ def prompt_snippet_from_index(
 
     windows: list[tuple[int, int]] = []
     for idx in sorted(anchors):
-        windows.append((max(0, idx - radius), min(len(line_index), idx + radius + 1)))
+        method_window = expand_method_window(line_index, idx)
+        if method_window is not None:
+            windows.append(method_window)
+        else:
+            windows.append((max(0, idx - radius), min(len(line_index), idx + radius + 1)))
 
     merged: list[tuple[int, int]] = []
     for start, end in windows:
@@ -2125,7 +2240,8 @@ def main() -> int:
                 out: list[tuple] = []
                 for row in rows:
                     row_vals = list(row)
-                    relative = payload_file_path(str(row_vals[payload_idx]))
+                    original_payload = str(row_vals[payload_idx])
+                    relative = payload_file_path(original_payload)
                     if relative and relative in file_contents_by_relative:
                         cache_key = (relative, question.prompt)
                         snippet = snippet_cache.get(cache_key)
@@ -2134,9 +2250,10 @@ def main() -> int:
                                 relative,
                                 file_snippet_index_by_relative[relative],
                                 question.prompt,
+                                anchor_count=4,
                             )
                             snippet_cache[cache_key] = snippet
-                        row_vals[payload_idx] = snippet
+                        row_vals[payload_idx] = f"{original_payload}\n{snippet}"
                     out.append(tuple(row_vals))
                 return out
 

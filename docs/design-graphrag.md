@@ -2655,8 +2655,13 @@ Contract:
 - for each returned summary row, resolve the underlying source file
 - extract a prompt-focused snippet from the full file using:
   - prompt-term matching against code-aware line tokens
-  - coverage-greedy anchor selection
-  - merged local windows around the chosen anchors
+  - coverage-greedy anchor selection with method-definition tie-breaks
+  - Crystal method-body expansion instead of fixed-radius windows for selected
+    `def` anchors
+  - adjacent helper-method merge for short `?` helpers referenced by the
+    selected method body
+  - append the snippet to the original summary payload instead of replacing the
+    summary row
 - cache `(file, prompt)` snippets in-process so repeated runs are measured in
   both cold and warm regimes
 
@@ -2673,9 +2678,9 @@ Verified local result on the stable real code-corpus point (`40` files,
     - `73.3%` keyword coverage
     - `50.0%` full hits
   - `prompt_summary_snippet_py`:
-    - warm-cache `p50 0.564-0.600 ms`
-    - cold first-pass `p50 12.543 ms`, `avg 12.864 ms`
-    - `93.3%` keyword coverage
+    - warm-cache `p50 0.551-0.573 ms`
+    - cold first-pass `p50 13.973 ms`, `avg 14.517 ms`
+    - `96.7%` keyword coverage
     - `83.3%` full hits
 - code-aware embedding mode:
   - `prompt_summary_rerank_in`:
@@ -2683,8 +2688,8 @@ Verified local result on the stable real code-corpus point (`40` files,
     - `77.6%`
     - `33.3%`
   - `prompt_summary_snippet_py`:
-    - warm-cache `p50 0.565-0.616 ms`
-    - `86.2%`
+    - warm-cache `p50 0.560-0.580 ms`
+    - `94.3%`
     - `66.7%`
 
 Per-question generic rerun on the same corpus shows what the snippet layer
@@ -2694,19 +2699,23 @@ actually fixed:
   - `Butler response routing`
   - `Memory store flow`
   - `Two-stage answering`
+  - `NLU hybrid classification`
   - `Response memory policy`
-  - `Streaming overlap`
 - still failing:
-  - `NLU hybrid classification` at `60.0%`
+  - `Streaming overlap` at `80.0%`
 
 Interpretation:
 
 - the remaining plateau on this real code corpus was **not** primarily file
   retrieval
-- it was a file-local evidence selection problem
+  - it was a file-local evidence selection problem
+- the strongest fix was not "wider windows"
+  - it was preserving summary rows while adding code-structured snippets
+    underneath them
 - prompt-focused snippet extraction is the first branch that moves the real
   code-corpus benchmark from `50.0%` to `83.3%` full hits at the same
-  tiny-budget `top_k=4`
+  tiny-budget `top_k=4`, while also lifting generic keyword coverage from
+  `73.3%` to `96.7%`
 
 Important caveat:
 
