@@ -2838,46 +2838,52 @@ point (`384D`, `ann_k=16`, `top_k=4`, `ef_search=64`, `ef_construction=200`,
 `m=24`, fresh backend):
 
 - `prompt_summary_snippet_py`
-  - `p50 median 1.030 ms`, range `0.925-1.060 ms`
+  - `p50 median 1.048 ms`, range `0.913-4.141 ms`
+  - quality drifted across fresh builds: `90.5-100.0%` keyword coverage,
+    `83.3-100.0%` full hits
+- `prompt_lexseed_require_summary_snippet_py`
+  - `p50 median 10.788 ms`, range `10.670-10.947 ms`
   - stable `100.0% / 100.0%`
 - `oracle_prompt_summary_snippet_py`
-  - `p50 median 1.179 ms`, range `1.095-1.315 ms`
-  - same stable `100.0% / 100.0%`
-  - therefore slower, with no quality gain
-- a bounded require-expanded summary variant was tested as a rescue for the
-  hard `Lexicographic potential order` prompt
-  - it did rescue that one prompt on a bad build by surfacing `folding/potential.cr`
-  - but across repeated builds it was slower (`p50 median 2.727 ms`) and
-    inferior overall (`93.3% / 83.3%`)
-  - it therefore does **not** become the new default frontier
+  - on a bounded full rerun it also stayed at `100.0% / 100.0%`, but the
+    non-oracle `prompt_lexseed_require_summary_snippet_py` already matches that
+    quality, so oracle seeds are no longer the interesting external-generic
+    diagnostic
 
 Interpretation:
 
-- the current generic snippet contract now transfers to a second real code
-  corpus with the same repeated-build `100/100` stability seen on the
+- the old claim that generic external folding was already solved by
+  `prompt_summary_snippet_py` was too strong
+- the generic baseline is now clearly less robust on this corpus than on the
   in-repo `cogniformerus` slice
-- the oracle diagnostic shows that this external real-corpus point is **not**
-  seed-limited at the current operating point; exact/oracle file seeds do not
-  improve quality
-- graph-native `REQUIRES_FILE` expansion is still useful as a diagnostic
-  falsifier, but not as the winning retrieval contract on this external corpus
+- a narrow non-oracle rescue does exist: supplement ANN summary seeds with
+  lexical summary hits and then pull one-hop `REQUIRES_FILE` summaries from
+  those lexical anchors
+- that rescue closes the quality gap, but only by paying roughly a `10x`
+  latency penalty
 
 The same external `folding/src` corpus also answered the code-aware question.
 At the same repeated-build point:
 
 - code-aware `prompt_summary_snippet_py`
-  - `p50 median 1.080 ms`, range `1.007-1.131 ms`
-  - stable `91.7% / 83.3%`
+  - `p50 median 1.080 ms`, range `1.048-1.146 ms`
+  - stable `79.8% / 66.7%`
+- code-aware `prompt_lexseed_require_summary_snippet_py`
+  - `p50 median 11.318 ms`, range `10.565-13.162 ms`
+  - stable `100.0% / 100.0%`
 - code-aware `oracle_prompt_summary_snippet_py`
-  - `p50 median 1.184 ms`, range `1.179-1.205 ms`
+  - `p50 median 1.217 ms`, range `1.149-1.303 ms`
   - stable `100.0% / 100.0%`
 
 So the external folding split is now sharper:
 
-- **generic** external folding is no longer a retrieval problem at this point
-- **code-aware** external folding is still quality-limited, and the oracle
-  diagnostic shows that this remaining gap is a **seed-selection problem**
-  rather than a snippet or rerank problem
-- existing symbol-aware summary seeding does not rescue that code-aware gap on
-  folding, so the next real branch there is a non-oracle code-aware seed
-  rescue, not another snippet tweak
+- both **generic** and **code-aware** external folding now have a verified
+  non-oracle rescue to `100.0% / 100.0%`
+- the external problem really was a **seed-selection problem**, not a snippet
+  extraction problem
+- but the rescue is expensive enough that it does **not** replace the faster
+  in-repo winners as the default repository story
+- the honest conclusion is narrower:
+  - external folding is no longer blocked by an unsolved quality gap
+  - it is blocked by a quality/latency tradeoff that is much worse than on the
+    primary `cogniformerus` code corpus
