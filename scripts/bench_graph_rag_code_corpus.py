@@ -739,6 +739,22 @@ def expand_method_window(
                     return (helper_window[0], end_idx)
                 break
 
+    ivar_refs = set(re.findall(r"@[A-Za-z_][A-Za-z0-9_]*", body_text))
+    if ivar_refs:
+        for prev_idx in range(start_idx - 1, max(-1, start_idx - 60), -1):
+            prev_stripped = line_index[prev_idx][0]
+            if not prev_stripped:
+                continue
+            if prev_stripped.startswith(("def initialize(", "private def initialize(", "protected def initialize(")):
+                init_window = method_window_bounds(line_index, prev_idx)
+                if init_window is not None and start_idx - init_window[1] <= 12:
+                    init_body = "\n".join(line_index[idx][0] for idx in range(init_window[0], init_window[1]))
+                    if any(ivar in init_body for ivar in ivar_refs):
+                        return (init_window[0], end_idx)
+                break
+            if prev_stripped.startswith(("class ", "struct ", "module ", "enum ")):
+                break
+
     return method_window
 
 

@@ -2660,6 +2660,8 @@ Contract:
     `def` anchors
   - adjacent helper-method merge for short `?` helpers referenced by the
     selected method body
+  - nearby config-initializer merge for short ivar-based helpers, so snippets
+    keep concrete defaults like `window_size=1500` / `overlap=100`
   - append the snippet to the original summary payload instead of replacing the
     summary row
 - cache `(file, prompt)` snippets in-process so repeated runs are measured in
@@ -2678,19 +2680,19 @@ Verified local result on the stable real code-corpus point (`40` files,
     - `73.3%` keyword coverage
     - `50.0%` full hits
   - `prompt_summary_snippet_py`:
-    - warm-cache `p50 0.551-0.573 ms`
-    - cold first-pass `p50 13.973 ms`, `avg 14.517 ms`
-    - `96.7%` keyword coverage
-    - `83.3%` full hits
+    - warm-cache `p50 0.551-0.698 ms`
+    - cold first-pass `p50 15.316 ms`, `avg 15.435 ms`
+    - `100.0%` keyword coverage
+    - `100.0%` full hits
 - code-aware embedding mode:
   - `prompt_summary_rerank_in`:
     - `p50 0.395-0.398 ms`
     - `77.6%`
     - `33.3%`
   - `prompt_summary_snippet_py`:
-    - warm-cache `p50 0.560-0.580 ms`
-    - `94.3%`
-    - `66.7%`
+    - warm-cache `p50 0.570-0.619 ms`
+    - `97.6%`
+    - `83.3%`
 
 Per-question generic rerun on the same corpus shows what the snippet layer
 actually fixed:
@@ -2701,8 +2703,7 @@ actually fixed:
   - `Two-stage answering`
   - `NLU hybrid classification`
   - `Response memory policy`
-- still failing:
-  - `Streaming overlap` at `80.0%`
+  - `Streaming overlap`
 
 Interpretation:
 
@@ -2713,9 +2714,9 @@ Interpretation:
   - it was preserving summary rows while adding code-structured snippets
     underneath them
 - prompt-focused snippet extraction is the first branch that moves the real
-  code-corpus benchmark from `50.0%` to `83.3%` full hits at the same
+  code-corpus benchmark from `50.0%` to `100.0%` full hits at the same
   tiny-budget `top_k=4`, while also lifting generic keyword coverage from
-  `73.3%` to `96.7%`
+  `73.3%` to `100.0%`
 
 Important caveat:
 
