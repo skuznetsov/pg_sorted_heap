@@ -2884,6 +2884,20 @@ Even on the isolated cold pass, the dominant term is still the lexical-seed +
 `REQUIRES_FILE` fetch path. Snippet generation is a real secondary tax on the
 first pass, but it is not where the largest win now sits.
 
+A kept-temp-cluster component probe narrowed that one step further. On the
+same external `folding/src` corpus:
+
+- `ann` alone was cheap: about `0.51 ms` median across the 6 real prompts
+- `lexical_seed` alone was the real dominant stage: about `9.34 ms` median
+- `rescue_require` landed at about `9.28 ms` median because it inherits the
+  same lexical-seed cost
+- `rescue_lexical_require_summaries` was about `9.86 ms` median
+
+The summary rows explain why this stage is expensive: `REL_FILE_SUMMARY`
+payload length was `80 / 2078 / 5441` bytes at `min / median / max` on the
+external corpus. So the rescue is paying to run prompt-term substring scoring
+against multi-kilobyte summary payloads even before snippet extraction starts.
+
 The same external `folding/src` corpus also answered the code-aware question.
 At the same repeated-build point:
 
@@ -2936,3 +2950,18 @@ were already falsified (`ann_k < 16` and lexical-seed `LIMIT 1` both got
 worse), and the timing split shows that further work should focus on reducing
 the post-seed summary/require candidate work rather than treating snippet
 extraction as the main bottleneck.
+
+One obvious branch was also falsified directly: truncating lexical scoring to a
+summary prefix. On the external corpus:
+
+- `left(payload, 512)` dropped the rescue query to about `7.9 ms`, but quality
+  fell back to `96.7% / 83.3%`
+- `left(payload, 1024)` restored `100.0% / 100.0%`, but it no longer sped the
+  query up
+- the narrower threshold sweep (`640..992`) confirmed there was no useful
+  middle ground: `992` bytes recovered `100.0% / 100.0%`, but was still slower
+  than the full-payload rescue
+
+So a naive prefix cut is now a documented dead end. The remaining work is not
+"look at less text in the same way"; it needs a different lexical-seed
+representation or a different seed-selection contract altogether.
