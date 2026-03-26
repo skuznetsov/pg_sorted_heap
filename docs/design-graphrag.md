@@ -1855,3 +1855,78 @@ The correct next step is therefore:
 
 That remains the smallest change that can still convert the observed
 block-pruning advantage into an end-to-end query win.
+
+## Real code-corpus prototype
+
+The next honest check after the Butler gate fact smoke was not another
+synthetic graph. It was the actual `cogniformerus` code corpus plus the real
+cross-file question bank already used by Butler's own code benchmark.
+
+- source tree:
+  `cogniformerus/src/cogniformerus`
+- question source:
+  `cogniformerus/bin/butler_code_test.cr`
+- harness:
+  [`scripts/bench_graph_rag_code_corpus.py`](/Users/sergey/Projects/C/clustered_pg/scripts/bench_graph_rag_code_corpus.py)
+
+This harness builds a narrow code-GraphRAG shape:
+
+- each source file is one entity
+- each chunk in that file becomes one fact row
+  - `entity_id = file_id`
+  - `relation_id = HAS_CHUNK`
+  - `target_id = chunk_id`
+- query quality is scored against the real CrossFile benchmark keywords
+  from `butler_code_test.cr`
+
+This is not a full code graph. It is a bounded falsifier for a simpler claim:
+
+> if GraphRAG-style seeded expansion is already useful on a real corpus, it
+> should show up even on the natural `file -> chunk` expansion shape
+
+The first stable local point used:
+
+- `40` files
+- `747` chunk rows
+- `6` real CrossFile questions
+- `384D`
+- `ann_k=16`
+- `top_k=4`
+- `m=24`
+- `ef_construction=200`
+- `sorted_hnsw.ef_search=64`
+- `shared_buffers=64MB`
+- fresh backend
+- `3` timing runs
+
+Result:
+
+- direct ANN over raw chunks:
+  - heap: `p50 0.740 ms`
+  - `sorted_heap`: `p50 0.712 ms`
+  - keyword coverage: `63.3%`
+  - full-keyword hits: `33.3%`
+- file-seeded SQL expansion:
+  - heap: `p50 0.516 ms`
+  - `sorted_heap`: `p50 0.468 ms`
+  - same `63.3%` keyword coverage
+  - same `33.3%` full-keyword hits
+- `sorted_heap_expand_rerank()` helper:
+  - `p50 0.665 ms`
+  - same `63.3%` keyword coverage
+  - same `33.3%` full-keyword hits
+
+The important conclusion is narrow but real:
+
+- the real code corpus branch is now reproducible inside this repository
+- seeded expansion by file preserves answer-support quality on the real
+  CrossFile question set
+- on this code corpus, the current gain is **latency**, not answer quality
+- the helper is not yet the latency leader on this tiny real corpus; the
+  simple SQL expansion shape still wins locally
+
+This means the next code-corpus GraphRAG step is not "invent a bigger graph
+API". It is either:
+
+- a richer real code-graph relation hypothesis than plain `file -> chunk`, or
+- a lower-overhead helper path for this very simple expansion contract
