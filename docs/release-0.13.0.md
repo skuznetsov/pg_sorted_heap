@@ -162,6 +162,42 @@ This bundle covers the narrow stable GraphRAG surface directly:
 - crash recovery for registered/indexed graph tables
 - concurrent DML with online compact / online merge on registered fact graphs
 
+## Extension-wide release-candidate checks
+
+Fresh extension-wide release checks run on `2026-03-26`:
+
+```bash
+make pg-core-regression-smoke
+make policy-safety-selftest
+make test-dump-restore
+make test-toast
+make test-alter-table
+make test-crash-recovery
+make test-concurrent
+make test-pg-upgrade
+```
+
+Observed signals:
+
+- `make pg-core-regression-smoke` ->
+  `status=ok|installcheck_target=present|tap_prove=present|isolation_regress=missing`
+- `make policy-safety-selftest` -> all constituent selftests reported `status=ok`
+- `make test-dump-restore` -> `status=ok pass=10 fail=0 total=10`
+- `make test-toast` -> `status=ok pass=26 fail=0 total=26`
+- `make test-alter-table` -> `status=ok pass=36 fail=0 total=36`
+- `make test-crash-recovery` -> `status=ok pass=15 fail=0 total=15`
+- `make test-concurrent` -> `status=ok pass=8 fail=0 total=8`
+- `make test-pg-upgrade` -> `status=ok pass=13 fail=0 total=13`
+
+These checks exercise the already-stable core extension surface around:
+
+- table AM crash recovery
+- online compact / merge under concurrent DML
+- TOAST integrity across rewrite paths
+- ALTER TABLE compatibility
+- dump / restore lifecycle
+- `pg_upgrade` compatibility from PostgreSQL 17 to 18
+
 ## Release positioning
 
 The clean `0.13` split is:
