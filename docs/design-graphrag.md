@@ -2042,7 +2042,7 @@ Stable local result, `3` runs, same `40`-file / `840`-row / `6`-question point:
   - same `63.3%` keyword coverage
   - same `33.3%` full hits
 - prompt-derived lexical rerank:
-  - `sorted_heap`: `3.146 ms`
+  - `sorted_heap`: `3.005 ms`
   - same `63.3%` keyword coverage
   - worse `16.7%` full hits
 - oracle keyword rerank:
@@ -2055,7 +2055,7 @@ This is a useful but narrow falsifier:
 
 - the plateau is **not** explained by weak file seeds alone
 - richer local graph structure also did not explain it
-- a cheap lexical hybrid derived from the real prompt also did not explain it
+- a simple prompt-term rerank at `top_k=4` also did not explain it
 - but once the rerank contract is allowed to use the benchmark's own gold
   keywords, quality jumps sharply
 
@@ -2066,3 +2066,47 @@ targeted next hypothesis:
 > the remaining quality frontier on the real code corpus is more likely in the
 > query/rerank contract or embedding space than in local graph topology or seed
 > selection
+
+### Result-budget and packing diagnostic
+
+The broad "cheap lexical hybrid does not help" claim turned out to be too
+strong once the same real code-corpus harness was rerun at larger result
+budgets.
+
+Bounded local sweep, same `40`-file / `840`-row / `6`-question corpus,
+`ann_k=16`, `3` runs:
+
+- plain file-seeded `sorted_heap` expansion:
+  - `top_k=4`: `0.402 ms`, `63.3%` keyword coverage, `33.3%` full hits
+  - `top_k=8`: `0.460 ms`, `68.1%` keyword coverage, same `33.3%` full hits
+  - `top_k=16`: `0.469 ms`, `84.3%` keyword coverage, same `33.3%` full hits
+  - `top_k=32`: `0.449 ms`, `94.3%` keyword coverage, `66.7%` full hits
+- prompt-derived lexical rerank:
+  - `top_k=4`: `3.005 ms`, `63.3%`, `16.7%`
+  - `top_k=8`: `3.176 ms`, `86.7%`, `50.0%`
+  - `top_k=12`: `3.149 ms`, `90.0%`, `66.7%`
+  - `top_k=32`: `3.147 ms`, `96.7%`, `83.3%`
+
+So the real code-corpus plateau is not just a seed-quality problem. It is also
+partly a **result-budget / packing** problem:
+
+- with more rows, even the plain file-seeded path recovers much more keyword
+  coverage
+- prompt-derived lexical rerank starts to help only once the row budget is not
+  extremely tight
+
+That makes the next bounded hypothesis more specific:
+
+> the remaining small-`top_k` gap is likely about how evidence is packed into a
+> tiny chunk budget, not about choosing better files
+
+One more diagnostic supports that narrower claim. On the original `top_k=4`
+point, a diversity-aware prompt-term rerank was also tested:
+
+- `sorted_heap` prompt-diverse rerank:
+  - `3.229 ms`
+  - `76.7%` keyword coverage
+  - still only `33.3%` full hits
+
+That is a partial gain in coverage, but still not the qualitative jump needed
+to make the current small-budget contract compelling.

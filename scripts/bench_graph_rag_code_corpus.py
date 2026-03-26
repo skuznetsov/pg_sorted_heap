@@ -829,6 +829,52 @@ def main() -> int:
                 lambda q: (q.query_vec, list(extract_prompt_terms(q.prompt)), q.query_vec),
             )
 
+            prompt_diverse_rerank_sql = base.QueryCase(
+                "prompt_diverse_rerank_in",
+                f"""
+                WITH ann AS MATERIALIZED (
+                    SELECT entity_id
+                    FROM {{table}}
+                    ORDER BY embedding <=> %s::svec
+                    LIMIT {args.ann_k}
+                ),
+                seeds AS MATERIALIZED (
+                    SELECT DISTINCT entity_id FROM ann
+                ),
+                expanded AS MATERIALIZED (
+                    SELECT *
+                    FROM {{table}}
+                    WHERE entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+                      AND relation_id = {REL_HAS_CHUNK}
+                ),
+                scored AS MATERIALIZED (
+                    SELECT
+                        expanded.*,
+                        (
+                            SELECT count(*)
+                            FROM unnest(%s::text[]) kw
+                            WHERE position(lower(kw) in lower(expanded.payload)) > 0
+                        ) AS lexical_hits,
+                        (expanded.embedding <=> %s::svec) AS semantic_distance
+                    FROM expanded
+                ),
+                ranked AS MATERIALIZED (
+                    SELECT
+                        scored.*,
+                        row_number() OVER (
+                            PARTITION BY entity_id
+                            ORDER BY lexical_hits DESC, semantic_distance, target_id
+                        ) AS file_rank
+                    FROM scored
+                )
+                SELECT entity_id, relation_id, target_id, embedding, payload
+                FROM ranked
+                ORDER BY file_rank, lexical_hits DESC, semantic_distance, entity_id, relation_id, target_id
+                LIMIT {args.top_k}
+                """,
+                lambda q: (q.query_vec, list(extract_prompt_terms(q.prompt)), q.query_vec),
+            )
+
             dependency_twohop_sql = base.QueryCase(
                 "seed_require_twohop_in",
                 f"""
@@ -962,6 +1008,8 @@ def main() -> int:
                 ("facts_heap", "facts_heap", seed_expand_sql),
                 ("facts_sh", "facts_sh", seed_expand_sql),
                 ("facts_sh", "facts_sh", seed_expand_fn),
+                ("facts_heap", "facts_heap", prompt_diverse_rerank_sql),
+                ("facts_sh", "facts_sh", prompt_diverse_rerank_sql),
                 ("facts_heap", "facts_heap", prompt_lexical_rerank_sql),
                 ("facts_sh", "facts_sh", prompt_lexical_rerank_sql),
                 ("facts_heap", "facts_heap", keyword_rerank_sql),
