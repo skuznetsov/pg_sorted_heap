@@ -2207,3 +2207,59 @@ or "more graph edges". It is:
 
 > for real code GraphRAG, file summaries are a stronger final output unit than
 > raw chunks when the answer budget is tiny
+
+### Summary rows as seed unit
+
+The next narrow question was whether summaries are only a better **output**
+unit, or also a better **seed** unit.
+
+That was tested by forcing the ANN seed step to rank only `REL_FILE_SUMMARY`
+rows and then keeping the final result set on summaries as well.
+
+Stable local result on the same real `40`-file / `840`-row / `6`-question
+point, `ann_k=16`, `top_k=4`, `3` runs:
+
+- generic embedding mode:
+  - summary output from mixed ANN seeds (`seed_file_summary_output_in`,
+    `sorted_heap`):
+    - `0.199 ms`
+    - `71.0%` keyword coverage
+    - `33.3%` full hits
+  - summary output from summary-only seeds
+    (`summary_seed_summary_output_in`, `sorted_heap`):
+    - `0.116 ms`
+    - `77.6%` keyword coverage
+    - `33.3%` full hits
+  - prompt summary rerank from mixed seeds:
+    - `0.329 ms`
+    - `73.3%`
+    - `50.0%`
+  - prompt summary rerank from summary-only seeds:
+    - `0.541 ms`
+    - `74.3%`
+    - `33.3%`
+- code-aware embedding mode:
+  - mixed-seed summary output:
+    - `0.193 ms`
+    - `77.6%`
+    - `33.3%`
+  - summary-only seed summary output:
+    - `0.112 ms`
+    - `64.3%`
+    - `33.3%`
+
+So the current tiny-budget frontier is now split into two clear points:
+
+- **fastest coverage point** on this corpus:
+  - generic embedding mode
+  - summary-only seeds
+  - summary output
+- **best full-hit point** on this corpus:
+  - generic embedding mode
+  - mixed ANN seeds
+  - prompt-aware summary rerank
+
+And one more falsifier is now clear:
+
+> summary rows are not universally a better seed unit; the benefit depends on
+> the embedding mode and the final scoring contract

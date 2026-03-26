@@ -871,6 +871,62 @@ def main() -> int:
                 lambda q: (q.query_vec, list(extract_prompt_terms(q.prompt)), q.query_vec),
             )
 
+            summary_seed_summary_output_sql = base.QueryCase(
+                "summary_seed_summary_output_in",
+                f"""
+                WITH ann AS MATERIALIZED (
+                    SELECT entity_id
+                    FROM {{table}}
+                    WHERE relation_id = {REL_FILE_SUMMARY}
+                    ORDER BY embedding <=> %s::svec
+                    LIMIT {args.ann_k}
+                ),
+                seeds AS MATERIALIZED (
+                    SELECT DISTINCT entity_id FROM ann
+                )
+                SELECT *
+                FROM {{table}}
+                WHERE entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+                  AND relation_id = {REL_FILE_SUMMARY}
+                ORDER BY embedding <=> %s::svec, entity_id, relation_id, target_id
+                LIMIT {args.top_k}
+                """,
+                lambda q: (q.query_vec, q.query_vec),
+            )
+
+            prompt_summary_seed_rerank_sql = base.QueryCase(
+                "prompt_summary_seed_rerank_in",
+                f"""
+                WITH ann AS MATERIALIZED (
+                    SELECT entity_id
+                    FROM {{table}}
+                    WHERE relation_id = {REL_FILE_SUMMARY}
+                    ORDER BY embedding <=> %s::svec
+                    LIMIT {args.ann_k}
+                ),
+                seeds AS MATERIALIZED (
+                    SELECT DISTINCT entity_id FROM ann
+                ),
+                summaries AS MATERIALIZED (
+                    SELECT *
+                    FROM {{table}}
+                    WHERE entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+                      AND relation_id = {REL_FILE_SUMMARY}
+                )
+                SELECT *
+                FROM summaries
+                ORDER BY (
+                    SELECT count(*)
+                    FROM unnest(%s::text[]) kw
+                    WHERE position(lower(kw) in lower(payload)) > 0
+                ) DESC,
+                embedding <=> %s::svec,
+                entity_id, relation_id, target_id
+                LIMIT {args.top_k}
+                """,
+                lambda q: (q.query_vec, list(extract_prompt_terms(q.prompt)), q.query_vec),
+            )
+
             oracle_seed_expand_in = base.QueryCase(
                 "oracle_seed_expand_in",
                 f"""
@@ -1157,6 +1213,10 @@ def main() -> int:
                 ("facts_sh", "facts_sh", summary_output_sql),
                 ("facts_heap", "facts_heap", prompt_summary_rerank_sql),
                 ("facts_sh", "facts_sh", prompt_summary_rerank_sql),
+                ("facts_heap", "facts_heap", summary_seed_summary_output_sql),
+                ("facts_sh", "facts_sh", summary_seed_summary_output_sql),
+                ("facts_heap", "facts_heap", prompt_summary_seed_rerank_sql),
+                ("facts_sh", "facts_sh", prompt_summary_seed_rerank_sql),
                 ("facts_heap", "facts_heap", oracle_seed_expand_in),
                 ("facts_sh", "facts_sh", oracle_seed_expand_in),
                 ("facts_sh", "facts_sh", oracle_seed_expand_fn),
