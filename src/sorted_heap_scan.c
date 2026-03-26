@@ -15,7 +15,9 @@
 #include "access/stratnum.h"
 #include "access/tableam.h"
 #include "catalog/pg_am.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_opclass.h"
+#include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
 #include "commands/extension.h"
@@ -40,6 +42,7 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 
 #include "access/parallel.h"
 
@@ -157,6 +160,7 @@ static bool zone_overlaps_in_values(SortedHeapZoneMapEntry *e,
 									int64 *values, int nvalues);
 static bool sorted_heap_value_in_set(int64 value, int64 *values, int nvalues);
 static const char *sorted_heap_get_ext_schema(void);
+static bool sorted_heap_graph_type_is_svec(Oid typid);
 
 typedef struct GraphRagTopKEntry
 {
@@ -167,6 +171,25 @@ typedef struct GraphRagTopKEntry
 	Datum		payload;
 	bool		payload_isnull;
 } GraphRagTopKEntry;
+
+typedef struct SortedHeapGraphAttrs
+{
+	AttrNumber	entity_att;
+	AttrNumber	relation_att;
+	AttrNumber	target_att;
+	AttrNumber	embedding_att;
+	AttrNumber	payload_att;
+	Oid			entity_typid;
+	Oid			relation_typid;
+	Oid			target_typid;
+	Oid			embedding_typid;
+	Oid			payload_typid;
+	NameData	entity_col;
+	NameData	relation_col;
+	NameData	target_col;
+	NameData	embedding_col;
+	NameData	payload_col;
+} SortedHeapGraphAttrs;
 
 typedef struct GraphRagTargetScore
 {
@@ -3501,6 +3524,199 @@ sorted_heap_get_ext_schema(void)
 	return quote_identifier(get_namespace_name(get_extension_schema(ext_oid)));
 }
 
+static bool
+sorted_heap_graph_type_is_svec(Oid typid)
+{
+	HeapTuple		tup;
+	Form_pg_type	typeform;
+	bool			is_svec = false;
+
+	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+	if (!HeapTupleIsValid(tup))
+		return false;
+
+	typeform = (Form_pg_type) GETSTRUCT(tup);
+	is_svec = (strcmp(NameStr(typeform->typname), "svec") == 0);
+	ReleaseSysCache(tup);
+
+	return is_svec;
+}
+
+static void
+sorted_heap_graph_resolve_attrs(Relation rel, const char *caller,
+								  SortedHeapGraphAttrs *attrs)
+{
+	Oid				rel_oid = RelationGetRelid(rel);
+	Oid				ext_oid = get_extension_oid("pg_sorted_heap", false);
+	Oid				ext_schema_oid = get_extension_schema(ext_oid);
+	Oid				registry_oid;
+	char		   *entity_col = NULL;
+	char		   *relation_col = NULL;
+	char		   *target_col = NULL;
+	char		   *embedding_col = NULL;
+	char		   *payload_col = NULL;
+	const char	   *relname = RelationGetRelationName(rel);
+
+	memset(attrs, 0, sizeof(*attrs));
+
+	registry_oid = get_relname_relid("sorted_heap_graph_registry", ext_schema_oid);
+	if (OidIsValid(registry_oid))
+	{
+		Relation		registry_rel;
+		TableScanDesc	registry_scan;
+		TupleTableSlot *registry_slot;
+		AttrNumber		reg_relid_att;
+		AttrNumber		reg_entity_att;
+		AttrNumber		reg_relation_att;
+		AttrNumber		reg_target_att;
+		AttrNumber		reg_embedding_att;
+		AttrNumber		reg_payload_att;
+
+		registry_rel = table_open(registry_oid, AccessShareLock);
+		reg_relid_att = get_attnum(registry_oid, "relid");
+		reg_entity_att = get_attnum(registry_oid, "entity_column");
+		reg_relation_att = get_attnum(registry_oid, "relation_column");
+		reg_target_att = get_attnum(registry_oid, "target_column");
+		reg_embedding_att = get_attnum(registry_oid, "embedding_column");
+		reg_payload_att = get_attnum(registry_oid, "payload_column");
+
+		if (reg_relid_att == InvalidAttrNumber ||
+			reg_entity_att == InvalidAttrNumber ||
+			reg_relation_att == InvalidAttrNumber ||
+			reg_target_att == InvalidAttrNumber ||
+			reg_embedding_att == InvalidAttrNumber ||
+			reg_payload_att == InvalidAttrNumber)
+		{
+			table_close(registry_rel, AccessShareLock);
+			elog(ERROR, "%s: graph registry schema is invalid", caller);
+		}
+
+		registry_scan = table_beginscan(registry_rel, GetActiveSnapshot(), 0, NULL);
+		registry_slot = table_slot_create(registry_rel, NULL);
+
+		while (table_scan_getnextslot(registry_scan, ForwardScanDirection, registry_slot))
+		{
+			bool	isnull;
+			Oid		config_rel_oid;
+
+			config_rel_oid = DatumGetObjectId(slot_getattr(registry_slot,
+														 reg_relid_att,
+														 &isnull));
+			if (isnull || config_rel_oid != rel_oid)
+				continue;
+
+			entity_col = pstrdup(NameStr(*DatumGetName(slot_getattr(registry_slot,
+															   reg_entity_att,
+															   &isnull))));
+			if (isnull)
+				elog(ERROR, "%s: graph registry entity_column is NULL", caller);
+			relation_col = pstrdup(NameStr(*DatumGetName(slot_getattr(registry_slot,
+																 reg_relation_att,
+																 &isnull))));
+			if (isnull)
+				elog(ERROR, "%s: graph registry relation_column is NULL", caller);
+			target_col = pstrdup(NameStr(*DatumGetName(slot_getattr(registry_slot,
+															   reg_target_att,
+															   &isnull))));
+			if (isnull)
+				elog(ERROR, "%s: graph registry target_column is NULL", caller);
+			embedding_col = pstrdup(NameStr(*DatumGetName(slot_getattr(registry_slot,
+																  reg_embedding_att,
+																  &isnull))));
+			if (isnull)
+				elog(ERROR, "%s: graph registry embedding_column is NULL", caller);
+			payload_col = pstrdup(NameStr(*DatumGetName(slot_getattr(registry_slot,
+																reg_payload_att,
+																&isnull))));
+			if (isnull)
+				elog(ERROR, "%s: graph registry payload_column is NULL", caller);
+			break;
+		}
+
+		ExecDropSingleTupleTableSlot(registry_slot);
+		table_endscan(registry_scan);
+		table_close(registry_rel, AccessShareLock);
+	}
+
+	if (entity_col == NULL)
+		entity_col = pstrdup("entity_id");
+	if (relation_col == NULL)
+		relation_col = pstrdup("relation_id");
+	if (target_col == NULL)
+		target_col = pstrdup("target_id");
+	if (embedding_col == NULL)
+		embedding_col = pstrdup("embedding");
+	if (payload_col == NULL)
+		payload_col = pstrdup("payload");
+
+	namestrcpy(&attrs->entity_col, entity_col);
+	namestrcpy(&attrs->relation_col, relation_col);
+	namestrcpy(&attrs->target_col, target_col);
+	namestrcpy(&attrs->embedding_col, embedding_col);
+	namestrcpy(&attrs->payload_col, payload_col);
+
+	pfree(entity_col);
+	pfree(relation_col);
+	pfree(target_col);
+	pfree(embedding_col);
+	pfree(payload_col);
+
+	attrs->entity_att = get_attnum(rel_oid, NameStr(attrs->entity_col));
+	attrs->relation_att = get_attnum(rel_oid, NameStr(attrs->relation_col));
+	attrs->target_att = get_attnum(rel_oid, NameStr(attrs->target_col));
+	attrs->embedding_att = get_attnum(rel_oid, NameStr(attrs->embedding_col));
+	attrs->payload_att = get_attnum(rel_oid, NameStr(attrs->payload_col));
+
+	if (attrs->entity_att == InvalidAttrNumber ||
+		attrs->relation_att == InvalidAttrNumber ||
+		attrs->target_att == InvalidAttrNumber ||
+		attrs->embedding_att == InvalidAttrNumber ||
+		attrs->payload_att == InvalidAttrNumber)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("%s: relation \"%s\" must expose graph columns via canonical names or sorted_heap_graph_register()",
+						caller, relname)));
+	}
+
+	attrs->entity_typid =
+		TupleDescAttr(RelationGetDescr(rel), attrs->entity_att - 1)->atttypid;
+	attrs->relation_typid =
+		TupleDescAttr(RelationGetDescr(rel), attrs->relation_att - 1)->atttypid;
+	attrs->target_typid =
+		TupleDescAttr(RelationGetDescr(rel), attrs->target_att - 1)->atttypid;
+	attrs->embedding_typid =
+		TupleDescAttr(RelationGetDescr(rel), attrs->embedding_att - 1)->atttypid;
+	attrs->payload_typid =
+		TupleDescAttr(RelationGetDescr(rel), attrs->payload_att - 1)->atttypid;
+
+	if (attrs->entity_typid != INT4OID ||
+		attrs->relation_typid != INT2OID ||
+		attrs->target_typid != INT4OID)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("%s: relation \"%s\" must map graph columns to int4/int2/int4 for entity/relation/target",
+						caller, relname)));
+	}
+
+	if (!sorted_heap_graph_type_is_svec(attrs->embedding_typid))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("%s: relation \"%s\" must map the graph embedding column to svec",
+						caller, relname)));
+	}
+
+	if (attrs->payload_typid != TEXTOID)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("%s: relation \"%s\" must map the graph payload column to text",
+						caller, relname)));
+	}
+}
+
 /* ----------------------------------------------------------------
  *  Narrow GraphRAG primitive: expand known entity IDs on sorted_heap.
  *
@@ -3529,14 +3745,12 @@ sorted_heap_expand_ids(PG_FUNCTION_ARGS)
 	int32				limit_rows;
 	Relation			rel;
 	SortedHeapRelInfo  *info;
+	SortedHeapGraphAttrs gattrs;
 	AttrNumber			entity_att;
 	AttrNumber			relation_att;
 	AttrNumber			target_att;
 	AttrNumber			embedding_att;
 	AttrNumber			payload_att;
-	Oid					entity_typid;
-	Oid					relation_typid;
-	Oid					target_typid;
 	const char		   *relname;
 	Datum			   *seed_datums = NULL;
 	bool			   *seed_nulls = NULL;
@@ -3607,35 +3821,12 @@ sorted_heap_expand_ids(PG_FUNCTION_ARGS)
 						relname)));
 	}
 
-	entity_att = get_attnum(rel_oid, "entity_id");
-	relation_att = get_attnum(rel_oid, "relation_id");
-	target_att = get_attnum(rel_oid, "target_id");
-	embedding_att = get_attnum(rel_oid, "embedding");
-	payload_att = get_attnum(rel_oid, "payload");
-	if (entity_att == InvalidAttrNumber ||
-		relation_att == InvalidAttrNumber ||
-		target_att == InvalidAttrNumber ||
-		embedding_att == InvalidAttrNumber ||
-		payload_att == InvalidAttrNumber)
-	{
-		table_close(rel, AccessShareLock);
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_COLUMN),
-				 errmsg("sorted_heap_expand_ids: relation \"%s\" must have entity_id, relation_id, target_id, embedding, and payload columns",
-						relname)));
-	}
-
-	entity_typid = TupleDescAttr(RelationGetDescr(rel), entity_att - 1)->atttypid;
-	relation_typid = TupleDescAttr(RelationGetDescr(rel), relation_att - 1)->atttypid;
-	target_typid = TupleDescAttr(RelationGetDescr(rel), target_att - 1)->atttypid;
-	if (entity_typid != INT4OID || relation_typid != INT2OID || target_typid != INT4OID)
-	{
-		table_close(rel, AccessShareLock);
-		ereport(ERROR,
-				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("sorted_heap_expand_ids: relation \"%s\" must use entity_id int4, relation_id int2, target_id int4",
-						relname)));
-	}
+	sorted_heap_graph_resolve_attrs(rel, "sorted_heap_expand_ids", &gattrs);
+	entity_att = gattrs.entity_att;
+	relation_att = gattrs.relation_att;
+	target_att = gattrs.target_att;
+	embedding_att = gattrs.embedding_att;
+	payload_att = gattrs.payload_att;
 
 	info = sorted_heap_get_relinfo(rel);
 
@@ -3828,14 +4019,12 @@ sorted_heap_expand_rerank(PG_FUNCTION_ARGS)
 	int32				limit_rows;
 	Relation			rel;
 	SortedHeapRelInfo  *info;
+	SortedHeapGraphAttrs gattrs;
 	AttrNumber			entity_att;
 	AttrNumber			relation_att;
 	AttrNumber			target_att;
 	AttrNumber			embedding_att;
 	AttrNumber			payload_att;
-	Oid					entity_typid;
-	Oid					relation_typid;
-	Oid					target_typid;
 	const char		   *relname;
 	Datum			   *seed_datums = NULL;
 	bool			   *seed_nulls = NULL;
@@ -3902,35 +4091,12 @@ sorted_heap_expand_rerank(PG_FUNCTION_ARGS)
 						relname)));
 	}
 
-	entity_att = get_attnum(rel_oid, "entity_id");
-	relation_att = get_attnum(rel_oid, "relation_id");
-	target_att = get_attnum(rel_oid, "target_id");
-	embedding_att = get_attnum(rel_oid, "embedding");
-	payload_att = get_attnum(rel_oid, "payload");
-	if (entity_att == InvalidAttrNumber ||
-		relation_att == InvalidAttrNumber ||
-		target_att == InvalidAttrNumber ||
-		embedding_att == InvalidAttrNumber ||
-		payload_att == InvalidAttrNumber)
-	{
-		table_close(rel, AccessShareLock);
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_COLUMN),
-				 errmsg("sorted_heap_expand_rerank: relation \"%s\" must have entity_id, relation_id, target_id, embedding, and payload columns",
-						relname)));
-	}
-
-	entity_typid = TupleDescAttr(RelationGetDescr(rel), entity_att - 1)->atttypid;
-	relation_typid = TupleDescAttr(RelationGetDescr(rel), relation_att - 1)->atttypid;
-	target_typid = TupleDescAttr(RelationGetDescr(rel), target_att - 1)->atttypid;
-	if (entity_typid != INT4OID || relation_typid != INT2OID || target_typid != INT4OID)
-	{
-		table_close(rel, AccessShareLock);
-		ereport(ERROR,
-				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("sorted_heap_expand_rerank: relation \"%s\" must use entity_id int4, relation_id int2, target_id int4",
-						relname)));
-	}
+	sorted_heap_graph_resolve_attrs(rel, "sorted_heap_expand_rerank", &gattrs);
+	entity_att = gattrs.entity_att;
+	relation_att = gattrs.relation_att;
+	target_att = gattrs.target_att;
+	embedding_att = gattrs.embedding_att;
+	payload_att = gattrs.payload_att;
 
 	info = sorted_heap_get_relinfo(rel);
 
@@ -3988,14 +4154,12 @@ sorted_heap_expand_twohop_rerank(PG_FUNCTION_ARGS)
 	int32				limit_rows;
 	Relation			rel;
 	SortedHeapRelInfo  *info;
+	SortedHeapGraphAttrs gattrs;
 	AttrNumber			entity_att;
 	AttrNumber			relation_att;
 	AttrNumber			target_att;
 	AttrNumber			embedding_att;
 	AttrNumber			payload_att;
-	Oid					entity_typid;
-	Oid					relation_typid;
-	Oid					target_typid;
 	const char		   *relname;
 	Datum			   *seed_datums = NULL;
 	bool			   *seed_nulls = NULL;
@@ -4073,35 +4237,12 @@ sorted_heap_expand_twohop_rerank(PG_FUNCTION_ARGS)
 						relname)));
 	}
 
-	entity_att = get_attnum(rel_oid, "entity_id");
-	relation_att = get_attnum(rel_oid, "relation_id");
-	target_att = get_attnum(rel_oid, "target_id");
-	embedding_att = get_attnum(rel_oid, "embedding");
-	payload_att = get_attnum(rel_oid, "payload");
-	if (entity_att == InvalidAttrNumber ||
-		relation_att == InvalidAttrNumber ||
-		target_att == InvalidAttrNumber ||
-		embedding_att == InvalidAttrNumber ||
-		payload_att == InvalidAttrNumber)
-	{
-		table_close(rel, AccessShareLock);
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_COLUMN),
-				 errmsg("sorted_heap_expand_twohop_rerank: relation \"%s\" must have entity_id, relation_id, target_id, embedding, and payload columns",
-						relname)));
-	}
-
-	entity_typid = TupleDescAttr(RelationGetDescr(rel), entity_att - 1)->atttypid;
-	relation_typid = TupleDescAttr(RelationGetDescr(rel), relation_att - 1)->atttypid;
-	target_typid = TupleDescAttr(RelationGetDescr(rel), target_att - 1)->atttypid;
-	if (entity_typid != INT4OID || relation_typid != INT2OID || target_typid != INT4OID)
-	{
-		table_close(rel, AccessShareLock);
-		ereport(ERROR,
-				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("sorted_heap_expand_twohop_rerank: relation \"%s\" must use entity_id int4, relation_id int2, target_id int4",
-						relname)));
-	}
+	sorted_heap_graph_resolve_attrs(rel, "sorted_heap_expand_twohop_rerank", &gattrs);
+	entity_att = gattrs.entity_att;
+	relation_att = gattrs.relation_att;
+	target_att = gattrs.target_att;
+	embedding_att = gattrs.embedding_att;
+	payload_att = gattrs.payload_att;
 
 	info = sorted_heap_get_relinfo(rel);
 
@@ -4175,14 +4316,12 @@ sorted_heap_expand_twohop_path_rerank(PG_FUNCTION_ARGS)
 	int32				limit_rows;
 	Relation			rel;
 	SortedHeapRelInfo  *info;
+	SortedHeapGraphAttrs gattrs;
 	AttrNumber			entity_att;
 	AttrNumber			relation_att;
 	AttrNumber			target_att;
 	AttrNumber			embedding_att;
 	AttrNumber			payload_att;
-	Oid					entity_typid;
-	Oid					relation_typid;
-	Oid					target_typid;
 	const char		   *relname;
 	Datum			   *seed_datums = NULL;
 	bool			   *seed_nulls = NULL;
@@ -4260,35 +4399,12 @@ sorted_heap_expand_twohop_path_rerank(PG_FUNCTION_ARGS)
 						relname)));
 	}
 
-	entity_att = get_attnum(rel_oid, "entity_id");
-	relation_att = get_attnum(rel_oid, "relation_id");
-	target_att = get_attnum(rel_oid, "target_id");
-	embedding_att = get_attnum(rel_oid, "embedding");
-	payload_att = get_attnum(rel_oid, "payload");
-	if (entity_att == InvalidAttrNumber ||
-		relation_att == InvalidAttrNumber ||
-		target_att == InvalidAttrNumber ||
-		embedding_att == InvalidAttrNumber ||
-		payload_att == InvalidAttrNumber)
-	{
-		table_close(rel, AccessShareLock);
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_COLUMN),
-				 errmsg("sorted_heap_expand_twohop_path_rerank: relation \"%s\" must have entity_id, relation_id, target_id, embedding, and payload columns",
-						relname)));
-	}
-
-	entity_typid = TupleDescAttr(RelationGetDescr(rel), entity_att - 1)->atttypid;
-	relation_typid = TupleDescAttr(RelationGetDescr(rel), relation_att - 1)->atttypid;
-	target_typid = TupleDescAttr(RelationGetDescr(rel), target_att - 1)->atttypid;
-	if (entity_typid != INT4OID || relation_typid != INT2OID || target_typid != INT4OID)
-	{
-		table_close(rel, AccessShareLock);
-		ereport(ERROR,
-				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("sorted_heap_expand_twohop_path_rerank: relation \"%s\" must use entity_id int4, relation_id int2, target_id int4",
-						relname)));
-	}
+	sorted_heap_graph_resolve_attrs(rel, "sorted_heap_expand_twohop_path_rerank", &gattrs);
+	entity_att = gattrs.entity_att;
+	relation_att = gattrs.relation_att;
+	target_att = gattrs.target_att;
+	embedding_att = gattrs.embedding_att;
+	payload_att = gattrs.payload_att;
 
 	info = sorted_heap_get_relinfo(rel);
 
@@ -4369,13 +4485,15 @@ sorted_heap_graph_rag_scan(PG_FUNCTION_ARGS)
 	int32				relation_filter = 0;
 	int32				limit_rows;
 	Relation			rel;
-	AttrNumber			embedding_att;
+	SortedHeapGraphAttrs gattrs;
 	Oid					embedding_typid;
 	char			   *schema_name;
 	char			   *relname;
 	const char		   *quoted_schema;
 	const char		   *quoted_relname;
 	const char		   *quoted_ext_schema;
+	const char		   *quoted_target_col;
+	const char		   *quoted_embedding_col;
 	StringInfoData		seed_sql;
 	StringInfoData		helper_sql;
 	Oid					argtypes[6];
@@ -4440,21 +4558,15 @@ sorted_heap_graph_rag_scan(PG_FUNCTION_ARGS)
 						relname)));
 	}
 
-	embedding_att = get_attnum(rel_oid, "embedding");
-	if (embedding_att == InvalidAttrNumber)
-	{
-		table_close(rel, AccessShareLock);
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_COLUMN),
-				 errmsg("sorted_heap_graph_rag_scan: relation \"%s\" must have an embedding column",
-						relname)));
-	}
-	embedding_typid = TupleDescAttr(RelationGetDescr(rel), embedding_att - 1)->atttypid;
+	sorted_heap_graph_resolve_attrs(rel, "sorted_heap_graph_rag_scan", &gattrs);
+	embedding_typid = gattrs.embedding_typid;
 
 	schema_name = get_namespace_name(get_rel_namespace(rel_oid));
 	quoted_schema = quote_identifier(schema_name);
 	quoted_relname = quote_identifier(relname);
 	quoted_ext_schema = sorted_heap_get_ext_schema();
+	quoted_target_col = quote_identifier(NameStr(gattrs.target_col));
+	quoted_embedding_col = quote_identifier(NameStr(gattrs.embedding_col));
 
 	ret = SPI_connect();
 	if (ret != SPI_OK_CONNECT)
@@ -4465,12 +4577,13 @@ sorted_heap_graph_rag_scan(PG_FUNCTION_ARGS)
 
 	initStringInfo(&seed_sql);
 	appendStringInfo(&seed_sql,
-					 "SELECT array_agg(target_id::int4) "
-					 "FROM (SELECT DISTINCT target_id "
-					 "      FROM (SELECT target_id "
+					 "SELECT array_agg(%s::int4) "
+					 "FROM (SELECT DISTINCT %s "
+					 "      FROM (SELECT %s "
 					 "            FROM %s.%s "
-					 "            ORDER BY embedding <=> $1 LIMIT %d) ann) seeds",
-					 quoted_schema, quoted_relname, ann_k);
+					 "            ORDER BY %s <=> $1 LIMIT %d) ann) seeds",
+					 quoted_target_col, quoted_target_col, quoted_target_col,
+					 quoted_schema, quoted_relname, quoted_embedding_col, ann_k);
 
 	argtypes[0] = embedding_typid;
 	values[0] = PointerGetDatum(query);
@@ -4567,13 +4680,15 @@ sorted_heap_graph_rag_twohop_scan(PG_FUNCTION_ARGS)
 	int32				hop2_filter = 0;
 	int32				limit_rows;
 	Relation			rel;
-	AttrNumber			embedding_att;
+	SortedHeapGraphAttrs gattrs;
 	Oid					embedding_typid;
 	char			   *schema_name;
 	char			   *relname;
 	const char		   *quoted_schema;
 	const char		   *quoted_relname;
 	const char		   *quoted_ext_schema;
+	const char		   *quoted_entity_col;
+	const char		   *quoted_embedding_col;
 	StringInfoData		seed_sql;
 	StringInfoData		helper_sql;
 	Oid					argtypes[7];
@@ -4647,21 +4762,15 @@ sorted_heap_graph_rag_twohop_scan(PG_FUNCTION_ARGS)
 						relname)));
 	}
 
-	embedding_att = get_attnum(rel_oid, "embedding");
-	if (embedding_att == InvalidAttrNumber)
-	{
-		table_close(rel, AccessShareLock);
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_COLUMN),
-				 errmsg("sorted_heap_graph_rag_twohop_scan: relation \"%s\" must have an embedding column",
-						relname)));
-	}
-	embedding_typid = TupleDescAttr(RelationGetDescr(rel), embedding_att - 1)->atttypid;
+	sorted_heap_graph_resolve_attrs(rel, "sorted_heap_graph_rag_twohop_scan", &gattrs);
+	embedding_typid = gattrs.embedding_typid;
 
 	schema_name = get_namespace_name(get_rel_namespace(rel_oid));
 	quoted_schema = quote_identifier(schema_name);
 	quoted_relname = quote_identifier(relname);
 	quoted_ext_schema = sorted_heap_get_ext_schema();
+	quoted_entity_col = quote_identifier(NameStr(gattrs.entity_col));
+	quoted_embedding_col = quote_identifier(NameStr(gattrs.embedding_col));
 
 	ret = SPI_connect();
 	if (ret != SPI_OK_CONNECT)
@@ -4672,12 +4781,13 @@ sorted_heap_graph_rag_twohop_scan(PG_FUNCTION_ARGS)
 
 	initStringInfo(&seed_sql);
 	appendStringInfo(&seed_sql,
-					 "SELECT array_agg(entity_id::int4) "
-					 "FROM (SELECT DISTINCT entity_id "
-					 "      FROM (SELECT entity_id "
+					 "SELECT array_agg(%s::int4) "
+					 "FROM (SELECT DISTINCT %s "
+					 "      FROM (SELECT %s "
 					 "            FROM %s.%s "
-					 "            ORDER BY embedding <=> $1 LIMIT %d) ann) seeds",
-					 quoted_schema, quoted_relname, ann_k);
+					 "            ORDER BY %s <=> $1 LIMIT %d) ann) seeds",
+					 quoted_entity_col, quoted_entity_col, quoted_entity_col,
+					 quoted_schema, quoted_relname, quoted_embedding_col, ann_k);
 
 	argtypes[0] = embedding_typid;
 	values[0] = PointerGetDatum(query);
@@ -4774,13 +4884,15 @@ sorted_heap_graph_rag_twohop_path_scan(PG_FUNCTION_ARGS)
 	int32				hop2_filter = 0;
 	int32				limit_rows;
 	Relation			rel;
-	AttrNumber			embedding_att;
+	SortedHeapGraphAttrs gattrs;
 	Oid					embedding_typid;
 	char			   *schema_name;
 	char			   *relname;
 	const char		   *quoted_schema;
 	const char		   *quoted_relname;
 	const char		   *quoted_ext_schema;
+	const char		   *quoted_entity_col;
+	const char		   *quoted_embedding_col;
 	StringInfoData		seed_sql;
 	StringInfoData		helper_sql;
 	Oid					argtypes[7];
@@ -4854,21 +4966,15 @@ sorted_heap_graph_rag_twohop_path_scan(PG_FUNCTION_ARGS)
 						relname)));
 	}
 
-	embedding_att = get_attnum(rel_oid, "embedding");
-	if (embedding_att == InvalidAttrNumber)
-	{
-		table_close(rel, AccessShareLock);
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_COLUMN),
-				 errmsg("sorted_heap_graph_rag_twohop_path_scan: relation \"%s\" must have an embedding column",
-						relname)));
-	}
-	embedding_typid = TupleDescAttr(RelationGetDescr(rel), embedding_att - 1)->atttypid;
+	sorted_heap_graph_resolve_attrs(rel, "sorted_heap_graph_rag_twohop_path_scan", &gattrs);
+	embedding_typid = gattrs.embedding_typid;
 
 	schema_name = get_namespace_name(get_rel_namespace(rel_oid));
 	quoted_schema = quote_identifier(schema_name);
 	quoted_relname = quote_identifier(relname);
 	quoted_ext_schema = sorted_heap_get_ext_schema();
+	quoted_entity_col = quote_identifier(NameStr(gattrs.entity_col));
+	quoted_embedding_col = quote_identifier(NameStr(gattrs.embedding_col));
 
 	ret = SPI_connect();
 	if (ret != SPI_OK_CONNECT)
@@ -4879,12 +4985,13 @@ sorted_heap_graph_rag_twohop_path_scan(PG_FUNCTION_ARGS)
 
 	initStringInfo(&seed_sql);
 	appendStringInfo(&seed_sql,
-					 "SELECT array_agg(entity_id::int4) "
-					 "FROM (SELECT DISTINCT entity_id "
-					 "      FROM (SELECT entity_id "
+					 "SELECT array_agg(%s::int4) "
+					 "FROM (SELECT DISTINCT %s "
+					 "      FROM (SELECT %s "
 					 "            FROM %s.%s "
-					 "            ORDER BY embedding <=> $1 LIMIT %d) ann) seeds",
-					 quoted_schema, quoted_relname, ann_k);
+					 "            ORDER BY %s <=> $1 LIMIT %d) ann) seeds",
+					 quoted_entity_col, quoted_entity_col, quoted_entity_col,
+					 quoted_schema, quoted_relname, quoted_embedding_col, ann_k);
 
 	argtypes[0] = embedding_typid;
 	values[0] = PointerGetDatum(query);

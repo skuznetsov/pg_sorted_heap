@@ -496,5 +496,74 @@ COPY (
   ) diff
 ) TO STDOUT;
 
+CREATE TABLE facts_alias (
+  src_id    int4 NOT NULL,
+  edge_type int2 NOT NULL,
+  dst_id    int4 NOT NULL,
+  vec       svec(4) NOT NULL,
+  body      text NOT NULL,
+  PRIMARY KEY (src_id, edge_type, dst_id)
+) USING sorted_heap;
+
+INSERT INTO facts_alias VALUES
+  (1, 1, 2, '[1,0,0,0]'::svec, 'a'),
+  (1, 2, 3, '[0.9,0.1,0,0]'::svec, 'b'),
+  (2, 1, 4, '[0,1,0,0]'::svec, 'c'),
+  (3, 1, 1, '[0,0,1,0]'::svec, 'd'),
+  (3, 2, 5, '[0,0,0.9,0.1]'::svec, 'e'),
+  (4, 1, 6, '[0,0,0,1]'::svec, 'f');
+
+SELECT sorted_heap_compact('facts_alias'::regclass);
+
+SELECT sorted_heap_graph_register(
+  'facts_alias'::regclass,
+  entity_column := 'src_id',
+  relation_column := 'edge_type',
+  target_column := 'dst_id',
+  embedding_column := 'vec',
+  payload_column := 'body'
+);
+
+COPY (
+  SELECT entity_column::text, relation_column::text, target_column::text,
+         embedding_column::text, payload_column::text, is_registered
+  FROM sorted_heap_graph_config('facts_alias'::regclass)
+) TO STDOUT;
+
+COPY (
+  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+  FROM sorted_heap_expand_rerank('facts_alias'::regclass, ARRAY[1,3], '[1,0,0,0]'::svec, 2, 2, 0)
+  ORDER BY distance, entity_id, relation_id, target_id
+) TO STDOUT;
+
+COPY (
+  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+  FROM sorted_heap_graph_rag(
+    'facts_alias'::regclass,
+    '[1,0,0,0]'::svec,
+    relation_path := ARRAY[2],
+    ann_k := 2,
+    top_k := 2,
+    score_mode := 'endpoint',
+    limit_rows := 0
+  )
+  ORDER BY distance, entity_id, relation_id, target_id
+) TO STDOUT;
+
+COPY (
+  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+  FROM sorted_heap_graph_rag_twohop_path_scan('facts_alias'::regclass, '[0,0,1,0]'::svec, 2, 2, 1, 2, 0)
+  ORDER BY distance, entity_id, relation_id, target_id
+) TO STDOUT;
+
+SELECT sorted_heap_graph_unregister('facts_alias'::regclass);
+
+COPY (
+  SELECT entity_column::text, relation_column::text, target_column::text,
+         embedding_column::text, payload_column::text, is_registered
+  FROM sorted_heap_graph_config('facts_alias'::regclass)
+) TO STDOUT;
+
+DROP TABLE facts_alias;
 DROP TABLE facts_sh;
 DROP EXTENSION pg_sorted_heap;

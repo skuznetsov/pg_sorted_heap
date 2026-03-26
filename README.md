@@ -18,6 +18,9 @@ plus planner-integrated HNSW search.
 
 - GraphRAG helper/wrapper API:
   - `sorted_heap_graph_rag(...)`
+  - `sorted_heap_graph_register(...)`
+  - `sorted_heap_graph_config(...)`
+  - `sorted_heap_graph_unregister(...)`
   - `sorted_heap_expand_ids(...)`
   - `sorted_heap_expand_rerank(...)`
   - `sorted_heap_expand_twohop_rerank(...)`
@@ -174,6 +177,19 @@ FROM sorted_heap_graph_rag(
     ann_k := 64,
     top_k := 10,
     score_mode := 'path'
+);
+```
+
+If your fact table uses different column names, register the mapping once:
+
+```sql
+SELECT sorted_heap_graph_register(
+    'facts_alias'::regclass,
+    entity_column := 'src_id',
+    relation_column := 'edge_type',
+    target_column := 'dst_id',
+    embedding_column := 'vec',
+    payload_column := 'body'
 );
 ```
 

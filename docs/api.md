@@ -466,6 +466,36 @@ ON facts USING sorted_hnsw (embedding)
 WITH (m = 24, ef_construction = 200);
 ```
 
+Canonical fact columns work out of the box. If a fact table uses different
+names, register the mapping once and then keep using the same GraphRAG API.
+
+### `sorted_heap_graph_register(rel, entity_column, relation_column, target_column, embedding_column, payload_column)`
+
+Registers a non-canonical fact-table schema for GraphRAG helpers and wrappers.
+All mapped columns must still be type-compatible with the fact-graph contract:
+`int4 / int2 / int4 / svec / text`.
+
+```sql
+SELECT sorted_heap_graph_register(
+    'facts_alias'::regclass,
+    entity_column := 'src_id',
+    relation_column := 'edge_type',
+    target_column := 'dst_id',
+    embedding_column := 'vec',
+    payload_column := 'body'
+);
+```
+
+### `sorted_heap_graph_config(rel)`
+
+Returns the current GraphRAG mapping for a relation, including whether it was
+explicitly registered or is still using the canonical default names.
+
+### `sorted_heap_graph_unregister(rel)`
+
+Removes a previously registered mapping and restores the canonical-name
+defaults for that relation.
+
 ### `sorted_heap_graph_rag(rel, query, relation_path, ann_k, top_k, score_mode, limit_rows)`
 
 Preferred fact-shaped GraphRAG entry point.
@@ -485,8 +515,10 @@ Current constraints:
 
 - `relation_path` must be a one-dimensional `int4[]` of length `1` or `2`
 - supported `score_mode` values are `endpoint` and `path`
-- current schema contract still expects canonical fact columns:
-  `entity_id`, `relation_id`, `target_id`, `embedding`, `payload`
+- canonical fact columns (`entity_id`, `relation_id`, `target_id`,
+  `embedding`, `payload`) need no extra setup
+- non-canonical schemas must be registered first with
+  `sorted_heap_graph_register(...)`
 
 ```sql
 SET sorted_hnsw.ef_search = 128;

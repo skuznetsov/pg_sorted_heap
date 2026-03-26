@@ -30,7 +30,8 @@ FROM sorted_heap_graph_rag(
 
 Contract:
 
-- fact rows clustered by `(entity_id, relation_id, target_id)`
+- fact rows clustered by `(entity_id, relation_id, target_id)`, or by an
+  equivalent registered alias mapping
 - ANN seed retrieval on `entity_id`
 - `relation_path` length `1` or `2`
 - `score_mode = 'endpoint' | 'path'`
@@ -113,10 +114,11 @@ The existing beta surface works, but it is a function zoo.
      - `~/SrcArchives`
 
 5. Non-canonical schema story
-   - current fact-graph contract still assumes canonical column names
-   - either:
-     - keep that as the explicit `0.13` limitation, or
-     - add graph registration / mapping before release
+   - non-canonical fact schemas are now supported via:
+     - `sorted_heap_graph_register(...)`
+     - `sorted_heap_graph_config(...)`
+     - `sorted_heap_graph_unregister(...)`
+   - remaining work is hardening and documentation, not naming flexibility
 
 ## Implementation phases
 
@@ -135,15 +137,17 @@ Needed next:
 
 - lifecycle regression coverage
 - larger real-corpus repeated-build gates
-- explicit caveats for non-canonical schemas
+- observability across seed / expand / rerank stages
 
 ### Phase 3: schema registration
 
-Optional but likely valuable:
+Implemented in this branch:
 
 - register graph metadata for non-canonical column names
 - keep `sorted_heap_graph_rag(...)` syntax stable while relaxing the schema
   naming constraint
+- regression coverage now includes an alias schema:
+  `src_id / edge_type / dst_id / vec / body`
 
 ### Phase 4: code-corpus productization
 

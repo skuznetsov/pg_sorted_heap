@@ -1,3 +1,66 @@
+CREATE TABLE @extschema@.sorted_heap_graph_registry (
+  relid regclass PRIMARY KEY,
+  entity_column name NOT NULL,
+  relation_column name NOT NULL,
+  target_column name NOT NULL,
+  embedding_column name NOT NULL,
+  payload_column name NOT NULL
+);
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_register(
+  rel regclass,
+  entity_column name DEFAULT 'entity_id',
+  relation_column name DEFAULT 'relation_id',
+  target_column name DEFAULT 'target_id',
+  embedding_column name DEFAULT 'embedding',
+  payload_column name DEFAULT 'payload'
+) RETURNS void
+AS $$
+  INSERT INTO @extschema@.sorted_heap_graph_registry (
+    relid, entity_column, relation_column, target_column, embedding_column, payload_column
+  )
+  VALUES ($1, $2, $3, $4, $5, $6)
+  ON CONFLICT (relid) DO UPDATE SET
+    entity_column = EXCLUDED.entity_column,
+    relation_column = EXCLUDED.relation_column,
+    target_column = EXCLUDED.target_column,
+    embedding_column = EXCLUDED.embedding_column,
+    payload_column = EXCLUDED.payload_column;
+$$ LANGUAGE SQL;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_unregister(rel regclass)
+RETURNS boolean
+AS $$
+DECLARE
+  deleted_rows int4;
+BEGIN
+  DELETE FROM @extschema@.sorted_heap_graph_registry WHERE relid = rel;
+  GET DIAGNOSTICS deleted_rows = ROW_COUNT;
+  RETURN deleted_rows > 0;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_config(rel regclass)
+RETURNS TABLE (
+  entity_column name,
+  relation_column name,
+  target_column name,
+  embedding_column name,
+  payload_column name,
+  is_registered boolean
+)
+AS $$
+  SELECT
+    COALESCE(r.entity_column, 'entity_id'::name) AS entity_column,
+    COALESCE(r.relation_column, 'relation_id'::name) AS relation_column,
+    COALESCE(r.target_column, 'target_id'::name) AS target_column,
+    COALESCE(r.embedding_column, 'embedding'::name) AS embedding_column,
+    COALESCE(r.payload_column, 'payload'::name) AS payload_column,
+    (r.relid IS NOT NULL) AS is_registered
+  FROM (SELECT $1::regclass AS relid) args
+  LEFT JOIN @extschema@.sorted_heap_graph_registry r ON r.relid = args.relid;
+$$ LANGUAGE SQL STABLE;
+
 CREATE FUNCTION @extschema@.sorted_heap_graph_rag(
   rel regclass,
   query @extschema@.svec,
@@ -20,6 +83,7 @@ DECLARE
   seed_ids int4[];
   mode text;
   seed_sql text;
+  cfg record;
 BEGIN
   IF ann_k < 1 THEN
     RAISE EXCEPTION 'sorted_heap_graph_rag: ann_k must be >= 1';
@@ -46,6 +110,8 @@ BEGIN
   END LOOP;
 
   mode := coalesce(nullif(lower(btrim(score_mode)), ''), 'path');
+  SELECT * INTO cfg
+  FROM @extschema@.sorted_heap_graph_config(rel);
 
   IF path_len = 1 THEN
     IF mode NOT IN ('endpoint', 'path') THEN
@@ -53,17 +119,19 @@ BEGIN
     END IF;
 
     seed_sql := format(
-      'SELECT array_agg(entity_id::int4)
+      'SELECT array_agg(%1$I::int4)
        FROM (
-         SELECT DISTINCT entity_id
+         SELECT DISTINCT %1$I
          FROM (
-           SELECT entity_id
-           FROM %s
-           ORDER BY embedding <=> $1
+           SELECT %1$I
+           FROM %2$s
+           ORDER BY %3$I <=> $1
            LIMIT $2
          ) ann
        ) seeds',
-      rel);
+      cfg.entity_column,
+      rel,
+      cfg.embedding_column);
     EXECUTE seed_sql USING query, ann_k INTO seed_ids;
 
     IF seed_ids IS NULL OR array_length(seed_ids, 1) IS NULL THEN

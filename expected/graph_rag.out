@@ -16,16 +16,16 @@ INSERT INTO facts_sh VALUES
   (3, 2, 5, '[0,0,0.9,0.1]'::svec, 'e'),
   (4, 1, 6, '[0,0,0,1]'::svec, 'f');
 SELECT sorted_heap_compact('facts_sh'::regclass);
- sorted_heap_compact 
+ sorted_heap_compact
 ---------------------
- 
+
 (1 row)
 
 ANALYZE facts_sh;
 SELECT entity_id, relation_id, target_id, payload
 FROM sorted_heap_expand_ids('facts_sh'::regclass, ARRAY[1,3], NULL, 0)
 ORDER BY entity_id, relation_id, target_id;
- entity_id | relation_id | target_id | payload 
+ entity_id | relation_id | target_id | payload
 -----------+-------------+-----------+---------
          1 |           1 |         2 | a
          1 |           2 |         3 | b
@@ -36,7 +36,7 @@ ORDER BY entity_id, relation_id, target_id;
 SELECT entity_id, relation_id, target_id, payload
 FROM sorted_heap_expand_ids('facts_sh'::regclass, ARRAY[1,3], 1, 0)
 ORDER BY entity_id, relation_id, target_id;
- entity_id | relation_id | target_id | payload 
+ entity_id | relation_id | target_id | payload
 -----------+-------------+-----------+---------
          1 |           1 |         2 | a
          3 |           1 |         1 | d
@@ -45,7 +45,7 @@ ORDER BY entity_id, relation_id, target_id;
 SELECT entity_id, relation_id, target_id, payload
 FROM sorted_heap_expand_ids('facts_sh'::regclass, ARRAY[1,3], NULL, 2)
 ORDER BY entity_id, relation_id, target_id;
- entity_id | relation_id | target_id | payload 
+ entity_id | relation_id | target_id | payload
 -----------+-------------+-----------+---------
          1 |           1 |         2 | a
          1 |           2 |         3 | b
@@ -54,7 +54,7 @@ ORDER BY entity_id, relation_id, target_id;
 SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
 FROM sorted_heap_expand_rerank('facts_sh'::regclass, ARRAY[1,3], '[1,0,0,0]'::svec, 2, NULL, 0)
 ORDER BY distance, entity_id, relation_id, target_id;
- entity_id | relation_id | target_id | payload | distance 
+ entity_id | relation_id | target_id | payload | distance
 -----------+-------------+-----------+---------+----------
          1 |           1 |         2 | a       | 0.000000
          1 |           2 |         3 | b       | 0.006116
@@ -63,7 +63,7 @@ ORDER BY distance, entity_id, relation_id, target_id;
 SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
 FROM sorted_heap_graph_rag_scan('facts_sh'::regclass, '[1,0,0,0]'::svec, 2, 2, NULL, 0)
 ORDER BY distance, entity_id, relation_id, target_id;
- entity_id | relation_id | target_id | payload | distance 
+ entity_id | relation_id | target_id | payload | distance
 -----------+-------------+-----------+---------+----------
          2 |           1 |         4 | c       | 1.000000
          3 |           1 |         1 | d       | 1.000000
@@ -171,7 +171,7 @@ FROM (
   UNION ALL
   (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
 ) diff;
- diff_rows 
+ diff_rows
 -----------
          0
 (1 row)
@@ -194,7 +194,7 @@ FROM (
   UNION ALL
   (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
 ) diff;
- rerank_diff_rows 
+ rerank_diff_rows
 ------------------
                 0
 (1 row)
@@ -290,7 +290,7 @@ FROM (
   UNION ALL
   (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
 ) diff;
- graph_rag_diff_rows 
+ graph_rag_diff_rows
 ---------------------
                    0
 (1 row)
@@ -538,5 +538,85 @@ COPY (
   ) diff
 ) TO STDOUT;
 0
+CREATE TABLE facts_alias (
+  src_id    int4 NOT NULL,
+  edge_type int2 NOT NULL,
+  dst_id    int4 NOT NULL,
+  vec       svec(4) NOT NULL,
+  body      text NOT NULL,
+  PRIMARY KEY (src_id, edge_type, dst_id)
+) USING sorted_heap;
+INSERT INTO facts_alias VALUES
+  (1, 1, 2, '[1,0,0,0]'::svec, 'a'),
+  (1, 2, 3, '[0.9,0.1,0,0]'::svec, 'b'),
+  (2, 1, 4, '[0,1,0,0]'::svec, 'c'),
+  (3, 1, 1, '[0,0,1,0]'::svec, 'd'),
+  (3, 2, 5, '[0,0,0.9,0.1]'::svec, 'e'),
+  (4, 1, 6, '[0,0,0,1]'::svec, 'f');
+SELECT sorted_heap_compact('facts_alias'::regclass);
+ sorted_heap_compact
+---------------------
+
+(1 row)
+
+SELECT sorted_heap_graph_register(
+  'facts_alias'::regclass,
+  entity_column := 'src_id',
+  relation_column := 'edge_type',
+  target_column := 'dst_id',
+  embedding_column := 'vec',
+  payload_column := 'body'
+);
+ sorted_heap_graph_register
+----------------------------
+
+(1 row)
+
+COPY (
+  SELECT entity_column::text, relation_column::text, target_column::text,
+         embedding_column::text, payload_column::text, is_registered
+  FROM sorted_heap_graph_config('facts_alias'::regclass)
+) TO STDOUT;
+src_id	edge_type	dst_id	vec	body	t
+COPY (
+  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+  FROM sorted_heap_expand_rerank('facts_alias'::regclass, ARRAY[1,3], '[1,0,0,0]'::svec, 2, 2, 0)
+  ORDER BY distance, entity_id, relation_id, target_id
+) TO STDOUT;
+1	2	3	b	0.006116
+3	2	5	e	1.000000
+COPY (
+  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+  FROM sorted_heap_graph_rag(
+    'facts_alias'::regclass,
+    '[1,0,0,0]'::svec,
+    relation_path := ARRAY[2],
+    ann_k := 2,
+    top_k := 2,
+    score_mode := 'endpoint',
+    limit_rows := 0
+  )
+  ORDER BY distance, entity_id, relation_id, target_id
+) TO STDOUT;
+1	2	3	b	0.006116
+COPY (
+  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+  FROM sorted_heap_graph_rag_twohop_path_scan('facts_alias'::regclass, '[0,0,1,0]'::svec, 2, 2, 1, 2, 0)
+  ORDER BY distance, entity_id, relation_id, target_id
+) TO STDOUT;
+1	2	3	b	1.000000
+SELECT sorted_heap_graph_unregister('facts_alias'::regclass);
+ sorted_heap_graph_unregister
+------------------------------
+ t
+(1 row)
+
+COPY (
+  SELECT entity_column::text, relation_column::text, target_column::text,
+         embedding_column::text, payload_column::text, is_registered
+  FROM sorted_heap_graph_config('facts_alias'::regclass)
+) TO STDOUT;
+entity_id	relation_id	target_id	embedding	payload	f
+DROP TABLE facts_alias;
 DROP TABLE facts_sh;
 DROP EXTENSION pg_sorted_heap;

@@ -19,6 +19,22 @@
 - Added `docs/graphrag-0.13-plan.md` to separate the narrow stable `0.13`
   target from the broader experimental code-GraphRAG surface.
 
+### GraphRAG schema registration
+
+- Added:
+  - `sorted_heap_graph_register(...)`
+  - `sorted_heap_graph_config(...)`
+  - `sorted_heap_graph_unregister(...)`
+- GraphRAG helpers and wrappers can now run against non-canonical fact-table
+  schemas as long as the mapped columns still satisfy the fact contract:
+  `int4 / int2 / int4 / svec / text`.
+- Added regression coverage for an alias schema using:
+  - `src_id`
+  - `edge_type`
+  - `dst_id`
+  - `vec`
+  - `body`
+
 ## 0.12.0 (2026-03-26)
 
 ### Release documentation pass
