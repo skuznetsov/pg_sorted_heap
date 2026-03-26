@@ -2746,3 +2746,41 @@ Important caveat:
 - so this is a quality-oriented contract, not a free latency win
 - the symbol-aware variant is not a generic improvement:
   - in generic mode it gives no quality lift and only adds cost
+
+That code-corpus frontier is now also checked under a repeated-build protocol:
+
+- [`scripts/repeat_graph_rag_code_corpus_builds.py`](/Users/sergey/Projects/C/clustered_pg/scripts/repeat_graph_rag_code_corpus_builds.py)
+- `3` independent fresh temp-cluster builds
+- local `facts_sh` only, same stable point:
+  - `384D`
+  - `ann_k=16`
+  - `top_k=4`
+  - `ef_search=64`
+  - `ef_construction=200`
+  - `m=24`
+  - fresh backend
+
+Verified repeated-build result:
+
+- generic:
+  - `prompt_summary_snippet_py`
+    - `p50 median 0.613 ms`, range `0.543-0.632 ms`
+    - stable `100.0% / 100.0%`
+  - `prompt_symbol_summary_snippet_py`
+    - `p50 median 0.986 ms`, range `0.932-1.047 ms`
+    - same `100.0% / 100.0%`
+    - therefore strictly slower on the generic frontier
+- code-aware:
+  - `prompt_summary_snippet_py`
+    - `p50 median 0.612 ms`, range `0.602-0.629 ms`
+    - stable `97.6% / 83.3%`
+  - `prompt_symbol_summary_snippet_py`
+    - `p50 median 0.963 ms`, range `0.928-1.022 ms`
+    - stable `100.0% / 100.0%`
+
+Interpretation:
+
+- the new symbol-aware code-aware win is **build-stable**, not a one-off lucky
+  HNSW construction
+- the generic frontier is also build-stable, and the symbol-aware case remains
+  dominated there
