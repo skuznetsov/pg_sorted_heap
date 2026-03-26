@@ -52,6 +52,7 @@ TEST_ALTER_PORT ?= 65493
 TEST_GRAPHRAG_PORT ?= 65494
 TEST_DUMP_PORT ?= 65495
 TEST_GRAPHRAG_CRASH_PORT ?= 65498
+TEST_GRAPHRAG_CONCURRENT_PORT ?= 65499
 TEST_GRAPH_PORT ?= 65489
 BENCH_PORT ?= 65494
 BENCH_SCALES ?= 1000000,10000000
@@ -466,6 +467,9 @@ test-crash-recovery:
 test-graphrag-crash:
 	./scripts/test_graph_rag_crash_recovery.sh $(TMP_SELFTEST_ROOT) $(TEST_GRAPHRAG_CRASH_PORT)
 
+test-graphrag-concurrent:
+	./scripts/test_graph_rag_concurrent.sh $(TMP_SELFTEST_ROOT) $(TEST_GRAPHRAG_CONCURRENT_PORT)
+
 test-toast:
 	./scripts/test_toast_and_concurrent_compact.sh $(TMP_SELFTEST_ROOT) $(TEST_TOAST_PORT)
 
@@ -602,6 +606,7 @@ help:
 	@echo "  make test-concurrent TEST_CONCURRENT_PORT=<port>"
 	@echo "  make test-crash-recovery TEST_CRASH_PORT=<base_port>"
 	@echo "  make test-graphrag-crash TEST_GRAPHRAG_CRASH_PORT=<base_port>"
+	@echo "  make test-graphrag-concurrent TEST_GRAPHRAG_CONCURRENT_PORT=<port>"
 	@echo "  make test-toast TEST_TOAST_PORT=<port>"
 	@echo "  make test-alter-table TEST_ALTER_PORT=<port>"
 	@echo "  make test-graphrag-lifecycle TEST_GRAPHRAG_PORT=<port>"

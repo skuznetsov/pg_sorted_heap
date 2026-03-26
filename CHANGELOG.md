@@ -70,6 +70,23 @@
   path, so unified wrapper calls report the underlying C path they dispatched
   to.
 
+### GraphRAG concurrent online-operation hardening
+
+- Added `scripts/test_graph_rag_concurrent.sh` and
+  `make test-graphrag-concurrent` to verify registered alias-schema fact
+  graphs under:
+  - concurrent `INSERT` / `UPDATE` / `DELETE`
+  - concurrent GraphRAG queries
+  - concurrent `sorted_hnsw` KNN queries
+  - `sorted_heap_compact_online(...)`
+  - `sorted_heap_merge_online(...)`
+- The new harness verifies that:
+  - GraphRAG alias mappings remain registered
+  - the deterministic helper signature remains stable across online operations
+  - the unified GraphRAG wrapper remains callable and non-empty
+  - `sorted_hnsw` indexes stay valid and usable
+  - backend-local GraphRAG observability still reports non-empty stage stats
+
 ## 0.12.0 (2026-03-26)
 
 ### Release documentation pass

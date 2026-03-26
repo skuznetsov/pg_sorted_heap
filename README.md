@@ -229,6 +229,14 @@ rows, and per-stage timing for ANN, expansion, rerank, and total time. The
 wrapper may report `sorted_heap_graph_rag_twohop_path_scan` or another
 underlying helper/wrapper path.
 
+For `0.13` hardening, the fact-graph path now also has dedicated lifecycle
+coverage for:
+
+- upgrade + dump/restore
+- crash recovery
+- concurrent DML during `sorted_heap_compact_online(...)`
+- concurrent DML during `sorted_heap_merge_online(...)`
+
 On the current AWS ARM64 rerun (`4 vCPU`, `8 GiB RAM`), `5K` chains / `10K`
 rows / `384D`, the current portable point is:
 
@@ -570,6 +578,7 @@ SELECT * FROM events WHERE id BETWEEN 500 AND 600;
 make installcheck              # regression tests
 make test-crash-recovery       # crash recovery (4 scenarios)
 make test-graphrag-crash       # GraphRAG crash recovery
+make test-graphrag-concurrent  # GraphRAG concurrent DML + online ops
 make test-concurrent           # concurrent DML + online ops
 make test-toast                # TOAST integrity
 make test-alter-table          # ALTER TABLE DDL (36 checks)
