@@ -1783,9 +1783,70 @@ What is not yet true:
 - the current benchmark suite is still deterministic/synthetic rather than a
   real `cogniformerus` corpus, so the remaining generalization gap is about
   workload realism more than about build variance
-- transfer to a real `cogniformerus` corpus is still unverified; the current
-  fact-shaped benchmark is deterministic and synthetic even though it matches
-  the intended multihop query shape
+- transfer to a larger real `cogniformerus` corpus is still unverified; the
+  current fact-shaped benchmark is deterministic and synthetic even though it
+  matches the intended multihop query shape
+
+## Actual Butler gate seed-corpus smoke
+
+The next honest step after the synthetic-chain work was to stop guessing and
+run the path-aware GraphRAG helpers on the actual tiny multihop corpus that
+`cogniformerus` already ships in its Butler gate smoke:
+
+- source: `cogniformerus/bin/butler_small_model_eval.cr`
+- repo-owned fixture:
+  [`scripts/fixtures/graph_rag_butler_gate_seed.json`](/Users/sergey/Projects/C/clustered_pg/scripts/fixtures/graph_rag_butler_gate_seed.json)
+- harness:
+  [`scripts/bench_graph_rag_butler_gate.py`](/Users/sergey/Projects/C/clustered_pg/scripts/bench_graph_rag_butler_gate.py)
+
+This fixture is intentionally tiny:
+
+- `7` graph facts loaded into `facts_heap` / `facts_sh`
+- `2` positive multihop queries
+  - `Project Atlas -> Orion -> Helsinki`
+  - `Release 13 -> Aurora -> April`
+
+So it is not a publishable latency frontier. Its job is narrower:
+
+- verify that the current path-aware helper and wrapper work on the real Butler
+  gate fact texts and prompts
+- replace the previous blanket statement "real cogniformerus still unverified"
+  with a tighter one: the actual gate seed corpus is covered, but larger real
+  corpora are not
+
+The first local smoke run on this real gate seed corpus used:
+
+- `384D`
+- `ann_k=4`
+- `top_k=4`
+- `m=24`
+- `ef_construction=200`
+- `sorted_hnsw.ef_search=64`
+- `5` timing runs on a fresh temp cluster
+
+Result:
+
+- heap path-aware SQL baseline:
+  - `p50 0.027 ms`
+  - `hit@1/hit@k = 100/100`
+- `facts_sh` path-aware SQL baseline:
+  - `p50 0.026 ms`
+  - `hit@1/hit@k = 100/100`
+- `sorted_heap_expand_twohop_path_rerank()`:
+  - `p50 0.017 ms`
+  - `hit@1/hit@k = 100/100`
+- `sorted_heap_graph_rag_twohop_path_scan()`:
+  - `p50 0.045 ms`
+  - `hit@1/hit@k = 100/100`
+
+This does not prove scale behavior. It proves something narrower and still
+useful: the current path-aware GraphRAG helper/wrapper contract works on the
+actual Butler gate seed facts and prompts, not only on the synthetic
+`person -> parent -> city` generator.
+
+One adversary control also mattered here: this was not only a pass at a
+near-full seed budget. Re-running the same smoke at `ann_k=2`, `top_k=2`
+still kept both multihop queries at `100/100`.
 
 The correct next step is therefore:
 

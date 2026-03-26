@@ -1,0 +1,84 @@
+{
+  "source": {
+    "repo": "cogniformerus",
+    "file": "bin/butler_small_model_eval.cr",
+    "captured_at": "2026-03-25",
+    "note": "Derived from the compact Butler gate seed facts and eval cases."
+  },
+  "facts": [
+    {
+      "text": "The capital of France is Paris.",
+      "entity": "France",
+      "relation": "capital",
+      "target": "Paris",
+      "include_in_graph": true
+    },
+    {
+      "text": "The capital of Japan is Tokyo.",
+      "entity": "Japan",
+      "relation": "capital",
+      "target": "Tokyo",
+      "include_in_graph": true
+    },
+    {
+      "text": "Project Atlas uses database engine Orion.",
+      "entity": "Project Atlas",
+      "relation": "uses_database_engine",
+      "target": "Orion",
+      "include_in_graph": true
+    },
+    {
+      "text": "Orion is maintained in Helsinki.",
+      "entity": "Orion",
+      "relation": "maintained_in",
+      "target": "Helsinki",
+      "include_in_graph": true
+    },
+    {
+      "text": "Release 13 has codename Aurora.",
+      "entity": "Release 13",
+      "relation": "codename",
+      "target": "Aurora",
+      "include_in_graph": true
+    },
+    {
+      "text": "Aurora launches in April.",
+      "entity": "Aurora",
+      "relation": "launches_in",
+      "target": "April",
+      "include_in_graph": true
+    },
+    {
+      "text": "Butler external memory backend is PostgreSQL.",
+      "entity": "Butler external memory backend",
+      "relation": "backend",
+      "target": "PostgreSQL",
+      "include_in_graph": true
+    },
+    {
+      "text": "When evidence is missing, Butler should abstain.",
+      "entity": "Butler",
+      "relation": "policy",
+      "target": "abstain_when_evidence_is_missing",
+      "include_in_graph": false
+    }
+  ],
+  "multihop_queries": [
+    {
+      "label": "multihop_1",
+      "prompt": "Jarvis, in what city is the database engine used by Project Atlas maintained?",
+      "seed_entity": "Project Atlas",
+      "hop1_relation": "uses_database_engine",
+      "hop2_relation": "maintained_in",
+      "expected_target": "Helsinki"
+    },
+    {
+      "label": "multihop_2",
+      "prompt": "Jarvis, when does codename Aurora launch?",
+      "seed_entity": "Release 13",
+      "hop1_relation": "codename",
+      "hop2_relation": "launches_in",
+      "expected_target": "April"
+    }
+  ]
+}
