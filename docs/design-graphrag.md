@@ -1591,12 +1591,28 @@ So for multihop fact retrieval, the next serious question is no longer
 whether path-aware rerank helps. It does. The next question is whether this
 new helper/wrapper transfers cleanly to AWS and then to a real
 `cogniformerus`-like corpus.
-- at the balanced `m=24` point, `sorted_heap` matches `zvec` / `Qdrant` on
-  `hit@k` and trails only slightly on `hit@1`
-- at the higher-quality `m=32` point, `sorted_heap` reaches parity with
-  `zvec` / `Qdrant` on both `hit@1` and `hit@k`
-- pgvector is slower and weaker on answer quality than the tuned
-  `sorted_heap` helper on this workload
+
+That AWS transfer is now verified too. On AWS ARM64 (`4 vCPU`, `8 GiB RAM`),
+at the same balanced `m=24 / ef_construction=200 / ann_k=64 / ef_search=128`
+point:
+
+- `5K` chains
+  - heap two-hop SQL: `1.088 ms`, `hit@1 = 75.0%`, `hit@k = 96.9%`
+  - city-only wrapper: `1.012 ms`, `hit@1 = 75.0%`, `hit@k = 96.9%`
+  - SQL path-aware baseline: `1.204 ms`, `hit@1 = 98.4%`, `hit@k = 98.4%`
+  - fused helper: `0.955 ms`, `hit@1 = 98.4%`, `hit@k = 98.4%`
+  - one-call path-aware wrapper: `1.018 ms`, `hit@1 = 98.4%`, `hit@k = 98.4%`
+
+- `10K` chains, same knobs
+  - heap two-hop SQL: `1.319 ms`, `hit@1 = 71.9%`, `hit@k = 92.2%`
+  - city-only wrapper: `1.197 ms`, `hit@1 = 73.4%`, `hit@k = 93.8%`
+  - SQL path-aware baseline: `1.436 ms`, `hit@1 = 96.9%`, `hit@k = 98.4%`
+  - fused helper: `1.185 ms`, `hit@1 = 96.9%`, `hit@k = 98.4%`
+  - one-call path-aware wrapper: `1.212 ms`, `hit@1 = 96.9%`, `hit@k = 98.4%`
+
+So the answer to the transfer question is now yes: the path-aware helper and
+wrapper survive the AWS move cleanly, and the old larger-scale caveat narrows
+substantially once the rerank contract is fixed.
 
 This also falsifies one tempting but wrong simplification:
 
@@ -1631,6 +1647,9 @@ What is now true:
   contract to use hop-1 and hop-2 evidence together
 - `sorted_heap_graph_rag_twohop_path_scan()` makes that path-aware contract
   available as a single-call primitive
+- the path-aware helper and wrapper transfer cleanly from local to AWS ARM64
+  on the same balanced `m=24 / ef_construction=200 / ann_k=64 /
+  ef_search=128` point
 - the narrow-helper direction is a justified building block
 - the current helper model already composes into a competitive two-hop
   real-text GraphRAG path on Gutenberg without requiring a new graph API
@@ -1650,11 +1669,12 @@ What is not yet true:
 - two-hop helper composition is not yet a universal latency win; at higher
   rerank dimensions it narrows to parity with heap+btree rather than staying
   clearly ahead
-- the current one-call wrapper still bakes in a `target_id` seed contract,
-  which is wrong for the current fact-shaped multihop workload
-- on the cogniformerus-style fact benchmark, the tuned helper is now a
-  latency leader and can reach full observed parity with the strongest
-  external paths we tested when moved to the `m=32 / ef_search=128` point
+- the current repository-owned external parity rows are still on the older
+  city-only rerank contract, so external engine comparisons are not yet
+  apples-to-apples against the new path-aware helper/wrapper
+- transfer to a real `cogniformerus` corpus is still unverified; the current
+  fact-shaped benchmark is deterministic and synthetic even though it matches
+  the intended multihop query shape
 
 The correct next step is therefore:
 

@@ -124,17 +124,19 @@ rows / `384D`, the current portable point is:
 - `ann_k=64`
 - `sorted_hnsw.ef_search=128`
 
-which gives:
+which gives, on the current path-aware two-hop contract:
 
-- `sorted_heap_graph_rag_twohop_scan()` -> `1.004 ms`, `hit@1 76.6%`, `hit@k 98.4%`
-- `sorted_heap_expand_twohop_rerank()` -> `0.947 ms`, `hit@1 76.6%`, `hit@k 98.4%`
-- `pgvector` -> `1.296 ms`, `hit@1 70.3%`, `hit@k 85.9%`
-- `zvec` -> `1.646 ms`, `hit@1 76.6%`, `hit@k 96.9%`
-- `Qdrant` -> `3.396 ms`, `hit@1 76.6%`, `hit@k 96.9%`
+- `sorted_heap_expand_twohop_path_rerank()` -> `0.955 ms`, `hit@1 98.4%`, `hit@k 98.4%`
+- `sorted_heap_graph_rag_twohop_path_scan()` -> `1.018 ms`, `hit@1 98.4%`, `hit@k 98.4%`
 
-The local M-series tuning run found a slightly different frontier, and on the
-same AWS rerun `m=32` did not improve over `m=24` (`1.066 ms`, `hit@k 96.9%`).
-The full tuning history, reasoning, and caveats live in
+At the same knobs, the older city-only contract stays around `0.95-1.01 ms`
+but drops to `hit@1 75.0%` / `hit@k 96.9%`, so the main quality gain is now
+coming from the scorer contract rather than from a slower seed frontier.
+
+The local M-series tuning run found a slightly different frontier, but the new
+path-aware helper transferred cleanly to AWS at both `5K` and `10K` chains.
+The full tuning history, reasoning, external-engine caveats, and larger-scale
+results live in
 [docs/design-graphrag.md](/Users/sergey/Projects/C/clustered_pg/docs/design-graphrag.md).
 
 ### Legacy/manual ANN paths

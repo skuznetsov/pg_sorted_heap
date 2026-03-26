@@ -200,6 +200,11 @@ contract, not seed ANN quality. The fused path-aware helper now gives the best
 local latency/quality point at the same `m=24`, `ef_construction=200`,
 `ann_k=64`, `ef_search=128` operating point.
 
+The external engine rows above are still on the older city-only rerank shape.
+So they remain useful as repository-owned baseline numbers, but they are not a
+strict apples-to-apples comparison against the new path-aware `sorted_heap`
+rows yet.
+
 ### Current AWS GraphRAG multihop benchmark (`person -> parent -> city`)
 
 Repo-owned harness:
@@ -212,23 +217,40 @@ This is the current portable multihop GraphRAG point.
 
 | Method | p50 latency | hit@1 | hit@k | Notes |
 |--------|:-----------:|:-----:|:-----:|-------|
-| Heap two-hop SQL | 1.087 ms | 75.0% | 96.9% | exact rerank over expanded heap set |
-| sorted_heap_expand_twohop_rerank() | 0.947 ms | 76.6% | 98.4% | `m=24`, `ef_construction=200`, `ann_k=64`, `ef_search=128` |
-| **sorted_heap_graph_rag_twohop_scan()** | **1.004 ms** | **76.6%** | **98.4%** | same portable point, one-call wrapper |
-| pgvector HNSW + heap expansion | 1.296 ms | 70.3% | 85.9% | `ef_search=64` |
-| zvec HNSW + heap expansion | 1.646 ms | 76.6% | 96.9% | `ef=64` |
-| Qdrant HNSW + heap expansion | 3.396 ms | 76.6% | 96.9% | `hnsw_ef=64` |
+| Heap two-hop SQL | 1.088 ms | 75.0% | 96.9% | exact rerank over expanded heap set |
+| sorted_heap_expand_twohop_rerank() | 0.952 ms | 75.0% | 96.9% | older city-only helper |
+| sorted_heap_graph_rag_twohop_scan() | 1.012 ms | 75.0% | 96.9% | older city-only wrapper |
+| sorted_heap SQL `pathsum` baseline | 1.204 ms | 98.4% | 98.4% | same ANN seeds, `hop1_distance + hop2_distance` |
+| **sorted_heap_expand_twohop_path_rerank()** | **0.955 ms** | **98.4%** | **98.4%** | fused path-aware helper |
+| sorted_heap_graph_rag_twohop_path_scan() | 1.018 ms | 98.4% | 98.4% | fused path-aware wrapper |
 
-Re-running the same AWS point at `m=32` did not improve the frontier:
-`sorted_heap_graph_rag_twohop_scan()` moved to `1.066 ms` with
-`hit@1 76.6%` and `hit@k 96.9%`. So the locally observed `m=32` parity point
-does not transfer unchanged to this ARM64 environment.
+The new AWS result matches the local diagnostic cleanly: the dominant quality
+loss on this workload was the old hop-2-only rerank contract, not the seed ANN
+frontier. The path-aware helper preserves the quality gain on ARM64 with only
+trivial latency cost versus the older helper.
 
-The larger `10K`-chain AWS rerun reproduced the local scale caveat almost
-exactly: at the same portable point, `sorted_heap_graph_rag_twohop_scan()`
-measured `1.248 ms`, `hit@1 71.9%`, `hit@k 92.2%`. The best verified AWS
-recovery point there is `m=32`, `ef_search=192`, which moved it to
-`1.687 ms`, `hit@1 76.6%`, `hit@k 95.3%`.
+The external engine rows below are still on the older city-only rerank shape,
+so they remain a baseline for the previous contract rather than a strict
+apples-to-apples comparison against the new path-aware `sorted_heap` rows:
+
+| Method | p50 latency | hit@1 | hit@k | Notes |
+|--------|:-----------:|:-----:|:-----:|-------|
+| pgvector HNSW + heap expansion | 1.323 ms | 70.3% | 85.9% | `ef_search=64`, city-only rerank |
+| zvec HNSW + heap expansion | 1.629 ms | 76.6% | 96.9% | `ef=64`, city-only rerank |
+| Qdrant HNSW + heap expansion | 3.330 ms | 76.6% | 96.9% | `hnsw_ef=64`, city-only rerank |
+
+The larger `10K`-chain AWS rerun now tells a different story than the older
+city-only benchmark. At the same portable point:
+
+- heap two-hop SQL: `1.319 ms`, `hit@1 71.9%`, `hit@k 92.2%`
+- city-only `sorted_heap_graph_rag_twohop_scan()`: `1.197 ms`, `hit@1 73.4%`, `hit@k 93.8%`
+- SQL `pathsum` baseline: `1.436 ms`, `hit@1 96.9%`, `hit@k 98.4%`
+- `sorted_heap_expand_twohop_path_rerank()`: `1.185 ms`, `hit@1 96.9%`, `hit@k 98.4%`
+- `sorted_heap_graph_rag_twohop_path_scan()`: `1.212 ms`, `hit@1 96.9%`, `hit@k 98.4%`
+
+So the old larger-scale caveat now narrows materially: the main `10K` loss was
+also the city-only rerank contract, not a fundamental collapse of the seed
+frontier at that scale.
 
 An exact-seed diagnostic on the local `5K` and `10K` points did not improve
 `hit@1` or `hit@k` versus the ANN-seeded `sorted_heap` helper. So on this
@@ -247,14 +269,15 @@ the same ANN seeds and the same two-hop expansion, but scoring candidates as
 - `5K`: `0.957 ms`, `hit@1 98.4%`, `hit@k 98.4%`
 - `10K`: `1.179 ms`, `hit@1 95.3%`, `hit@k 96.9%`
 
-That branch is now implemented locally in the extension too. On the same
-balanced local point, the fused path-aware helper measured:
-- `5K`: `0.726 ms`, `hit@1 98.4%`, `hit@k 98.4%`
-- `10K`: `0.823 ms`, `hit@1 95.3%`, `hit@k 96.9%`
+That branch is now implemented in the extension and verified on both local and
+AWS ARM64 runs. The fused path-aware helper measured:
+- local `5K`: `0.726 ms`, `hit@1 98.4%`, `hit@k 98.4%`
+- local `10K`: `0.823 ms`, `hit@1 95.3%`, `hit@k 96.9%`
+- AWS `5K`: `0.955 ms`, `hit@1 98.4%`, `hit@k 98.4%`
+- AWS `10K`: `1.185 ms`, `hit@1 96.9%`, `hit@k 98.4%`
 
-So the current strongest local GraphRAG result is no longer the SQL baseline;
-it is the fused path-aware helper. AWS reruns for the new helper are still
-pending, so the AWS table above remains on the older city-only contract.
+So the current strongest portable GraphRAG result is no longer the SQL
+baseline or the old city-only helper. It is the fused path-aware helper.
 
 ### Legacy/manual IVF-PQ benchmark
 
