@@ -99,6 +99,14 @@ class CodeChunk:
     text: str
 
 
+@dataclass(frozen=True)
+class QuestionQuality:
+    label: str
+    keyword_pct: float
+    full_hit: bool
+    rows: int
+
+
 def default_cogniformerus_root(repo_root: Path) -> Path:
     return repo_root.parent.parent / "Crystal" / "cogniformerus"
 
@@ -599,6 +607,30 @@ def measure_quality(cur, table_name: str, case: base.QueryCase, questions: list[
     )
 
 
+def measure_quality_details(cur, table_name: str, case: base.QueryCase, questions: list[CodeQuestion]) -> list[QuestionQuality]:
+    sql = case.sql_template.format(table=table_name)
+    out: list[QuestionQuality] = []
+
+    for question in questions:
+        cur.execute(sql, case.params_builder(question))
+        payload_idx = payload_index_from_description(cur.description)
+        rows = cur.fetchall()
+        payload_rows = [str(row[payload_idx]) for row in rows]
+        keyword_pct, full_hit = keyword_coverage(
+            [(None, None, None, None, payload) for payload in payload_rows], question.keywords
+        )
+        out.append(
+            QuestionQuality(
+                label=question.label,
+                keyword_pct=keyword_pct,
+                full_hit=full_hit,
+                rows=len(rows),
+            )
+        )
+
+    return out
+
+
 def print_result(table: str, case: str, p50: float, avg: float, hits: float, reads: float, root: str, rows: int, keyword_pct: float, full_pct: float, avg_rows: float) -> None:
     print(
         f"{table}|{case}|p50_ms={p50:.3f}|avg_ms={avg:.3f}|shared_hit={hits:.1f}|shared_read={reads:.1f}|"
@@ -625,6 +657,8 @@ def main() -> int:
     ap.add_argument("--embedding-mode", choices=("generic", "code_aware"), default="generic")
     ap.add_argument("--chunk-window", type=int, default=CHUNK_WINDOW)
     ap.add_argument("--chunk-overlap", type=int, default=CHUNK_OVERLAP)
+    ap.add_argument("--case-filter", default="")
+    ap.add_argument("--report-questions", action="store_true")
     ap.add_argument("--install-cmd", default="")
     ap.add_argument("--keep-temp", action="store_true")
     args = ap.parse_args()
@@ -1666,11 +1700,24 @@ def main() -> int:
                 ("facts_sh", "facts_sh", dependency_twohop_fn),
             ]
 
+            case_filter = re.compile(args.case_filter) if args.case_filter else None
+            if case_filter is not None:
+                cases = [
+                    item for item in cases
+                    if case_filter.search(item[0]) or case_filter.search(item[2].name)
+                ]
+
             for label, table, case in cases:
                 print(f"running|table={label}|case={case.name}", flush=True)
                 p50, avg, hits, reads, root, rows = measure_case(cur, table, case, questions, args.runs)
                 keyword_pct, full_pct, avg_rows = measure_quality(cur, table, case, questions)
                 print_result(label, case.name, p50, avg, hits, reads, root, rows, keyword_pct, full_pct, avg_rows)
+                if args.report_questions:
+                    for detail in measure_quality_details(cur, table, case, questions):
+                        print(
+                            f"detail|table={label}|case={case.name}|label={detail.label}|"
+                            f"keyword_pct={detail.keyword_pct:.1f}|full_hit={'1' if detail.full_hit else '0'}|rows={detail.rows}"
+                        )
         finally:
             cur.close()
             conn.close()

@@ -2434,3 +2434,47 @@ This closes the seed-unit branch for the current frontier:
 - **code-aware mode**:
   - summary-only seeds are clearly worse; the mixed-seed summary-heavy hybrid
     remains the strongest point
+
+### Per-question failure pattern
+
+Aggregate percentages were no longer enough to guide the next branch, so the
+real code-corpus harness now supports targeted diagnostics:
+
+- `--case-filter`
+- `--report-questions`
+
+That was used to inspect the current best generic and code-aware contracts on
+the exact CrossFile prompts from `butler_code_test.cr`.
+
+Stable local diagnostic, same `40`-file / `840`-row / `6`-question point,
+`ann_k=16`, `top_k=4`, `3` runs:
+
+- **generic mode**
+  - best latency/full-hit point:
+    - `prompt_summary_rerank_in`
+  - best coverage/full-hit point:
+    - `prompt_summary_chunk_hybrid_s3_in`
+- **code-aware mode**
+  - best point:
+    - `prompt_summary_chunk_hybrid_s3_in`
+
+The important result is not just the percentages, but **which** questions stay
+hard:
+
+- `Response memory policy`
+  - still misses under all current best contracts
+  - current quality stays around `40.0%`
+- `Streaming overlap`
+  - still misses under all current best contracts
+  - current quality stays around `80.0%`
+- `Butler response routing`
+  - generic contracts still miss it
+  - code-aware summary-heavy hybrid fixes it to `100.0%`
+- `Memory store flow`
+  - generic best contracts already solve it
+  - code-aware summary-heavy hybrid still leaves it at `85.7%`
+
+This narrows the remaining frontier again:
+
+> the next real improvement is likely query-specific or corpus-specific, not a
+> broad packing or seed policy that helps every question equally
