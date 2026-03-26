@@ -288,6 +288,23 @@ So the old larger-scale caveat now narrows materially: the main `10K` loss was
 also the city-only rerank contract, not a fundamental collapse of the seed
 frontier at that scale.
 
+An AWS repeated-build protocol then checked whether the remaining `10K`
+difference was really a build-variance problem. Using three independent fresh
+builds on the same `10K` path-aware point:
+
+- `sorted_heap_expand_twohop_path_rerank()` median `1.177 ms`, range
+  `1.148-1.191 ms`, `hit@1/hit@k = 95.3/96.9` on all three builds
+- `sorted_heap_graph_rag_twohop_path_scan()` median `1.236 ms`, range
+  `1.211-1.240 ms`, `hit@1/hit@k = 95.3/96.9` on all three builds
+- `pgvector` path-aware parity row median `1.667 ms`, `hit@1/hit@k`
+  `76.6-82.8`
+- `zvec` path-aware parity row median `2.788 ms`, `98.4/100.0`
+- `Qdrant` path-aware parity row median `3.818 ms`, `98.4/100.0`
+
+So the larger `10K` AWS point is now repeated-build stable too. The remaining
+issue is scale frontier, not build instability: the `10K` quality band is
+lower than `5K`, but it stayed fixed across fresh builds.
+
 An exact-seed diagnostic on the local `5K` and `10K` points did not improve
 `hit@1` or `hit@k` versus the ANN-seeded `sorted_heap` helper. So on this
 benchmark shape, the remaining gap is not explained by ANN approximation alone.

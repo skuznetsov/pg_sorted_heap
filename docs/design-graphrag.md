@@ -1694,8 +1694,33 @@ So the current confidence picture is stronger than before:
 
 - local balanced `5K`: repeated-build stable
 - AWS balanced `5K`: repeated-build stable
-- larger `10K` AWS path-aware rows: still only per-build verified, not yet
-  repeated-build summarized
+- larger `10K` AWS path-aware rows: repeated-build stable too, but at a lower
+  quality frontier than `5K`
+
+The AWS repeated-build protocol on the larger `10K` point produced:
+
+- `sorted_heap_expand_twohop_path_rerank()`
+  - `p50_ms`: median `1.177`, range `1.148-1.191`
+  - `hit@1 = 95.3%`, `hit@k = 96.9%` on all three builds
+- `sorted_heap_graph_rag_twohop_path_scan()`
+  - `p50_ms`: median `1.236`, range `1.211-1.240`
+  - `hit@1 = 95.3%`, `hit@k = 96.9%` on all three builds
+- `pgvector` path-aware parity row
+  - `p50_ms`: median `1.667`, range `1.665-1.676`
+  - `hit@1/hit@k`: `76.6-82.8%`
+- `zvec` path-aware parity row
+  - `p50_ms`: median `2.788`, range `2.762-2.789`
+  - `hit@1 = 98.4%`, `hit@k = 100.0%` on all three builds
+- `Qdrant` path-aware parity row
+  - `p50_ms`: median `3.818`, range `3.788-3.846`
+  - `hit@1 = 98.4%`, `hit@k = 100.0%` on all three builds
+
+This sharpens the conclusion again:
+
+- the `10K` AWS point is no longer a variance question
+- it is a real scale frontier
+- `sorted_heap` remains the latency leader there
+- `zvec` and Qdrant still lead on answer quality
 
 This also falsifies one tempting but wrong simplification:
 
@@ -1755,9 +1780,9 @@ What is not yet true:
 - two-hop helper composition is not yet a universal latency win; at higher
   rerank dimensions it narrows to parity with heap+btree rather than staying
   clearly ahead
-- the larger-scale `10K` AWS parity rows still come from per-build reruns
-  rather than a repeated-build median protocol, so build-variance confidence
-  bounds are still looser there than on the balanced `5K` point
+- the current benchmark suite is still deterministic/synthetic rather than a
+  real `cogniformerus` corpus, so the remaining generalization gap is about
+  workload realism more than about build variance
 - transfer to a real `cogniformerus` corpus is still unverified; the current
   fact-shaped benchmark is deterministic and synthetic even though it matches
   the intended multihop query shape
