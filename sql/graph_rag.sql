@@ -62,6 +62,12 @@ COPY (
 
 COPY (
   SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+  FROM sorted_heap_expand_twohop_path_rerank('facts_sh'::regclass, ARRAY[1,3], '[1,0,0,0]'::svec, 2, 1, 2, 0)
+  ORDER BY distance, entity_id, relation_id, target_id
+) TO STDOUT;
+
+COPY (
+  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
   FROM sorted_heap_graph_rag_scan('facts_sh'::regclass, '[1,0,0,0]'::svec, 2, 2, 2, 0)
   ORDER BY distance, entity_id, relation_id, target_id
 ) TO STDOUT;
@@ -69,6 +75,12 @@ COPY (
 COPY (
   SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
   FROM sorted_heap_graph_rag_twohop_scan('facts_sh'::regclass, '[0,0,1,0]'::svec, 2, 2, 1, 2, 0)
+  ORDER BY distance, entity_id, relation_id, target_id
+) TO STDOUT;
+
+COPY (
+  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+  FROM sorted_heap_graph_rag_twohop_path_scan('facts_sh'::regclass, '[0,0,1,0]'::svec, 2, 2, 1, 2, 0)
   ORDER BY distance, entity_id, relation_id, target_id
 ) TO STDOUT;
 
@@ -128,6 +140,38 @@ COPY (
     LIMIT 2
   )
   SELECT count(*) AS twohop_rerank_diff_rows
+  FROM (
+    (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
+    UNION ALL
+    (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
+  ) diff
+) TO STDOUT;
+
+COPY (
+  WITH helper AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_expand_twohop_path_rerank('facts_sh'::regclass, ARRAY[1,3], '[1,0,0,0]'::svec, 2, 1, 2, 0)
+  ),
+  hop1 AS MATERIALIZED (
+    SELECT DISTINCT ON (target_id)
+           target_id AS parent_id,
+           (embedding <=> '[1,0,0,0]'::svec) AS hop1_distance
+    FROM facts_sh
+    WHERE entity_id = ANY (ARRAY[1,3]::int4[])
+      AND relation_id = 1
+    ORDER BY target_id, embedding <=> '[1,0,0,0]'::svec, entity_id
+  ),
+  sql_baseline AS (
+    SELECT city.entity_id, city.relation_id, city.target_id, city.payload,
+           round(((city.embedding <=> '[1,0,0,0]'::svec) + hop1.hop1_distance)::numeric, 6) AS distance
+    FROM facts_sh city
+    JOIN hop1 ON hop1.parent_id = city.entity_id
+    WHERE city.relation_id = 2
+    ORDER BY ((city.embedding <=> '[1,0,0,0]'::svec) + hop1.hop1_distance),
+             city.entity_id, city.relation_id, city.target_id
+    LIMIT 2
+  )
+  SELECT count(*) AS twohop_path_rerank_diff_rows
   FROM (
     (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
     UNION ALL
@@ -197,6 +241,47 @@ COPY (
     LIMIT 2
   )
   SELECT count(*) AS graph_rag_twohop_diff_rows
+  FROM (
+    (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
+    UNION ALL
+    (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
+  ) diff
+) TO STDOUT;
+
+COPY (
+  WITH helper AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_graph_rag_twohop_path_scan('facts_sh'::regclass, '[0,0,1,0]'::svec, 2, 2, 1, 2, 0)
+  ),
+  ann AS MATERIALIZED (
+    SELECT entity_id
+    FROM facts_sh
+    ORDER BY embedding <=> '[0,0,1,0]'::svec
+    LIMIT 2
+  ),
+  seeds AS MATERIALIZED (
+    SELECT DISTINCT entity_id FROM ann
+  ),
+  hop1 AS MATERIALIZED (
+    SELECT DISTINCT ON (target_id)
+           target_id AS parent_id,
+           (embedding <=> '[0,0,1,0]'::svec) AS hop1_distance
+    FROM facts_sh
+    WHERE entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+      AND relation_id = 1
+    ORDER BY target_id, embedding <=> '[0,0,1,0]'::svec, entity_id
+  ),
+  sql_baseline AS (
+    SELECT city.entity_id, city.relation_id, city.target_id, city.payload,
+           round(((city.embedding <=> '[0,0,1,0]'::svec) + hop1.hop1_distance)::numeric, 6) AS distance
+    FROM facts_sh city
+    JOIN hop1 ON hop1.parent_id = city.entity_id
+    WHERE city.relation_id = 2
+    ORDER BY ((city.embedding <=> '[0,0,1,0]'::svec) + hop1.hop1_distance),
+             city.entity_id, city.relation_id, city.target_id
+    LIMIT 2
+  )
+  SELECT count(*) AS graph_rag_twohop_path_diff_rows
   FROM (
     (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
     UNION ALL

@@ -1569,9 +1569,28 @@ benchmark:
 - a simple path-aware scorer recovers most of the lost quality with only a
   modest latency increase
 
-So for multihop fact retrieval, the next serious product branch is not more
-`sorted_hnsw` tuning. It is a fused path-aware rerank helper that can use hop-1
-and hop-2 evidence together instead of ranking hop-2 facts in isolation.
+That branch is now implemented locally too:
+
+- `sorted_heap_expand_twohop_path_rerank(...)`
+- `sorted_heap_graph_rag_twohop_path_scan(...)`
+
+And the fused helper beats the SQL path-aware baseline on the same balanced
+points:
+
+- `5K` chains
+  - SQL path-aware baseline: `0.847 ms`, `hit@1 = 98.4%`, `hit@k = 98.4%`
+  - fused helper: `0.726 ms`, `hit@1 = 98.4%`, `hit@k = 98.4%`
+  - one-call wrapper: `0.739 ms`, `hit@1 = 98.4%`, `hit@k = 98.4%`
+
+- `10K` chains
+  - SQL path-aware baseline: `0.942 ms`, `hit@1 = 95.3%`, `hit@k = 96.9%`
+  - fused helper: `0.823 ms`, `hit@1 = 95.3%`, `hit@k = 96.9%`
+  - one-call wrapper: `0.834 ms`, `hit@1 = 95.3%`, `hit@k = 96.9%`
+
+So for multihop fact retrieval, the next serious question is no longer
+whether path-aware rerank helps. It does. The next question is whether this
+new helper/wrapper transfers cleanly to AWS and then to a real
+`cogniformerus`-like corpus.
 - at the balanced `m=24` point, `sorted_heap` matches `zvec` / `Qdrant` on
   `hit@k` and trails only slightly on `hit@1`
 - at the higher-quality `m=32` point, `sorted_heap` reaches parity with
@@ -1583,9 +1602,11 @@ This also falsifies one tempting but wrong simplification:
 
 > once the helper is fast, the remaining GraphRAG problem is solved
 
-Not quite. On fact-shaped multihop queries, seed ANN quality still matters
-enough that `ann_k`, `ef_search`, and graph build quality remain first-class
-tuning knobs.
+Not quite. On fact-shaped multihop queries, seed ANN quality and graph build
+quality still matter enough that `ann_k`, `ef_search`, and graph build quality
+remain first-class tuning knobs. But the old hop-2-only rerank contract was a
+separate, larger problem, and the new path-aware helper fixes most of it on
+the current local benchmark.
 
 ## Current verdict
 
@@ -1606,6 +1627,10 @@ What is now true:
   two-hop helper is the fastest PostgreSQL path we tested
 - `sorted_heap_graph_rag_twohop_scan()` closes the current fact-shaped wrapper
   gap without materially giving back latency
+- `sorted_heap_expand_twohop_path_rerank()` upgrades the fact-shaped rerank
+  contract to use hop-1 and hop-2 evidence together
+- `sorted_heap_graph_rag_twohop_path_scan()` makes that path-aware contract
+  available as a single-call primitive
 - the narrow-helper direction is a justified building block
 - the current helper model already composes into a competitive two-hop
   real-text GraphRAG path on Gutenberg without requiring a new graph API

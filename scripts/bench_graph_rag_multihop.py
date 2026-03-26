@@ -296,6 +296,142 @@ def verify_graph_rag_twohop_scan_equivalence(cur, table_name: str, queries: list
             )
 
 
+def verify_helper_twohop_path_equivalence(cur, table_name: str, queries: list[MultiHopQuery], ann_k: int, top_k: int) -> None:
+    sql = f"""
+    WITH ann AS MATERIALIZED (
+        SELECT entity_id
+        FROM {table_name}
+        ORDER BY embedding <=> %s::svec
+        LIMIT {ann_k}
+    ),
+    seeds AS MATERIALIZED (
+        SELECT DISTINCT entity_id FROM ann
+    ),
+    helper AS (
+        SELECT entity_id, relation_id, target_id, round(distance::numeric, 6) AS distance
+        FROM sorted_heap_expand_twohop_path_rerank(
+            '{table_name}'::regclass,
+            ARRAY(SELECT entity_id FROM seeds),
+            %s::svec,
+            {top_k},
+            {REL_PARENT},
+            {REL_CITY},
+            0
+        )
+    ),
+    hop1_sql AS MATERIALIZED (
+        SELECT DISTINCT ON (target_id)
+               target_id AS parent_id,
+               (embedding <=> %s::svec) AS hop1_distance
+        FROM {table_name}
+        WHERE entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+          AND relation_id = {REL_PARENT}
+        ORDER BY target_id, embedding <=> %s::svec, entity_id
+    ),
+    sql_baseline AS (
+        SELECT city.entity_id, city.relation_id, city.target_id,
+               round(((city.embedding <=> %s::svec) + hop1_sql.hop1_distance)::numeric, 6) AS distance
+        FROM {table_name} city
+        JOIN hop1_sql ON hop1_sql.parent_id = city.entity_id
+        WHERE city.relation_id = {REL_CITY}
+        ORDER BY ((city.embedding <=> %s::svec) + hop1_sql.hop1_distance),
+                 city.entity_id, city.relation_id, city.target_id
+        LIMIT {top_k}
+    )
+    SELECT count(*) FROM (
+        (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
+        UNION ALL
+        (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
+    ) diff
+    """
+
+    for idx, query in enumerate(queries, start=1):
+        cur.execute(
+            sql,
+            (
+                query.query_vec,
+                query.query_vec,
+                query.query_vec,
+                query.query_vec,
+                query.query_vec,
+                query.query_vec,
+            ),
+        )
+        diff_rows = cur.fetchone()[0]
+        if diff_rows != 0:
+            raise RuntimeError(
+                f"sorted_heap_expand_twohop_path_rerank mismatch on {table_name} query#{idx}: diff_rows={diff_rows}"
+            )
+
+
+def verify_graph_rag_twohop_path_scan_equivalence(cur, table_name: str, queries: list[MultiHopQuery], ann_k: int, top_k: int) -> None:
+    sql = f"""
+    WITH helper AS (
+        SELECT entity_id, relation_id, target_id, round(distance::numeric, 6) AS distance
+        FROM sorted_heap_graph_rag_twohop_path_scan(
+            '{table_name}'::regclass,
+            %s::svec,
+            {ann_k},
+            {top_k},
+            {REL_PARENT},
+            {REL_CITY},
+            0
+        )
+    ),
+    ann AS MATERIALIZED (
+        SELECT entity_id
+        FROM {table_name}
+        ORDER BY embedding <=> %s::svec
+        LIMIT {ann_k}
+    ),
+    seeds AS MATERIALIZED (
+        SELECT DISTINCT entity_id FROM ann
+    ),
+    hop1_sql AS MATERIALIZED (
+        SELECT DISTINCT ON (target_id)
+               target_id AS parent_id,
+               (embedding <=> %s::svec) AS hop1_distance
+        FROM {table_name}
+        WHERE entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+          AND relation_id = {REL_PARENT}
+        ORDER BY target_id, embedding <=> %s::svec, entity_id
+    ),
+    sql_baseline AS (
+        SELECT city.entity_id, city.relation_id, city.target_id,
+               round(((city.embedding <=> %s::svec) + hop1_sql.hop1_distance)::numeric, 6) AS distance
+        FROM {table_name} city
+        JOIN hop1_sql ON hop1_sql.parent_id = city.entity_id
+        WHERE city.relation_id = {REL_CITY}
+        ORDER BY ((city.embedding <=> %s::svec) + hop1_sql.hop1_distance),
+                 city.entity_id, city.relation_id, city.target_id
+        LIMIT {top_k}
+    )
+    SELECT count(*) FROM (
+        (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
+        UNION ALL
+        (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
+    ) diff
+    """
+
+    for idx, query in enumerate(queries, start=1):
+        cur.execute(
+            sql,
+            (
+                query.query_vec,
+                query.query_vec,
+                query.query_vec,
+                query.query_vec,
+                query.query_vec,
+                query.query_vec,
+            ),
+        )
+        diff_rows = cur.fetchone()[0]
+        if diff_rows != 0:
+            raise RuntimeError(
+                f"sorted_heap_graph_rag_twohop_path_scan mismatch on {table_name} query#{idx}: diff_rows={diff_rows}"
+            )
+
+
 def measure_quality(cur, table_name: str, case: base.QueryCase, queries: list[MultiHopQuery]) -> tuple[float, float, float]:
     sql = case.sql_template.format(table=table_name)
     hit1 = 0
@@ -731,6 +867,31 @@ def main() -> int:
                 """,
                 lambda q: (q.query_vec, q.query_vec),
             )
+            helper_path_twohop = base.QueryCase(
+                "seed_expand2_rerank_rel_twohop_path_fn",
+                f"""
+                WITH ann AS MATERIALIZED (
+                    SELECT entity_id
+                    FROM {{table}}
+                    ORDER BY embedding <=> %s::svec
+                    LIMIT {args.ann_k}
+                ),
+                seeds AS MATERIALIZED (
+                    SELECT DISTINCT entity_id FROM ann
+                )
+                SELECT *
+                FROM sorted_heap_expand_twohop_path_rerank(
+                    '{{table}}'::regclass,
+                    ARRAY(SELECT entity_id FROM seeds),
+                    %s::svec,
+                    {args.top_k},
+                    {REL_PARENT},
+                    {REL_CITY},
+                    0
+                )
+                """,
+                lambda q: (q.query_vec, q.query_vec),
+            )
             pathsum_twohop = base.QueryCase(
                 "seed_expand2_rerank_rel_pathsum_in",
                 f"""
@@ -761,7 +922,7 @@ def main() -> int:
                 )
                 SELECT *
                 FROM expanded
-                ORDER BY path_distance, target_id
+                ORDER BY path_distance, entity_id, relation_id, target_id
                 LIMIT {args.top_k}
                 """,
                 lambda q: (q.query_vec, q.query_vec, q.query_vec, q.query_vec),
@@ -793,6 +954,22 @@ def main() -> int:
                 )
                 """,
                 lambda q: (q.query_vec, q.query_vec),
+            )
+            wrapper_path_twohop = base.QueryCase(
+                "seed_graph_rag_twohop_path_scan_fn",
+                f"""
+                SELECT *
+                FROM sorted_heap_graph_rag_twohop_path_scan(
+                    '{{table}}'::regclass,
+                    %s::svec,
+                    {args.ann_k},
+                    {args.top_k},
+                    {REL_PARENT},
+                    {REL_CITY},
+                    0
+                )
+                """,
+                lambda q: (q.query_vec,),
             )
             wrapper_twohop = base.QueryCase(
                 "seed_graph_rag_twohop_scan_fn",
@@ -913,14 +1090,18 @@ def main() -> int:
             exact_seed_fn = build_exact_seed_fn(cur, args.ann_k, args.dim)
             verify_helper_twohop_equivalence(cur, "facts_sh", queries, args.ann_k, args.top_k)
             verify_graph_rag_twohop_scan_equivalence(cur, "facts_sh", queries, args.ann_k, args.top_k)
+            verify_helper_twohop_path_equivalence(cur, "facts_sh", queries, args.ann_k, args.top_k)
+            verify_graph_rag_twohop_path_scan_equivalence(cur, "facts_sh", queries, args.ann_k, args.top_k)
 
             cases: list[tuple[str, str, base.QueryCase]] = [
                 ("facts_heap", "facts_heap", sql_twohop),
                 ("facts_sh", "facts_sh", sql_twohop),
                 ("facts_sh", "facts_sh", pathsum_twohop),
+                ("facts_sh", "facts_sh", helper_path_twohop),
                 ("facts_sh", "facts_sh", composed_twohop),
                 ("facts_sh", "facts_sh", helper_twohop),
                 ("facts_sh", "facts_sh", wrapper_twohop),
+                ("facts_sh", "facts_sh", wrapper_path_twohop),
             ]
 
             for label, table, case in cases:

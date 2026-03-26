@@ -112,7 +112,9 @@ The current helpers are:
 
 - `sorted_heap_expand_rerank(...)`
 - `sorted_heap_expand_twohop_rerank(...)`
+- `sorted_heap_expand_twohop_path_rerank(...)`
 - `sorted_heap_graph_rag_twohop_scan(...)`
+- `sorted_heap_graph_rag_twohop_path_scan(...)`
 
 On the current AWS ARM64 rerun (`4 vCPU`, `8 GiB RAM`), `5K` chains / `10K`
 rows / `384D`, the current portable point is:

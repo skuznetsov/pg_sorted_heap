@@ -185,22 +185,20 @@ This is the current balanced GraphRAG point for the fact-shaped workload.
 | Method | p50 latency | hit@1 | hit@k | Notes |
 |--------|:-----------:|:-----:|:-----:|-------|
 | Heap two-hop SQL | 0.762 ms | 75.0% | 96.9% | exact rerank over expanded heap set |
-| **sorted_heap_graph_rag_twohop_scan()** | **0.727 ms** | **75.0%** | **96.9%** | `m=24`, `ef_construction=200`, `ann_k=64`, `ef_search=128` |
-| sorted_heap_expand_twohop_rerank() | 0.726 ms | 75.0% | 96.9% | same seed point, composed helper path |
+| sorted_heap_graph_rag_twohop_scan() | 0.720 ms | 75.0% | 96.9% | old city-only rerank contract |
+| sorted_heap_expand_twohop_rerank() | 0.712 ms | 75.0% | 96.9% | same city-only seed point |
+| sorted_heap SQL `pathsum` baseline | 0.847 ms | 98.4% | 98.4% | `hop1_distance + hop2_distance` in SQL |
+| sorted_heap_graph_rag_twohop_path_scan() | 0.739 ms | 98.4% | 98.4% | fused path-aware wrapper |
+| **sorted_heap_expand_twohop_path_rerank()** | **0.726 ms** | **98.4%** | **98.4%** | same knobs, fused path-aware helper |
 | pgvector HNSW + heap expansion | 1.244 ms | 70.3% | 85.9% | `ef_search=64` |
 | zvec HNSW + heap expansion | 0.927 ms | 76.6% | 96.9% | `ef=64` |
 | Qdrant HNSW + heap expansion | 2.417 ms | 76.6% | 96.9% | `hnsw_ef=64` |
 
-The higher-quality local point is now:
-
-- `m=32`
-- `ef_construction=200`
-- `ann_k=64`
-- `sorted_hnsw.ef_search=128`
-
-At that setting, `sorted_heap_graph_rag_twohop_scan()` measured `0.786 ms`
-with `hit@1 76.6%` and `hit@k 96.9%`, matching `zvec` and Qdrant on both
-quality metrics while remaining faster than both.
+The path-aware helper changes the local conclusion materially: the dominant
+quality issue on this fact-shaped workload was the old hop-2-only rerank
+contract, not seed ANN quality. The fused path-aware helper now gives the best
+local latency/quality point at the same `m=24`, `ef_construction=200`,
+`ann_k=64`, `ef_search=128` operating point.
 
 ### Current AWS GraphRAG multihop benchmark (`person -> parent -> city`)
 
@@ -249,8 +247,14 @@ the same ANN seeds and the same two-hop expansion, but scoring candidates as
 - `5K`: `0.957 ms`, `hit@1 98.4%`, `hit@k 98.4%`
 - `10K`: `1.179 ms`, `hit@1 95.3%`, `hit@k 96.9%`
 
-That is the current strongest sign that fact-shaped multihop quality is mostly
-limited by the city-only rerank contract, not by seed ANN quality.
+That branch is now implemented locally in the extension too. On the same
+balanced local point, the fused path-aware helper measured:
+- `5K`: `0.726 ms`, `hit@1 98.4%`, `hit@k 98.4%`
+- `10K`: `0.823 ms`, `hit@1 95.3%`, `hit@k 96.9%`
+
+So the current strongest local GraphRAG result is no longer the SQL baseline;
+it is the fused path-aware helper. AWS reruns for the new helper are still
+pending, so the AWS table above remains on the older city-only contract.
 
 ### Legacy/manual IVF-PQ benchmark
 
