@@ -56,6 +56,7 @@ class CodeQuestion:
     prompt: str
     keywords: tuple[str, ...]
     query_vec: str
+    oracle_file_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -195,6 +196,26 @@ def list_source_files(src_dir: Path) -> list[Path]:
     if not files:
         raise RuntimeError(f"no Crystal source files found under {src_dir}")
     return files
+
+
+def build_oracle_seed_map(files: list[Path], questions: list[CodeQuestion], ann_k: int) -> dict[str, tuple[int, ...]]:
+    file_texts = [(idx, path.read_text(encoding="utf-8").lower()) for idx, path in enumerate(files, start=1)]
+    seed_map: dict[str, tuple[int, ...]] = {}
+
+    for question in questions:
+        scored: list[tuple[int, int]] = []
+        for file_id, text in file_texts:
+            score = sum(1 for kw in question.keywords if kw.lower() in text)
+            if score > 0:
+                scored.append((score, file_id))
+
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        seeds = tuple(file_id for _, file_id in scored[:ann_k])
+        if not seeds and file_texts:
+            seeds = (file_texts[0][0],)
+        seed_map[question.label] = seeds
+
+    return seed_map
 
 
 def resolve_local_require_targets(path: Path, src_dir: Path, rel_to_id: dict[str, int]) -> list[str]:
@@ -517,6 +538,18 @@ def main() -> int:
 
     try:
         questions = parse_crossfile_questions(question_source, args.dim)
+        source_files = list_source_files(source_dir)
+        oracle_seed_map = build_oracle_seed_map(source_files, questions, args.ann_k)
+        questions = [
+            CodeQuestion(
+                label=q.label,
+                prompt=q.prompt,
+                keywords=q.keywords,
+                query_vec=q.query_vec,
+                oracle_file_ids=oracle_seed_map[q.label],
+            )
+            for q in questions
+        ]
         file_count, rowcount, edge_count, summary_count = build_code_csv(source_dir, csv_path, args.dim, args.chunk_window, args.chunk_overlap)
 
         conn = base.connect(tmp, port)
@@ -658,6 +691,67 @@ def main() -> int:
                 lambda q: (q.query_vec, q.query_vec),
             )
 
+            oracle_seed_expand_in = base.QueryCase(
+                "oracle_seed_expand_in",
+                f"""
+                SELECT *
+                FROM {{table}}
+                WHERE entity_id = ANY (%s::int4[])
+                  AND relation_id = {REL_HAS_CHUNK}
+                ORDER BY embedding <=> %s::svec, entity_id, relation_id, target_id
+                LIMIT {args.top_k}
+                """,
+                lambda q: (list(q.oracle_file_ids), q.query_vec),
+            )
+
+            oracle_seed_expand_fn = base.QueryCase(
+                "oracle_seed_expand_fn",
+                f"""
+                SELECT *
+                FROM sorted_heap_expand_rerank(
+                    '{{table}}'::regclass,
+                    %s::int4[],
+                    %s::svec,
+                    {args.top_k},
+                    {REL_HAS_CHUNK},
+                    0
+                )
+                """,
+                lambda q: (list(q.oracle_file_ids), q.query_vec),
+            )
+
+            keyword_rerank_sql = base.QueryCase(
+                "oracle_keyword_rerank_in",
+                f"""
+                WITH ann AS MATERIALIZED (
+                    SELECT entity_id
+                    FROM {{table}}
+                    ORDER BY embedding <=> %s::svec
+                    LIMIT {args.ann_k}
+                ),
+                seeds AS MATERIALIZED (
+                    SELECT DISTINCT entity_id FROM ann
+                ),
+                expanded AS MATERIALIZED (
+                    SELECT *
+                    FROM {{table}}
+                    WHERE entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+                      AND relation_id = {REL_HAS_CHUNK}
+                )
+                SELECT *
+                FROM expanded
+                ORDER BY (
+                    SELECT count(*)
+                    FROM unnest(%s::text[]) kw
+                    WHERE position(lower(kw) in lower(payload)) > 0
+                ) DESC,
+                embedding <=> %s::svec,
+                entity_id, relation_id, target_id
+                LIMIT {args.top_k}
+                """,
+                lambda q: (q.query_vec, list(q.keywords), q.query_vec),
+            )
+
             dependency_twohop_sql = base.QueryCase(
                 "seed_require_twohop_in",
                 f"""
@@ -777,7 +871,8 @@ def main() -> int:
             print()
 
             for question in questions:
-                print(f"query|label={question.label}|keywords={','.join(question.keywords)}|prompt={question.prompt}")
+                oracle_ids = ",".join(str(v) for v in question.oracle_file_ids)
+                print(f"query|label={question.label}|keywords={','.join(question.keywords)}|oracle_files={oracle_ids}|prompt={question.prompt}")
             print()
 
             cases: list[tuple[str, str, base.QueryCase]] = [
@@ -786,9 +881,14 @@ def main() -> int:
                 ("facts_heap", "facts_heap", seed_expand_sql),
                 ("facts_sh", "facts_sh", seed_expand_sql),
                 ("facts_sh", "facts_sh", seed_expand_fn),
+                ("facts_heap", "facts_heap", keyword_rerank_sql),
+                ("facts_sh", "facts_sh", keyword_rerank_sql),
                 ("facts_heap", "facts_heap", summary_seed_expand_sql),
                 ("facts_sh", "facts_sh", summary_seed_expand_sql),
                 ("facts_sh", "facts_sh", summary_seed_expand_fn),
+                ("facts_heap", "facts_heap", oracle_seed_expand_in),
+                ("facts_sh", "facts_sh", oracle_seed_expand_in),
+                ("facts_sh", "facts_sh", oracle_seed_expand_fn),
                 ("facts_heap", "facts_heap", seed_plus_require_sql),
                 ("facts_sh", "facts_sh", seed_plus_require_sql),
                 ("facts_heap", "facts_heap", dependency_twohop_sql),

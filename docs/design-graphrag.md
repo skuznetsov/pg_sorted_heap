@@ -1986,7 +1986,7 @@ was a poor way to choose files.
 
 That also failed to improve answer-support quality.
 
-Stable smoke result on the same point:
+Stable smoke result on the same `40`-file / `840`-row / `6`-question point:
 
 - summary-seeded expansion:
   - heap: `0.587 ms`
@@ -2008,3 +2008,52 @@ The remaining frontier is more likely one of:
 - a different quality metric / question contract,
 - better embeddings,
 - or a lower-overhead execution path on the already-best file-seeded shape.
+
+### Oracle-seed and oracle-rerank diagnostic
+
+The next adversary question was sharper:
+
+> is the plateau really about bad file seeds, or is it already downstream in
+> the rerank / evaluation contract?
+
+The harness now includes two explicit oracle diagnostics on the same real code
+corpus:
+
+- **oracle file seeds**
+  - choose seed files by benchmark-keyword overlap against the full file text
+  - this is not a deployable retrieval contract; it is a diagnostic ceiling
+- **oracle keyword rerank**
+  - keep the same ANN-derived file seeds
+  - rerank the expanded chunk rows by direct overlap with the benchmark's gold
+    CrossFile keywords before falling back to embedding distance
+
+Stable local result, `3` runs, same `40`-file / `840`-row / `6`-question point:
+
+- plain file-seeded expansion:
+  - `sorted_heap`: `0.443 ms`
+  - keyword coverage: `63.3%`
+  - full hits: `33.3%`
+- oracle file seeds:
+  - `sorted_heap`: `0.416 ms`
+  - same `63.3%` keyword coverage
+  - same `33.3%` full hits
+- oracle keyword rerank:
+  - heap: `2.905 ms`
+  - `sorted_heap`: `2.944 ms`
+  - keyword coverage: `90.0%`
+  - full hits: `66.7%`
+
+This is a useful but narrow falsifier:
+
+- the plateau is **not** explained by weak file seeds alone
+- richer local graph structure also did not explain it
+- but once the rerank contract is allowed to use the benchmark's own gold
+  keywords, quality jumps sharply
+
+That does **not** justify a product claim, because the oracle rerank is using
+the same keyword signal that the benchmark later scores. It does justify a more
+targeted next hypothesis:
+
+> the remaining quality frontier on the real code corpus is more likely in the
+> query/rerank contract or embedding space than in local graph topology or seed
+> selection
