@@ -606,6 +606,7 @@ make test-crash-recovery       # crash recovery (4 scenarios)
 make test-graphrag-crash       # GraphRAG crash recovery
 make test-graphrag-concurrent  # GraphRAG concurrent DML + online ops
 make test-graphrag-release     # GraphRAG release-candidate bundle
+make test-release              # full extension release-candidate bundle
 make test-concurrent           # concurrent DML + online ops
 make test-toast                # TOAST integrity
 make test-alter-table          # ALTER TABLE DDL (36 checks)

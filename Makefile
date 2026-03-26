@@ -489,6 +489,17 @@ test-graphrag-release:
 	$(MAKE) test-graphrag-crash
 	$(MAKE) test-graphrag-concurrent
 
+test-release:
+	$(MAKE) pg-core-regression-smoke
+	$(MAKE) policy-safety-selftest
+	$(MAKE) test-dump-restore
+	$(MAKE) test-toast
+	$(MAKE) test-alter-table
+	$(MAKE) test-crash-recovery
+	$(MAKE) test-concurrent
+	$(MAKE) test-pg-upgrade
+	$(MAKE) test-graphrag-release
+
 test-graph-builder:
 	./scripts/test_graph_builder.sh $(TMP_SELFTEST_ROOT) $(TEST_GRAPH_PORT)
 
@@ -618,6 +629,7 @@ help:
 	@echo "  make test-alter-table TEST_ALTER_PORT=<port>"
 	@echo "  make test-graphrag-lifecycle TEST_GRAPHRAG_PORT=<port>"
 	@echo "  make test-graphrag-release TMP_SELFTEST_ROOT=<abs_tmp_dir>"
+	@echo "  make test-release TMP_SELFTEST_ROOT=<abs_tmp_dir>"
 	@echo "  make test-graph-builder TEST_GRAPH_PORT=<port>"
 	@echo "  make build-graph-bench-nomic VECTOR_BENCH_DSN='<dsn>' VECTOR_GRAPH_TABLE=<graph_table> VECTOR_ENTRY_TABLE=<entry_table>"
 	@echo "  make build-hnsw-bench-nomic VECTOR_BENCH_DSN='<dsn>' HNSW_SOURCE_TABLE=<graph_table> HNSW_PREFIX=<prefix>"

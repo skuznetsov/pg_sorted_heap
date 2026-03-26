@@ -28,6 +28,12 @@
   - lifecycle
   - crash recovery
   - concurrent online-operation coverage
+- Added `make test-release` to run the broader `0.13` extension release bundle:
+  - core regression smoke
+  - policy/doc contract selftests
+  - dump/restore, TOAST, DDL, crash recovery, concurrent online ops
+  - `pg_upgrade`
+  - the narrower `make test-graphrag-release` bundle
 
 ### GraphRAG syntax unification
 

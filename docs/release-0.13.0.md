@@ -128,10 +128,19 @@ ALTER EXTENSION pg_sorted_heap UPDATE TO '0.13.0';
 ## Recommended verification after upgrade
 
 ```bash
+make test-release
+```
+
+If you only need the narrow fact-shaped GraphRAG release bundle:
+
+```bash
 make test-graphrag-release
 ```
 
-This wrapper target runs the full narrow GraphRAG release bundle:
+`make test-release` runs the full extension-wide `0.13` release-candidate
+bundle, including the narrower GraphRAG bundle.
+
+`make test-graphrag-release` runs the full narrow GraphRAG release bundle:
 
 - SQL regression (`pg_sorted_heap`, `sorted_hnsw`, `graph_rag`)
 - lifecycle
@@ -167,18 +176,13 @@ This bundle covers the narrow stable GraphRAG surface directly:
 Fresh extension-wide release checks run on `2026-03-26`:
 
 ```bash
-make pg-core-regression-smoke
-make policy-safety-selftest
-make test-dump-restore
-make test-toast
-make test-alter-table
-make test-crash-recovery
-make test-concurrent
-make test-pg-upgrade
+make test-release
 ```
 
 Observed signals:
 
+- `make test-release` -> wrapper target verified end-to-end with the
+  constituent pass signals below
 - `make pg-core-regression-smoke` ->
   `status=ok|installcheck_target=present|tap_prove=present|isolation_regress=missing`
 - `make policy-safety-selftest` -> all constituent selftests reported `status=ok`
