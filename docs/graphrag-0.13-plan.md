@@ -126,8 +126,14 @@ The existing beta surface works, but it is a function zoo.
      - on that corpus, the fast generic point is repeated-build stable but only
        partial (`90.0% / 60.0%`), while the code-aware helper-backed compact
        include rescue is repeated-build stable at `100.0% / 100.0%`
-   - remaining larger-corpus gates should still cover corpora from:
+     - a first archive-side gate on `~/SrcArchives/apple/ninja/src` is now also
+       repeated-build stable:
+       - generic `prompt_summary_snippet_py` closes at `100.0% / 100.0%`
+         with `top_k=12`
+       - code-aware `prompt_summary_snippet_py` remains partial there
+   - the scoped `0.13` larger real-corpus gate is now covered across:
      - `~/Projects/Crystal`
+     - `~/Projects/C`
      - `~/SrcArchives`
 
 5. Non-canonical schema story
@@ -161,7 +167,8 @@ Implemented in this branch:
 
 Still needed:
 
-- archive repeated-build gates under `~/SrcArchives`
+- no additional larger real-corpus gate is currently required for the narrow
+  `0.13` fact-graph stable target
 
 ### Phase 3: schema registration
 

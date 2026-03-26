@@ -1,0 +1,35 @@
+{
+  "source": {
+    "repo": "ninja/src",
+    "captured_at": "2026-03-26",
+    "extensions": [".h", ".cc"],
+    "note": "Archive-side mixed-language fixture for Ninja source code."
+  },
+  "questions": [
+    {
+      "label": "manifest_and_logs",
+      "prompt": "How does Ninja load the manifest and open the build and deps logs before running a build?",
+      "keywords": ["ManifestParser", "OpenBuildLog", "OpenDepsLog", "NinjaMain"]
+    },
+    {
+      "label": "pool_scheduling",
+      "prompt": "How do Ninja pools delay edges and release ready work when capacity frees up?",
+      "keywords": ["Pool", "ShouldDelayEdge", "DelayEdge", "RetrieveReadyEdges"]
+    },
+    {
+      "label": "plan_ready_work",
+      "prompt": "How does Ninja Plan track wanted edges and schedule initial ready work?",
+      "keywords": ["Plan", "want_", "ScheduleInitialEdges", "FindWork"]
+    },
+    {
+      "label": "dyndep_parsing",
+      "prompt": "How does Ninja parse dyndep files and connect them back to edges in the state graph?",
+      "keywords": ["DyndepParser", "ParseEdge", "ReadToken", "LookupNode"]
+    },
+    {
+      "label": "command_execution",
+      "prompt": "How does Ninja run build commands and wait for command completion?",
+      "keywords": ["Builder", "CommandRunner", "StartCommand", "WaitForCommand"]
+    }
+  ]
+}

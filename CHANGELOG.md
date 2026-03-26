@@ -110,8 +110,17 @@
     (`90.0% / 60.0%`)
   - the code-aware helper-backed compact include rescue is repeated-build
     stable at `100.0% / 100.0%`
-- Narrowed the remaining `0.13` real-corpus gap to archive corpora under
-  `~/SrcArchives`.
+- Added the first archive-side adversary gate on `~/SrcArchives/apple/ninja/src`
+  using `scripts/fixtures/graph_rag_ninja_questions.json`.
+- Verified on `ninja/src` that:
+  - the plain generic `prompt_summary_snippet_py` path is repeated-build stable
+    at `100.0% / 100.0%` once the final result budget is raised to `top_k=12`
+  - the code-aware `prompt_summary_snippet_py` path remains partial
+    (`85.0% / 80.0%`) on the same corpus
+- The scoped `0.13` larger real-corpus gate now spans:
+  - `~/Projects/Crystal`
+  - `~/Projects/C`
+  - `~/SrcArchives`
 
 ## 0.12.0 (2026-03-26)
 

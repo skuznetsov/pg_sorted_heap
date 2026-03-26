@@ -422,6 +422,40 @@ Interpretation:
 - so the remaining larger-corpus gap for `0.13` is no longer `~/Projects/C`;
   it is the archive side under `~/SrcArchives`
 
+### Archive-side code-corpus GraphRAG beta benchmark (`ninja/src`)
+
+The same widened harness was then pointed at an archive-side corpus under
+`~/SrcArchives`: `apple/ninja/src`. This run used a second repo-owned fixture in
+`scripts/fixtures/graph_rag_ninja_questions.json` and the local include graph
+inside `ninja/src` (`103` files, `1757` rows after chunk + summary expansion,
+`282` dependency edges).
+
+Initial smoke at `top_k=8`:
+
+| Mode | Best fast case | Local p50 | Keyword coverage | Full hits | Notes |
+|------|----------------|:---------:|:----------------:|:---------:|-------|
+| generic | `prompt_summary_snippet_py` | `0.898 ms` | `95.0%` | `80.0%` | already close without rescue |
+| code-aware | `prompt_summary_snippet_py` | `0.928 ms` | `85.0%` | `80.0%` | code-aware mode is weaker on this corpus |
+
+Bounded budget probe (`top_k=12`, `3` fresh builds):
+
+| Mode | Best case | Local repeated-build p50 | Keyword coverage | Full hits | Avg returned rows | Notes |
+|------|-----------|:------------------------:|:----------------:|:---------:|:-----------------:|-------|
+| generic | `prompt_summary_snippet_py` | `0.914 ms` | `100.0%` | `100.0%` | `7.80` | archive-side gate closes with a small result-budget bump |
+| code-aware | `prompt_summary_snippet_py` | `0.871 ms` | `85.0%` | `80.0%` | `7.60` | still not the winner on this corpus |
+
+Interpretation:
+
+- the `~/SrcArchives` side is now covered by a real repeated-build gate
+- unlike `pycdc`, this archive corpus does **not** need a dependency-rescue
+  contract to close
+- the winner is the simple generic summary-snippet path at a slightly larger
+  final budget (`top_k=12`)
+- the larger real-corpus verification matrix for `0.13` now spans:
+  - `~/Projects/Crystal`
+  - `~/Projects/C`
+  - `~/SrcArchives`
+
 ### External folding stress corpus for GraphRAG beta (`folding/src`)
 
 The same harness was then pointed at a second real code corpus outside this

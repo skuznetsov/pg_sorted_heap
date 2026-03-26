@@ -2953,6 +2953,76 @@ That still narrows the `0.13` release gap meaningfully:
 - `~/Projects/C` is covered
 - the remaining unverified archive-side gate is now `~/SrcArchives`
 
+## Archive-side `~/SrcArchives` gate (`ninja/src`)
+
+The last remaining real-corpus gap named in the `0.13` plan was the archive
+side under `~/SrcArchives`. The new mixed-language harness path made it
+possible to cover that without another code change, so the next adversary
+corpus was:
+
+- source tree: `~/SrcArchives/apple/ninja/src`
+- fixture: `scripts/fixtures/graph_rag_ninja_questions.json`
+- source extensions:
+  - `.h`
+  - `.cc`
+- corpus size:
+  - `103` files
+  - `1757` rows after summary + chunk expansion
+  - `282` local dependency edges from quoted includes
+
+The first smoke at the current default-ish budget (`top_k=8`) already gave a
+useful signal:
+
+- generic `prompt_summary_snippet_py`
+  - `95.0%` keyword coverage
+  - `80.0%` full hits
+- code-aware `prompt_summary_snippet_py`
+  - `85.0%`
+  - `80.0%`
+
+That differed from `pycdc` in an important way:
+
+- the archive corpus was already close on the plain generic path
+- the code-aware path was not stronger here
+- there was no immediate evidence that a dependency-rescue branch was needed
+
+The cheapest falsifier was therefore not a new query contract, but just a small
+increase in the final result budget. At `top_k=12`:
+
+- generic `prompt_summary_snippet_py`
+  - `100.0% / 100.0%`
+  - `p50 0.996 ms` on the first smoke
+- code-aware `prompt_summary_snippet_py`
+  - stayed at `85.0% / 80.0%`
+
+Repeated-build verification (`3` fresh builds) then confirmed the archive-side
+winner:
+
+- generic `prompt_summary_snippet_py`
+  - `p50 median 0.914 ms`, range `0.827-0.921 ms`
+  - stable `100.0% / 100.0%`
+  - `avg_rows 7.80`
+- code-aware `prompt_summary_snippet_py`
+  - `p50 median 0.871 ms`, range `0.848-0.901 ms`
+  - stable `85.0% / 80.0%`
+  - `avg_rows 7.60`
+
+So the archive-side gate is now covered, and the conclusion is pleasantly
+narrow:
+
+- `~/SrcArchives` does not require a new rescue contract for the first verified
+  corpus
+- the simple generic summary-snippet path closes `ninja/src`
+- the only change needed versus the smaller code-corpus points was a small
+  result-budget bump from `top_k=8` to `top_k=12`
+
+This means the `0.13` larger real-corpus verification matrix is now complete in
+the scoped sense the plan asked for:
+
+- `~/Projects/Crystal`
+- `~/Projects/C`
+- `~/SrcArchives`
+
 ## External folding corpus check
 
 The next adversary check was a second real code corpus outside this repository:
