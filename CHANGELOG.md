@@ -46,6 +46,11 @@
   - alias-schema registration
   - registry persistence across dump/restore
   - post-restore GraphRAG query correctness on registered alias schemas
+- Added `scripts/test_graph_rag_crash_recovery.sh` and
+  `make test-graphrag-crash` to verify crash recovery for:
+  - committed registered GraphRAG tables
+  - crash during insert into a registered/indexed graph table
+  - crash during compact on a registered graph table
 
 ## 0.12.0 (2026-03-26)
 

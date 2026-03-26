@@ -138,12 +138,12 @@ Implemented in this branch:
 - dump/restore coverage for registered GraphRAG alias mappings
 - extension upgrade coverage for `0.12.0 -> 0.13.0`
 - persistence coverage for `sorted_heap_graph_registry` across pg_dump/restore
+- crash recovery coverage for registered GraphRAG alias schemas
 
 Still needed:
 
 - larger real-corpus repeated-build gates
 - observability across seed / expand / rerank stages
-- crash recovery coverage
 - concurrent DML/compact interaction checks on GraphRAG-shaped tables
 
 ### Phase 3: schema registration
