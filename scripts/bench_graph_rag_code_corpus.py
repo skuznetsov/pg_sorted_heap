@@ -48,6 +48,33 @@ QUESTION_TOPIC_RE = re.compile(r'topic:\s*"(.*)",\s*$')
 QUESTION_TIER_RE = re.compile(r"tier:\s*Tier::([A-Za-z_]+),\s*$")
 QUOTED_RE = re.compile(r'"([^"]+)"')
 REQUIRE_RE = re.compile(r'^require\s+"([^"]+)"')
+PROMPT_TERM_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\d+")
+
+PROMPT_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "between",
+    "by",
+    "does",
+    "for",
+    "from",
+    "handle",
+    "happens",
+    "how",
+    "in",
+    "is",
+    "jarvis",
+    "of",
+    "or",
+    "the",
+    "to",
+    "what",
+    "when",
+    "which",
+    "with",
+}
 
 
 @dataclass(frozen=True)
@@ -216,6 +243,24 @@ def build_oracle_seed_map(files: list[Path], questions: list[CodeQuestion], ann_
         seed_map[question.label] = seeds
 
     return seed_map
+
+
+def extract_prompt_terms(prompt: str) -> tuple[str, ...]:
+    terms: list[str] = []
+    seen: set[str] = set()
+
+    for token in PROMPT_TERM_RE.findall(prompt):
+        lowered = token.lower()
+        if lowered in PROMPT_STOPWORDS:
+            continue
+        if len(lowered) <= 2 and not lowered.isdigit():
+            continue
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        terms.append(lowered)
+
+    return tuple(terms)
 
 
 def resolve_local_require_targets(path: Path, src_dir: Path, rel_to_id: dict[str, int]) -> list[str]:
@@ -752,6 +797,38 @@ def main() -> int:
                 lambda q: (q.query_vec, list(q.keywords), q.query_vec),
             )
 
+            prompt_lexical_rerank_sql = base.QueryCase(
+                "prompt_lexical_rerank_in",
+                f"""
+                WITH ann AS MATERIALIZED (
+                    SELECT entity_id
+                    FROM {{table}}
+                    ORDER BY embedding <=> %s::svec
+                    LIMIT {args.ann_k}
+                ),
+                seeds AS MATERIALIZED (
+                    SELECT DISTINCT entity_id FROM ann
+                ),
+                expanded AS MATERIALIZED (
+                    SELECT *
+                    FROM {{table}}
+                    WHERE entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+                      AND relation_id = {REL_HAS_CHUNK}
+                )
+                SELECT *
+                FROM expanded
+                ORDER BY (
+                    SELECT count(*)
+                    FROM unnest(%s::text[]) kw
+                    WHERE position(lower(kw) in lower(payload)) > 0
+                ) DESC,
+                embedding <=> %s::svec,
+                entity_id, relation_id, target_id
+                LIMIT {args.top_k}
+                """,
+                lambda q: (q.query_vec, list(extract_prompt_terms(q.prompt)), q.query_vec),
+            )
+
             dependency_twohop_sql = base.QueryCase(
                 "seed_require_twohop_in",
                 f"""
@@ -872,7 +949,11 @@ def main() -> int:
 
             for question in questions:
                 oracle_ids = ",".join(str(v) for v in question.oracle_file_ids)
-                print(f"query|label={question.label}|keywords={','.join(question.keywords)}|oracle_files={oracle_ids}|prompt={question.prompt}")
+                prompt_terms = ",".join(extract_prompt_terms(question.prompt))
+                print(
+                    f"query|label={question.label}|keywords={','.join(question.keywords)}|"
+                    f"prompt_terms={prompt_terms}|oracle_files={oracle_ids}|prompt={question.prompt}"
+                )
             print()
 
             cases: list[tuple[str, str, base.QueryCase]] = [
@@ -881,6 +962,8 @@ def main() -> int:
                 ("facts_heap", "facts_heap", seed_expand_sql),
                 ("facts_sh", "facts_sh", seed_expand_sql),
                 ("facts_sh", "facts_sh", seed_expand_fn),
+                ("facts_heap", "facts_heap", prompt_lexical_rerank_sql),
+                ("facts_sh", "facts_sh", prompt_lexical_rerank_sql),
                 ("facts_heap", "facts_heap", keyword_rerank_sql),
                 ("facts_sh", "facts_sh", keyword_rerank_sql),
                 ("facts_heap", "facts_heap", summary_seed_expand_sql),

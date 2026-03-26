@@ -2022,6 +2022,10 @@ corpus:
 - **oracle file seeds**
   - choose seed files by benchmark-keyword overlap against the full file text
   - this is not a deployable retrieval contract; it is a diagnostic ceiling
+- **prompt-derived lexical rerank**
+  - keep the same ANN-derived file seeds
+  - rerank by lexical overlap with terms extracted from the actual user prompt
+  - this is deployable in principle, but much weaker than the oracle signal
 - **oracle keyword rerank**
   - keep the same ANN-derived file seeds
   - rerank the expanded chunk rows by direct overlap with the benchmark's gold
@@ -2037,6 +2041,10 @@ Stable local result, `3` runs, same `40`-file / `840`-row / `6`-question point:
   - `sorted_heap`: `0.416 ms`
   - same `63.3%` keyword coverage
   - same `33.3%` full hits
+- prompt-derived lexical rerank:
+  - `sorted_heap`: `3.146 ms`
+  - same `63.3%` keyword coverage
+  - worse `16.7%` full hits
 - oracle keyword rerank:
   - heap: `2.905 ms`
   - `sorted_heap`: `2.944 ms`
@@ -2047,6 +2055,7 @@ This is a useful but narrow falsifier:
 
 - the plateau is **not** explained by weak file seeds alone
 - richer local graph structure also did not explain it
+- a cheap lexical hybrid derived from the real prompt also did not explain it
 - but once the rerank contract is allowed to use the benchmark's own gold
   keywords, quality jumps sharply
 
