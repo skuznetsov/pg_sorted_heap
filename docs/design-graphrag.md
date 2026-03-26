@@ -2110,3 +2110,45 @@ point, a diversity-aware prompt-term rerank was also tested:
 
 That is a partial gain in coverage, but still not the qualitative jump needed
 to make the current small-budget contract compelling.
+
+### Code-aware embedding diagnostic
+
+The next bounded hypothesis was exactly what the code corpus suggests:
+
+> maybe the remaining gap is not just about rerank logic, but about the fact
+> that the current harness still uses a Gutenberg-style lexical tokenizer that
+> does not understand `CamelCase` or `_snake_case` identifiers well
+
+The harness now supports two embedding modes:
+
+- `generic`
+  - existing lexical hash over generic text tokens
+- `code_aware`
+  - keeps the full code token, but also splits identifiers on `_` and
+    `CamelCase` before hashing
+
+Stable local comparison on the same real `40`-file / `840`-row / `6`-question
+point, `ann_k=16`, `top_k=4`, `3` runs:
+
+- plain file-seeded `sorted_heap` expansion:
+  - `generic`: `0.450 ms`, `63.3%` keyword coverage, `33.3%` full hits
+  - `code_aware`: `0.427 ms`, `61.4%` keyword coverage, `16.7%` full hits
+- prompt-diverse rerank:
+  - `generic`: `3.178 ms`, `76.7%`, `33.3%`
+  - `code_aware`: `3.351 ms`, `76.7%`, `50.0%`
+- oracle keyword rerank:
+  - `generic`: `2.672 ms`, `90.0%`, `66.7%`
+  - `code_aware`: `2.435 ms`, `96.7%`, `83.3%`
+
+This is another mixed but useful falsifier:
+
+- code-aware tokenization is **not** a free win by itself
+- plain ANN + file expansion actually got slightly worse
+- but once combined with a diversity-aware rerank, the same code-aware mode
+  did improve the small-budget `full_pct`
+
+So the current code-corpus frontier is now even narrower:
+
+> the next likely win is not "better seeds" or "more edges", but a tighter
+> coupling between code-aware embeddings and a smarter small-budget rerank /
+> packing contract

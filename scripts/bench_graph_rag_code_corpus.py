@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import math
 import re
 import shlex
 import statistics
@@ -49,6 +51,8 @@ QUESTION_TIER_RE = re.compile(r"tier:\s*Tier::([A-Za-z_]+),\s*$")
 QUOTED_RE = re.compile(r'"([^"]+)"')
 REQUIRE_RE = re.compile(r'^require\s+"([^"]+)"')
 PROMPT_TERM_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\d+")
+CODE_TOKEN_RE = re.compile(r"[A-Za-z0-9_']+")
+CAMEL_SPLIT_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z]|\b)|[A-Z]?[a-z]+|\d+")
 
 PROMPT_STOPWORDS = {
     "a",
@@ -245,6 +249,65 @@ def build_oracle_seed_map(files: list[Path], questions: list[CodeQuestion], ann_
     return seed_map
 
 
+def split_code_token(token: str) -> list[str]:
+    token = token.strip("_")
+    if not token:
+        return []
+
+    parts: list[str] = []
+    underscore_parts = [part for part in re.split(r"_+", token) if part]
+    for part in underscore_parts:
+        camel_parts = CAMEL_SPLIT_RE.findall(part)
+        if camel_parts:
+            parts.extend(camel_parts)
+        else:
+            parts.append(part)
+    return [part.lower() for part in parts if part]
+
+
+def code_aware_tokens(text: str) -> list[str]:
+    out: list[str] = []
+    for raw in CODE_TOKEN_RE.findall(text):
+        lowered = raw.lower()
+        out.append(lowered)
+        pieces = split_code_token(raw)
+        for piece in pieces:
+            if piece != lowered:
+                out.append(piece)
+    return out
+
+
+def code_aware_lexical_hash_vector(text: str, dim: int) -> str:
+    acc = [0.0] * dim
+    tokens = code_aware_tokens(text)
+    if not tokens:
+        tokens = [text.lower() or "_"]
+
+    for token in tokens[:512]:
+        digest = hashlib.sha256(token.encode("utf-8")).digest()
+        block = digest
+        for i in range(dim):
+            if i > 0 and i % 256 == 0:
+                block = hashlib.sha256(block).digest()
+            bit = (block[(i // 8) % len(block)] >> (i % 8)) & 1
+            acc[i] += 1.0 if bit else -1.0
+
+    norm = math.sqrt(sum(v * v for v in acc))
+    if norm < 1e-8:
+        vals = [0.0] * dim
+    else:
+        vals = [v / norm for v in acc]
+    return "[" + ",".join(f"{v:.6f}" for v in vals) + "]"
+
+
+def vectorize_text(text: str, dim: int, mode: str) -> str:
+    if mode == "generic":
+        return mh.lexical_hash_vector(text, dim)
+    if mode == "code_aware":
+        return code_aware_lexical_hash_vector(text, dim)
+    raise ValueError(f"unknown embedding mode: {mode}")
+
+
 def extract_prompt_terms(prompt: str) -> tuple[str, ...]:
     terms: list[str] = []
     seen: set[str] = set()
@@ -301,7 +364,7 @@ def resolve_local_require_targets(path: Path, src_dir: Path, rel_to_id: dict[str
     return out
 
 
-def build_code_csv(src_dir: Path, csv_path: Path, dim: int, window: int, overlap: int) -> tuple[int, int, int, int]:
+def build_code_csv(src_dir: Path, csv_path: Path, dim: int, window: int, overlap: int, embedding_mode: str) -> tuple[int, int, int, int]:
     files = list_source_files(src_dir)
     rel_to_id = {str(path.relative_to(src_dir)): idx for idx, path in enumerate(files, start=1)}
 
@@ -320,7 +383,7 @@ def build_code_csv(src_dir: Path, csv_path: Path, dim: int, window: int, overlap
                     file_id,
                     REL_FILE_SUMMARY,
                     file_id,
-                    mh.lexical_hash_vector(summary_text, dim),
+                    vectorize_text(summary_text, dim, embedding_mode),
                     summary_text,
                 ]
             )
@@ -332,7 +395,7 @@ def build_code_csv(src_dir: Path, csv_path: Path, dim: int, window: int, overlap
                         chunk.file_id,
                         REL_HAS_CHUNK,
                         chunk.global_id,
-                        mh.lexical_hash_vector(chunk.text, dim),
+                        vectorize_text(chunk.text, dim, embedding_mode),
                         chunk.text,
                     ]
                 )
@@ -341,14 +404,14 @@ def build_code_csv(src_dir: Path, csv_path: Path, dim: int, window: int, overlap
                 required_id = rel_to_id[required_rel]
                 edge_text = f"# Require: {relative} -> {required_rel}"
                 w.writerow(
-                    [
-                        file_id,
-                        REL_REQUIRES_FILE,
-                        required_id,
-                        mh.lexical_hash_vector(edge_text, dim),
-                        edge_text,
-                    ]
-                )
+                        [
+                            file_id,
+                            REL_REQUIRES_FILE,
+                            required_id,
+                            vectorize_text(edge_text, dim, embedding_mode),
+                            edge_text,
+                        ]
+                    )
                 rowcount += 1
                 edge_count += 1
 
@@ -559,6 +622,7 @@ def main() -> int:
     ap.add_argument("--m", type=int, default=24)
     ap.add_argument("--shared-buffers-mb", type=int, default=64)
     ap.add_argument("--backend-mode", choices=("fresh", "reuse"), default="fresh")
+    ap.add_argument("--embedding-mode", choices=("generic", "code_aware"), default="generic")
     ap.add_argument("--chunk-window", type=int, default=CHUNK_WINDOW)
     ap.add_argument("--chunk-overlap", type=int, default=CHUNK_OVERLAP)
     ap.add_argument("--install-cmd", default="")
@@ -583,6 +647,16 @@ def main() -> int:
 
     try:
         questions = parse_crossfile_questions(question_source, args.dim)
+        questions = [
+            CodeQuestion(
+                label=q.label,
+                prompt=q.prompt,
+                keywords=q.keywords,
+                query_vec=vectorize_text(q.prompt, args.dim, args.embedding_mode),
+                oracle_file_ids=q.oracle_file_ids,
+            )
+            for q in questions
+        ]
         source_files = list_source_files(source_dir)
         oracle_seed_map = build_oracle_seed_map(source_files, questions, args.ann_k)
         questions = [
@@ -595,7 +669,14 @@ def main() -> int:
             )
             for q in questions
         ]
-        file_count, rowcount, edge_count, summary_count = build_code_csv(source_dir, csv_path, args.dim, args.chunk_window, args.chunk_overlap)
+        file_count, rowcount, edge_count, summary_count = build_code_csv(
+            source_dir,
+            csv_path,
+            args.dim,
+            args.chunk_window,
+            args.chunk_overlap,
+            args.embedding_mode,
+        )
 
         conn = base.connect(tmp, port)
         cur = conn.cursor()
@@ -984,6 +1065,7 @@ def main() -> int:
             print(f"queries:            {len(questions)}")
             print(f"runs:               {args.runs}")
             print(f"dim:                {args.dim}")
+            print(f"embedding_mode:     {args.embedding_mode}")
             print(f"ann_k:              {args.ann_k}")
             print(f"top_k:              {args.top_k}")
             print(f"ef_search:          {args.ef_search}")
