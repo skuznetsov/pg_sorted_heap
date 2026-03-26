@@ -120,6 +120,31 @@ class QuestionPayloadRow:
     payload: str
 
 
+@dataclass
+class TimingBreakdown:
+    query_samples: int = 0
+    fetch_ms_total: float = 0.0
+    post_ms_total: float = 0.0
+    snippet_rows: int = 0
+    snippet_cache_hits: int = 0
+    snippet_cache_misses: int = 0
+    snippet_build_ms_total: float = 0.0
+
+    def record_query(self, fetch_ms: float, post_ms: float) -> None:
+        self.query_samples += 1
+        self.fetch_ms_total += fetch_ms
+        self.post_ms_total += post_ms
+
+    def record_snippet_hit(self) -> None:
+        self.snippet_cache_hits += 1
+        self.snippet_rows += 1
+
+    def record_snippet_miss(self, build_ms: float) -> None:
+        self.snippet_cache_misses += 1
+        self.snippet_rows += 1
+        self.snippet_build_ms_total += build_ms
+
+
 def default_cogniformerus_root(repo_root: Path) -> Path:
     return repo_root.parent.parent / "Crystal" / "cogniformerus"
 
@@ -593,6 +618,7 @@ def measure_case(
     questions: list[CodeQuestion],
     runs: int,
     postprocessors: dict[str, callable] | None = None,
+    timing_breakdowns: dict[str, TimingBreakdown] | None = None,
 ) -> tuple[float, float, float, float, str, int]:
     sql = case.sql_template.format(table=table_name)
     total_ms: list[float] = []
@@ -608,10 +634,16 @@ def measure_case(
             hits.append(hit)
             reads.append(read)
             if postprocessors and case.name in postprocessors:
-                started = time.perf_counter()
+                fetch_started = time.perf_counter()
                 cur.execute(sql, params)
-                rows = apply_postprocess(case, question, cur.fetchall(), cur.description, postprocessors)
-                total_ms.append((time.perf_counter() - started) * 1000.0)
+                fetched_rows = cur.fetchall()
+                fetch_ms = (time.perf_counter() - fetch_started) * 1000.0
+                post_started = time.perf_counter()
+                rows = apply_postprocess(case, question, fetched_rows, cur.description, postprocessors, timing_breakdowns)
+                post_ms = (time.perf_counter() - post_started) * 1000.0
+                total_ms.append(fetch_ms + post_ms)
+                if timing_breakdowns is not None:
+                    timing_breakdowns.setdefault(case.name, TimingBreakdown()).record_query(fetch_ms, post_ms)
             else:
                 total_ms.append(exec_ms)
                 rows = None
@@ -916,13 +948,14 @@ def apply_postprocess(
     rows: list[tuple],
     description,
     postprocessors: dict[str, callable] | None,
+    timing_breakdowns: dict[str, TimingBreakdown] | None = None,
 ) -> list[tuple]:
     if not postprocessors:
         return rows
     postprocess = postprocessors.get(case.name)
     if postprocess is None:
         return rows
-    return postprocess(question, rows, description)
+    return postprocess(case.name, question, rows, description, timing_breakdowns)
 
 
 def measure_quality(
@@ -1020,6 +1053,23 @@ def print_result(table: str, case: str, p50: float, avg: float, hits: float, rea
     )
 
 
+def print_timing_breakdown(table: str, case: str, breakdown: TimingBreakdown) -> None:
+    avg_fetch_ms = breakdown.fetch_ms_total / breakdown.query_samples if breakdown.query_samples else 0.0
+    avg_post_ms = breakdown.post_ms_total / breakdown.query_samples if breakdown.query_samples else 0.0
+    avg_snippet_rows = breakdown.snippet_rows / breakdown.query_samples if breakdown.query_samples else 0.0
+    avg_build_miss_ms = (
+        breakdown.snippet_build_ms_total / breakdown.snippet_cache_misses
+        if breakdown.snippet_cache_misses
+        else 0.0
+    )
+    print(
+        f"timing|table={table}|case={case}|query_samples={breakdown.query_samples}|"
+        f"avg_fetch_ms={avg_fetch_ms:.3f}|avg_post_ms={avg_post_ms:.3f}|"
+        f"avg_snippet_rows={avg_snippet_rows:.2f}|cache_hit={breakdown.snippet_cache_hits}|"
+        f"cache_miss={breakdown.snippet_cache_misses}|avg_build_miss_ms={avg_build_miss_ms:.3f}"
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cogniformerus-root", default="")
@@ -1043,6 +1093,7 @@ def main() -> int:
     ap.add_argument("--question-filter", default="")
     ap.add_argument("--report-questions", action="store_true")
     ap.add_argument("--report-payloads", action="store_true")
+    ap.add_argument("--report-timing-breakdown", action="store_true")
     ap.add_argument("--install-cmd", default="")
     ap.add_argument("--keep-temp", action="store_true")
     args = ap.parse_args()
@@ -2580,9 +2631,18 @@ def main() -> int:
                 )
             print()
 
-            def summary_snippet_postprocess(question: CodeQuestion, rows: list[tuple], description) -> list[tuple]:
+            def summary_snippet_postprocess(
+                case_name: str,
+                question: CodeQuestion,
+                rows: list[tuple],
+                description,
+                timing_breakdowns: dict[str, TimingBreakdown] | None = None,
+            ) -> list[tuple]:
                 payload_idx = payload_index_from_description(description)
                 out: list[tuple] = []
+                breakdown = None
+                if timing_breakdowns is not None:
+                    breakdown = timing_breakdowns.setdefault(case_name, TimingBreakdown())
                 for row in rows:
                     row_vals = list(row)
                     original_payload = str(row_vals[payload_idx])
@@ -2591,13 +2651,19 @@ def main() -> int:
                         cache_key = (relative, question.prompt)
                         snippet = snippet_cache.get(cache_key)
                         if snippet is None:
+                            build_started = time.perf_counter()
                             snippet = prompt_snippet_from_index(
                                 relative,
                                 file_snippet_index_by_relative[relative],
                                 question.prompt,
                                 anchor_count=4,
                             )
+                            build_ms = (time.perf_counter() - build_started) * 1000.0
                             snippet_cache[cache_key] = snippet
+                            if breakdown is not None:
+                                breakdown.record_snippet_miss(build_ms)
+                        elif breakdown is not None:
+                            breakdown.record_snippet_hit()
                         row_vals[payload_idx] = f"{original_payload}\n{snippet}"
                     out.append(tuple(row_vals))
                 return out
@@ -2676,9 +2742,20 @@ def main() -> int:
 
             for label, table, case in cases:
                 print(f"running|table={label}|case={case.name}", flush=True)
-                p50, avg, hits, reads, root, rows = measure_case(cur, table, case, questions, args.runs, postprocessors)
+                timing_breakdowns: dict[str, TimingBreakdown] | None = {} if args.report_timing_breakdown else None
+                p50, avg, hits, reads, root, rows = measure_case(
+                    cur,
+                    table,
+                    case,
+                    questions,
+                    args.runs,
+                    postprocessors,
+                    timing_breakdowns,
+                )
                 keyword_pct, full_pct, avg_rows = measure_quality(cur, table, case, questions, postprocessors)
                 print_result(label, case.name, p50, avg, hits, reads, root, rows, keyword_pct, full_pct, avg_rows)
+                if args.report_timing_breakdown and timing_breakdowns and case.name in timing_breakdowns:
+                    print_timing_breakdown(label, case.name, timing_breakdowns[case.name])
                 if args.report_questions:
                     for detail in measure_quality_details(cur, table, case, questions, postprocessors):
                         print(

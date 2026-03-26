@@ -385,6 +385,9 @@ Interpretation:
 - the rescue is now verified on both local Apple Silicon and AWS ARM64
 - the helper-backed rescue is slightly faster and avoids the old rescue path's
   shared reads, so it is the current documented external rescue
+- an isolated local timing split shows the helper-backed rescue is still
+  dominated by lexical-seed + `REQUIRES_FILE` fetch work (`~10.7-11.0 ms/query`)
+  with snippet postprocess as a secondary cold-start cost (`~7.7-8.0 ms/query`)
 - but the rescue is much slower than the primary in-repo winners, so it does
   not replace them as the default GraphRAG contract
 

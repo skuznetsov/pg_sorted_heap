@@ -2865,6 +2865,25 @@ Interpretation:
 - that rescue closes the quality gap, but only by paying roughly a `10x`
   latency penalty
 
+An isolated timing split then narrowed where that penalty actually sits. On a
+fresh local `3`-run sweep of only the helper-backed rescue:
+
+- generic `prompt_lexseed_require_summary_snippet_fn`
+  - `avg fetch ms/query = 10.674`
+  - `avg postprocess ms/query = 8.033`
+  - `24` snippet-cache misses, `48` hits
+  - `avg build time per miss = 6.010 ms`
+- code-aware `prompt_lexseed_require_summary_snippet_fn`
+  - `avg fetch ms/query = 11.016`
+  - `avg postprocess ms/query = 7.742`
+  - `24` snippet-cache misses, `48` hits
+  - `avg build time per miss = 5.787 ms`
+
+So the external rescue is **not** primarily a snippet-extraction problem.
+Even on the isolated cold pass, the dominant term is still the lexical-seed +
+`REQUIRES_FILE` fetch path. Snippet generation is a real secondary tax on the
+first pass, but it is not where the largest win now sits.
+
 The same external `folding/src` corpus also answered the code-aware question.
 At the same repeated-build point:
 
@@ -2911,3 +2930,9 @@ So the external rescue is now **cross-environment verified**, not a local
 artifact. The quality/latency tradeoff also survives the environment change: on
 AWS the rescue remains much slower than the primary in-repo winners while
 staying reproducibly correct on the external corpus.
+
+The next honest optimization target therefore changed. Cheap seed-budget cuts
+were already falsified (`ann_k < 16` and lexical-seed `LIMIT 1` both got
+worse), and the timing split shows that further work should focus on reducing
+the post-seed summary/require candidate work rather than treating snippet
+extraction as the main bottleneck.
