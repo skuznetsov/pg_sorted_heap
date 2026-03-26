@@ -2504,3 +2504,65 @@ So for these two stubborn real prompts, the problem has narrowed from
 
 > the current system is usually choosing the right file region, but not yet the
 > exact evidence fragment or policy detail needed to close the benchmark
+
+### Same-file local chunk refinement does not rescue the hard prompts
+
+The next bounded hypothesis was:
+
+> if the right file is already selected, maybe the fix is simply to give the
+> best file two nearby chunks instead of one
+
+That was tested with a new `prompt_summary_chunk_local2_in` case:
+
+- keep the summary-heavy contract
+- keep mixed ANN seeds
+- replace the single best chunk from the top file with a 2-chunk local window
+  around the best chunk anchor
+
+It did **not** help.
+
+Targeted hard-prompt rerun (`Response memory policy` + `Streaming overlap`,
+`ann_k=16`, `top_k=4`, fresh backend):
+
+- generic mode:
+  - existing summary-heavy hybrid:
+    - `70.0%`
+    - `0.945-1.050 ms`
+  - local 2-chunk refinement:
+    - `70.0%`
+    - `1.660-1.729 ms`
+- code-aware mode:
+  - existing summary-heavy hybrid:
+    - `60.0%`
+    - `1.041-1.078 ms`
+  - local 2-chunk refinement:
+    - `60.0%`
+    - `1.689-1.733 ms`
+
+Bounded all-question rerun (`40` files, `840` rows, `6` real questions,
+`3` runs):
+
+- generic mode:
+  - existing summary-heavy hybrid:
+    - `0.988 ms`
+    - `86.7%`
+    - `50.0%`
+  - local 2-chunk refinement:
+    - `1.572 ms`
+    - `84.3%`
+    - `33.3%`
+- code-aware mode:
+  - existing summary-heavy hybrid:
+    - `0.979 ms`
+    - `84.3%`
+    - `50.0%`
+  - local 2-chunk refinement:
+    - `1.523 ms`
+    - `84.3%`
+    - `50.0%`
+
+So the next frontier is narrower again:
+
+> the missing quality is not solved by a simple "take one more nearby chunk"
+> policy; the remaining problem is finer-grained evidence choice, not just a
+> larger same-file window
