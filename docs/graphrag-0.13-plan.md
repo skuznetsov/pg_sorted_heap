@@ -100,11 +100,17 @@ The existing beta surface works, but it is a function zoo.
    - concurrent DML/compact interaction checks on GraphRAG-shaped tables
 
 3. Observability
-   - seed count
-   - expanded row count
-   - reranked row count
-   - returned row count
-   - ideally per-stage timing for ANN, expansion, rerank
+   - implemented via:
+     - `sorted_heap_graph_rag_stats()`
+     - `sorted_heap_graph_rag_reset_stats()`
+   - current stats include:
+     - seed count
+     - expanded row count
+     - reranked row count
+     - returned row count
+     - per-stage timing for ANN, expansion, rerank
+   - current scope is backend-local last-call observability, which is enough
+     for release tuning and debugging but not a full tracing system
 
 4. Larger real-corpus verification
    - current in-repo real code corpus is still small
@@ -143,7 +149,6 @@ Implemented in this branch:
 Still needed:
 
 - larger real-corpus repeated-build gates
-- observability across seed / expand / rerank stages
 - concurrent DML/compact interaction checks on GraphRAG-shaped tables
 
 ### Phase 3: schema registration

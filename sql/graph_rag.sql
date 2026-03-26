@@ -515,6 +515,54 @@ COPY (
   ) diff
 ) TO STDOUT;
 
+COPY (
+  SELECT 'ok'
+  FROM (SELECT sorted_heap_graph_rag_reset_stats()) s
+) TO STDOUT;
+
+COPY (
+  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+  FROM sorted_heap_expand_rerank('facts_sh'::regclass, ARRAY[1,3], '[1,0,0,0]'::svec, 2, 2, 0)
+  ORDER BY distance, entity_id, relation_id, target_id
+) TO STDOUT;
+
+COPY (
+  SELECT calls, api, seed_count, expanded_rows, reranked_rows, returned_rows,
+         (ann_ms >= 0.0)::int,
+         (expand_ms >= 0.0)::int,
+         (rerank_ms >= 0.0)::int,
+         (total_ms >= 0.0)::int
+  FROM sorted_heap_graph_rag_stats()
+) TO STDOUT;
+
+COPY (
+  SELECT 'ok'
+  FROM (SELECT sorted_heap_graph_rag_reset_stats()) s
+) TO STDOUT;
+
+COPY (
+  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+  FROM sorted_heap_graph_rag(
+    'facts_sh'::regclass,
+    '[0,0,1,0]'::svec,
+    relation_path := ARRAY[1,2],
+    ann_k := 2,
+    top_k := 2,
+    score_mode := 'path',
+    limit_rows := 0
+  )
+  ORDER BY distance, entity_id, relation_id, target_id
+) TO STDOUT;
+
+COPY (
+  SELECT calls, api, seed_count, expanded_rows, reranked_rows, returned_rows,
+         (ann_ms >= 0.0)::int,
+         (expand_ms >= 0.0)::int,
+         (rerank_ms >= 0.0)::int,
+         (total_ms >= 0.0)::int
+  FROM sorted_heap_graph_rag_stats()
+) TO STDOUT;
+
 CREATE TABLE facts_alias (
   src_id    int4 NOT NULL,
   edge_type int2 NOT NULL,

@@ -21,6 +21,8 @@ plus planner-integrated HNSW search.
   - `sorted_heap_graph_register(...)`
   - `sorted_heap_graph_config(...)`
   - `sorted_heap_graph_unregister(...)`
+  - `sorted_heap_graph_rag_stats()`
+  - `sorted_heap_graph_rag_reset_stats()`
   - `sorted_heap_expand_ids(...)`
   - `sorted_heap_expand_rerank(...)`
   - `sorted_heap_expand_twohop_rerank(...)`
@@ -200,6 +202,32 @@ facts; `score_mode := 'path'` uses hop-1 and hop-2 evidence together.
 The older `sorted_heap_graph_rag_scan(...)` wrapper is still available, but it
 seeds one-hop expansion from ANN-selected `target_id` values and is therefore
 not the preferred fact-graph contract.
+
+For tuning and debugging, GraphRAG now also exposes backend-local last-call
+stats:
+
+```sql
+SELECT sorted_heap_graph_rag_reset_stats();
+
+SELECT *
+FROM sorted_heap_graph_rag(
+    'facts'::regclass,
+    '[0.1,0.2,0.3,...]'::svec,
+    relation_path := ARRAY[1, 2],
+    ann_k := 64,
+    top_k := 10,
+    score_mode := 'path'
+);
+
+SELECT *
+FROM sorted_heap_graph_rag_stats();
+```
+
+The stats record includes seed count, expanded rows, reranked rows, returned
+rows, and per-stage timing for ANN, expansion, rerank, and total time. The
+`api` field reports the concrete GraphRAG execution path, so the unified
+wrapper may report `sorted_heap_graph_rag_twohop_path_scan` or another
+underlying helper/wrapper path.
 
 On the current AWS ARM64 rerun (`4 vCPU`, `8 GiB RAM`), `5K` chains / `10K`
 rows / `384D`, the current portable point is:

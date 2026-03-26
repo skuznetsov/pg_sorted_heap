@@ -52,6 +52,24 @@
   - crash during insert into a registered/indexed graph table
   - crash during compact on a registered graph table
 
+### GraphRAG observability
+
+- Added:
+  - `sorted_heap_graph_rag_stats()`
+  - `sorted_heap_graph_rag_reset_stats()`
+- GraphRAG now exposes backend-local last-call stats for:
+  - seed count
+  - expanded row count
+  - reranked row count
+  - returned row count
+  - ANN / expand / rerank / total timing
+- Added regression coverage for:
+  - direct helper observability via `sorted_heap_expand_rerank(...)`
+  - unified wrapper observability via `sorted_heap_graph_rag(...)`
+- The reported `api` field reflects the concrete top-level GraphRAG execution
+  path, so unified wrapper calls report the underlying C path they dispatched
+  to.
+
 ## 0.12.0 (2026-03-26)
 
 ### Release documentation pass

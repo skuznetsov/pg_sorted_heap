@@ -496,6 +496,42 @@ explicitly registered or is still using the canonical default names.
 Removes a previously registered mapping and restores the canonical-name
 defaults for that relation.
 
+### `sorted_heap_graph_rag_stats()`
+
+Returns backend-local statistics for the last GraphRAG helper or wrapper call.
+This is intended for stage-level observability while tuning seed breadth,
+expansion width, and rerank cost.
+
+Returned fields:
+
+- `calls`: number of top-level GraphRAG calls seen by the current backend
+- `api`: concrete GraphRAG execution path for the last call
+- `seed_count`: ANN or explicit seed count
+- `expanded_rows`: rows collected during graph expansion
+- `reranked_rows`: rows considered by the exact rerank stage
+- `returned_rows`: rows emitted to the caller
+- `ann_ms`: ANN seed stage time in milliseconds
+- `expand_ms`: graph expansion time in milliseconds
+- `rerank_ms`: final rerank / emit time in milliseconds
+- `total_ms`: aggregate of the recorded stages
+
+`api` reports the top-level C execution path, not necessarily the SQL wrapper
+name. For example, a unified `sorted_heap_graph_rag(...)` call with
+`relation_path := ARRAY[1, 2], score_mode := 'path'` will report
+`sorted_heap_graph_rag_twohop_path_scan`.
+
+```sql
+SELECT * FROM sorted_heap_graph_rag_stats();
+```
+
+### `sorted_heap_graph_rag_reset_stats()`
+
+Resets the backend-local GraphRAG stats counters.
+
+```sql
+SELECT sorted_heap_graph_rag_reset_stats();
+```
+
 ### `sorted_heap_graph_rag(rel, query, relation_path, ann_k, top_k, score_mode, limit_rows)`
 
 Preferred fact-shaped GraphRAG entry point.

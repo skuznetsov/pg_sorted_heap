@@ -488,6 +488,27 @@ AS $$
   LEFT JOIN @extschema@.sorted_heap_graph_registry r ON r.relid = args.relid;
 $$ LANGUAGE SQL STABLE;
 
+CREATE FUNCTION @extschema@.sorted_heap_graph_rag_stats()
+RETURNS TABLE (
+  calls bigint,
+  api text,
+  seed_count bigint,
+  expanded_rows bigint,
+  reranked_rows bigint,
+  returned_rows bigint,
+  ann_ms float8,
+  expand_ms float8,
+  rerank_ms float8,
+  total_ms float8
+)
+AS '$libdir/pg_sorted_heap', 'sorted_heap_graph_rag_stats'
+LANGUAGE C STABLE;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_rag_reset_stats()
+RETURNS void
+AS '$libdir/pg_sorted_heap', 'sorted_heap_graph_rag_reset_stats'
+LANGUAGE C VOLATILE;
+
 CREATE FUNCTION @extschema@.sorted_heap_expand_ids(
   rel regclass,
   seed_ids int4[],

@@ -38,6 +38,7 @@
 #include "storage/ipc.h"
 #include "storage/shmem.h"
 #include "funcapi.h"
+#include "portability/instr_time.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -197,6 +198,23 @@ typedef struct GraphRagTargetScore
 	float8		dist;
 } GraphRagTargetScore;
 
+typedef struct SortedHeapGraphRagStats
+{
+	uint64		calls;
+	char		last_api[64];
+	int64		last_seed_count;
+	int64		last_expanded_rows;
+	int64		last_reranked_rows;
+	int64		last_returned_rows;
+	double		last_ann_ms;
+	double		last_expand_ms;
+	double		last_rerank_ms;
+	double		last_total_ms;
+} SortedHeapGraphRagStats;
+
+static SortedHeapGraphRagStats sh_graph_rag_stats = {0};
+static int sh_graph_rag_obs_depth = 0;
+
 static int graph_rag_topk_cmp(const void *a, const void *b);
 static void graph_rag_topk_siftdown(GraphRagTopKEntry *heap, int n, int i);
 static void graph_rag_topk_siftup(GraphRagTopKEntry *heap, int i);
@@ -259,6 +277,14 @@ static void sorted_heap_graph_emit_twohop_path_rerank(ReturnSetInfo *rsinfo,
 										 bool has_relation_filter,
 										 int16 relation_filter,
 										 int32 limit_rows);
+static bool sorted_heap_graph_obs_begin(const char *api_name);
+static void sorted_heap_graph_obs_finish(void);
+static void sorted_heap_graph_obs_add_seed(int64 seed_count, double ann_ms);
+static void sorted_heap_graph_obs_add_expand(int64 expanded_rows, double expand_ms);
+static void sorted_heap_graph_obs_add_rerank(int64 reranked_rows,
+											 int64 returned_rows,
+											 double rerank_ms);
+static int sorted_heap_graph_count_int4_array(ArrayType *arr);
 static bool sorted_heap_exprs_need_deferred_runtime_resolve(List *exprs);
 static void sorted_heap_set_parallel_fallback_span(SortedHeapScanState *shstate);
 
@@ -2521,6 +2547,8 @@ sorted_heap_explain_custom_scan(CustomScanState *node, List *ancestors,
  *  SQL-callable scan stats function
  * ---------------------------------------------------------------- */
 PG_FUNCTION_INFO_V1(sorted_heap_scan_stats);
+PG_FUNCTION_INFO_V1(sorted_heap_graph_rag_stats);
+PG_FUNCTION_INFO_V1(sorted_heap_graph_rag_reset_stats);
 
 Datum
 sorted_heap_scan_stats(PG_FUNCTION_ARGS)
@@ -2557,6 +2585,38 @@ sorted_heap_scan_stats(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
 }
 
+Datum
+sorted_heap_graph_rag_stats(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[10];
+	bool		nulls[10] = {false, false, false, false, false,
+							 false, false, false, false, false};
+	HeapTuple	tuple;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("function returning record called in context "
+						"that cannot accept type record")));
+
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	values[0] = Int64GetDatum((int64) sh_graph_rag_stats.calls);
+	values[1] = CStringGetTextDatum(sh_graph_rag_stats.last_api);
+	values[2] = Int64GetDatum(sh_graph_rag_stats.last_seed_count);
+	values[3] = Int64GetDatum(sh_graph_rag_stats.last_expanded_rows);
+	values[4] = Int64GetDatum(sh_graph_rag_stats.last_reranked_rows);
+	values[5] = Int64GetDatum(sh_graph_rag_stats.last_returned_rows);
+	values[6] = Float8GetDatum(sh_graph_rag_stats.last_ann_ms);
+	values[7] = Float8GetDatum(sh_graph_rag_stats.last_expand_ms);
+	values[8] = Float8GetDatum(sh_graph_rag_stats.last_rerank_ms);
+	values[9] = Float8GetDatum(sh_graph_rag_stats.last_total_ms);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
 /* ----------------------------------------------------------------
  *  SQL-callable stats reset function
  * ---------------------------------------------------------------- */
@@ -2577,6 +2637,89 @@ sorted_heap_reset_stats(PG_FUNCTION_ARGS)
 	sh_local_blocks_pruned = 0;
 
 	PG_RETURN_VOID();
+}
+
+Datum
+sorted_heap_graph_rag_reset_stats(PG_FUNCTION_ARGS)
+{
+	MemSet(&sh_graph_rag_stats, 0, sizeof(sh_graph_rag_stats));
+	sh_graph_rag_obs_depth = 0;
+	PG_RETURN_VOID();
+}
+
+static bool
+sorted_heap_graph_obs_begin(const char *api_name)
+{
+	bool top_level = (sh_graph_rag_obs_depth == 0);
+
+	sh_graph_rag_obs_depth++;
+	if (top_level)
+	{
+		uint64 calls = sh_graph_rag_stats.calls + 1;
+
+		MemSet(&sh_graph_rag_stats, 0, sizeof(sh_graph_rag_stats));
+		sh_graph_rag_stats.calls = calls;
+		strlcpy(sh_graph_rag_stats.last_api, api_name,
+				sizeof(sh_graph_rag_stats.last_api));
+	}
+
+	return top_level;
+}
+
+static void
+sorted_heap_graph_obs_finish(void)
+{
+	if (sh_graph_rag_obs_depth > 0)
+		sh_graph_rag_obs_depth--;
+}
+
+static void
+sorted_heap_graph_obs_add_seed(int64 seed_count, double ann_ms)
+{
+	sh_graph_rag_stats.last_seed_count += seed_count;
+	sh_graph_rag_stats.last_ann_ms += ann_ms;
+	sh_graph_rag_stats.last_total_ms += ann_ms;
+}
+
+static void
+sorted_heap_graph_obs_add_expand(int64 expanded_rows, double expand_ms)
+{
+	sh_graph_rag_stats.last_expanded_rows += expanded_rows;
+	sh_graph_rag_stats.last_expand_ms += expand_ms;
+	sh_graph_rag_stats.last_total_ms += expand_ms;
+}
+
+static void
+sorted_heap_graph_obs_add_rerank(int64 reranked_rows,
+								 int64 returned_rows,
+								 double rerank_ms)
+{
+	sh_graph_rag_stats.last_reranked_rows += reranked_rows;
+	sh_graph_rag_stats.last_returned_rows += returned_rows;
+	sh_graph_rag_stats.last_rerank_ms += rerank_ms;
+	sh_graph_rag_stats.last_total_ms += rerank_ms;
+}
+
+static int
+sorted_heap_graph_count_int4_array(ArrayType *arr)
+{
+	Datum  *values = NULL;
+	bool   *nulls = NULL;
+	int		nitems = 0;
+	int		count = 0;
+
+	if (arr == NULL || ARR_NDIM(arr) == 0 ||
+		ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr)) == 0)
+		return 0;
+
+	deconstruct_array(arr, INT4OID, 4, true, TYPALIGN_INT,
+					  &values, &nulls, &nitems);
+	for (int i = 0; i < nitems; i++)
+	{
+		if (!nulls[i])
+			count++;
+	}
+	return count;
 }
 
 /* ----------------------------------------------------------------
@@ -2774,11 +2917,14 @@ sorted_heap_graph_collect_targets(Relation rel,
 	int64			   *targets = NULL;
 	int					target_cap = 0;
 	int					n_targets = 0;
+	instr_time			t_expand_start;
+	instr_time			t_expand_end;
 
 	*n_targets_out = 0;
 
 	if (nseed_values <= 0)
 		return NULL;
+	INSTR_TIME_SET_CURRENT(t_expand_start);
 
 	memset(&bounds, 0, sizeof(bounds));
 	bounds.has_lo = true;
@@ -2901,6 +3047,7 @@ sorted_heap_graph_collect_targets(Relation rel,
 	}
 
 done:
+	INSTR_TIME_SET_CURRENT(t_expand_end);
 	if (slot)
 		ExecDropSingleTupleTableSlot(slot);
 	if (scan)
@@ -2922,6 +3069,10 @@ done:
 	}
 
 	*n_targets_out = n_targets;
+	sorted_heap_graph_obs_add_expand(
+		n_targets,
+		INSTR_TIME_GET_MILLISEC(t_expand_end) -
+		INSTR_TIME_GET_MILLISEC(t_expand_start));
 	return targets;
 }
 
@@ -2951,11 +3102,14 @@ sorted_heap_graph_collect_target_scores(Relation rel,
 	GraphRagTargetScore *scores = NULL;
 	int					score_cap = 0;
 	int					n_scores = 0;
+	instr_time			t_expand_start;
+	instr_time			t_expand_end;
 
 	*n_scores_out = 0;
 
 	if (nseed_values <= 0)
 		return NULL;
+	INSTR_TIME_SET_CURRENT(t_expand_start);
 
 	memset(&bounds, 0, sizeof(bounds));
 	bounds.has_lo = true;
@@ -3087,6 +3241,7 @@ sorted_heap_graph_collect_target_scores(Relation rel,
 	}
 
 done:
+	INSTR_TIME_SET_CURRENT(t_expand_end);
 	if (slot)
 		ExecDropSingleTupleTableSlot(slot);
 	if (scan)
@@ -3114,6 +3269,10 @@ done:
 	}
 
 	*n_scores_out = n_scores;
+	sorted_heap_graph_obs_add_expand(
+		n_scores,
+		INSTR_TIME_GET_MILLISEC(t_expand_end) -
+		INSTR_TIME_GET_MILLISEC(t_expand_start));
 	return scores;
 }
 
@@ -3145,9 +3304,14 @@ sorted_heap_graph_emit_rerank(ReturnSetInfo *rsinfo,
 	int32				n_scanned = 0;
 	GraphRagTopKEntry  *heap = NULL;
 	int					heap_size = 0;
+	instr_time			t_expand_start;
+	instr_time			t_expand_end;
+	instr_time			t_emit_start;
+	instr_time			t_emit_end;
 
 	if (nseed_values <= 0)
 		return;
+	INSTR_TIME_SET_CURRENT(t_expand_start);
 
 	memset(&bounds, 0, sizeof(bounds));
 	bounds.has_lo = true;
@@ -3277,6 +3441,8 @@ sorted_heap_graph_emit_rerank(ReturnSetInfo *rsinfo,
 	}
 
 emit_results:
+	INSTR_TIME_SET_CURRENT(t_expand_end);
+	INSTR_TIME_SET_CURRENT(t_emit_start);
 	if (heap_size > 1)
 		qsort(heap, heap_size, sizeof(GraphRagTopKEntry), graph_rag_topk_cmp);
 
@@ -3293,6 +3459,16 @@ emit_results:
 		values[4] = Float8GetDatum(heap[i].dist);
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
+	INSTR_TIME_SET_CURRENT(t_emit_end);
+	sorted_heap_graph_obs_add_expand(
+		n_scanned,
+		INSTR_TIME_GET_MILLISEC(t_expand_end) -
+		INSTR_TIME_GET_MILLISEC(t_expand_start));
+	sorted_heap_graph_obs_add_rerank(
+		n_scanned,
+		heap_size,
+		INSTR_TIME_GET_MILLISEC(t_emit_end) -
+		INSTR_TIME_GET_MILLISEC(t_emit_start));
 
 	if (heap)
 	{
@@ -3340,9 +3516,14 @@ sorted_heap_graph_emit_twohop_path_rerank(ReturnSetInfo *rsinfo,
 	GraphRagTopKEntry  *heap = NULL;
 	int					heap_size = 0;
 	int64			   *hop1_values = NULL;
+	instr_time			t_expand_start;
+	instr_time			t_expand_end;
+	instr_time			t_emit_start;
+	instr_time			t_emit_end;
 
 	if (nhop1_scores <= 0)
 		return;
+	INSTR_TIME_SET_CURRENT(t_expand_start);
 
 	hop1_values = palloc(sizeof(int64) * nhop1_scores);
 	for (int i = 0; i < nhop1_scores; i++)
@@ -3480,6 +3661,8 @@ sorted_heap_graph_emit_twohop_path_rerank(ReturnSetInfo *rsinfo,
 	}
 
 emit_results:
+	INSTR_TIME_SET_CURRENT(t_expand_end);
+	INSTR_TIME_SET_CURRENT(t_emit_start);
 	if (heap_size > 1)
 		qsort(heap, heap_size, sizeof(GraphRagTopKEntry), graph_rag_topk_cmp);
 
@@ -3496,6 +3679,16 @@ emit_results:
 		values[4] = Float8GetDatum(heap[i].dist);
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
+	INSTR_TIME_SET_CURRENT(t_emit_end);
+	sorted_heap_graph_obs_add_expand(
+		n_scanned,
+		INSTR_TIME_GET_MILLISEC(t_expand_end) -
+		INSTR_TIME_GET_MILLISEC(t_expand_start));
+	sorted_heap_graph_obs_add_rerank(
+		n_scanned,
+		heap_size,
+		INSTR_TIME_GET_MILLISEC(t_emit_end) -
+		INSTR_TIME_GET_MILLISEC(t_emit_start));
 
 	if (hop1_values)
 		pfree(hop1_values);
@@ -3767,6 +3960,9 @@ sorted_heap_expand_ids(PG_FUNCTION_ARGS)
 	Snapshot			snapshot;
 	int					range_idx;
 	int32				n_out = 0;
+	bool				obs_top_level;
+	instr_time			t_expand_start;
+	instr_time			t_expand_end;
 
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
 		ereport(ERROR,
@@ -3852,6 +4048,10 @@ sorted_heap_expand_ids(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 	}
 	qsort(seed_values, nseed_values, sizeof(int64), sorted_heap_int64_cmp);
+	obs_top_level = sorted_heap_graph_obs_begin("sorted_heap_expand_ids");
+	if (obs_top_level)
+		sorted_heap_graph_obs_add_seed(nseed_values, 0.0);
+	INSTR_TIME_SET_CURRENT(t_expand_start);
 
 	memset(&bounds, 0, sizeof(bounds));
 	bounds.has_lo = true;
@@ -3982,6 +4182,12 @@ sorted_heap_expand_ids(PG_FUNCTION_ARGS)
 	}
 
 done:
+	INSTR_TIME_SET_CURRENT(t_expand_end);
+	sorted_heap_graph_obs_add_expand(
+		n_out,
+		INSTR_TIME_GET_MILLISEC(t_expand_end) -
+		INSTR_TIME_GET_MILLISEC(t_expand_start));
+	sorted_heap_graph_obs_add_rerank(0, n_out, 0.0);
 	if (ranges)
 		pfree(ranges);
 	if (seed_values)
@@ -3991,6 +4197,7 @@ done:
 	if (scan)
 		table_endscan(scan);
 	table_close(rel, AccessShareLock);
+	sorted_heap_graph_obs_finish();
 
 	PG_RETURN_NULL();
 }
@@ -4031,6 +4238,7 @@ sorted_heap_expand_rerank(PG_FUNCTION_ARGS)
 	int					nseed = 0;
 	int64			   *seed_values = NULL;
 	int					nseed_values = 0;
+	bool				obs_top_level;
 
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
 		ereport(ERROR,
@@ -4122,6 +4330,9 @@ sorted_heap_expand_rerank(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 	}
 	qsort(seed_values, nseed_values, sizeof(int64), sorted_heap_int64_cmp);
+	obs_top_level = sorted_heap_graph_obs_begin("sorted_heap_expand_rerank");
+	if (obs_top_level)
+		sorted_heap_graph_obs_add_seed(nseed_values, 0.0);
 
 	sorted_heap_graph_emit_rerank(rsinfo,
 								  rel, info,
@@ -4135,6 +4346,7 @@ sorted_heap_expand_rerank(PG_FUNCTION_ARGS)
 	if (seed_values)
 		pfree(seed_values);
 	table_close(rel, AccessShareLock);
+	sorted_heap_graph_obs_finish();
 
 	PG_RETURN_NULL();
 }
@@ -4168,6 +4380,7 @@ sorted_heap_expand_twohop_rerank(PG_FUNCTION_ARGS)
 	int					nseed_values = 0;
 	int64			   *hop1_values = NULL;
 	int					nhop1_values = 0;
+	bool				obs_top_level;
 
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
 		ereport(ERROR,
@@ -4268,6 +4481,9 @@ sorted_heap_expand_twohop_rerank(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 	}
 	qsort(seed_values, nseed_values, sizeof(int64), sorted_heap_int64_cmp);
+	obs_top_level = sorted_heap_graph_obs_begin("sorted_heap_expand_twohop_rerank");
+	if (obs_top_level)
+		sorted_heap_graph_obs_add_seed(nseed_values, 0.0);
 
 	hop1_values = sorted_heap_graph_collect_targets(rel, info,
 													entity_att, relation_att, target_att,
@@ -4282,6 +4498,7 @@ sorted_heap_expand_twohop_rerank(PG_FUNCTION_ARGS)
 		if (hop1_values)
 			pfree(hop1_values);
 		table_close(rel, AccessShareLock);
+		sorted_heap_graph_obs_finish();
 		PG_RETURN_NULL();
 	}
 
@@ -4297,6 +4514,7 @@ sorted_heap_expand_twohop_rerank(PG_FUNCTION_ARGS)
 	if (hop1_values)
 		pfree(hop1_values);
 	table_close(rel, AccessShareLock);
+	sorted_heap_graph_obs_finish();
 
 	PG_RETURN_NULL();
 }
@@ -4330,6 +4548,7 @@ sorted_heap_expand_twohop_path_rerank(PG_FUNCTION_ARGS)
 	int					nseed_values = 0;
 	GraphRagTargetScore *hop1_scores = NULL;
 	int					nhop1_scores = 0;
+	bool				obs_top_level;
 
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
 		ereport(ERROR,
@@ -4430,6 +4649,9 @@ sorted_heap_expand_twohop_path_rerank(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 	}
 	qsort(seed_values, nseed_values, sizeof(int64), sorted_heap_int64_cmp);
+	obs_top_level = sorted_heap_graph_obs_begin("sorted_heap_expand_twohop_path_rerank");
+	if (obs_top_level)
+		sorted_heap_graph_obs_add_seed(nseed_values, 0.0);
 
 	hop1_scores = sorted_heap_graph_collect_target_scores(rel, info,
 															entity_att, relation_att, target_att,
@@ -4446,6 +4668,7 @@ sorted_heap_expand_twohop_path_rerank(PG_FUNCTION_ARGS)
 		if (hop1_scores)
 			pfree(hop1_scores);
 		table_close(rel, AccessShareLock);
+		sorted_heap_graph_obs_finish();
 		PG_RETURN_NULL();
 	}
 
@@ -4461,6 +4684,7 @@ sorted_heap_expand_twohop_path_rerank(PG_FUNCTION_ARGS)
 	if (hop1_scores)
 		pfree(hop1_scores);
 	table_close(rel, AccessShareLock);
+	sorted_heap_graph_obs_finish();
 
 	PG_RETURN_NULL();
 }
@@ -4505,6 +4729,8 @@ sorted_heap_graph_rag_scan(PG_FUNCTION_ARGS)
 	HeapTuple			tuple;
 	TupleDesc			tupdesc;
 	uint64				row_idx;
+	instr_time			t_ann_start;
+	instr_time			t_ann_end;
 
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
 		ereport(ERROR,
@@ -4560,6 +4786,7 @@ sorted_heap_graph_rag_scan(PG_FUNCTION_ARGS)
 
 	sorted_heap_graph_resolve_attrs(rel, "sorted_heap_graph_rag_scan", &gattrs);
 	embedding_typid = gattrs.embedding_typid;
+	sorted_heap_graph_obs_begin("sorted_heap_graph_rag_scan");
 
 	schema_name = get_namespace_name(get_rel_namespace(rel_oid));
 	quoted_schema = quote_identifier(schema_name);
@@ -4587,8 +4814,10 @@ sorted_heap_graph_rag_scan(PG_FUNCTION_ARGS)
 
 	argtypes[0] = embedding_typid;
 	values[0] = PointerGetDatum(query);
+	INSTR_TIME_SET_CURRENT(t_ann_start);
 	ret = SPI_execute_with_args(seed_sql.data, 1, argtypes, values, nulls,
 								true, 1);
+	INSTR_TIME_SET_CURRENT(t_ann_end);
 	if (ret != SPI_OK_SELECT)
 	{
 		SPI_finish();
@@ -4605,11 +4834,16 @@ sorted_heap_graph_rag_scan(PG_FUNCTION_ARGS)
 			seed_arr = DatumGetArrayTypePCopy(values[0]);
 		SPI_freetuptable(SPI_tuptable);
 	}
+	sorted_heap_graph_obs_add_seed(
+		sorted_heap_graph_count_int4_array(seed_arr),
+		INSTR_TIME_GET_MILLISEC(t_ann_end) -
+		INSTR_TIME_GET_MILLISEC(t_ann_start));
 
 	if (seed_arr == NULL)
 	{
 		SPI_finish();
 		table_close(rel, AccessShareLock);
+		sorted_heap_graph_obs_finish();
 		PG_RETURN_NULL();
 	}
 
@@ -4658,6 +4892,7 @@ sorted_heap_graph_rag_scan(PG_FUNCTION_ARGS)
 	SPI_freetuptable(SPI_tuptable);
 	SPI_finish();
 	table_close(rel, AccessShareLock);
+	sorted_heap_graph_obs_finish();
 
 	PG_RETURN_NULL();
 }
@@ -4700,6 +4935,8 @@ sorted_heap_graph_rag_twohop_scan(PG_FUNCTION_ARGS)
 	HeapTuple			tuple;
 	TupleDesc			tupdesc;
 	uint64				row_idx;
+	instr_time			t_ann_start;
+	instr_time			t_ann_end;
 
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
 		ereport(ERROR,
@@ -4764,6 +5001,7 @@ sorted_heap_graph_rag_twohop_scan(PG_FUNCTION_ARGS)
 
 	sorted_heap_graph_resolve_attrs(rel, "sorted_heap_graph_rag_twohop_scan", &gattrs);
 	embedding_typid = gattrs.embedding_typid;
+	sorted_heap_graph_obs_begin("sorted_heap_graph_rag_twohop_scan");
 
 	schema_name = get_namespace_name(get_rel_namespace(rel_oid));
 	quoted_schema = quote_identifier(schema_name);
@@ -4791,8 +5029,10 @@ sorted_heap_graph_rag_twohop_scan(PG_FUNCTION_ARGS)
 
 	argtypes[0] = embedding_typid;
 	values[0] = PointerGetDatum(query);
+	INSTR_TIME_SET_CURRENT(t_ann_start);
 	ret = SPI_execute_with_args(seed_sql.data, 1, argtypes, values, nulls,
 								true, 1);
+	INSTR_TIME_SET_CURRENT(t_ann_end);
 	if (ret != SPI_OK_SELECT)
 	{
 		SPI_finish();
@@ -4809,11 +5049,16 @@ sorted_heap_graph_rag_twohop_scan(PG_FUNCTION_ARGS)
 			seed_arr = DatumGetArrayTypePCopy(values[0]);
 		SPI_freetuptable(SPI_tuptable);
 	}
+	sorted_heap_graph_obs_add_seed(
+		sorted_heap_graph_count_int4_array(seed_arr),
+		INSTR_TIME_GET_MILLISEC(t_ann_end) -
+		INSTR_TIME_GET_MILLISEC(t_ann_start));
 
 	if (seed_arr == NULL)
 	{
 		SPI_finish();
 		table_close(rel, AccessShareLock);
+		sorted_heap_graph_obs_finish();
 		PG_RETURN_NULL();
 	}
 
@@ -4866,6 +5111,7 @@ sorted_heap_graph_rag_twohop_scan(PG_FUNCTION_ARGS)
 	SPI_freetuptable(SPI_tuptable);
 	SPI_finish();
 	table_close(rel, AccessShareLock);
+	sorted_heap_graph_obs_finish();
 
 	PG_RETURN_NULL();
 }
@@ -4904,6 +5150,8 @@ sorted_heap_graph_rag_twohop_path_scan(PG_FUNCTION_ARGS)
 	HeapTuple			tuple;
 	TupleDesc			tupdesc;
 	uint64				row_idx;
+	instr_time			t_ann_start;
+	instr_time			t_ann_end;
 
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
 		ereport(ERROR,
@@ -4968,6 +5216,7 @@ sorted_heap_graph_rag_twohop_path_scan(PG_FUNCTION_ARGS)
 
 	sorted_heap_graph_resolve_attrs(rel, "sorted_heap_graph_rag_twohop_path_scan", &gattrs);
 	embedding_typid = gattrs.embedding_typid;
+	sorted_heap_graph_obs_begin("sorted_heap_graph_rag_twohop_path_scan");
 
 	schema_name = get_namespace_name(get_rel_namespace(rel_oid));
 	quoted_schema = quote_identifier(schema_name);
@@ -4995,8 +5244,10 @@ sorted_heap_graph_rag_twohop_path_scan(PG_FUNCTION_ARGS)
 
 	argtypes[0] = embedding_typid;
 	values[0] = PointerGetDatum(query);
+	INSTR_TIME_SET_CURRENT(t_ann_start);
 	ret = SPI_execute_with_args(seed_sql.data, 1, argtypes, values, nulls,
 								true, 1);
+	INSTR_TIME_SET_CURRENT(t_ann_end);
 	if (ret != SPI_OK_SELECT)
 	{
 		SPI_finish();
@@ -5013,11 +5264,16 @@ sorted_heap_graph_rag_twohop_path_scan(PG_FUNCTION_ARGS)
 			seed_arr = DatumGetArrayTypePCopy(values[0]);
 		SPI_freetuptable(SPI_tuptable);
 	}
+	sorted_heap_graph_obs_add_seed(
+		sorted_heap_graph_count_int4_array(seed_arr),
+		INSTR_TIME_GET_MILLISEC(t_ann_end) -
+		INSTR_TIME_GET_MILLISEC(t_ann_start));
 
 	if (seed_arr == NULL)
 	{
 		SPI_finish();
 		table_close(rel, AccessShareLock);
+		sorted_heap_graph_obs_finish();
 		PG_RETURN_NULL();
 	}
 
@@ -5070,6 +5326,7 @@ sorted_heap_graph_rag_twohop_path_scan(PG_FUNCTION_ARGS)
 	SPI_freetuptable(SPI_tuptable);
 	SPI_finish();
 	table_close(rel, AccessShareLock);
+	sorted_heap_graph_obs_finish();
 
 	PG_RETURN_NULL();
 }
