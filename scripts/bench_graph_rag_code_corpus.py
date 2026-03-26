@@ -32,6 +32,7 @@ import math
 import re
 import shlex
 import statistics
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -53,6 +54,7 @@ REQUIRE_RE = re.compile(r'^require\s+"([^"]+)"')
 PROMPT_TERM_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\d+")
 CODE_TOKEN_RE = re.compile(r"[A-Za-z0-9_']+")
 CAMEL_SPLIT_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z]|\b)|[A-Z]?[a-z]+|\d+")
+FILE_HEADER_RE = re.compile(r"^# File(?: Summary)?: ([^\n]+)")
 
 PROMPT_STOPWORDS = {
     "a",
@@ -560,7 +562,14 @@ def payload_index_from_description(description) -> int:
     raise RuntimeError("query result does not contain a payload column")
 
 
-def measure_case(cur, table_name: str, case: base.QueryCase, questions: list[CodeQuestion], runs: int) -> tuple[float, float, float, float, str, int]:
+def measure_case(
+    cur,
+    table_name: str,
+    case: base.QueryCase,
+    questions: list[CodeQuestion],
+    runs: int,
+    postprocessors: dict[str, callable] | None = None,
+) -> tuple[float, float, float, float, str, int]:
     sql = case.sql_template.format(table=table_name)
     total_ms: list[float] = []
     hits: list[int] = []
@@ -572,12 +581,21 @@ def measure_case(cur, table_name: str, case: base.QueryCase, questions: list[Cod
         for q_idx, question in enumerate(questions):
             params = case.params_builder(question)
             exec_ms, hit, read, root = base.explain_json(cur, sql, params)
-            total_ms.append(exec_ms)
             hits.append(hit)
             reads.append(read)
-            if run_idx == 0 and q_idx == 0:
+            if postprocessors and case.name in postprocessors:
+                started = time.perf_counter()
                 cur.execute(sql, params)
-                rowcount = len(cur.fetchall())
+                rows = apply_postprocess(case, question, cur.fetchall(), cur.description, postprocessors)
+                total_ms.append((time.perf_counter() - started) * 1000.0)
+            else:
+                total_ms.append(exec_ms)
+                rows = None
+            if run_idx == 0 and q_idx == 0:
+                if rows is None:
+                    cur.execute(sql, params)
+                    rows = cur.fetchall()
+                rowcount = len(rows)
 
     return (
         statistics.median(total_ms),
@@ -589,7 +607,179 @@ def measure_case(cur, table_name: str, case: base.QueryCase, questions: list[Cod
     )
 
 
-def measure_quality(cur, table_name: str, case: base.QueryCase, questions: list[CodeQuestion]) -> tuple[float, float, float]:
+def payload_file_path(payload: str) -> str | None:
+    match = FILE_HEADER_RE.match(payload)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def prompt_term_variants(prompt: str) -> tuple[tuple[str, ...], ...]:
+    variants: list[tuple[str, ...]] = []
+    for term in extract_prompt_terms(prompt):
+        opts = {term}
+        if term.endswith("ies") and len(term) > 4:
+            opts.add(term[:-3] + "y")
+        if term.endswith("s") and len(term) > 4:
+            opts.add(term[:-1])
+        if term.endswith("ing") and len(term) > 5:
+            opts.add(term[:-3])
+        variants.append(tuple(sorted(opts)))
+    return tuple(variants)
+
+
+def build_snippet_line_index(content: str) -> list[tuple[str, str, set[str]]]:
+    indexed: list[tuple[str, str, set[str]]] = []
+    for raw in content.splitlines():
+        stripped = raw.strip()
+        indexed.append((stripped, stripped.lower(), set(code_aware_tokens(stripped))))
+    return indexed
+
+
+def line_prompt_match_indexes_from_parts(
+    stripped: str,
+    lowered: str,
+    tokens: set[str],
+    prompt_variants: tuple[tuple[str, ...], ...],
+) -> tuple[int, ...]:
+    if not stripped:
+        return ()
+
+    matched: list[int] = []
+    for idx, variants in enumerate(prompt_variants):
+        if any(variant in tokens or variant in lowered for variant in variants):
+            matched.append(idx)
+
+    return tuple(matched)
+
+
+def line_prompt_match_indexes(line: str, prompt_variants: tuple[tuple[str, ...], ...]) -> tuple[int, ...]:
+    stripped = line.strip()
+    lowered = stripped.lower()
+    tokens = set(code_aware_tokens(stripped))
+    return line_prompt_match_indexes_from_parts(stripped, lowered, tokens, prompt_variants)
+
+
+def line_prompt_score_from_parts(
+    stripped: str,
+    lowered: str,
+    tokens: set[str],
+    prompt_variants: tuple[tuple[str, ...], ...],
+) -> float:
+    if not stripped:
+        return 0.0
+
+    distinct_hits = len(line_prompt_match_indexes_from_parts(stripped, lowered, tokens, prompt_variants))
+
+    code_bonus = 0.0
+    if stripped.startswith(("def ", "private def ", "protected def ", "property ", "getter ", "setter ", "class ", "struct ", "module ")):
+        code_bonus += 1.0
+    if "_" in stripped or "?" in stripped:
+        code_bonus += 0.5
+    if any(ch.isdigit() for ch in stripped):
+        code_bonus += 0.5
+    if " = " in stripped or stripped.startswith("@"):
+        code_bonus += 0.5
+
+    if distinct_hits == 0 and code_bonus < 1.0:
+        return 0.0
+
+    return distinct_hits * 10.0 + code_bonus
+
+
+def line_prompt_score(line: str, prompt_variants: tuple[tuple[str, ...], ...]) -> float:
+    stripped = line.strip()
+    lowered = stripped.lower()
+    tokens = set(code_aware_tokens(stripped))
+    return line_prompt_score_from_parts(stripped, lowered, tokens, prompt_variants)
+
+
+def prompt_snippet_from_index(
+    relative: str,
+    line_index: list[tuple[str, str, set[str]]],
+    prompt: str,
+    anchor_count: int = 3,
+    radius: int = 18,
+) -> str:
+    prompt_variants = prompt_term_variants(prompt)
+    candidates: list[tuple[float, int, tuple[int, ...]]] = []
+
+    for idx, (stripped, lowered, tokens) in enumerate(line_index):
+        matches = line_prompt_match_indexes_from_parts(stripped, lowered, tokens, prompt_variants)
+        score = line_prompt_score_from_parts(stripped, lowered, tokens, prompt_variants)
+        if score > 0.0:
+            candidates.append((score, idx, matches))
+
+    if not candidates:
+        return f"# File Snippet: {relative}"
+
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    anchors: list[int] = []
+    covered_terms: set[int] = set()
+
+    for _ in range(anchor_count):
+        best: tuple[int, float, int] | None = None
+        for score, idx, matches in candidates:
+            if any(abs(idx - chosen) <= radius for chosen in anchors):
+                continue
+            new_hits = len(set(matches) - covered_terms)
+            key = (new_hits, score, -idx)
+            if best is None or key > best:
+                best = key
+                best_idx = idx
+                best_matches = matches
+        if best is None:
+            break
+        anchors.append(best_idx)
+        covered_terms.update(best_matches)
+
+    windows: list[tuple[int, int]] = []
+    for idx in sorted(anchors):
+        windows.append((max(0, idx - radius), min(len(line_index), idx + radius + 1)))
+
+    merged: list[tuple[int, int]] = []
+    for start, end in windows:
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+
+    parts = [f"# File Snippet: {relative}"]
+    for start, end in merged:
+        for line_no in range(start, end):
+            stripped = line_index[line_no][0]
+            if stripped:
+                parts.append(f"L{line_no + 1}: {stripped}")
+
+    return "\n".join(parts)
+
+
+def prompt_snippet_from_file(relative: str, content: str, prompt: str, anchor_count: int = 3, radius: int = 18) -> str:
+    return prompt_snippet_from_index(relative, build_snippet_line_index(content), prompt, anchor_count=anchor_count, radius=radius)
+
+
+def apply_postprocess(
+    case: base.QueryCase,
+    question: CodeQuestion,
+    rows: list[tuple],
+    description,
+    postprocessors: dict[str, callable] | None,
+) -> list[tuple]:
+    if not postprocessors:
+        return rows
+    postprocess = postprocessors.get(case.name)
+    if postprocess is None:
+        return rows
+    return postprocess(question, rows, description)
+
+
+def measure_quality(
+    cur,
+    table_name: str,
+    case: base.QueryCase,
+    questions: list[CodeQuestion],
+    postprocessors: dict[str, callable] | None = None,
+) -> tuple[float, float, float]:
     sql = case.sql_template.format(table=table_name)
     full_hits = 0
     total_rows = 0
@@ -597,8 +787,8 @@ def measure_quality(cur, table_name: str, case: base.QueryCase, questions: list[
 
     for question in questions:
         cur.execute(sql, case.params_builder(question))
+        rows = apply_postprocess(case, question, cur.fetchall(), cur.description, postprocessors)
         payload_idx = payload_index_from_description(cur.description)
-        rows = cur.fetchall()
         total_rows += len(rows)
         payload_rows = [str(row[payload_idx]) for row in rows]
         coverage_pct, full_hit = keyword_coverage([(None, None, None, None, payload) for payload in payload_rows], question.keywords)
@@ -614,14 +804,20 @@ def measure_quality(cur, table_name: str, case: base.QueryCase, questions: list[
     )
 
 
-def measure_quality_details(cur, table_name: str, case: base.QueryCase, questions: list[CodeQuestion]) -> list[QuestionQuality]:
+def measure_quality_details(
+    cur,
+    table_name: str,
+    case: base.QueryCase,
+    questions: list[CodeQuestion],
+    postprocessors: dict[str, callable] | None = None,
+) -> list[QuestionQuality]:
     sql = case.sql_template.format(table=table_name)
     out: list[QuestionQuality] = []
 
     for question in questions:
         cur.execute(sql, case.params_builder(question))
+        rows = apply_postprocess(case, question, cur.fetchall(), cur.description, postprocessors)
         payload_idx = payload_index_from_description(cur.description)
-        rows = cur.fetchall()
         payload_rows = [str(row[payload_idx]) for row in rows]
         keyword_pct, full_hit = keyword_coverage(
             [(None, None, None, None, payload) for payload in payload_rows], question.keywords
@@ -638,14 +834,20 @@ def measure_quality_details(cur, table_name: str, case: base.QueryCase, question
     return out
 
 
-def measure_payload_details(cur, table_name: str, case: base.QueryCase, questions: list[CodeQuestion]) -> list[QuestionPayloadRow]:
+def measure_payload_details(
+    cur,
+    table_name: str,
+    case: base.QueryCase,
+    questions: list[CodeQuestion],
+    postprocessors: dict[str, callable] | None = None,
+) -> list[QuestionPayloadRow]:
     sql = case.sql_template.format(table=table_name)
     out: list[QuestionPayloadRow] = []
 
     for question in questions:
         cur.execute(sql, case.params_builder(question))
+        rows = apply_postprocess(case, question, cur.fetchall(), cur.description, postprocessors)
         payload_idx = payload_index_from_description(cur.description)
-        rows = cur.fetchall()
         for idx, row in enumerate(rows, start=1):
             payload = " ".join(str(row[payload_idx]).split())
             out.append(
@@ -722,6 +924,14 @@ def main() -> int:
             for q in questions
         ]
         source_files = list_source_files(source_dir)
+        file_contents_by_relative = {
+            str(path.relative_to(source_dir)): path.read_text(encoding="utf-8")
+            for path in source_files
+        }
+        file_snippet_index_by_relative = {
+            relative: build_snippet_line_index(content)
+            for relative, content in file_contents_by_relative.items()
+        }
         oracle_seed_map = build_oracle_seed_map(source_files, questions, args.ann_k)
         questions = [
             CodeQuestion(
@@ -941,6 +1151,12 @@ def main() -> int:
                 LIMIT {args.top_k}
                 """,
                 lambda q: (q.query_vec, list(extract_prompt_terms(q.prompt)), q.query_vec),
+            )
+
+            prompt_summary_snippet_sql = base.QueryCase(
+                "prompt_summary_snippet_py",
+                prompt_summary_rerank_sql.sql_template,
+                prompt_summary_rerank_sql.params_builder,
             )
 
             summary_seed_summary_output_sql = base.QueryCase(
@@ -1904,6 +2120,31 @@ def main() -> int:
                 )
             print()
 
+            def summary_snippet_postprocess(question: CodeQuestion, rows: list[tuple], description) -> list[tuple]:
+                payload_idx = payload_index_from_description(description)
+                out: list[tuple] = []
+                for row in rows:
+                    row_vals = list(row)
+                    relative = payload_file_path(str(row_vals[payload_idx]))
+                    if relative and relative in file_contents_by_relative:
+                        cache_key = (relative, question.prompt)
+                        snippet = snippet_cache.get(cache_key)
+                        if snippet is None:
+                            snippet = prompt_snippet_from_index(
+                                relative,
+                                file_snippet_index_by_relative[relative],
+                                question.prompt,
+                            )
+                            snippet_cache[cache_key] = snippet
+                        row_vals[payload_idx] = snippet
+                    out.append(tuple(row_vals))
+                return out
+
+            snippet_cache: dict[tuple[str, str], str] = {}
+            postprocessors: dict[str, callable] = {
+                prompt_summary_snippet_sql.name: summary_snippet_postprocess,
+            }
+
             cases: list[tuple[str, str, base.QueryCase]] = [
                 ("facts_heap", "facts_heap", direct_ann),
                 ("facts_sh", "facts_sh", direct_ann),
@@ -1923,6 +2164,8 @@ def main() -> int:
                 ("facts_sh", "facts_sh", summary_output_sql),
                 ("facts_heap", "facts_heap", prompt_summary_rerank_sql),
                 ("facts_sh", "facts_sh", prompt_summary_rerank_sql),
+                ("facts_heap", "facts_heap", prompt_summary_snippet_sql),
+                ("facts_sh", "facts_sh", prompt_summary_snippet_sql),
                 ("facts_heap", "facts_heap", summary_seed_summary_output_sql),
                 ("facts_sh", "facts_sh", summary_seed_summary_output_sql),
                 ("facts_heap", "facts_heap", prompt_summary_seed_rerank_sql),
@@ -1960,17 +2203,17 @@ def main() -> int:
 
             for label, table, case in cases:
                 print(f"running|table={label}|case={case.name}", flush=True)
-                p50, avg, hits, reads, root, rows = measure_case(cur, table, case, questions, args.runs)
-                keyword_pct, full_pct, avg_rows = measure_quality(cur, table, case, questions)
+                p50, avg, hits, reads, root, rows = measure_case(cur, table, case, questions, args.runs, postprocessors)
+                keyword_pct, full_pct, avg_rows = measure_quality(cur, table, case, questions, postprocessors)
                 print_result(label, case.name, p50, avg, hits, reads, root, rows, keyword_pct, full_pct, avg_rows)
                 if args.report_questions:
-                    for detail in measure_quality_details(cur, table, case, questions):
+                    for detail in measure_quality_details(cur, table, case, questions, postprocessors):
                         print(
                             f"detail|table={label}|case={case.name}|label={detail.label}|"
                             f"keyword_pct={detail.keyword_pct:.1f}|full_hit={'1' if detail.full_hit else '0'}|rows={detail.rows}"
                         )
                 if args.report_payloads:
-                    for detail in measure_payload_details(cur, table, case, questions):
+                    for detail in measure_payload_details(cur, table, case, questions, postprocessors):
                         print(
                             f"payload|table={label}|case={case.name}|label={detail.label}|"
                             f"row={detail.row_idx}|text={detail.payload}"

@@ -2634,3 +2634,82 @@ This creates a new mode-specific frontier:
 
 So the next branch should treat the two embedding modes separately instead of
 assuming one chunk-selection rule can dominate both.
+
+### Prompt-focused file-local snippet extraction
+
+The next successful branch stopped changing retrieval at all.
+
+Instead of asking the SQL layer to return better rows, it asked a narrower
+question:
+
+> if `prompt_summary_rerank_in` already selects the right files, can we extract
+> better evidence fragments from those files after retrieval?
+
+That is now implemented in the real code-corpus harness as:
+
+- `prompt_summary_snippet_py`
+
+Contract:
+
+- keep the existing `prompt_summary_rerank_in` SQL seed/output path
+- for each returned summary row, resolve the underlying source file
+- extract a prompt-focused snippet from the full file using:
+  - prompt-term matching against code-aware line tokens
+  - coverage-greedy anchor selection
+  - merged local windows around the chosen anchors
+- cache `(file, prompt)` snippets in-process so repeated runs are measured in
+  both cold and warm regimes
+
+This is a **downstream evidence-selection layer**, not a new PostgreSQL query
+primitive. The main value is answer quality on the real `cogniformerus`
+CrossFile benchmark.
+
+Verified local result on the stable real code-corpus point (`40` files,
+`840` rows, `6` questions, `384D`, `ann_k=16`, `top_k=4`, fresh backend):
+
+- generic embedding mode:
+  - `prompt_summary_rerank_in`:
+    - `p50 0.343-0.392 ms`
+    - `73.3%` keyword coverage
+    - `50.0%` full hits
+  - `prompt_summary_snippet_py`:
+    - warm-cache `p50 0.564-0.600 ms`
+    - cold first-pass `p50 12.543 ms`, `avg 12.864 ms`
+    - `93.3%` keyword coverage
+    - `83.3%` full hits
+- code-aware embedding mode:
+  - `prompt_summary_rerank_in`:
+    - `p50 0.395-0.398 ms`
+    - `77.6%`
+    - `33.3%`
+  - `prompt_summary_snippet_py`:
+    - warm-cache `p50 0.565-0.616 ms`
+    - `86.2%`
+    - `66.7%`
+
+Per-question generic rerun on the same corpus shows what the snippet layer
+actually fixed:
+
+- now solved at `100.0%`:
+  - `Butler response routing`
+  - `Memory store flow`
+  - `Two-stage answering`
+  - `Response memory policy`
+  - `Streaming overlap`
+- still failing:
+  - `NLU hybrid classification` at `60.0%`
+
+Interpretation:
+
+- the remaining plateau on this real code corpus was **not** primarily file
+  retrieval
+- it was a file-local evidence selection problem
+- prompt-focused snippet extraction is the first branch that moves the real
+  code-corpus benchmark from `50.0%` to `83.3%` full hits at the same
+  tiny-budget `top_k=4`
+
+Important caveat:
+
+- the warm numbers rely on an in-process `(file, prompt)` snippet cache
+- the cold first-pass cost is still materially higher than pure SQL rerank
+- so this is a quality-oriented contract, not a free latency win
