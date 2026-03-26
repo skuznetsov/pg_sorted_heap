@@ -107,6 +107,13 @@ class QuestionQuality:
     rows: int
 
 
+@dataclass(frozen=True)
+class QuestionPayloadRow:
+    label: str
+    row_idx: int
+    payload: str
+
+
 def default_cogniformerus_root(repo_root: Path) -> Path:
     return repo_root.parent.parent / "Crystal" / "cogniformerus"
 
@@ -631,6 +638,27 @@ def measure_quality_details(cur, table_name: str, case: base.QueryCase, question
     return out
 
 
+def measure_payload_details(cur, table_name: str, case: base.QueryCase, questions: list[CodeQuestion]) -> list[QuestionPayloadRow]:
+    sql = case.sql_template.format(table=table_name)
+    out: list[QuestionPayloadRow] = []
+
+    for question in questions:
+        cur.execute(sql, case.params_builder(question))
+        payload_idx = payload_index_from_description(cur.description)
+        rows = cur.fetchall()
+        for idx, row in enumerate(rows, start=1):
+            payload = " ".join(str(row[payload_idx]).split())
+            out.append(
+                QuestionPayloadRow(
+                    label=question.label,
+                    row_idx=idx,
+                    payload=payload[:240],
+                )
+            )
+
+    return out
+
+
 def print_result(table: str, case: str, p50: float, avg: float, hits: float, reads: float, root: str, rows: int, keyword_pct: float, full_pct: float, avg_rows: float) -> None:
     print(
         f"{table}|{case}|p50_ms={p50:.3f}|avg_ms={avg:.3f}|shared_hit={hits:.1f}|shared_read={reads:.1f}|"
@@ -658,7 +686,9 @@ def main() -> int:
     ap.add_argument("--chunk-window", type=int, default=CHUNK_WINDOW)
     ap.add_argument("--chunk-overlap", type=int, default=CHUNK_OVERLAP)
     ap.add_argument("--case-filter", default="")
+    ap.add_argument("--question-filter", default="")
     ap.add_argument("--report-questions", action="store_true")
+    ap.add_argument("--report-payloads", action="store_true")
     ap.add_argument("--install-cmd", default="")
     ap.add_argument("--keep-temp", action="store_true")
     args = ap.parse_args()
@@ -703,6 +733,14 @@ def main() -> int:
             )
             for q in questions
         ]
+        question_filter = re.compile(args.question_filter) if args.question_filter else None
+        if question_filter is not None:
+            questions = [
+                q for q in questions
+                if question_filter.search(q.label) or question_filter.search(q.prompt)
+            ]
+        if not questions:
+            raise RuntimeError("question filter removed all questions")
         file_count, rowcount, edge_count, summary_count = build_code_csv(
             source_dir,
             csv_path,
@@ -1646,6 +1684,8 @@ def main() -> int:
             print(f"m:                  {args.m}")
             print(f"shared_buffers:     {args.shared_buffers_mb}MB")
             print(f"backend_mode:       {args.backend_mode}")
+            if args.question_filter:
+                print(f"question_filter:    {args.question_filter}")
             print()
 
             for question in questions:
@@ -1717,6 +1757,12 @@ def main() -> int:
                         print(
                             f"detail|table={label}|case={case.name}|label={detail.label}|"
                             f"keyword_pct={detail.keyword_pct:.1f}|full_hit={'1' if detail.full_hit else '0'}|rows={detail.rows}"
+                        )
+                if args.report_payloads:
+                    for detail in measure_payload_details(cur, table, case, questions):
+                        print(
+                            f"payload|table={label}|case={case.name}|label={detail.label}|"
+                            f"row={detail.row_idx}|text={detail.payload}"
                         )
         finally:
             cur.close()

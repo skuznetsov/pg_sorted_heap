@@ -2478,3 +2478,29 @@ This narrows the remaining frontier again:
 
 > the next real improvement is likely query-specific or corpus-specific, not a
 > broad packing or seed policy that helps every question equally
+
+The new payload diagnostics make that even more concrete:
+
+- `Response memory policy`
+  - current best contracts already pull the **right file neighborhood**:
+    - `memory/hierarchical.cr`
+    - `memory/pgvector.cr`
+    - `memory/external_store.cr`
+    - `butler/persona.cr`
+  - the summary-heavy hybrid even surfaces the `_micro_only` chunk from
+    `memory/hierarchical.cr`
+  - but the remaining miss is about **policy nuance**, not file choice:
+    the returned rows still do not cover the full combination of
+    `_micro_only`, refusal/pollution behavior, and external-storage policy
+- `Streaming overlap`
+  - current best contracts already pull the correct file:
+    `streaming/controller.cr`
+  - both summary and chunk rows surface the overlap/chunking topic
+  - the remaining miss is about **exact constants / same-file granularity**:
+    the query still does not close the final `1500` / `100` coverage gap
+
+So for these two stubborn real prompts, the problem has narrowed from
+"retrieval picked the wrong files" to a much smaller statement:
+
+> the current system is usually choosing the right file region, but not yet the
+> exact evidence fragment or policy detail needed to close the benchmark
