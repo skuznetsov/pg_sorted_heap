@@ -2841,12 +2841,12 @@ point (`384D`, `ann_k=16`, `top_k=4`, `ef_search=64`, `ef_construction=200`,
   - `p50 median 1.048 ms`, range `0.913-4.141 ms`
   - quality drifted across fresh builds: `90.5-100.0%` keyword coverage,
     `83.3-100.0%` full hits
-- `prompt_lexseed_require_summary_snippet_py`
-  - `p50 median 10.788 ms`, range `10.670-10.947 ms`
+- `prompt_lexseed_require_summary_snippet_fn`
+  - `p50 median 10.856 ms`, range `10.738-10.948 ms`
   - stable `100.0% / 100.0%`
 - `oracle_prompt_summary_snippet_py`
   - on a bounded full rerun it also stayed at `100.0% / 100.0%`, but the
-    non-oracle `prompt_lexseed_require_summary_snippet_py` already matches that
+    non-oracle `prompt_lexseed_require_summary_snippet_fn` already matches that
     quality, so oracle seeds are no longer the interesting external-generic
     diagnostic
 
@@ -2859,6 +2859,9 @@ Interpretation:
 - a narrow non-oracle rescue does exist: supplement ANN summary seeds with
   lexical summary hits and then pull one-hop `REQUIRES_FILE` summaries from
   those lexical anchors
+- the helper-backed rescue variant is slightly better than the pure SQL rescue:
+  it keeps the same `100.0% / 100.0%` result while removing the rescue path's
+  shared reads and shaving a small but consistent amount off `p50`
 - that rescue closes the quality gap, but only by paying roughly a `10x`
   latency penalty
 
@@ -2868,8 +2871,8 @@ At the same repeated-build point:
 - code-aware `prompt_summary_snippet_py`
   - `p50 median 1.080 ms`, range `1.048-1.146 ms`
   - stable `79.8% / 66.7%`
-- code-aware `prompt_lexseed_require_summary_snippet_py`
-  - `p50 median 11.318 ms`, range `10.565-13.162 ms`
+- code-aware `prompt_lexseed_require_summary_snippet_fn`
+  - `p50 median 10.916 ms`, range `10.895-11.654 ms`
   - stable `100.0% / 100.0%`
 - code-aware `oracle_prompt_summary_snippet_py`
   - `p50 median 1.217 ms`, range `1.149-1.303 ms`
@@ -2894,14 +2897,14 @@ fresh `3`-build repeated-build protocol:
 - generic `prompt_summary_snippet_py`
   - `p50 median 1.540 ms`, range `1.535-1.604 ms`
   - stable `90.5% / 83.3%`
-- generic `prompt_lexseed_require_summary_snippet_py`
-  - `p50 median 14.407 ms`, range `14.400-14.537 ms`
+- generic `prompt_lexseed_require_summary_snippet_fn`
+  - `p50 median 14.328 ms`, range `14.280-14.401 ms`
   - stable `100.0% / 100.0%`
 - code-aware `prompt_summary_snippet_py`
   - `p50 median 1.775 ms`, range `1.729-1.836 ms`
   - stable `79.8% / 66.7%`
-- code-aware `prompt_lexseed_require_summary_snippet_py`
-  - `p50 median 14.509 ms`, range `14.490-14.633 ms`
+- code-aware `prompt_lexseed_require_summary_snippet_fn`
+  - `p50 median 14.400 ms`, range `14.347-14.415 ms`
   - stable `100.0% / 100.0%`
 
 So the external rescue is now **cross-environment verified**, not a local

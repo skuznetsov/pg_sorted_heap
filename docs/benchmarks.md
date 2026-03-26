@@ -374,15 +374,17 @@ Current repeated-build result:
 | Mode | Case | Local repeated-build p50 | AWS repeated-build p50 | Keyword coverage | Full hits | Notes |
 |------|------|:------------------------:|:----------------------:|:----------------:|:---------:|-------|
 | generic | `prompt_summary_snippet_py` | `1.048 ms` | `1.540 ms` | `90.5%` | `83.3%` | fast baseline drifts below perfect quality on this corpus |
-| generic | `prompt_lexseed_require_summary_snippet_py` | `10.788 ms` | `14.407 ms` | `100.0%` | `100.0%` | ANN summaries + lexical summary seeds + one-hop `REQUIRES_FILE` rescue |
+| generic | `prompt_lexseed_require_summary_snippet_fn` | `10.856 ms` | `14.328 ms` | `100.0%` | `100.0%` | helper-backed ANN summaries + lexical summary seeds + one-hop `REQUIRES_FILE` rescue |
 | code-aware | `prompt_summary_snippet_py` | `1.080 ms` | `1.775 ms` | `79.8%` | `66.7%` | worse baseline than the primary `cogniformerus` corpus |
-| code-aware | `prompt_lexseed_require_summary_snippet_py` | `11.318 ms` | `14.509 ms` | `100.0%` | `100.0%` | non-oracle rescue closes the external gap |
+| code-aware | `prompt_lexseed_require_summary_snippet_fn` | `10.916 ms` | `14.400 ms` | `100.0%` | `100.0%` | helper-backed non-oracle rescue closes the external gap |
 
 Interpretation:
 
 - the external folding miss was a real seed-selection problem, not a snippet
   extraction bug
 - the rescue is now verified on both local Apple Silicon and AWS ARM64
+- the helper-backed rescue is slightly faster and avoids the old rescue path's
+  shared reads, so it is the current documented external rescue
 - but the rescue is much slower than the primary in-repo winners, so it does
   not replace them as the default GraphRAG contract
 
