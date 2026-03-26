@@ -2263,3 +2263,63 @@ And one more falsifier is now clear:
 
 > summary rows are not universally a better seed unit; the benefit depends on
 > the embedding mode and the final scoring contract
+
+### Summary-plus-chunk hybrid output
+
+The next bounded question was whether the best tiny-budget contract should stay
+purely on summaries, or whether a hybrid output can do better:
+
+> use summaries to choose the right files, but also emit one best chunk from
+> each selected file so the final answer set contains both compressed context
+> and one concrete code span
+
+That was tested in two variants:
+
+- mixed ANN seeds -> summary ranking -> one best chunk per selected file
+- summary-only seeds -> summary ranking -> one best chunk per selected file
+
+Stable local result on the same real `40`-file / `840`-row / `6`-question
+point, `ann_k=16`, `top_k=4`, `3` runs:
+
+- generic embedding mode:
+  - best prior full-hit point: mixed-seed prompt summary rerank
+    - `0.363 ms`
+    - `73.3%`
+    - `50.0%`
+  - mixed-seed summary+chunk hybrid:
+    - `1.481 ms`
+    - `84.3%`
+    - `33.3%`
+  - summary-seeded summary+chunk hybrid:
+    - `1.627 ms`
+    - `78.1%`
+    - `50.0%`
+- code-aware embedding mode:
+  - best prior summary-only point:
+    - prompt summary rerank
+    - `0.372 ms`
+    - `77.6%`
+    - `33.3%`
+  - mixed-seed summary+chunk hybrid:
+    - `1.616 ms`
+    - `84.3%`
+    - `50.0%`
+  - summary-seeded summary+chunk hybrid:
+    - `1.688 ms`
+    - `77.6%`
+    - `33.3%`
+
+So this branch narrows the frontier again:
+
+- hybrid output is **not** a universal improvement
+- for the generic mode, pure summary rerank remains the better tiny-budget
+  full-hit point
+- for the code-aware mode, mixed-seed summary+chunk hybrid is the first path
+  that reaches `50.0%` full hits at `top_k=4`
+
+That means the current strongest small-budget choices are now split:
+
+- **generic mode**:
+  - summaries-only remain the better contract
+- **code-aware mode**:
+  - hybrid summary+chunk output is now the better contract
