@@ -104,6 +104,8 @@ def run_mode(
         cmd.extend(["--source-dir", args.source_dir])
     if args.question_source:
         cmd.extend(["--question-source", args.question_source])
+    if args.extensions:
+        cmd.extend(["--extensions", args.extensions])
     if args.install_cmd:
         cmd.extend(["--install-cmd", args.install_cmd])
     if args.question_filter:
@@ -133,6 +135,7 @@ def main() -> int:
     ap.add_argument("--cogniformerus-root", default="")
     ap.add_argument("--source-dir", default="")
     ap.add_argument("--question-source", default="")
+    ap.add_argument("--extensions", default="")
     ap.add_argument("--question-filter", default="")
     ap.add_argument("--install-cmd", default="")
     ap.add_argument(

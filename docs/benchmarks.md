@@ -391,8 +391,36 @@ Interpretation:
 - the dominant larger-corpus issue on the in-repo Crystal side is result
   budget, not a new retrieval failure
 - this larger-corpus gate is now covered locally for `~/Projects/Crystal`;
-  mixed-language transfer from `~/Projects/C` and `~/SrcArchives` is still the
-  remaining unverified part of the `0.13` hardening story
+  the remaining unverified part of the `0.13` hardening story is now primarily
+  the archive side under `~/SrcArchives`
+
+### Mixed-language external code-corpus GraphRAG beta benchmark (`pycdc`)
+
+The code-corpus harness now also supports:
+
+- JSON question fixtures
+- configurable source extensions
+- quoted local `#include "..."` dependency edges for C/C++ corpora
+
+The first mixed-language adversary corpus was `pycdc`, using a repo-owned
+fixture in `scripts/fixtures/graph_rag_pycdc_questions.json`. This run used the
+real `pycdc` source tree (`138` files, `1281` rows after chunk + summary
+expansion, `72` local dependency edges) and `3` fresh builds at `top_k=8`.
+
+| Mode | Best case | Local repeated-build p50 | Keyword coverage | Full hits | Avg returned rows | Notes |
+|------|-----------|:------------------------:|:----------------:|:---------:|:-----------------:|-------|
+| generic | `prompt_symbol_summary_snippet_py` | `0.850 ms` | `90.0%` | `60.0%` | `6.40` | fastest mixed-language point, but it does not close the corpus |
+| code-aware | `prompt_compactseed_require_summary_snippet_fn` | `8.006 ms` | `100.0%` | `100.0%` | `5.80` | helper-backed compact lexical seed + one-hop include rescue closes the corpus |
+
+Interpretation:
+
+- the mixed-language gate is now covered for a real `~/Projects/C` corpus
+- the result split is sharper than on the Crystal corpora:
+  - the fast generic path plateaus below perfect quality
+  - the code-aware include-rescue path closes the corpus, but at a much higher
+    latency
+- so the remaining larger-corpus gap for `0.13` is no longer `~/Projects/C`;
+  it is the archive side under `~/SrcArchives`
 
 ### External folding stress corpus for GraphRAG beta (`folding/src`)
 

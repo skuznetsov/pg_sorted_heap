@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-Benchmark a real code-corpus GraphRAG shape on cogniformerus source files.
+Benchmark a real code-corpus GraphRAG shape on source trees.
 
 Dataset:
   - each file is an entity
   - each chunk in that file is a fact row:
       entity_id=file_id, relation_id=HAS_CHUNK, target_id=chunk_id
-  - local require edges become graph rows:
+  - local dependency edges become graph rows:
       entity_id=file_id, relation_id=REQUIRES_FILE, target_id=required_file_id
+    derived from:
+      - Crystal `require "./..."` edges
+      - quoted C/C++ `#include "..."` edges
   - embedding/payload are derived from the real source chunk text
 
 Queries:
-  - actual CrossFile questions parsed from cogniformerus/bin/butler_code_test.cr
+  - either:
+      - CrossFile questions parsed from a `butler_*_test.cr` source, or
+      - a repo-owned JSON question fixture
 
 The benchmark asks a narrow question:
 
@@ -28,6 +33,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import json
 import math
 import re
 import shlex
@@ -45,6 +51,8 @@ REL_REQUIRES_FILE = 2
 REL_FILE_SUMMARY = 3
 CHUNK_WINDOW = 800
 CHUNK_OVERLAP = 200
+DEFAULT_CRYSTAL_EXTENSIONS = (".cr",)
+CPP_LIKE_EXTENSIONS = frozenset({".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx"})
 
 QUESTION_START_RE = re.compile(r"Question\.new\(")
 QUESTION_Q_RE = re.compile(r'q:\s*"(.*)",\s*$')
@@ -52,6 +60,7 @@ QUESTION_TOPIC_RE = re.compile(r'topic:\s*"(.*)",\s*$')
 QUESTION_TIER_RE = re.compile(r"tier:\s*Tier::([A-Za-z_]+),\s*$")
 QUOTED_RE = re.compile(r'"([^"]+)"')
 REQUIRE_RE = re.compile(r'^require\s+"([^"]+)"')
+INCLUDE_RE = re.compile(r'^#\s*include\s+"([^"]+)"')
 PROMPT_TERM_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\d+")
 PROMPT_SYMBOL_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_?]*")
 CODE_TOKEN_RE = re.compile(r"[A-Za-z0-9_']+")
@@ -213,6 +222,68 @@ def parse_crossfile_questions(question_path: Path, dim: int) -> list[CodeQuestio
     return questions
 
 
+def normalize_extensions(raw_exts: list[str]) -> tuple[str, ...]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_exts:
+        ext = raw.strip()
+        if not ext:
+            continue
+        if not ext.startswith("."):
+            ext = "." + ext
+        ext = ext.lower()
+        if ext in seen:
+            continue
+        seen.add(ext)
+        out.append(ext)
+    return tuple(out)
+
+
+def parse_json_questions(question_path: Path, dim: int) -> tuple[list[CodeQuestion], tuple[str, ...]]:
+    payload = json.loads(question_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"JSON question fixture must be an object: {question_path}")
+
+    source_meta = payload.get("source") or {}
+    raw_exts = source_meta.get("extensions") or []
+    default_extensions = normalize_extensions(list(raw_exts)) if isinstance(raw_exts, list) else ()
+
+    raw_questions = payload.get("questions")
+    if not isinstance(raw_questions, list) or not raw_questions:
+        raise RuntimeError(f"JSON question fixture must contain a non-empty questions[] array: {question_path}")
+
+    questions: list[CodeQuestion] = []
+    for idx, raw in enumerate(raw_questions, start=1):
+        if not isinstance(raw, dict):
+            raise RuntimeError(f"question #{idx} in {question_path} is not an object")
+        label = raw.get("label")
+        prompt = raw.get("prompt")
+        keywords = raw.get("keywords")
+        if not isinstance(label, str) or not label.strip():
+            raise RuntimeError(f"question #{idx} in {question_path} is missing a non-empty label")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise RuntimeError(f"question #{idx} in {question_path} is missing a non-empty prompt")
+        if not isinstance(keywords, list) or not keywords or not all(isinstance(item, str) and item.strip() for item in keywords):
+            raise RuntimeError(f"question #{idx} in {question_path} must provide a non-empty string keywords[] list")
+        clean_prompt = prompt.strip()
+        questions.append(
+            CodeQuestion(
+                label=label.strip(),
+                prompt=clean_prompt,
+                keywords=tuple(item.strip() for item in keywords),
+                query_vec=mh.lexical_hash_vector(clean_prompt, dim),
+            )
+        )
+
+    return questions, default_extensions
+
+
+def load_questions(question_path: Path, dim: int) -> tuple[list[CodeQuestion], tuple[str, ...]]:
+    if question_path.suffix.lower() == ".json":
+        return parse_json_questions(question_path, dim)
+    return parse_crossfile_questions(question_path, dim), ()
+
+
 def chunk_source_file(path: Path, src_dir: Path, file_id: int, window: int, overlap: int, start_chunk_id: int) -> tuple[list[CodeChunk], int]:
     content = path.read_text(encoding="utf-8")
     relative = str(path.relative_to(src_dir))
@@ -322,10 +393,16 @@ def file_lexical_seed_text(
     )
 
 
-def list_source_files(src_dir: Path) -> list[Path]:
-    files = sorted(path for path in src_dir.rglob("*.cr") if path.is_file())
+def list_source_files(src_dir: Path, extensions: tuple[str, ...]) -> list[Path]:
+    files = sorted(
+        path
+        for path in src_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in extensions
+    )
     if not files:
-        raise RuntimeError(f"no Crystal source files found under {src_dir}")
+        raise RuntimeError(
+            f"no source files found under {src_dir} for extensions {', '.join(extensions)}"
+        )
     return files
 
 
@@ -484,8 +561,55 @@ def resolve_local_require_targets(path: Path, src_dir: Path, rel_to_id: dict[str
     return out
 
 
-def build_code_csv(src_dir: Path, csv_path: Path, dim: int, window: int, overlap: int, embedding_mode: str) -> tuple[int, int, int, int]:
-    files = list_source_files(src_dir)
+def resolve_local_include_targets(path: Path, src_dir: Path, rel_to_id: dict[str, int]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    parent = path.parent
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = INCLUDE_RE.match(line.strip())
+        if not match:
+            continue
+
+        target = match.group(1)
+        candidates = [
+            (parent / target).resolve(),
+            (src_dir / target).resolve(),
+        ]
+        for candidate in candidates:
+            if not candidate.exists() or not candidate.is_file():
+                continue
+            try:
+                relative = str(candidate.relative_to(src_dir))
+            except ValueError:
+                continue
+            if relative not in rel_to_id or relative in seen:
+                continue
+            seen.add(relative)
+            out.append(relative)
+
+    return out
+
+
+def resolve_local_dependency_targets(path: Path, src_dir: Path, rel_to_id: dict[str, int]) -> list[str]:
+    suffix = path.suffix.lower()
+    if suffix == ".cr":
+        return resolve_local_require_targets(path, src_dir, rel_to_id)
+    if suffix in CPP_LIKE_EXTENSIONS:
+        return resolve_local_include_targets(path, src_dir, rel_to_id)
+    return []
+
+
+def build_code_csv(
+    src_dir: Path,
+    csv_path: Path,
+    dim: int,
+    window: int,
+    overlap: int,
+    embedding_mode: str,
+    extensions: tuple[str, ...],
+) -> tuple[int, int, int, int]:
+    files = list_source_files(src_dir, extensions)
     rel_to_id = {str(path.relative_to(src_dir)): idx for idx, path in enumerate(files, start=1)}
 
     next_chunk_id = 1
@@ -520,9 +644,9 @@ def build_code_csv(src_dir: Path, csv_path: Path, dim: int, window: int, overlap
                     ]
                 )
                 rowcount += 1
-            for required_rel in resolve_local_require_targets(path, src_dir, rel_to_id):
+            for required_rel in resolve_local_dependency_targets(path, src_dir, rel_to_id):
                 required_id = rel_to_id[required_rel]
-                edge_text = f"# Require: {relative} -> {required_rel}"
+                edge_text = f"# Dependency: {relative} -> {required_rel}"
                 w.writerow(
                         [
                             file_id,
@@ -538,8 +662,16 @@ def build_code_csv(src_dir: Path, csv_path: Path, dim: int, window: int, overlap
     return len(files), rowcount, edge_count, summary_count
 
 
-def build_code_seed_csv(src_dir: Path, csv_path: Path, dim: int, window: int, overlap: int, embedding_mode: str) -> int:
-    files = list_source_files(src_dir)
+def build_code_seed_csv(
+    src_dir: Path,
+    csv_path: Path,
+    dim: int,
+    window: int,
+    overlap: int,
+    embedding_mode: str,
+    extensions: tuple[str, ...],
+) -> int:
+    files = list_source_files(src_dir, extensions)
     rel_to_id = {str(path.relative_to(src_dir)): idx for idx, path in enumerate(files, start=1)}
     rowcount = 0
 
@@ -550,7 +682,7 @@ def build_code_seed_csv(src_dir: Path, csv_path: Path, dim: int, window: int, ov
             relative = str(path.relative_to(src_dir))
             chunks, next_chunk_id = chunk_source_file(path, src_dir, file_id, window, overlap, next_chunk_id)
             summary_text = file_summary_text(relative, chunks)
-            require_targets = resolve_local_require_targets(path, src_dir, rel_to_id)
+            require_targets = resolve_local_dependency_targets(path, src_dir, rel_to_id)
             lexical_text = file_lexical_seed_text(relative, summary_text, require_targets)
             w.writerow(
                 [
@@ -1155,6 +1287,7 @@ def main() -> int:
     ap.add_argument("--cogniformerus-root", default="")
     ap.add_argument("--source-dir", default="")
     ap.add_argument("--question-source", default="")
+    ap.add_argument("--extensions", default="")
     ap.add_argument("--tmp-root", default="/tmp")
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--runs", type=int, default=3)
@@ -1196,7 +1329,15 @@ def main() -> int:
     seed_csv_path = tmp / "facts_code_seed.csv"
 
     try:
-        questions = parse_crossfile_questions(question_source, args.dim)
+        questions, fixture_extensions = load_questions(question_source, args.dim)
+        if args.extensions:
+            source_extensions = normalize_extensions(args.extensions.split(","))
+        elif fixture_extensions:
+            source_extensions = fixture_extensions
+        else:
+            source_extensions = DEFAULT_CRYSTAL_EXTENSIONS
+        if not source_extensions:
+            raise RuntimeError("no source extensions resolved for code-corpus benchmark")
         questions = [
             CodeQuestion(
                 label=q.label,
@@ -1207,7 +1348,7 @@ def main() -> int:
             )
             for q in questions
         ]
-        source_files = list_source_files(source_dir)
+        source_files = list_source_files(source_dir, source_extensions)
         file_contents_by_relative = {
             str(path.relative_to(source_dir)): path.read_text(encoding="utf-8")
             for path in source_files
@@ -1242,6 +1383,7 @@ def main() -> int:
             args.chunk_window,
             args.chunk_overlap,
             args.embedding_mode,
+            source_extensions,
         )
         build_code_seed_csv(
             source_dir,
@@ -1250,6 +1392,7 @@ def main() -> int:
             args.chunk_window,
             args.chunk_overlap,
             args.embedding_mode,
+            source_extensions,
         )
 
         conn = base.connect(tmp, port)
@@ -2815,6 +2958,7 @@ def main() -> int:
             print(f"cogniformerus_root: {cogniformerus_root}")
             print(f"source_dir:         {source_dir}")
             print(f"question_source:    {question_source}")
+            print(f"extensions:         {','.join(source_extensions)}")
             print(f"port:               {port}")
             print(f"files:              {file_count}")
             print(f"rows:               {rowcount}")

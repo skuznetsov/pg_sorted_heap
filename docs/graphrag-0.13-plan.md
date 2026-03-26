@@ -120,9 +120,14 @@ The existing beta surface works, but it is a function zoo.
        `~/Projects/Crystal/cogniformerus` repository now also passes
        repeated-build verification once the final result budget is raised from
        `top_k=4` to `top_k=8`
+     - a first mixed-language gate on `~/Projects/C/pycdc` now also runs under
+       the same harness family via JSON fixtures + configurable source
+       extensions + quoted include-edge extraction
+     - on that corpus, the fast generic point is repeated-build stable but only
+       partial (`90.0% / 60.0%`), while the code-aware helper-backed compact
+       include rescue is repeated-build stable at `100.0% / 100.0%`
    - remaining larger-corpus gates should still cover corpora from:
      - `~/Projects/Crystal`
-     - `~/Projects/C`
      - `~/SrcArchives`
 
 5. Non-canonical schema story
@@ -156,8 +161,7 @@ Implemented in this branch:
 
 Still needed:
 
-- mixed-language / archive repeated-build gates outside the current Crystal
-  corpora (`~/Projects/C`, `~/SrcArchives`)
+- archive repeated-build gates under `~/SrcArchives`
 
 ### Phase 3: schema registration
 

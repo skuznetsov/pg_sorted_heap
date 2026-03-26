@@ -99,8 +99,19 @@
   corpus for both:
   - generic `prompt_summary_snippet_py`
   - code-aware `prompt_symbol_summary_snippet_py`
-- Narrowed the remaining `0.13` real-corpus gap to mixed-language / archive
-  corpora under `~/Projects/C` and `~/SrcArchives`.
+- Added mixed-language code-corpus support to the benchmark harness via:
+  - JSON question fixtures
+  - configurable source extensions
+  - quoted C/C++ include-edge extraction
+- Added the first real `~/Projects/C` adversary gate on `pycdc` using
+  `scripts/fixtures/graph_rag_pycdc_questions.json`.
+- Verified on `pycdc` that:
+  - the fast generic point is repeated-build stable but partial
+    (`90.0% / 60.0%`)
+  - the code-aware helper-backed compact include rescue is repeated-build
+    stable at `100.0% / 100.0%`
+- Narrowed the remaining `0.13` real-corpus gap to archive corpora under
+  `~/SrcArchives`.
 
 ## 0.12.0 (2026-03-26)
 

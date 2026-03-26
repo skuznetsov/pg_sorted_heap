@@ -1,0 +1,35 @@
+{
+  "source": {
+    "repo": "pycdc",
+    "captured_at": "2026-03-26",
+    "extensions": [".h", ".cpp", ".txt", ".markdown"],
+    "note": "Mixed-language external code-corpus fixture for Decompyle++ (pycdc)."
+  },
+  "questions": [
+    {
+      "label": "cli_decompile_flow",
+      "prompt": "How does pycdc load an input file and turn it into decompiled source output?",
+      "keywords": ["loadFromFile", "decompyle", "BuildFromCode", "print_src"]
+    },
+    {
+      "label": "marshalled_input_flow",
+      "prompt": "How does pycdc handle marshalled code objects when -c and -v are used?",
+      "keywords": ["loadFromMarshalledFile", "isSupportedVersion", "major", "minor"]
+    },
+    {
+      "label": "opcode_mapping",
+      "prompt": "How are opcode names and Python-version opcode bytes mapped in pycdc?",
+      "keywords": ["OpcodeName", "ByteToOpcode", "python_311_map", "bytecode_ops.inl"]
+    },
+    {
+      "label": "ast_stack_build",
+      "prompt": "How does AST construction manage stack state while building code in pycdc?",
+      "keywords": ["FastStack", "stack_hist", "StackPopTop", "BuildFromCode"]
+    },
+    {
+      "label": "binary_operator_translation",
+      "prompt": "How are Python bytecode binary operations translated into AST binary operators?",
+      "keywords": ["from_opcode", "from_binary_op", "BINARY_ADD", "BIN_INVALID"]
+    }
+  ]
+}

@@ -2880,8 +2880,78 @@ That narrows the remaining `0.13` real-corpus gap further:
 
 - `~/Projects/Crystal` now has both the small stable slice and a larger
   full-repo transfer gate
-- the remaining unverified generalization work is the mixed-language /
+- the next unverified generalization work was the mixed-language /
   archive side (`~/Projects/C`, `~/SrcArchives`)
+
+## Mixed-language `~/Projects/C` adversary gate (`pycdc`)
+
+The next release-hardening branch widened the code-corpus harness itself:
+
+- JSON question fixtures are now supported
+- source discovery is no longer hardcoded to `*.cr`
+- local dependency edges now also understand quoted C/C++ includes:
+  `#include "..."` -> `REQUIRES_FILE`
+
+That made it possible to run the same narrow code-GraphRAG benchmark shape on a
+real mixed-language corpus under `~/Projects/C` without inventing a separate
+harness family.
+
+The first such corpus was `pycdc`:
+
+- source tree: `~/Projects/C/pycdc`
+- fixture: `scripts/fixtures/graph_rag_pycdc_questions.json`
+- source extensions:
+  - `.h`
+  - `.cpp`
+  - `.txt`
+  - `.markdown`
+- corpus size:
+  - `138` files
+  - `1281` rows after summary + chunk expansion
+  - `72` local dependency edges from quoted includes
+
+The first smoke run already gave the key split:
+
+- generic `prompt_summary_snippet_py`
+  - `75.0%` keyword coverage
+  - `40.0%` full hits
+- generic `prompt_symbol_summary_snippet_py`
+  - `90.0%`
+  - `60.0%`
+- code-aware `prompt_summary_snippet_py`
+  - `70.0%`
+  - `60.0%`
+- code-aware `prompt_compactseed_require_summary_snippet_fn`
+  - `100.0%`
+  - `100.0%`
+
+That already falsified the lazy story that mixed-language transfer would look
+just like the Crystal corpora with only file-summary rerank. On `pycdc`, the
+include-aware rescue path matters much more.
+
+Repeated-build verification at `top_k=8`, `3` fresh builds, then gave:
+
+- generic `prompt_symbol_summary_snippet_py`
+  - `p50 median 0.850 ms`, range `0.825-1.118 ms`
+  - stable `90.0% / 60.0%`
+  - `avg_rows 6.40`
+- code-aware `prompt_compactseed_require_summary_snippet_fn`
+  - `p50 median 8.006 ms`, range `7.799-8.136 ms`
+  - stable `100.0% / 100.0%`
+  - `avg_rows 5.80`
+
+So the first real `~/Projects/C` gate is now covered, but it does **not**
+produce the same frontier as the Crystal corpora:
+
+- there is no equally cheap generic `100.0% / 100.0%` point here
+- the quality-complete point currently needs the slower helper-backed compact
+  lexical seed + include rescue
+
+That still narrows the `0.13` release gap meaningfully:
+
+- `~/Projects/Crystal` is covered
+- `~/Projects/C` is covered
+- the remaining unverified archive-side gate is now `~/SrcArchives`
 
 ## External folding corpus check
 
