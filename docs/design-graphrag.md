@@ -2152,3 +2152,58 @@ So the current code-corpus frontier is now even narrower:
 > the next likely win is not "better seeds" or "more edges", but a tighter
 > coupling between code-aware embeddings and a smarter small-budget rerank /
 > packing contract
+
+### Summary-output packing win
+
+The next bounded hypothesis was the most direct one implied by the previous
+diagnostics:
+
+> if the real bottleneck is small-budget packing, then maybe raw chunks are
+> simply the wrong final output unit for this code benchmark
+
+The harness already materializes one summary row per file. The new test keeps
+the same ANN-derived file seeds, but returns file summaries as the final output
+rows instead of raw chunks.
+
+Stable local result on the same real `40`-file / `840`-row / `6`-question
+point, `ann_k=16`, `top_k=4`, `3` runs:
+
+- generic embedding mode:
+  - chunk output (`seed_file_expand_in`, `sorted_heap`):
+    - `0.418 ms`
+    - `63.3%` keyword coverage
+    - `33.3%` full hits
+  - summary output (`seed_file_summary_output_in`, `sorted_heap`):
+    - `0.200 ms`
+    - `71.0%` keyword coverage
+    - `33.3%` full hits
+  - prompt summary rerank (`prompt_summary_rerank_in`, `sorted_heap`):
+    - `0.318 ms`
+    - `73.3%` keyword coverage
+    - `50.0%` full hits
+- code-aware embedding mode:
+  - chunk output:
+    - `0.418 ms`
+    - `61.4%`
+    - `16.7%`
+  - summary output:
+    - `0.207 ms`
+    - `77.6%`
+    - `33.3%`
+  - prompt summary rerank:
+    - `0.426 ms`
+    - `77.6%`
+    - `33.3%`
+
+This is the first clean small-budget win on the real code corpus:
+
+- summary rows are a better packing unit than raw chunks at `top_k=4`
+- they improve coverage while also reducing latency
+- in the generic mode, prompt-aware reranking over summaries also improves
+  `full_pct`
+
+So the current strongest product-facing hypothesis is no longer "better seeds"
+or "more graph edges". It is:
+
+> for real code GraphRAG, file summaries are a stronger final output unit than
+> raw chunks when the answer budget is tiny
