@@ -1634,6 +1634,45 @@ one verified outlier plus two confirming reruns, which is strong enough for a
 benchmark note but still argues for a future repeated-build protocol if we
 want tighter confidence intervals.
 
+## Repeated-build local variance
+
+That future protocol now exists locally too:
+
+- [`scripts/repeat_graph_rag_multihop_builds.py`](/Users/sergey/Projects/C/clustered_pg/scripts/repeat_graph_rag_multihop_builds.py)
+
+It wraps [`scripts/bench_graph_rag_multihop.py`](/Users/sergey/Projects/C/clustered_pg/scripts/bench_graph_rag_multihop.py)
+so each repeat gets a fresh temp cluster and a fresh HNSW build, then reports
+median / min / max for selected rows.
+
+On the balanced local `5K` point (`m=24 / ef_construction=200 / ann_k=64 /
+ef_search=128`), three independent rebuilds produced:
+
+- `sorted_heap_expand_twohop_path_rerank()`
+  - `p50_ms`: median `0.798`, range `0.771-0.819`
+  - `hit@1 = 98.4%`, `hit@k = 98.4%` on all three builds
+- `sorted_heap_graph_rag_twohop_path_scan()`
+  - `p50_ms`: median `0.796`, range `0.778-0.804`
+  - `hit@1 = 98.4%`, `hit@k = 98.4%` on all three builds
+- `pgvector` path-aware parity row
+  - `p50_ms`: median `1.405`, range `1.318-1.456`
+  - `hit@1/hit@k`: `85.9-89.1%`
+- `zvec` path-aware parity row
+  - `p50_ms`: median `1.076`, range `1.053-1.087`
+  - `hit@1 = 100.0%`, `hit@k = 100.0%` on all three builds
+- `Qdrant` path-aware parity row
+  - `p50_ms`: median `2.799`, range `2.792-2.805`
+  - `hit@1 = 100.0%`, `hit@k = 100.0%` on all three builds
+
+So the balanced local path-aware `sorted_heap` point is not just a lucky
+single build. The answer quality stayed fixed across rebuilds, and the
+latency spread was narrow. The remaining variance story now looks more like:
+
+- local balanced `sorted_heap`: stable across rebuilds
+- AWS balanced `sorted_heap`: mostly stable, but with at least one observed
+  outlier rerun
+- `pgvector`: measurable quality drift across local rebuilds
+- `zvec` / `Qdrant`: stable on this deterministic local fact graph
+
 This also falsifies one tempting but wrong simplification:
 
 > once the helper is fast, the remaining GraphRAG problem is solved

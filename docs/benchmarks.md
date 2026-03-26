@@ -204,6 +204,23 @@ Under the same path-aware scorer contract, the current local conclusion gets
 sharper: `sorted_heap` keeps the latency lead, while `zvec` and Qdrant reach
 the strongest observed answer quality on this deterministic fact graph.
 
+A repeated-build local protocol then quantified how much of this is just
+single-run luck. Using three independent fresh builds of the same `5K`/`384D`
+balanced point:
+
+- `sorted_heap_expand_twohop_path_rerank()` median `0.798 ms`, range
+  `0.771-0.819 ms`, `hit@1 = 98.4%`, `hit@k = 98.4%` on every build
+- `sorted_heap_graph_rag_twohop_path_scan()` median `0.796 ms`, range
+  `0.778-0.804 ms`, `hit@1 = 98.4%`, `hit@k = 98.4%` on every build
+- `pgvector` path-aware parity row median `1.405 ms`, `hit@1/hit@k`
+  `85.9-89.1%`
+- `zvec` path-aware parity row median `1.076 ms`, `100.0% / 100.0%`
+- `Qdrant` path-aware parity row median `2.799 ms`, `100.0% / 100.0%`
+
+So on the local balanced point, the current `sorted_heap` path-aware rows are
+not a fragile one-off. The latency band is tight, and the answer quality did
+not drift across the three rebuilds.
+
 ### Current AWS GraphRAG multihop benchmark (`person -> parent -> city`)
 
 Repo-owned harness:
