@@ -259,6 +259,22 @@ and a second full all-engines rerun both returned the stable `98.4% / 98.4%`
 point above, so the published table uses the confirmed rerun rather than the
 single outlier.
 
+An AWS repeated-build protocol then tightened that confidence band on the same
+balanced `5K` point. Using three independent fresh builds:
+
+- `sorted_heap_expand_twohop_path_rerank()` median `0.962 ms`, range
+  `0.956-0.965 ms`, `hit@1/hit@k = 98.4/98.4` on all three builds
+- `sorted_heap_graph_rag_twohop_path_scan()` median `1.025 ms`, range
+  `1.018-1.043 ms`, `hit@1/hit@k = 98.4/98.4` on all three builds
+- `pgvector` path-aware parity row median `1.434 ms`, `hit@1/hit@k`
+  `84.4-89.1`
+- `zvec` path-aware parity row median `1.711 ms`, `100.0/100.0`
+- `Qdrant` path-aware parity row median `3.355 ms`, `100.0/100.0`
+
+So on the current portable `5K` point, the earlier AWS outlier now looks like
+an anomaly rather than a broad instability. The balanced `sorted_heap`
+path-aware rows stayed fixed across all three rebuilds.
+
 The larger `10K`-chain AWS rerun now tells a different story than the older
 city-only benchmark. At the same portable point:
 

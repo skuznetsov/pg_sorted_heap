@@ -1630,15 +1630,14 @@ under the same path-aware contract:
 One AWS all-engines rerun briefly dropped the `sorted_heap` path-aware rows to
 `96.9% / 96.9%`, but an immediate `sorted_heap`-only control and a second
 full rerun both returned `98.4% / 98.4%`. So the portable parity story now has
-one verified outlier plus two confirming reruns, which is strong enough for a
-benchmark note but still argues for a future repeated-build protocol if we
-want tighter confidence intervals.
+one verified outlier plus two confirming reruns. That was enough to justify
+the benchmark note, and it directly motivated the repeated-build protocol
+recorded below.
 
 ## Repeated-build local variance
 
-That future protocol now exists locally too:
-
 - [`scripts/repeat_graph_rag_multihop_builds.py`](/Users/sergey/Projects/C/clustered_pg/scripts/repeat_graph_rag_multihop_builds.py)
+- [`scripts/repeat_graph_rag_multihop_builds_aws.sh`](/Users/sergey/Projects/C/clustered_pg/scripts/repeat_graph_rag_multihop_builds_aws.sh)
 
 It wraps [`scripts/bench_graph_rag_multihop.py`](/Users/sergey/Projects/C/clustered_pg/scripts/bench_graph_rag_multihop.py)
 so each repeat gets a fresh temp cluster and a fresh HNSW build, then reports
@@ -1668,10 +1667,35 @@ single build. The answer quality stayed fixed across rebuilds, and the
 latency spread was narrow. The remaining variance story now looks more like:
 
 - local balanced `sorted_heap`: stable across rebuilds
-- AWS balanced `sorted_heap`: mostly stable, but with at least one observed
-  outlier rerun
+- AWS balanced `sorted_heap`: also stable across repeated builds on the `5K`
+  point, with one earlier outlier now downgraded to an anomaly
 - `pgvector`: measurable quality drift across local rebuilds
 - `zvec` / `Qdrant`: stable on this deterministic local fact graph
+
+The AWS repeated-build protocol on the balanced `5K` point produced:
+
+- `sorted_heap_expand_twohop_path_rerank()`
+  - `p50_ms`: median `0.962`, range `0.956-0.965`
+  - `hit@1 = 98.4%`, `hit@k = 98.4%` on all three builds
+- `sorted_heap_graph_rag_twohop_path_scan()`
+  - `p50_ms`: median `1.025`, range `1.018-1.043`
+  - `hit@1 = 98.4%`, `hit@k = 98.4%` on all three builds
+- `pgvector` path-aware parity row
+  - `p50_ms`: median `1.434`, range `1.370-1.493`
+  - `hit@1/hit@k`: `84.4-89.1%`
+- `zvec` path-aware parity row
+  - `p50_ms`: median `1.711`, range `1.703-1.768`
+  - `hit@1 = 100.0%`, `hit@k = 100.0%` on all three builds
+- `Qdrant` path-aware parity row
+  - `p50_ms`: median `3.355`, range `3.302-3.465`
+  - `hit@1 = 100.0%`, `hit@k = 100.0%` on all three builds
+
+So the current confidence picture is stronger than before:
+
+- local balanced `5K`: repeated-build stable
+- AWS balanced `5K`: repeated-build stable
+- larger `10K` AWS path-aware rows: still only per-build verified, not yet
+  repeated-build summarized
 
 This also falsifies one tempting but wrong simplification:
 
@@ -1731,9 +1755,9 @@ What is not yet true:
 - two-hop helper composition is not yet a universal latency win; at higher
   rerank dimensions it narrows to parity with heap+btree rather than staying
   clearly ahead
-- the current parity numbers still come from per-build reruns rather than a
-  fixed-graph or repeated-build median protocol, so build-variance confidence
-  bounds are still looser than ideal
+- the larger-scale `10K` AWS parity rows still come from per-build reruns
+  rather than a repeated-build median protocol, so build-variance confidence
+  bounds are still looser there than on the balanced `5K` point
 - transfer to a real `cogniformerus` corpus is still unverified; the current
   fact-shaped benchmark is deterministic and synthetic even though it matches
   the intended multihop query shape
