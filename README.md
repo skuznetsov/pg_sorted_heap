@@ -13,25 +13,33 @@ plus planner-integrated HNSW search.
   update modes.
 - `sorted_hnsw` Index AM: planner-integrated KNN for `svec` and `hsvec`,
   shared decoded cache, exact rerank inside the index scan.
-
-### Beta
-
-- GraphRAG helper/wrapper API:
+- Fact-shaped GraphRAG API:
   - `sorted_heap_graph_rag(...)`
   - `sorted_heap_graph_register(...)`
   - `sorted_heap_graph_config(...)`
   - `sorted_heap_graph_unregister(...)`
   - `sorted_heap_graph_rag_stats()`
   - `sorted_heap_graph_rag_reset_stats()`
+- This stable GraphRAG surface is intentionally narrow:
+  - fact rows clustered by `(entity_id, relation_id, target_id)` or an
+    equivalent registered alias mapping
+  - one-hop or two-hop retrieval via `relation_path`
+  - `score_mode := 'endpoint' | 'path'`
+
+### Beta
+
+- Lower-level GraphRAG helper/wrapper building blocks:
   - `sorted_heap_expand_ids(...)`
   - `sorted_heap_expand_rerank(...)`
   - `sorted_heap_expand_twohop_rerank(...)`
   - `sorted_heap_expand_twohop_path_rerank(...)`
+  - `sorted_heap_graph_rag_scan(...)`
   - `sorted_heap_graph_rag_twohop_scan(...)`
   - `sorted_heap_graph_rag_twohop_path_scan(...)`
-- These functions are usable now and benchmarked repeatedly, but they are
-  still workload-sensitive and should be treated as a beta retrieval surface,
-  not as a general-purpose graph database API.
+- Code-corpus and snippet-oriented GraphRAG contracts that currently live in
+  benchmark/reference logic.
+- These remain useful and benchmarked, but they are still workload-sensitive
+  and are not the stable release-facing GraphRAG contract.
 
 ### Legacy/manual
 
@@ -133,27 +141,18 @@ ON documents_compact USING sorted_hnsw (embedding hsvec_cosine_ops)
 WITH (m = 16, ef_construction = 200);
 ```
 
-### GraphRAG and fact graphs (beta)
+### GraphRAG and fact graphs (stable fact-shaped API)
 
-`pg_sorted_heap` now also has a narrow GraphRAG path for fact-shaped multihop
-queries. The intended workload is:
+`pg_sorted_heap` now has a stable narrow GraphRAG surface for fact-shaped
+multihop queries. The intended workload is:
 
 - ANN seed retrieval on `entity_id`
 - 1-hop or 2-hop expansion over facts clustered by `(entity_id, relation_id, target_id)`
 - exact rerank of the expanded candidates
 
-The current helpers are:
+The stable entry point is the unified fact-graph wrapper:
 
-- `sorted_heap_graph_rag(...)`
-- `sorted_heap_expand_rerank(...)`
-- `sorted_heap_expand_twohop_rerank(...)`
-- `sorted_heap_expand_twohop_path_rerank(...)`
-- `sorted_heap_graph_rag_twohop_scan(...)`
-- `sorted_heap_graph_rag_twohop_path_scan(...)`
-
-The preferred beta syntax is now the unified fact-graph entry point:
-
-Minimal beta shape:
+Minimal stable shape:
 
 ```sql
 CREATE TABLE facts (
@@ -199,9 +198,19 @@ SELECT sorted_heap_graph_register(
 gives two-hop expansion. `score_mode := 'endpoint'` ranks only the final-hop
 facts; `score_mode := 'path'` uses hop-1 and hop-2 evidence together.
 
-The older `sorted_heap_graph_rag_scan(...)` wrapper is still available, but it
-seeds one-hop expansion from ANN-selected `target_id` values and is therefore
-not the preferred fact-graph contract.
+The older helper/wrapper family is still available for lower-level control:
+
+- `sorted_heap_expand_ids(...)`
+- `sorted_heap_expand_rerank(...)`
+- `sorted_heap_expand_twohop_rerank(...)`
+- `sorted_heap_expand_twohop_path_rerank(...)`
+- `sorted_heap_graph_rag_scan(...)`
+- `sorted_heap_graph_rag_twohop_scan(...)`
+- `sorted_heap_graph_rag_twohop_path_scan(...)`
+
+Those building blocks remain beta. In particular,
+`sorted_heap_graph_rag_scan(...)` seeds one-hop expansion from ANN-selected
+`target_id` values and is therefore not the preferred fact-graph contract.
 
 For tuning and debugging, GraphRAG now also exposes backend-local last-call
 stats:
@@ -712,7 +721,7 @@ SELECT * FROM svec_hnsw_scan('tbl', query, 'tbl_hnsw',
     ef_search:=96, lim:=10, rerank_topk:=20);
 ```
 
-### GraphRAG (beta)
+### GraphRAG (stable fact-shaped API)
 
 ```sql
 CREATE TABLE facts (
@@ -753,10 +762,12 @@ FROM sorted_heap_graph_rag(
 );
 ```
 
-Recommended release positioning: ship this API as beta. It is benchmarked and
-useful now, but its best operating point still depends strongly on workload
-shape and scoring contract. Lower-level wrappers remain available when you
-need exact control over seeds, hop filters, or rerank stages.
+Recommended release positioning for `0.13`:
+
+- **stable**: the unified fact-shaped API above
+- **beta**: lower-level wrappers and helper composition
+- **reference logic**: code-corpus snippet/symbol/lexical contracts used by
+  the benchmark harnesses
 
 ### Configuration
 

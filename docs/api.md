@@ -442,12 +442,35 @@ Encode a vector as an M-byte PQ code. The residual variant encodes
 
 ---
 
-## GraphRAG (beta)
+## GraphRAG
 
-These functions are intended for fact-shaped retrieval over a `sorted_heap`
-table clustered by `(entity_id, relation_id, target_id)`. The stable release
-story for GraphRAG is still beta: the API is usable and benchmarked, but the
-best operating point depends on workload shape and scoring contract.
+The stable `0.13` GraphRAG surface is intentionally narrow: fact-shaped
+retrieval over a `sorted_heap` table clustered by
+`(entity_id, relation_id, target_id)`, or by an equivalent registered alias
+mapping.
+
+Stable API:
+
+- `sorted_heap_graph_rag(...)`
+- `sorted_heap_graph_register(...)`
+- `sorted_heap_graph_config(...)`
+- `sorted_heap_graph_unregister(...)`
+- `sorted_heap_graph_rag_stats()`
+- `sorted_heap_graph_rag_reset_stats()`
+
+Beta API:
+
+- `sorted_heap_expand_ids(...)`
+- `sorted_heap_expand_rerank(...)`
+- `sorted_heap_expand_twohop_rerank(...)`
+- `sorted_heap_expand_twohop_path_rerank(...)`
+- `sorted_heap_graph_rag_scan(...)`
+- `sorted_heap_graph_rag_twohop_scan(...)`
+- `sorted_heap_graph_rag_twohop_path_scan(...)`
+
+The stable contract covers one-hop and two-hop fact retrieval. Broader
+code-corpus snippet/symbol/lexical retrieval recipes remain benchmark-side
+reference logic, not SQL-stable product surface.
 
 Recommended schema shape:
 
@@ -569,6 +592,8 @@ FROM sorted_heap_graph_rag(
     score_mode := 'path'
 );
 ```
+
+### Lower-level GraphRAG building blocks (beta)
 
 ### `sorted_heap_expand_ids(rel, seed_ids, relation_filter, limit_rows)`
 

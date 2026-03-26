@@ -173,15 +173,18 @@ This corpus is materially harder than the deterministic synthetic one. It is a
 better signal for default-parameter recall, while the synthetic table remains
 useful for controlled same-host engine comparisons and regression tracking.
 
-### Current local GraphRAG beta benchmark (`person -> parent -> city`)
+### Current local GraphRAG benchmark (`person -> parent -> city`, stable fact contract)
 
 Repo-owned harness:
 
 - `python3 scripts/bench_graph_rag_multihop.py --num-pairs 5000 --query-count 64 --runs 3 --dim 384 --ann-k 64 --top-k 10 --ef-search 128 --ef-construction 200 --m 24 --pgv-ef-search 64 --zvec-ef 64 --qdrant-ef 64 --shared-buffers-mb 64 --backend-mode fresh`
 
 Deterministic fact graph, `5K` chains / `10K` rows total, `384D`, top-10.
-This is the current balanced beta GraphRAG point for the fact-shaped
-fact-retrieval workload.
+This is the current balanced stable GraphRAG point for the narrow fact-shaped
+fact-retrieval workload. The stable-facing SQL entry point is
+`sorted_heap_graph_rag(...)`; the table below also shows the underlying helper
+and wrapper paths because the harness measures the dispatched execution path
+directly.
 
 | Method | p50 latency | hit@1 | hit@k | Notes |
 |--------|:-----------:|:-----:|:-----:|-------|
@@ -222,7 +225,7 @@ So on the local balanced point, the current `sorted_heap` path-aware rows are
 not a fragile one-off. The latency band is tight, and the answer quality did
 not drift across the three rebuilds.
 
-### Current AWS GraphRAG beta benchmark (`person -> parent -> city`)
+### Current AWS GraphRAG benchmark (`person -> parent -> city`, stable fact contract)
 
 Repo-owned harness:
 
@@ -230,7 +233,8 @@ Repo-owned harness:
 
 AWS ARM64 host (`4 vCPU`, `8 GiB RAM`), deterministic fact graph,
 `5K` chains / `10K` rows total, `384D`, top-10, `64` queries, `3` runs.
-This is the current portable beta multihop GraphRAG point.
+This is the current portable stable multihop GraphRAG point for the narrow
+fact-shaped contract.
 
 | Method | p50 latency | hit@1 | hit@k | Notes |
 |--------|:-----------:|:-----:|:-----:|-------|
@@ -333,7 +337,7 @@ AWS ARM64 runs. The fused path-aware helper measured:
 So the current strongest portable GraphRAG result is no longer the SQL
 baseline or the old city-only helper. It is the fused path-aware helper.
 
-### Current real code-corpus GraphRAG beta benchmark (`cogniformerus` CrossFile)
+### Current real code-corpus GraphRAG reference benchmark (`cogniformerus` CrossFile)
 
 Repo-owned harnesses:
 
@@ -390,11 +394,11 @@ Interpretation:
   slice
 - the dominant larger-corpus issue on the in-repo Crystal side is result
   budget, not a new retrieval failure
-- this larger-corpus gate is now covered locally for `~/Projects/Crystal`;
-  the remaining unverified part of the `0.13` hardening story is now primarily
-  the archive side under `~/SrcArchives`
+- this larger-corpus Crystal gate is now covered and serves as a transfer
+  check for the benchmark-side code-retrieval logic, not as the stable
+  release contract for GraphRAG
 
-### Mixed-language external code-corpus GraphRAG beta benchmark (`pycdc`)
+### Mixed-language external code-corpus GraphRAG reference benchmark (`pycdc`)
 
 The code-corpus harness now also supports:
 
@@ -419,10 +423,10 @@ Interpretation:
   - the fast generic path plateaus below perfect quality
   - the code-aware include-rescue path closes the corpus, but at a much higher
     latency
-- so the remaining larger-corpus gap for `0.13` is no longer `~/Projects/C`;
-  it is the archive side under `~/SrcArchives`
+- so `~/Projects/C` is now covered as part of the broader code-corpus
+  reference matrix, even though the fastest generic point remains partial
 
-### Archive-side code-corpus GraphRAG beta benchmark (`ninja/src`)
+### Archive-side code-corpus GraphRAG reference benchmark (`ninja/src`)
 
 The same widened harness was then pointed at an archive-side corpus under
 `~/SrcArchives`: `apple/ninja/src`. This run used a second repo-owned fixture in
@@ -451,12 +455,13 @@ Interpretation:
   contract to close
 - the winner is the simple generic summary-snippet path at a slightly larger
   final budget (`top_k=12`)
-- the larger real-corpus verification matrix for `0.13` now spans:
+- the larger real-corpus verification matrix for the narrow `0.13`
+  fact-graph release now spans:
   - `~/Projects/Crystal`
   - `~/Projects/C`
   - `~/SrcArchives`
 
-### External folding stress corpus for GraphRAG beta (`folding/src`)
+### External folding stress corpus for GraphRAG reference logic (`folding/src`)
 
 The same harness was then pointed at a second real code corpus outside this
 repository: `folding/src` with prompts from `butler_folding_test.cr`. This is

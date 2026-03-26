@@ -41,9 +41,13 @@ btree-competitive query performance without a separate index structure.
   `hsvec` (float16, up to 32K dim) with planner-integrated `sorted_hnsw` KNN
   index scans. See [Vector Search](vector-search).
 
-- **Beta GraphRAG helpers** -- Narrow one-hop and two-hop expansion+rereank
-  primitives for fact-shaped retrieval workflows. See
-  [SQL API](api) and [Benchmarks](benchmarks).
+- **Stable fact-shaped GraphRAG API** -- Unified one-hop and two-hop retrieval
+  for fact graphs via `sorted_heap_graph_rag(...)`, plus schema registration
+  and last-call stats. See [SQL API](api) and [Benchmarks](benchmarks).
+
+- **Beta GraphRAG building blocks** -- Lower-level expansion/rerank helpers
+  and wrapper primitives remain available for explicit control and reference
+  workflows.
 
 - **Legacy/manual ANN paths** -- IVF-PQ and sidecar HNSW APIs remain available
   for manual storage/recall tuning, but they are no longer the default path.
@@ -94,6 +98,8 @@ At 100M rows, a point query reads **1 buffer** (vs 8 for btree, 519,906 for seq 
 ## Release surface
 
 - **Stable:** `sorted_heap` table AM, compaction/merge surface, zone-map scan
-  pruning, `sorted_hnsw` Index AM for `svec` and `hsvec`.
-- **Beta:** GraphRAG helper/wrapper API for fact-shaped retrieval.
+  pruning, `sorted_hnsw` Index AM for `svec` and `hsvec`, and the narrow
+  fact-shaped GraphRAG API.
+- **Beta:** Lower-level GraphRAG helpers/wrappers and code-corpus reference
+  contracts.
 - **Legacy/manual:** IVF-PQ and sidecar HNSW paths.

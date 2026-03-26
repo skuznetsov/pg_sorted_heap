@@ -2,6 +2,27 @@
 
 ## 0.13.0 (in development)
 
+### GraphRAG release status
+
+- The narrow fact-shaped GraphRAG contract is now the intended stable
+  `0.13` release surface:
+  - `sorted_heap_graph_rag(...)`
+  - `sorted_heap_graph_register(...)`
+  - `sorted_heap_graph_config(...)`
+  - `sorted_heap_graph_unregister(...)`
+  - `sorted_heap_graph_rag_stats()`
+  - `sorted_heap_graph_rag_reset_stats()`
+- Lower-level helper/wrapper building blocks remain beta:
+  - `sorted_heap_expand_ids(...)`
+  - `sorted_heap_expand_rerank(...)`
+  - `sorted_heap_expand_twohop_rerank(...)`
+  - `sorted_heap_expand_twohop_path_rerank(...)`
+  - `sorted_heap_graph_rag_scan(...)`
+  - `sorted_heap_graph_rag_twohop_scan(...)`
+  - `sorted_heap_graph_rag_twohop_path_scan(...)`
+- Code-corpus snippet/symbol/lexical retrieval contracts remain
+  benchmark/reference logic, not the stable SQL surface.
+
 ### GraphRAG syntax unification
 
 - Added `sorted_heap_graph_rag(...)` as the new unified fact-shaped GraphRAG

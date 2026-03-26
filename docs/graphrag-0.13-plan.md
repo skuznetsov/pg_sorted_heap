@@ -12,9 +12,13 @@ The goal is not to ship a general-purpose graph database API in `0.13`.
 The goal is to ship a stable fact-shaped GraphRAG contract on top of the
 already-verified `sorted_heap` + `sorted_hnsw` path.
 
+Current status: all listed release gates below are now covered for the narrow
+fact-shaped `0.13` surface. The remaining work is release bundling and
+documentation clarity, not new release-critical hardening.
+
 ## Stable target
 
-The stable candidate surface for `0.13` is:
+The stable surface for `0.13` is:
 
 ```sql
 SELECT *
@@ -72,7 +76,7 @@ These remain beta even after the new syntax lands:
 
 The existing beta surface works, but it is a function zoo.
 
-`sorted_heap_graph_rag(...)` is the first stable-facing layer because it:
+`sorted_heap_graph_rag(...)` is the stable-facing layer because it:
 
 - collapses the public fact-graph contract to one entry point
 - keeps the fast path on top of already-verified helper/wrapper internals
@@ -85,7 +89,7 @@ The existing beta surface works, but it is a function zoo.
 
 ## Release gates for 0.13
 
-`0.13` should not promote GraphRAG to stable until all of these are true:
+All of the following are now covered for the narrow fact-shaped contract:
 
 1. Surface freeze
    - `sorted_heap_graph_rag(...)` is the documented primary entry point for
@@ -151,7 +155,7 @@ Done in this branch:
 
 - introduce `sorted_heap_graph_rag(...)`
 - keep the current lower-level wrappers as implementation building blocks
-- document the stable candidate contract separately from the experimental
+- document the stable contract separately from the experimental
   code-corpus contracts
 
 ### Phase 2: hardening
@@ -167,8 +171,10 @@ Implemented in this branch:
 
 Still needed:
 
-- no additional larger real-corpus gate is currently required for the narrow
-  `0.13` fact-graph stable target
+- no additional release-critical hardening is currently required for the
+  narrow `0.13` fact-graph stable target
+- remaining work is release packaging and keeping the stable/beta/reference
+  split explicit in the public docs
 
 ### Phase 3: schema registration
 
