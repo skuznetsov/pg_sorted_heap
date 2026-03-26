@@ -466,6 +466,42 @@ ON facts USING sorted_hnsw (embedding)
 WITH (m = 24, ef_construction = 200);
 ```
 
+### `sorted_heap_graph_rag(rel, query, relation_path, ann_k, top_k, score_mode, limit_rows)`
+
+Preferred fact-shaped GraphRAG entry point.
+
+- `relation_path := ARRAY[1]`
+  - one-hop expansion
+  - ANN seed on `entity_id`
+  - exact rerank on the endpoint facts
+- `relation_path := ARRAY[1, 2], score_mode := 'endpoint'`
+  - two-hop expansion
+  - rerank by the final-hop endpoint only
+- `relation_path := ARRAY[1, 2], score_mode := 'path'`
+  - two-hop expansion
+  - path-aware rerank using hop-1 and hop-2 evidence together
+
+Current constraints:
+
+- `relation_path` must be a one-dimensional `int4[]` of length `1` or `2`
+- supported `score_mode` values are `endpoint` and `path`
+- current schema contract still expects canonical fact columns:
+  `entity_id`, `relation_id`, `target_id`, `embedding`, `payload`
+
+```sql
+SET sorted_hnsw.ef_search = 128;
+
+SELECT *
+FROM sorted_heap_graph_rag(
+    'facts'::regclass,
+    '[0.1,0.2,0.3,...]'::svec,
+    relation_path := ARRAY[1, 2],
+    ann_k := 64,
+    top_k := 10,
+    score_mode := 'path'
+);
+```
+
 ### `sorted_heap_expand_ids(rel, seed_ids, relation_filter, limit_rows)`
 
 Expands known entity seeds into fact rows without reranking.
@@ -518,28 +554,33 @@ FROM sorted_heap_expand_twohop_path_rerank(
 
 ### `sorted_heap_graph_rag_scan(rel, query, ann_k, top_k, relation_filter, limit_rows)`
 
-One-call wrapper: ANN seed retrieval on `entity_id`, then one-hop expansion
-and rerank.
+Lower-level one-hop wrapper retained for backward compatibility and
+target-seeded graph shapes. This wrapper seeds one-hop expansion from
+ANN-selected `target_id` values, so it is not the preferred fact-graph
+contract.
 
 ### `sorted_heap_graph_rag_twohop_scan(rel, query, ann_k, top_k, hop1_relation_filter, hop2_relation_filter, limit_rows)`
 
-One-call wrapper for ANN seed retrieval plus two-hop expansion.
+Lower-level endpoint-scored two-hop wrapper. `sorted_heap_graph_rag(...)`
+with `relation_path := ARRAY[hop1, hop2], score_mode := 'endpoint'`
+is the preferred higher-level syntax.
 
 ### `sorted_heap_graph_rag_twohop_path_scan(rel, query, ann_k, top_k, hop1_relation_filter, hop2_relation_filter, limit_rows)`
 
-One-call wrapper for ANN seed retrieval plus two-hop path-aware rerank. This
-is the current default beta entry point for fact-shaped multihop GraphRAG.
+Lower-level path-aware two-hop wrapper. `sorted_heap_graph_rag(...)` with
+`relation_path := ARRAY[hop1, hop2], score_mode := 'path'` is the preferred
+higher-level syntax.
 
 ```sql
 SET sorted_hnsw.ef_search = 128;
 
 SELECT *
-FROM sorted_heap_graph_rag_twohop_path_scan(
+FROM sorted_heap_graph_rag(
     'facts'::regclass,
     '[0.1,0.2,0.3,...]'::svec,
+    relation_path := ARRAY[1, 2],
     ann_k := 64,
     top_k := 10,
-    hop1_relation_filter := 1,
-    hop2_relation_filter := 2
+    score_mode := 'path'
 );
 ```

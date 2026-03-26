@@ -17,11 +17,11 @@ plus planner-integrated HNSW search.
 ### Beta
 
 - GraphRAG helper/wrapper API:
+  - `sorted_heap_graph_rag(...)`
   - `sorted_heap_expand_ids(...)`
   - `sorted_heap_expand_rerank(...)`
   - `sorted_heap_expand_twohop_rerank(...)`
   - `sorted_heap_expand_twohop_path_rerank(...)`
-  - `sorted_heap_graph_rag_scan(...)`
   - `sorted_heap_graph_rag_twohop_scan(...)`
   - `sorted_heap_graph_rag_twohop_path_scan(...)`
 - These functions are usable now and benchmarked repeatedly, but they are
@@ -139,11 +139,14 @@ queries. The intended workload is:
 
 The current helpers are:
 
+- `sorted_heap_graph_rag(...)`
 - `sorted_heap_expand_rerank(...)`
 - `sorted_heap_expand_twohop_rerank(...)`
 - `sorted_heap_expand_twohop_path_rerank(...)`
 - `sorted_heap_graph_rag_twohop_scan(...)`
 - `sorted_heap_graph_rag_twohop_path_scan(...)`
+
+The preferred beta syntax is now the unified fact-graph entry point:
 
 Minimal beta shape:
 
@@ -164,15 +167,23 @@ WITH (m = 24, ef_construction = 200);
 SET sorted_hnsw.ef_search = 128;
 
 SELECT *
-FROM sorted_heap_graph_rag_twohop_path_scan(
+FROM sorted_heap_graph_rag(
     'facts'::regclass,
     '[0.1,0.2,0.3,...]'::svec,
+    relation_path := ARRAY[1, 2],
     ann_k := 64,
     top_k := 10,
-    hop1_relation_filter := 1,
-    hop2_relation_filter := 2
+    score_mode := 'path'
 );
 ```
+
+`relation_path := ARRAY[1]` gives one-hop expansion. `relation_path := ARRAY[1,2]`
+gives two-hop expansion. `score_mode := 'endpoint'` ranks only the final-hop
+facts; `score_mode := 'path'` uses hop-1 and hop-2 evidence together.
+
+The older `sorted_heap_graph_rag_scan(...)` wrapper is still available, but it
+seeds one-hop expansion from ANN-selected `target_id` values and is therefore
+not the preferred fact-graph contract.
 
 On the current AWS ARM64 rerun (`4 vCPU`, `8 GiB RAM`), `5K` chains / `10K`
 rows / `384D`, the current portable point is:
@@ -202,6 +213,8 @@ path-aware helper transferred cleanly to AWS at both `5K` and `10K` chains.
 The full tuning history, reasoning, external-engine caveats, and larger-scale
 results live in
 [docs/design-graphrag.md](/Users/sergey/Projects/C/clustered_pg/docs/design-graphrag.md).
+The current `0.13` release target and hardening gates live in
+[docs/graphrag-0.13-plan.md](/Users/sergey/Projects/C/clustered_pg/docs/graphrag-0.13-plan.md).
 
 There is now also a **real code-corpus** GraphRAG benchmark using the actual
 `cogniformerus` source tree plus the real CrossFile prompts from
@@ -645,31 +658,33 @@ WITH (m = 24, ef_construction = 200);
 
 SET sorted_hnsw.ef_search = 128;
 
--- One-hop: expand known entity seeds and exact-rerank by query vector
+-- One-hop fact retrieval
 SELECT *
-FROM sorted_heap_expand_rerank(
-    'facts'::regclass,
-    ARRAY[101, 202],
-    '[0.1,0.2,0.3,...]'::svec,
-    top_k := 10,
-    relation_filter := 1
-);
-
--- Two-hop path-aware wrapper: ANN seed -> two-hop expansion -> path-aware rerank
-SELECT *
-FROM sorted_heap_graph_rag_twohop_path_scan(
+FROM sorted_heap_graph_rag(
     'facts'::regclass,
     '[0.1,0.2,0.3,...]'::svec,
+    relation_path := ARRAY[1],
     ann_k := 64,
     top_k := 10,
-    hop1_relation_filter := 1,
-    hop2_relation_filter := 2
+    score_mode := 'endpoint'
+);
+
+-- Two-hop path-aware retrieval
+SELECT *
+FROM sorted_heap_graph_rag(
+    'facts'::regclass,
+    '[0.1,0.2,0.3,...]'::svec,
+    relation_path := ARRAY[1, 2],
+    ann_k := 64,
+    top_k := 10,
+    score_mode := 'path'
 );
 ```
 
 Recommended release positioning: ship this API as beta. It is benchmarked and
 useful now, but its best operating point still depends strongly on workload
-shape and scoring contract.
+shape and scoring contract. Lower-level wrappers remain available when you
+need exact control over seeds, hop filters, or rerank stages.
 
 ### Configuration
 
@@ -736,6 +751,7 @@ SET sorted_heap.ann_timing = on;                 -- timing breakdown in DEBUG1
 - [Architecture](docs/architecture.md) -- zone maps, custom scan, compaction
 - [SQL API](docs/api.md) -- full function reference
 - [Benchmarks](docs/benchmarks.md) -- latency, throughput, vector search
+- [GraphRAG 0.13 Plan](docs/graphrag-0.13-plan.md) -- stable target and hardening gates
 - [Limitations](docs/limitations.md)
 - [Changelog](CHANGELOG.md)
 - [Operations](OPERATIONS.md) -- make targets and diagnostics

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.13.0 (in development)
+
+### GraphRAG syntax unification
+
+- Added `sorted_heap_graph_rag(...)` as the new unified fact-shaped GraphRAG
+  entry point.
+- The new syntax accepts:
+  - `relation_path := ARRAY[hop]` for one-hop retrieval
+  - `relation_path := ARRAY[hop1, hop2]` for two-hop retrieval
+  - `score_mode := 'endpoint' | 'path'`
+- One-hop semantics are now aligned with the fact-graph contract:
+  ANN seed selection is on `entity_id`, not `target_id`.
+- Added regression coverage for:
+  - one-hop unified syntax
+  - two-hop endpoint-scored unified syntax
+  - two-hop path-aware unified syntax
+- Added `docs/graphrag-0.13-plan.md` to separate the narrow stable `0.13`
+  target from the broader experimental code-GraphRAG surface.
+
 ## 0.12.0 (2026-03-26)
 
 ### Release documentation pass
