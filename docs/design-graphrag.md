@@ -2566,3 +2566,71 @@ So the next frontier is narrower again:
 > the missing quality is not solved by a simple "take one more nearby chunk"
 > policy; the remaining problem is finer-grained evidence choice, not just a
 > larger same-file window
+
+### Semantic chunk selection is a generic-mode win, but not a universal one
+
+The next bounded question was different from the failed local-window branch:
+
+> maybe the chunk budget is fine, and the real problem is that the last chunk is
+> being picked with the wrong scoring rule
+
+That was tested with `prompt_summary_chunk_semantic_s3_in`:
+
+- keep the current summary-heavy mixed-seed contract
+- keep the same `3 summaries + 1 chunk` budget
+- change only the final chunk selection:
+  - old path: lexical-first within the top file
+  - new path: semantic-distance-first within the top file
+
+Hard-prompt rerun (`Response memory policy` + `Streaming overlap`,
+fresh backend, `ann_k=16`, `top_k=4`):
+
+- generic mode:
+  - old summary-heavy hybrid:
+    - `70.0%`
+    - `0.992 ms`
+  - semantic chunk selection:
+    - `70.0%`
+    - `0.481 ms`
+- code-aware mode:
+  - old summary-heavy hybrid:
+    - `60.0%`
+    - `1.035 ms`
+  - semantic chunk selection:
+    - `60.0%`
+    - `0.429 ms`
+
+Full `6`-question rerun (`40` files, `840` rows, `3` runs):
+
+- generic mode:
+  - old summary-heavy hybrid:
+    - `0.976 ms`
+    - `86.7%`
+    - `50.0%`
+  - semantic chunk selection:
+    - `0.453 ms`
+    - `86.7%`
+    - `50.0%`
+- code-aware mode:
+  - old summary-heavy hybrid:
+    - `0.975 ms`
+    - `84.3%`
+    - `50.0%`
+  - semantic chunk selection:
+    - `0.474 ms`
+    - `77.6%`
+    - `33.3%`
+
+This creates a new mode-specific frontier:
+
+- **generic mode**
+  - `prompt_summary_chunk_semantic_s3_in` is now the stronger
+    coverage-preserving hybrid
+  - it keeps the same aggregate quality as the old summary-heavy hybrid while
+    cutting latency by roughly half
+- **code-aware mode**
+  - the same semantic swap is not acceptable
+  - it buys latency, but loses both coverage and full hits
+
+So the next branch should treat the two embedding modes separately instead of
+assuming one chunk-selection rule can dominate both.
