@@ -2816,3 +2816,44 @@ So the code-aware split is now **cross-environment verified**:
 - generic keeps the older snippet contract
 - code-aware keeps the symbol-aware snippet contract
 - the change in winner is not a local Apple-only artifact
+
+## External folding corpus check
+
+The next adversary check was a second real code corpus outside this repository:
+
+- source tree: `folding/src`
+- prompt set: `butler_folding_test.cr`
+
+This surfaced one real harness bug first:
+
+- [`scripts/bench_graph_rag_code_corpus.py`](/Users/sergey/Projects/C/clustered_pg/scripts/bench_graph_rag_code_corpus.py)
+  originally globbed `*.cr` paths without filtering `is_file()`
+- on the `folding` tree that accidentally picked up `.crystal-cache` directories
+  ending in `.cr`
+- the harness now filters to real files only
+
+Once that was fixed, the external corpus produced a useful repeated-build
+result. Local `3`-build protocol on `facts_sh`, generic mode, same small-budget
+point (`384D`, `ann_k=16`, `top_k=4`, `ef_search=64`, `ef_construction=200`,
+`m=24`, fresh backend):
+
+- `prompt_summary_snippet_py`
+  - `p50 median 1.116 ms`, range `0.896-1.123 ms`
+  - `keyword_pct` median `100.0%`, range `90.5-100.0`
+  - `full_pct` median `100.0%`, range `83.3-100.0`
+- a bounded require-expanded summary variant was tested as a rescue for the
+  hard `Lexicographic potential order` prompt
+  - it did rescue that one prompt on a bad build by surfacing `folding/potential.cr`
+  - but across repeated builds it was slower (`p50 median 2.727 ms`) and
+    inferior overall (`93.3% / 83.3%`)
+  - it therefore does **not** become the new default frontier
+
+Interpretation:
+
+- the current generic snippet contract transfers to a second real code corpus
+  with good quality, but not with the same strict `100/100` stability seen on
+  the smaller in-repo `cogniformerus` slice
+- the remaining variance on `folding/src` is more plausibly HNSW/build
+  variability than a systematic failure of the snippet contract
+- graph-native `REQUIRES_FILE` expansion is still useful as a diagnostic
+  falsifier, but not as the winning retrieval contract on this external corpus
