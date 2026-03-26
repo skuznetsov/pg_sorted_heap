@@ -2861,3 +2861,23 @@ Interpretation:
   improve quality
 - graph-native `REQUIRES_FILE` expansion is still useful as a diagnostic
   falsifier, but not as the winning retrieval contract on this external corpus
+
+The same external `folding/src` corpus also answered the code-aware question.
+At the same repeated-build point:
+
+- code-aware `prompt_summary_snippet_py`
+  - `p50 median 1.080 ms`, range `1.007-1.131 ms`
+  - stable `91.7% / 83.3%`
+- code-aware `oracle_prompt_summary_snippet_py`
+  - `p50 median 1.184 ms`, range `1.179-1.205 ms`
+  - stable `100.0% / 100.0%`
+
+So the external folding split is now sharper:
+
+- **generic** external folding is no longer a retrieval problem at this point
+- **code-aware** external folding is still quality-limited, and the oracle
+  diagnostic shows that this remaining gap is a **seed-selection problem**
+  rather than a snippet or rerank problem
+- existing symbol-aware summary seeding does not rescue that code-aware gap on
+  folding, so the next real branch there is a non-oracle code-aware seed
+  rescue, not another snippet tweak
