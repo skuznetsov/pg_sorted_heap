@@ -1930,3 +1930,44 @@ API". It is either:
 
 - a richer real code-graph relation hypothesis than plain `file -> chunk`, or
 - a lower-overhead helper path for this very simple expansion contract
+
+### Real `require`-graph falsifier
+
+The obvious next hypothesis was that plain `file -> chunk` was too weak, and
+that the real local code graph should help once actual `require` edges were
+present.
+
+That hypothesis is now tested in the same harness:
+
+- `53` local `require` edges derived from the real `cogniformerus` source tree
+- relation `REQUIRES_FILE`
+- two new query shapes:
+  - `seed_require_twohop_*`
+  - `seed_file_plus_require_in`
+
+Stable local result on the same `40`-file / `800`-row / `6`-question point,
+`3` runs:
+
+- plain file-seeded expansion:
+  - `sorted_heap`: `0.471 ms`
+  - keyword coverage: `63.3%`
+  - full hits: `33.3%`
+- file plus required files:
+  - `sorted_heap`: `0.605 ms`
+  - same `63.3%` keyword coverage
+  - same `33.3%` full hits
+- dependency-only two-hop:
+  - `sorted_heap`: `0.391 ms`
+  - keyword coverage: `20.0%`
+  - full hits: `0.0%`
+
+So the richer real relation hypothesis is currently **refuted** on this code
+corpus:
+
+- adding dependency files does not improve answer-support quality
+- dependency-only traversal is actively worse because it drops own-file context
+- unioning own files with required files only adds cost, not quality
+
+This is a useful stopping point. The next likely win for real code-GraphRAG is
+not "just add more code edges". It is a different retrieval contract or a
+lower-overhead helper path on the already-good file-seeded shape.

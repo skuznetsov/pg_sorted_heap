@@ -6,6 +6,8 @@ Dataset:
   - each file is an entity
   - each chunk in that file is a fact row:
       entity_id=file_id, relation_id=HAS_CHUNK, target_id=chunk_id
+  - local require edges become graph rows:
+      entity_id=file_id, relation_id=REQUIRES_FILE, target_id=required_file_id
   - embedding/payload are derived from the real source chunk text
 
 Queries:
@@ -13,8 +15,8 @@ Queries:
 
 The benchmark asks a narrow question:
 
-  Does file-seeded GraphRAG expansion help real code-question retrieval
-  compared to direct ANN over raw chunks?
+  Do real file-level relations from the code graph help real code-question
+  retrieval, or is plain file-seeded expansion already enough?
 
 Quality metric:
   - keyword coverage percentage over the retrieved payload union
@@ -35,6 +37,7 @@ import bench_graph_rag as base
 import bench_graph_rag_multihop as mh
 
 REL_HAS_CHUNK = 1
+REL_REQUIRES_FILE = 2
 CHUNK_WINDOW = 800
 CHUNK_OVERLAP = 200
 
@@ -43,6 +46,7 @@ QUESTION_Q_RE = re.compile(r'q:\s*"(.*)",\s*$')
 QUESTION_TOPIC_RE = re.compile(r'topic:\s*"(.*)",\s*$')
 QUESTION_TIER_RE = re.compile(r"tier:\s*Tier::([A-Za-z_]+),\s*$")
 QUOTED_RE = re.compile(r'"([^"]+)"')
+REQUIRE_RE = re.compile(r'^require\s+"([^"]+)"')
 
 
 @dataclass(frozen=True)
@@ -165,16 +169,62 @@ def chunk_source_file(path: Path, src_dir: Path, file_id: int, window: int, over
     return chunks, global_chunk_id
 
 
-def build_code_csv(src_dir: Path, csv_path: Path, dim: int, window: int, overlap: int) -> tuple[int, int]:
+def list_source_files(src_dir: Path) -> list[Path]:
     files = sorted(src_dir.rglob("*.cr"))
     if not files:
         raise RuntimeError(f"no Crystal source files found under {src_dir}")
+    return files
+
+
+def resolve_local_require_targets(path: Path, src_dir: Path, rel_to_id: dict[str, int]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    parent = path.parent
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = REQUIRE_RE.match(line.strip())
+        if not match:
+            continue
+
+        target = match.group(1)
+        if not target.startswith("."):
+            continue
+
+        if target.endswith("/*"):
+            base = (parent / target[:-2]).resolve()
+            if not base.exists() or not base.is_dir():
+                continue
+            candidates = sorted(base.glob("*.cr"))
+        else:
+            base = (parent / target).resolve()
+            candidate = base if base.suffix == ".cr" else base.with_suffix(".cr")
+            candidates = [candidate] if candidate.exists() else []
+
+        for candidate in candidates:
+            try:
+                relative = str(candidate.relative_to(src_dir))
+            except ValueError:
+                continue
+            if relative not in rel_to_id:
+                continue
+            if relative not in seen:
+                seen.add(relative)
+                out.append(relative)
+
+    return out
+
+
+def build_code_csv(src_dir: Path, csv_path: Path, dim: int, window: int, overlap: int) -> tuple[int, int, int]:
+    files = list_source_files(src_dir)
+    rel_to_id = {str(path.relative_to(src_dir)): idx for idx, path in enumerate(files, start=1)}
 
     next_chunk_id = 1
     rowcount = 0
+    edge_count = 0
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         for file_id, path in enumerate(files, start=1):
+            relative = str(path.relative_to(src_dir))
             chunks, next_chunk_id = chunk_source_file(path, src_dir, file_id, window, overlap, next_chunk_id)
             for chunk in chunks:
                 w.writerow(
@@ -187,8 +237,22 @@ def build_code_csv(src_dir: Path, csv_path: Path, dim: int, window: int, overlap
                     ]
                 )
                 rowcount += 1
+            for required_rel in resolve_local_require_targets(path, src_dir, rel_to_id):
+                required_id = rel_to_id[required_rel]
+                edge_text = f"# Require: {relative} -> {required_rel}"
+                w.writerow(
+                    [
+                        file_id,
+                        REL_REQUIRES_FILE,
+                        required_id,
+                        mh.lexical_hash_vector(edge_text, dim),
+                        edge_text,
+                    ]
+                )
+                rowcount += 1
+                edge_count += 1
 
-    return len(files), rowcount
+    return len(files), rowcount, edge_count
 
 
 def verify_helper_equivalence(cur, table_name: str, questions: list[CodeQuestion], ann_k: int, top_k: int) -> None:
@@ -238,6 +302,63 @@ def verify_helper_equivalence(cur, table_name: str, questions: list[CodeQuestion
         if diff_rows != 0:
             raise RuntimeError(
                 f"sorted_heap_expand_rerank mismatch on {table_name} question#{idx}: diff_rows={diff_rows}"
+            )
+
+
+def verify_twohop_equivalence(cur, table_name: str, questions: list[CodeQuestion], ann_k: int, top_k: int) -> None:
+    sql = f"""
+    WITH ann AS MATERIALIZED (
+        SELECT entity_id
+        FROM {table_name}
+        ORDER BY embedding <=> %s::svec
+        LIMIT {ann_k}
+    ),
+    seeds AS MATERIALIZED (
+        SELECT DISTINCT entity_id FROM ann
+    ),
+    helper AS (
+        SELECT entity_id, relation_id, target_id, round(distance::numeric, 6) AS distance
+        FROM sorted_heap_expand_twohop_rerank(
+            '{table_name}'::regclass,
+            ARRAY(SELECT entity_id FROM seeds),
+            %s::svec,
+            {top_k},
+            {REL_REQUIRES_FILE},
+            {REL_HAS_CHUNK},
+            0
+        )
+    ),
+    hop1 AS MATERIALIZED (
+        SELECT DISTINCT target_id
+        FROM {table_name}
+        WHERE entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+          AND relation_id = {REL_REQUIRES_FILE}
+    ),
+    expanded AS MATERIALIZED (
+        SELECT *
+        FROM {table_name}
+        WHERE entity_id = ANY (ARRAY(SELECT target_id FROM hop1))
+          AND relation_id = {REL_HAS_CHUNK}
+    ),
+    sql_baseline AS (
+        SELECT entity_id, relation_id, target_id, round((embedding <=> %s::svec)::numeric, 6) AS distance
+        FROM expanded
+        ORDER BY embedding <=> %s::svec, entity_id, relation_id, target_id
+        LIMIT {top_k}
+    )
+    SELECT count(*) FROM (
+        (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
+        UNION ALL
+        (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
+    ) diff
+    """
+
+    for idx, question in enumerate(questions, start=1):
+        cur.execute(sql, (question.query_vec, question.query_vec, question.query_vec, question.query_vec))
+        diff_rows = cur.fetchone()[0]
+        if diff_rows != 0:
+            raise RuntimeError(
+                f"sorted_heap_expand_twohop_rerank mismatch on {table_name} question#{idx}: diff_rows={diff_rows}"
             )
 
 
@@ -362,7 +483,7 @@ def main() -> int:
 
     try:
         questions = parse_crossfile_questions(question_source, args.dim)
-        file_count, rowcount = build_code_csv(source_dir, csv_path, args.dim, args.chunk_window, args.chunk_overlap)
+        file_count, rowcount, edge_count = build_code_csv(source_dir, csv_path, args.dim, args.chunk_window, args.chunk_overlap)
 
         conn = base.connect(tmp, port)
         cur = conn.cursor()
@@ -385,6 +506,7 @@ def main() -> int:
             cur.execute(f"SET sorted_hnsw.ef_search = {args.ef_search}")
 
             verify_helper_equivalence(cur, "facts_sh", questions, args.ann_k, args.top_k)
+            verify_twohop_equivalence(cur, "facts_sh", questions, args.ann_k, args.top_k)
 
             direct_ann = base.QueryCase(
                 "direct_ann",
@@ -449,6 +571,101 @@ def main() -> int:
                 lambda q: (q.query_vec, q.query_vec),
             )
 
+            dependency_twohop_sql = base.QueryCase(
+                "seed_require_twohop_in",
+                f"""
+                WITH ann AS MATERIALIZED (
+                    SELECT entity_id
+                    FROM {{table}}
+                    ORDER BY embedding <=> %s::svec
+                    LIMIT {args.ann_k}
+                ),
+                seeds AS MATERIALIZED (
+                    SELECT DISTINCT entity_id FROM ann
+                ),
+                hop1 AS MATERIALIZED (
+                    SELECT DISTINCT target_id
+                    FROM {{table}}
+                    WHERE entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+                      AND relation_id = {REL_REQUIRES_FILE}
+                ),
+                expanded AS MATERIALIZED (
+                    SELECT *
+                    FROM {{table}}
+                    WHERE entity_id = ANY (ARRAY(SELECT target_id FROM hop1))
+                      AND relation_id = {REL_HAS_CHUNK}
+                )
+                SELECT *
+                FROM expanded
+                ORDER BY embedding <=> %s::svec, entity_id, relation_id, target_id
+                LIMIT {args.top_k}
+                """,
+                lambda q: (q.query_vec, q.query_vec),
+            )
+
+            dependency_twohop_fn = base.QueryCase(
+                "seed_require_twohop_fn",
+                f"""
+                WITH ann AS MATERIALIZED (
+                    SELECT entity_id
+                    FROM {{table}}
+                    ORDER BY embedding <=> %s::svec
+                    LIMIT {args.ann_k}
+                ),
+                seeds AS MATERIALIZED (
+                    SELECT DISTINCT entity_id FROM ann
+                )
+                SELECT *
+                FROM sorted_heap_expand_twohop_rerank(
+                    '{{table}}'::regclass,
+                    ARRAY(SELECT entity_id FROM seeds),
+                    %s::svec,
+                    {args.top_k},
+                    {REL_REQUIRES_FILE},
+                    {REL_HAS_CHUNK},
+                    0
+                )
+                """,
+                lambda q: (q.query_vec, q.query_vec),
+            )
+
+            seed_plus_require_sql = base.QueryCase(
+                "seed_file_plus_require_in",
+                f"""
+                WITH ann AS MATERIALIZED (
+                    SELECT entity_id
+                    FROM {{table}}
+                    ORDER BY embedding <=> %s::svec
+                    LIMIT {args.ann_k}
+                ),
+                seeds AS MATERIALIZED (
+                    SELECT DISTINCT entity_id FROM ann
+                ),
+                hop1 AS MATERIALIZED (
+                    SELECT DISTINCT target_id AS entity_id
+                    FROM {{table}}
+                    WHERE entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+                      AND relation_id = {REL_REQUIRES_FILE}
+                ),
+                expanded_entities AS MATERIALIZED (
+                    SELECT entity_id FROM seeds
+                    UNION
+                    SELECT entity_id FROM hop1
+                ),
+                expanded AS MATERIALIZED (
+                    SELECT *
+                    FROM {{table}}
+                    WHERE entity_id = ANY (ARRAY(SELECT entity_id FROM expanded_entities))
+                      AND relation_id = {REL_HAS_CHUNK}
+                )
+                SELECT *
+                FROM expanded
+                ORDER BY embedding <=> %s::svec, entity_id, relation_id, target_id
+                LIMIT {args.top_k}
+                """,
+                lambda q: (q.query_vec, q.query_vec),
+            )
+
             print("============================================================")
             print("graph rag code corpus")
             print("============================================================")
@@ -458,6 +675,7 @@ def main() -> int:
             print(f"port:               {port}")
             print(f"files:              {file_count}")
             print(f"rows:               {rowcount}")
+            print(f"require_edges:      {edge_count}")
             print(f"queries:            {len(questions)}")
             print(f"runs:               {args.runs}")
             print(f"dim:                {args.dim}")
@@ -480,6 +698,11 @@ def main() -> int:
                 ("facts_heap", "facts_heap", seed_expand_sql),
                 ("facts_sh", "facts_sh", seed_expand_sql),
                 ("facts_sh", "facts_sh", seed_expand_fn),
+                ("facts_heap", "facts_heap", seed_plus_require_sql),
+                ("facts_sh", "facts_sh", seed_plus_require_sql),
+                ("facts_heap", "facts_heap", dependency_twohop_sql),
+                ("facts_sh", "facts_sh", dependency_twohop_sql),
+                ("facts_sh", "facts_sh", dependency_twohop_fn),
             ]
 
             for label, table, case in cases:
