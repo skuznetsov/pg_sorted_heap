@@ -1971,3 +1971,40 @@ corpus:
 This is a useful stopping point. The next likely win for real code-GraphRAG is
 not "just add more code edges". It is a different retrieval contract or a
 lower-overhead helper path on the already-good file-seeded shape.
+
+### File-summary seed falsifier
+
+The next retrieval-contract hypothesis was also tested locally on the same real
+code corpus:
+
+- add one synthetic-but-data-derived summary row per file
+- seed on those summary rows
+- then expand back to the file's chunk rows
+
+The goal was to test whether the missing factor was simply that chunk-level ANN
+was a poor way to choose files.
+
+That also failed to improve answer-support quality.
+
+Stable smoke result on the same point:
+
+- summary-seeded expansion:
+  - heap: `0.587 ms`
+  - `sorted_heap`: `0.564 ms`
+  - keyword coverage: `63.3%`
+  - full hits: `33.3%`
+
+So the current real code-corpus plateau is now bounded more tightly:
+
+- plain file-seeded expansion: same quality, lower latency
+- file summaries: same quality, higher latency
+- require edges: no quality gain
+- require-only traversal: quality regression
+
+That strongly suggests the next code-corpus GraphRAG branch should not be
+"more local graph structure" or "better file seeds" in the same lexical setup.
+The remaining frontier is more likely one of:
+
+- a different quality metric / question contract,
+- better embeddings,
+- or a lower-overhead execution path on the already-best file-seeded shape.

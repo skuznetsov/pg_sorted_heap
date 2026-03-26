@@ -38,6 +38,7 @@ import bench_graph_rag_multihop as mh
 
 REL_HAS_CHUNK = 1
 REL_REQUIRES_FILE = 2
+REL_FILE_SUMMARY = 3
 CHUNK_WINDOW = 800
 CHUNK_OVERLAP = 200
 
@@ -169,6 +170,26 @@ def chunk_source_file(path: Path, src_dir: Path, file_id: int, window: int, over
     return chunks, global_chunk_id
 
 
+def file_summary_text(relative: str, chunks: list[CodeChunk], token_budget: int = 256) -> str:
+    parts = [f"# File Summary: {relative}"]
+    token_count = 0
+
+    for chunk in chunks:
+        snippet = chunk.text.replace("\n", " ")
+        words = snippet.split()
+        if not words:
+            continue
+        take = min(len(words), max(0, token_budget - token_count))
+        if take <= 0:
+            break
+        parts.append(" ".join(words[:take]))
+        token_count += take
+        if token_count >= token_budget:
+            break
+
+    return "\n".join(parts)
+
+
 def list_source_files(src_dir: Path) -> list[Path]:
     files = sorted(src_dir.rglob("*.cr"))
     if not files:
@@ -214,18 +235,31 @@ def resolve_local_require_targets(path: Path, src_dir: Path, rel_to_id: dict[str
     return out
 
 
-def build_code_csv(src_dir: Path, csv_path: Path, dim: int, window: int, overlap: int) -> tuple[int, int, int]:
+def build_code_csv(src_dir: Path, csv_path: Path, dim: int, window: int, overlap: int) -> tuple[int, int, int, int]:
     files = list_source_files(src_dir)
     rel_to_id = {str(path.relative_to(src_dir)): idx for idx, path in enumerate(files, start=1)}
 
     next_chunk_id = 1
     rowcount = 0
     edge_count = 0
+    summary_count = 0
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         for file_id, path in enumerate(files, start=1):
             relative = str(path.relative_to(src_dir))
             chunks, next_chunk_id = chunk_source_file(path, src_dir, file_id, window, overlap, next_chunk_id)
+            summary_text = file_summary_text(relative, chunks)
+            w.writerow(
+                [
+                    file_id,
+                    REL_FILE_SUMMARY,
+                    file_id,
+                    mh.lexical_hash_vector(summary_text, dim),
+                    summary_text,
+                ]
+            )
+            rowcount += 1
+            summary_count += 1
             for chunk in chunks:
                 w.writerow(
                     [
@@ -252,7 +286,7 @@ def build_code_csv(src_dir: Path, csv_path: Path, dim: int, window: int, overlap
                 rowcount += 1
                 edge_count += 1
 
-    return len(files), rowcount, edge_count
+    return len(files), rowcount, edge_count, summary_count
 
 
 def verify_helper_equivalence(cur, table_name: str, questions: list[CodeQuestion], ann_k: int, top_k: int) -> None:
@@ -483,7 +517,7 @@ def main() -> int:
 
     try:
         questions = parse_crossfile_questions(question_source, args.dim)
-        file_count, rowcount, edge_count = build_code_csv(source_dir, csv_path, args.dim, args.chunk_window, args.chunk_overlap)
+        file_count, rowcount, edge_count, summary_count = build_code_csv(source_dir, csv_path, args.dim, args.chunk_window, args.chunk_overlap)
 
         conn = base.connect(tmp, port)
         cur = conn.cursor()
@@ -552,6 +586,59 @@ def main() -> int:
                 WITH ann AS MATERIALIZED (
                     SELECT entity_id
                     FROM {{table}}
+                    ORDER BY embedding <=> %s::svec
+                    LIMIT {args.ann_k}
+                ),
+                seeds AS MATERIALIZED (
+                    SELECT DISTINCT entity_id FROM ann
+                )
+                SELECT *
+                FROM sorted_heap_expand_rerank(
+                    '{{table}}'::regclass,
+                    ARRAY(SELECT entity_id FROM seeds),
+                    %s::svec,
+                    {args.top_k},
+                    {REL_HAS_CHUNK},
+                    0
+                )
+                """,
+                lambda q: (q.query_vec, q.query_vec),
+            )
+
+            summary_seed_expand_sql = base.QueryCase(
+                "summary_seed_expand_in",
+                f"""
+                WITH ann AS MATERIALIZED (
+                    SELECT entity_id
+                    FROM {{table}}
+                    WHERE relation_id = {REL_FILE_SUMMARY}
+                    ORDER BY embedding <=> %s::svec
+                    LIMIT {args.ann_k}
+                ),
+                seeds AS MATERIALIZED (
+                    SELECT DISTINCT entity_id FROM ann
+                ),
+                expanded AS MATERIALIZED (
+                    SELECT *
+                    FROM {{table}}
+                    WHERE entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+                      AND relation_id = {REL_HAS_CHUNK}
+                )
+                SELECT *
+                FROM expanded
+                ORDER BY embedding <=> %s::svec, entity_id, relation_id, target_id
+                LIMIT {args.top_k}
+                """,
+                lambda q: (q.query_vec, q.query_vec),
+            )
+
+            summary_seed_expand_fn = base.QueryCase(
+                "summary_seed_expand_fn",
+                f"""
+                WITH ann AS MATERIALIZED (
+                    SELECT entity_id
+                    FROM {{table}}
+                    WHERE relation_id = {REL_FILE_SUMMARY}
                     ORDER BY embedding <=> %s::svec
                     LIMIT {args.ann_k}
                 ),
@@ -676,6 +763,7 @@ def main() -> int:
             print(f"files:              {file_count}")
             print(f"rows:               {rowcount}")
             print(f"require_edges:      {edge_count}")
+            print(f"summary_rows:       {summary_count}")
             print(f"queries:            {len(questions)}")
             print(f"runs:               {args.runs}")
             print(f"dim:                {args.dim}")
@@ -698,6 +786,9 @@ def main() -> int:
                 ("facts_heap", "facts_heap", seed_expand_sql),
                 ("facts_sh", "facts_sh", seed_expand_sql),
                 ("facts_sh", "facts_sh", seed_expand_fn),
+                ("facts_heap", "facts_heap", summary_seed_expand_sql),
+                ("facts_sh", "facts_sh", summary_seed_expand_sql),
+                ("facts_sh", "facts_sh", summary_seed_expand_fn),
                 ("facts_heap", "facts_heap", seed_plus_require_sql),
                 ("facts_sh", "facts_sh", seed_plus_require_sql),
                 ("facts_heap", "facts_heap", dependency_twohop_sql),
