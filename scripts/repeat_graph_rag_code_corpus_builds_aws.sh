@@ -4,16 +4,20 @@ set -euo pipefail
 # Reproducible repeated-build runner for the real code-corpus GraphRAG benchmark
 # on a user-provided AWS host.
 #
-# It syncs the current repo subset plus the minimal cogniformerus source tree
-# needed by bench_graph_rag_code_corpus.py, installs the extension remotely,
-# and runs repeat_graph_rag_code_corpus_builds.py on the target host.
+# It syncs the current repo subset plus a user-provided local code corpus
+# fixture, installs the extension remotely, and runs
+# repeat_graph_rag_code_corpus_builds.py on the target host.
 
 HOST="${1:-${AWS_HOST:-}}"
 REMOTE_DIR="${2:-${AWS_REMOTE_DIR:-}}"
 PORT_BASE="${3:-${AWS_PORT_BASE:-65300}}"
 REMOTE_PYTHON="${REMOTE_PYTHON:-python3}"
 LOCAL_CODE_ROOT="${LOCAL_CODE_ROOT:-/Users/sergey/Projects/Crystal/cogniformerus}"
+LOCAL_SOURCE_DIR="${LOCAL_SOURCE_DIR:-$LOCAL_CODE_ROOT/src/cogniformerus}"
+LOCAL_QUESTION_SOURCE="${LOCAL_QUESTION_SOURCE:-$LOCAL_CODE_ROOT/bin/butler_code_test.cr}"
 REMOTE_CODE_ROOT="${REMOTE_CODE_ROOT:-$REMOTE_DIR/.graph_rag_code_corpus}"
+REMOTE_SOURCE_DIR="${REMOTE_SOURCE_DIR:-$REMOTE_CODE_ROOT/source}"
+REMOTE_QUESTION_SOURCE="${REMOTE_QUESTION_SOURCE:-$REMOTE_CODE_ROOT/questions/$(basename "$LOCAL_QUESTION_SOURCE")}"
 
 LOCAL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPEATS="${REPEATS:-3}"
@@ -34,8 +38,13 @@ if [[ -z "$HOST" || -z "$REMOTE_DIR" ]]; then
   exit 2
 fi
 
-if [[ ! -d "$LOCAL_CODE_ROOT/src/cogniformerus" || ! -f "$LOCAL_CODE_ROOT/bin/butler_code_test.cr" ]]; then
-  echo "local cogniformerus tree not found under $LOCAL_CODE_ROOT" >&2
+if [[ ! -d "$LOCAL_SOURCE_DIR" ]]; then
+  echo "local source dir not found: $LOCAL_SOURCE_DIR" >&2
+  exit 2
+fi
+
+if [[ ! -f "$LOCAL_QUESTION_SOURCE" ]]; then
+  echo "local question source not found: $LOCAL_QUESTION_SOURCE" >&2
   exit 2
 fi
 
@@ -69,13 +78,13 @@ rsync -az --delete --delete-excluded \
   "$HOST:$REMOTE_DIR/"
 
 echo "== sync code corpus fixture =="
-ssh "${SSH_OPTS[@]}" "$HOST" "mkdir -p '$REMOTE_CODE_ROOT/src' '$REMOTE_CODE_ROOT/bin'"
+ssh "${SSH_OPTS[@]}" "$HOST" "mkdir -p '$REMOTE_SOURCE_DIR' '$(dirname "$REMOTE_QUESTION_SOURCE")'"
 rsync -az --delete \
-  "$LOCAL_CODE_ROOT/src/cogniformerus" \
-  "$HOST:$REMOTE_CODE_ROOT/src/"
+  "$LOCAL_SOURCE_DIR/" \
+  "$HOST:$REMOTE_SOURCE_DIR/"
 rsync -az \
-  "$LOCAL_CODE_ROOT/bin/butler_code_test.cr" \
-  "$HOST:$REMOTE_CODE_ROOT/bin/"
+  "$LOCAL_QUESTION_SOURCE" \
+  "$HOST:$REMOTE_QUESTION_SOURCE"
 
 QUESTION_FILTER_ARG=""
 if [[ -n "$QUESTION_FILTER" ]]; then
@@ -100,6 +109,8 @@ cd '$REMOTE_DIR'
   --shared-buffers-mb '$SHARED_BUFFERS_MB' \
   --backend-mode '$BACKEND_MODE' \
   --cogniformerus-root '$REMOTE_CODE_ROOT' \
+  --source-dir '$REMOTE_SOURCE_DIR' \
+  --question-source '$REMOTE_QUESTION_SOURCE' \
   --install-cmd "sudo make -C '$REMOTE_DIR' install" \
   $QUESTION_FILTER_ARG \
   $EXTRA_ARGS

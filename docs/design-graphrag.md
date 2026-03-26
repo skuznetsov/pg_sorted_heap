@@ -2887,3 +2887,24 @@ So the external folding split is now sharper:
   - external folding is no longer blocked by an unsolved quality gap
   - it is blocked by a quality/latency tradeoff that is much worse than on the
     primary `cogniformerus` code corpus
+
+That local result also transferred to AWS ARM64 (`4 vCPU`, `8 GiB RAM`) under a
+fresh `3`-build repeated-build protocol:
+
+- generic `prompt_summary_snippet_py`
+  - `p50 median 1.540 ms`, range `1.535-1.604 ms`
+  - stable `90.5% / 83.3%`
+- generic `prompt_lexseed_require_summary_snippet_py`
+  - `p50 median 14.407 ms`, range `14.400-14.537 ms`
+  - stable `100.0% / 100.0%`
+- code-aware `prompt_summary_snippet_py`
+  - `p50 median 1.775 ms`, range `1.729-1.836 ms`
+  - stable `79.8% / 66.7%`
+- code-aware `prompt_lexseed_require_summary_snippet_py`
+  - `p50 median 14.509 ms`, range `14.490-14.633 ms`
+  - stable `100.0% / 100.0%`
+
+So the external rescue is now **cross-environment verified**, not a local
+artifact. The quality/latency tradeoff also survives the environment change: on
+AWS the rescue remains much slower than the primary in-repo winners while
+staying reproducibly correct on the external corpus.
