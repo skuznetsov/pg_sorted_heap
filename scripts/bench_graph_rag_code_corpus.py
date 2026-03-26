@@ -33,6 +33,7 @@ import re
 import shlex
 import statistics
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -268,6 +269,59 @@ def file_summary_text(relative: str, chunks: list[CodeChunk], token_budget: int 
     return "\n".join(parts)
 
 
+def file_lexical_seed_text(
+    relative: str,
+    summary_text: str,
+    require_targets: list[str],
+    token_budget: int = 192,
+) -> str:
+    seen: set[str] = set()
+    ordered_tokens: list[str] = []
+    counts = Counter()
+    boosted: set[str] = set()
+
+    def add_token(token: str, *, boost: bool = False) -> None:
+        lowered = token.lower()
+        if lowered in PROMPT_STOPWORDS:
+            return
+        if len(lowered) <= 2 and not lowered.isdigit():
+            return
+        if lowered not in seen:
+            seen.add(lowered)
+            ordered_tokens.append(lowered)
+        counts[lowered] += 1
+        if boost:
+            boosted.add(lowered)
+
+    for token in code_aware_tokens(relative):
+        add_token(token, boost=True)
+
+    for required in require_targets:
+        for token in code_aware_tokens(required):
+            add_token(token, boost=True)
+
+    for token in code_aware_tokens(summary_text):
+        add_token(token)
+
+    ranked = sorted(
+        ordered_tokens,
+        key=lambda token: (
+            0 if token in boosted else 1,
+            -counts[token],
+            len(token),
+            token,
+        ),
+    )
+
+    seed_tokens = ranked[:token_budget]
+    return "\n".join(
+        [
+            f"# File Lexical Seed: {relative}",
+            " ".join(seed_tokens),
+        ]
+    )
+
+
 def list_source_files(src_dir: Path) -> list[Path]:
     files = sorted(path for path in src_dir.rglob("*.cr") if path.is_file())
     if not files:
@@ -482,6 +536,32 @@ def build_code_csv(src_dir: Path, csv_path: Path, dim: int, window: int, overlap
                 edge_count += 1
 
     return len(files), rowcount, edge_count, summary_count
+
+
+def build_code_seed_csv(src_dir: Path, csv_path: Path, dim: int, window: int, overlap: int, embedding_mode: str) -> int:
+    files = list_source_files(src_dir)
+    rel_to_id = {str(path.relative_to(src_dir)): idx for idx, path in enumerate(files, start=1)}
+    rowcount = 0
+
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        next_chunk_id = 1
+        for file_id, path in enumerate(files, start=1):
+            relative = str(path.relative_to(src_dir))
+            chunks, next_chunk_id = chunk_source_file(path, src_dir, file_id, window, overlap, next_chunk_id)
+            summary_text = file_summary_text(relative, chunks)
+            require_targets = resolve_local_require_targets(path, src_dir, rel_to_id)
+            lexical_text = file_lexical_seed_text(relative, summary_text, require_targets)
+            w.writerow(
+                [
+                    file_id,
+                    vectorize_text(lexical_text, dim, embedding_mode),
+                    lexical_text,
+                ]
+            )
+            rowcount += 1
+
+    return rowcount
 
 
 def verify_helper_equivalence(cur, table_name: str, questions: list[CodeQuestion], ann_k: int, top_k: int) -> None:
@@ -1113,6 +1193,7 @@ def main() -> int:
     install_cmd = shlex.split(args.install_cmd) if args.install_cmd else None
     tmp, pg_bindir = base.init_temp_cluster(repo_root, port, tmp_root, args.shared_buffers_mb, install_cmd)
     csv_path = tmp / "facts_code_corpus.csv"
+    seed_csv_path = tmp / "facts_code_seed.csv"
 
     try:
         questions = parse_crossfile_questions(question_source, args.dim)
@@ -1162,6 +1243,14 @@ def main() -> int:
             args.chunk_overlap,
             args.embedding_mode,
         )
+        build_code_seed_csv(
+            source_dir,
+            seed_csv_path,
+            args.dim,
+            args.chunk_window,
+            args.chunk_overlap,
+            args.embedding_mode,
+        )
 
         conn = base.connect(tmp, port)
         cur = conn.cursor()
@@ -1171,6 +1260,24 @@ def main() -> int:
             cur.execute(f"SET sorted_hnsw.ef_search = {args.ef_search}")
             base.bootstrap_schema(cur, args.dim)
             base.load_data(cur, csv_path)
+            cur.execute(
+                f"""
+                CREATE TABLE facts_seed (
+                    entity_id int4 PRIMARY KEY,
+                    embedding svec({args.dim}) NOT NULL,
+                    payload text NOT NULL
+                )
+                """
+            )
+            with open(seed_csv_path, "r", encoding="utf-8") as f:
+                cur.copy_expert(
+                    """
+                    COPY facts_seed (entity_id, embedding, payload)
+                    FROM STDIN WITH (FORMAT csv)
+                    """,
+                    f,
+                )
+            cur.execute("ANALYZE facts_seed")
             base.build_indexes(cur, args.ef_construction, m=args.m)
 
             if args.backend_mode == "fresh":
@@ -1572,6 +1679,114 @@ def main() -> int:
                     SELECT entity_id
                     FROM {{table}}
                     WHERE relation_id = {REL_FILE_SUMMARY}
+                    ORDER BY (
+                        SELECT count(*)
+                        FROM unnest(%s::text[]) kw
+                        WHERE position(lower(kw) in lower(payload)) > 0
+                    ) DESC,
+                    embedding <=> %s::svec,
+                    entity_id
+                    LIMIT 2
+                ),
+                require_seed AS MATERIALIZED (
+                    SELECT DISTINCT target_id AS entity_id
+                    FROM sorted_heap_expand_ids(
+                        '{{table}}'::regclass,
+                        ARRAY(SELECT entity_id FROM lexical_seed),
+                        {REL_REQUIRES_FILE},
+                        0
+                    )
+                ),
+                ann_summaries AS MATERIALIZED (
+                    SELECT
+                        s.*,
+                        (
+                            SELECT count(*)
+                            FROM unnest(%s::text[]) kw
+                            WHERE position(lower(kw) in lower(s.payload)) > 0
+                        ) AS lexical_hits,
+                        (s.embedding <=> %s::svec) AS semantic_distance,
+                        0 AS source_rank
+                    FROM sorted_heap_expand_ids(
+                        '{{table}}'::regclass,
+                        ARRAY(SELECT entity_id FROM ann),
+                        {REL_FILE_SUMMARY},
+                        0
+                    ) AS s
+                    ORDER BY lexical_hits DESC, semantic_distance, entity_id
+                    LIMIT {max(1, args.top_k // 2)}
+                ),
+                lexical_require_summaries AS MATERIALIZED (
+                    SELECT
+                        s.*,
+                        (
+                            SELECT count(*)
+                            FROM unnest(%s::text[]) kw
+                            WHERE position(lower(kw) in lower(s.payload)) > 0
+                        ) AS lexical_hits,
+                        (s.embedding <=> %s::svec) AS semantic_distance,
+                        1 AS source_rank
+                    FROM sorted_heap_expand_ids(
+                        '{{table}}'::regclass,
+                        ARRAY(
+                            SELECT entity_id FROM lexical_seed
+                            UNION
+                            SELECT entity_id FROM require_seed
+                        ),
+                        {REL_FILE_SUMMARY},
+                        0
+                    ) AS s
+                    ORDER BY lexical_hits DESC, semantic_distance, entity_id
+                    LIMIT {args.top_k}
+                ),
+                combined AS MATERIALIZED (
+                    SELECT entity_id, relation_id, target_id, embedding, payload, lexical_hits, semantic_distance, source_rank
+                    FROM ann_summaries
+                    UNION ALL
+                    SELECT entity_id, relation_id, target_id, embedding, payload, lexical_hits, semantic_distance, source_rank
+                    FROM lexical_require_summaries
+                ),
+                deduped AS MATERIALIZED (
+                    SELECT entity_id, relation_id, target_id, embedding, payload, lexical_hits, semantic_distance, source_rank
+                    FROM (
+                        SELECT
+                            c.*,
+                            row_number() OVER (
+                                PARTITION BY c.entity_id
+                                ORDER BY c.source_rank, c.lexical_hits DESC, c.semantic_distance, c.target_id
+                            ) AS entity_rank
+                        FROM combined c
+                    ) ranked
+                    WHERE entity_rank = 1
+                )
+                SELECT entity_id, relation_id, target_id, embedding, payload
+                FROM deduped
+                ORDER BY lexical_hits DESC, source_rank, semantic_distance, entity_id, relation_id, target_id
+                LIMIT {args.top_k}
+                """,
+                lambda q: (
+                    q.query_vec,
+                    list(extract_prompt_terms(q.prompt)),
+                    q.query_vec,
+                    list(extract_prompt_terms(q.prompt)),
+                    q.query_vec,
+                    list(extract_prompt_terms(q.prompt)),
+                    q.query_vec,
+                ),
+            )
+
+            prompt_compactseed_require_summary_snippet_fn = base.QueryCase(
+                "prompt_compactseed_require_summary_snippet_fn",
+                f"""
+                WITH ann AS MATERIALIZED (
+                    SELECT entity_id
+                    FROM {{table}}
+                    ORDER BY embedding <=> %s::svec
+                    LIMIT {args.ann_k}
+                ),
+                lexical_seed AS MATERIALIZED (
+                    SELECT entity_id
+                    FROM facts_seed
                     ORDER BY (
                         SELECT count(*)
                         FROM unnest(%s::text[]) kw
@@ -2675,6 +2890,7 @@ def main() -> int:
                 oracle_prompt_summary_snippet_sql.name: summary_snippet_postprocess,
                 prompt_lexseed_require_summary_snippet_sql.name: summary_snippet_postprocess,
                 prompt_lexseed_require_summary_snippet_fn.name: summary_snippet_postprocess,
+                prompt_compactseed_require_summary_snippet_fn.name: summary_snippet_postprocess,
             }
 
             cases: list[tuple[str, str, base.QueryCase]] = [
@@ -2705,6 +2921,7 @@ def main() -> int:
                 ("facts_heap", "facts_heap", prompt_lexseed_require_summary_snippet_sql),
                 ("facts_sh", "facts_sh", prompt_lexseed_require_summary_snippet_sql),
                 ("facts_sh", "facts_sh", prompt_lexseed_require_summary_snippet_fn),
+                ("facts_sh", "facts_sh", prompt_compactseed_require_summary_snippet_fn),
                 ("facts_heap", "facts_heap", summary_seed_summary_output_sql),
                 ("facts_sh", "facts_sh", summary_seed_summary_output_sql),
                 ("facts_heap", "facts_heap", prompt_summary_seed_rerank_sql),

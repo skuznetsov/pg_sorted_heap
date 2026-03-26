@@ -2842,13 +2842,17 @@ point (`384D`, `ann_k=16`, `top_k=4`, `ef_search=64`, `ef_construction=200`,
   - quality drifted across fresh builds: `90.5-100.0%` keyword coverage,
     `83.3-100.0%` full hits
 - `prompt_lexseed_require_summary_snippet_fn`
-  - `p50 median 10.856 ms`, range `10.738-10.948 ms`
+  - the first non-oracle rescue to `100.0% / 100.0%`
+  - but under a colder repeated-build protocol it turned out to be much more
+    expensive than the earlier one-build numbers suggested:
+    `p50 median 28.266 ms`, range `26.887-30.698`
+- `prompt_compactseed_require_summary_snippet_fn`
+  - `p50 median 5.940 ms`, range `5.914-6.128`
   - stable `100.0% / 100.0%`
 - `oracle_prompt_summary_snippet_py`
   - on a bounded full rerun it also stayed at `100.0% / 100.0%`, but the
-    non-oracle `prompt_lexseed_require_summary_snippet_fn` already matches that
-    quality, so oracle seeds are no longer the interesting external-generic
-    diagnostic
+    non-oracle compact-seed rescue already matches that quality, so oracle
+    seeds are no longer the interesting external-generic diagnostic
 
 Interpretation:
 
@@ -2856,17 +2860,16 @@ Interpretation:
   `prompt_summary_snippet_py` was too strong
 - the generic baseline is now clearly less robust on this corpus than on the
   in-repo `cogniformerus` slice
-- a narrow non-oracle rescue does exist: supplement ANN summary seeds with
-  lexical summary hits and then pull one-hop `REQUIRES_FILE` summaries from
-  those lexical anchors
-- the helper-backed rescue variant is slightly better than the pure SQL rescue:
-  it keeps the same `100.0% / 100.0%` result while removing the rescue path's
-  shared reads and shaving a small but consistent amount off `p50`
-- that rescue closes the quality gap, but only by paying roughly a `10x`
-  latency penalty
+- the first full-summary lexical rescue proved that the external gap was
+  solvable, but it was too expensive to be a real frontier
+- the stronger branch was a **different lexical-seed representation**:
+  a compact per-file seed table built from file path terms, require-target
+  terms, and deduplicated summary tokens
+- that compact-seed rescue still closes the quality gap to `100.0% / 100.0%`,
+  but cuts the old full-summary lexical rescue by about `4.8x` locally
 
 An isolated timing split then narrowed where that penalty actually sits. On a
-fresh local `3`-run sweep of only the helper-backed rescue:
+fresh local `3`-run sweep of only the old full-summary helper-backed rescue:
 
 - generic `prompt_lexseed_require_summary_snippet_fn`
   - `avg fetch ms/query = 10.674`
@@ -2905,7 +2908,10 @@ At the same repeated-build point:
   - `p50 median 1.080 ms`, range `1.048-1.146 ms`
   - stable `79.8% / 66.7%`
 - code-aware `prompt_lexseed_require_summary_snippet_fn`
-  - `p50 median 10.916 ms`, range `10.895-11.654 ms`
+  - `p50 median 36.676 ms`, range `29.806-40.705`
+  - stable `100.0% / 100.0%`
+- code-aware `prompt_compactseed_require_summary_snippet_fn`
+  - `p50 median 5.804 ms`, range `5.776-6.510`
   - stable `100.0% / 100.0%`
 - code-aware `oracle_prompt_summary_snippet_py`
   - `p50 median 1.217 ms`, range `1.149-1.303 ms`
@@ -2915,14 +2921,16 @@ So the external folding split is now sharper:
 
 - both **generic** and **code-aware** external folding now have a verified
   non-oracle rescue to `100.0% / 100.0%`
-- the external problem really was a **seed-selection problem**, not a snippet
-  extraction problem
-- but the rescue is expensive enough that it does **not** replace the faster
-  in-repo winners as the default repository story
+- the external problem really was a **seed-representation problem**, not a
+  snippet extraction problem
+- the current external default is the compact-seed rescue, not the old
+  full-summary lexical rescue
+- the old full-summary rescue is now useful mainly as a diagnostic anchor for
+  why the compact representation matters
 - the honest conclusion is narrower:
   - external folding is no longer blocked by an unsolved quality gap
-  - it is blocked by a quality/latency tradeoff that is much worse than on the
-    primary `cogniformerus` code corpus
+  - it still pays a quality/latency tax relative to the primary
+    `cogniformerus` code corpus, but that tax is now much smaller than before
 
 That local result also transferred to AWS ARM64 (`4 vCPU`, `8 GiB RAM`) under a
 fresh `3`-build repeated-build protocol:
@@ -2931,25 +2939,38 @@ fresh `3`-build repeated-build protocol:
   - `p50 median 1.540 ms`, range `1.535-1.604 ms`
   - stable `90.5% / 83.3%`
 - generic `prompt_lexseed_require_summary_snippet_fn`
-  - `p50 median 14.328 ms`, range `14.280-14.401 ms`
+  - `p50 median 41.960 ms`, range `41.747-42.081`
+  - stable `100.0% / 100.0%`
+- generic `prompt_compactseed_require_summary_snippet_fn`
+  - `p50 median 8.839 ms`, range `8.732-8.846`
   - stable `100.0% / 100.0%`
 - code-aware `prompt_summary_snippet_py`
   - `p50 median 1.775 ms`, range `1.729-1.836 ms`
   - stable `79.8% / 66.7%`
 - code-aware `prompt_lexseed_require_summary_snippet_fn`
-  - `p50 median 14.400 ms`, range `14.347-14.415 ms`
+  - `p50 median 60.413 ms`, range `60.298-60.660`
+  - stable `100.0% / 100.0%`
+- code-aware `prompt_compactseed_require_summary_snippet_fn`
+  - `p50 median 8.392 ms`, range `8.329-8.413`
   - stable `100.0% / 100.0%`
 
-So the external rescue is now **cross-environment verified**, not a local
-artifact. The quality/latency tradeoff also survives the environment change: on
-AWS the rescue remains much slower than the primary in-repo winners while
-staying reproducibly correct on the external corpus.
+So the compact-seed external rescue is now **cross-environment verified**, not
+a local artifact. The speedup over the old full-summary lexical rescue also
+survives the environment change:
+
+- generic: `41.960 ms -> 8.839 ms`
+- code-aware: `60.413 ms -> 8.392 ms`
+
+The external rescue is still slower than the primary in-repo winners, but it is
+no longer "full-quality only at tens of milliseconds".
 
 The next honest optimization target therefore changed. Cheap seed-budget cuts
 were already falsified (`ann_k < 16` and lexical-seed `LIMIT 1` both got
 worse), and the timing split shows that further work should focus on reducing
-the post-seed summary/require candidate work rather than treating snippet
-extraction as the main bottleneck.
+the old full-summary lexical-seed cost. The compact lexical seed table already
+eliminated most of that cost, so the next branch is no longer "make lexical
+seeding viable at all"; it is whether the compact representation can be pushed
+closer to the primary in-repo code-corpus frontier.
 
 One obvious branch was also falsified directly: truncating lexical scoring to a
 summary prefix. On the external corpus:
