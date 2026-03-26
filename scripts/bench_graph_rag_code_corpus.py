@@ -244,7 +244,7 @@ def file_summary_text(relative: str, chunks: list[CodeChunk], token_budget: int 
 
 
 def list_source_files(src_dir: Path) -> list[Path]:
-    files = sorted(src_dir.rglob("*.cr"))
+    files = sorted(path for path in src_dir.rglob("*.cr") if path.is_file())
     if not files:
         raise RuntimeError(f"no Crystal source files found under {src_dir}")
     return files
