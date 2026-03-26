@@ -2385,3 +2385,52 @@ So the refined tiny-budget frontier is now:
   - best coverage at the same full-hit level: summary-heavy hybrid
 - **code-aware mode**:
   - summary-heavy hybrid is now the strongest point
+
+### Summary-heavy hybrid with summary-only seeds
+
+The remaining seed question after the fixed-ratio result was very narrow:
+
+> if the winning hybrid is already summary-heavy, should its seed unit also be
+> switched fully to summaries?
+
+That was tested directly against the current summary-heavy mixed-seed hybrid.
+
+Stable local result on the same real `40`-file / `840`-row / `6`-question
+point, `ann_k=16`, `top_k=4`, `3` runs:
+
+- generic embedding mode:
+  - prompt summary rerank:
+    - `0.395 ms`
+    - `73.3%`
+    - `50.0%`
+  - mixed-seed summary-heavy hybrid:
+    - `1.062 ms`
+    - `86.7%`
+    - `50.0%`
+  - summary-seeded summary-heavy hybrid:
+    - `1.175 ms`
+    - `87.6%`
+    - `50.0%`
+- code-aware embedding mode:
+  - prompt summary rerank:
+    - `0.390 ms`
+    - `77.6%`
+    - `33.3%`
+  - mixed-seed summary-heavy hybrid:
+    - `0.965 ms`
+    - `84.3%`
+    - `50.0%`
+  - summary-seeded summary-heavy hybrid:
+    - `0.981 ms`
+    - `77.6%`
+    - `33.3%`
+
+This closes the seed-unit branch for the current frontier:
+
+- **generic mode**:
+  - summary-only seeds can squeeze out a tiny extra coverage gain, but they do
+    not improve full hits and they cost more latency than the mixed-seed
+    summary-heavy hybrid
+- **code-aware mode**:
+  - summary-only seeds are clearly worse; the mixed-seed summary-heavy hybrid
+    remains the strongest point
