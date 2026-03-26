@@ -2690,9 +2690,13 @@ Verified local result on the stable real code-corpus point (`40` files,
     - `77.6%`
     - `33.3%`
   - `prompt_summary_snippet_py`:
-    - warm-cache `p50 0.570-0.619 ms`
+    - warm-cache `p50 0.623 ms`
     - `97.6%`
     - `83.3%`
+  - `prompt_symbol_summary_snippet_py`:
+    - warm-cache `p50 0.970-0.989 ms`
+    - `100.0%`
+    - `100.0%`
 
 Per-question generic rerun on the same corpus shows what the snippet layer
 actually fixed:
@@ -2705,21 +2709,40 @@ actually fixed:
   - `Response memory policy`
   - `Streaming overlap`
 
+Per-question code-aware rerun with `prompt_symbol_summary_snippet_py` now also
+solves the full set at `100.0%`, including the old remaining miss:
+
+- `Memory store flow`
+
 Interpretation:
 
 - the remaining plateau on this real code corpus was **not** primarily file
   retrieval
   - it was a file-local evidence selection problem
+- the last code-aware miss turned out to be a **seed-ranking problem inside the
+  summary path**, not a snippet-window problem
+  - `HierarchicalMemory` was already present in the summary row for
+    `memory/hierarchical.cr`
+  - the fix was a bounded symbol-aware variant,
+    `prompt_symbol_summary_snippet_py`, which:
+    - extracts exact prompt symbols like `HierarchicalMemory`,
+      `TwoStageAnswerer`, `DialogueNLU`
+    - unions a tiny exact-symbol summary seed set with the existing ANN seeds
+    - ranks summary rows by `symbol_hits` before the older prompt-term score
 - the strongest fix was not "wider windows"
   - it was preserving summary rows while adding code-structured snippets
     underneath them
 - prompt-focused snippet extraction is the first branch that moves the real
   code-corpus benchmark from `50.0%` to `100.0%` full hits at the same
-  tiny-budget `top_k=4`, while also lifting generic keyword coverage from
-  `73.3%` to `100.0%`
+  tiny-budget `top_k=4`
+- the current frontier is now split by embedding mode:
+  - generic: `prompt_summary_snippet_py` remains the better latency point
+  - code-aware: `prompt_symbol_summary_snippet_py` is the quality winner
 
 Important caveat:
 
 - the warm numbers rely on an in-process `(file, prompt)` snippet cache
 - the cold first-pass cost is still materially higher than pure SQL rerank
 - so this is a quality-oriented contract, not a free latency win
+- the symbol-aware variant is not a generic improvement:
+  - in generic mode it gives no quality lift and only adds cost

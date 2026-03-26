@@ -52,6 +52,7 @@ QUESTION_TIER_RE = re.compile(r"tier:\s*Tier::([A-Za-z_]+),\s*$")
 QUOTED_RE = re.compile(r'"([^"]+)"')
 REQUIRE_RE = re.compile(r'^require\s+"([^"]+)"')
 PROMPT_TERM_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\d+")
+PROMPT_SYMBOL_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_?]*")
 CODE_TOKEN_RE = re.compile(r"[A-Za-z0-9_']+")
 CAMEL_SPLIT_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z]|\b)|[A-Z]?[a-z]+|\d+")
 FILE_HEADER_RE = re.compile(r"^# File(?: Summary)?: ([^\n]+)")
@@ -344,6 +345,26 @@ def extract_prompt_terms(prompt: str) -> tuple[str, ...]:
         terms.append(lowered)
 
     return tuple(terms)
+
+
+def extract_prompt_symbols(prompt: str) -> tuple[str, ...]:
+    symbols: list[str] = []
+    seen: set[str] = set()
+
+    for token in PROMPT_SYMBOL_RE.findall(prompt):
+        lowered = token.lower()
+        if lowered in PROMPT_STOPWORDS:
+            continue
+        has_inner_upper = any(ch.isupper() for ch in token[1:])
+        looks_symbolic = has_inner_upper or "_" in token or (token.isupper() and len(token) > 1)
+        if not looks_symbolic:
+            continue
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        symbols.append(token)
+
+    return tuple(symbols)
 
 
 def resolve_local_require_targets(path: Path, src_dir: Path, rel_to_id: dict[str, int]) -> list[str]:
@@ -1288,6 +1309,75 @@ def main() -> int:
                 "prompt_summary_snippet_py",
                 prompt_summary_rerank_sql.sql_template,
                 prompt_summary_rerank_sql.params_builder,
+            )
+
+            prompt_symbol_summary_snippet_sql = base.QueryCase(
+                "prompt_symbol_summary_snippet_py",
+                f"""
+                WITH ann AS MATERIALIZED (
+                    SELECT entity_id
+                    FROM {{table}}
+                    ORDER BY embedding <=> %s::svec
+                    LIMIT {args.ann_k}
+                ),
+                symbol_seed AS MATERIALIZED (
+                    SELECT entity_id
+                    FROM {{table}}
+                    WHERE relation_id = {REL_FILE_SUMMARY}
+                      AND EXISTS (
+                        SELECT 1
+                        FROM unnest(%s::text[]) sym
+                        WHERE position(lower(sym) in lower(payload)) > 0
+                      )
+                    ORDER BY (
+                        SELECT count(*)
+                        FROM unnest(%s::text[]) sym
+                        WHERE position(lower(sym) in lower(payload)) > 0
+                    ) DESC,
+                    embedding <=> %s::svec,
+                    entity_id
+                    LIMIT 2
+                ),
+                seeds AS MATERIALIZED (
+                    SELECT DISTINCT entity_id FROM ann
+                    UNION
+                    SELECT DISTINCT entity_id FROM symbol_seed
+                ),
+                summaries AS MATERIALIZED (
+                    SELECT
+                        s.*,
+                        (
+                            SELECT count(*)
+                            FROM unnest(%s::text[]) sym
+                            WHERE position(lower(sym) in lower(s.payload)) > 0
+                        ) AS symbol_hits,
+                        (
+                            SELECT count(*)
+                            FROM unnest(%s::text[]) kw
+                            WHERE position(lower(kw) in lower(s.payload)) > 0
+                        ) AS lexical_hits,
+                        (s.embedding <=> %s::svec) AS semantic_distance
+                    FROM {{table}} s
+                    WHERE s.entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+                      AND s.relation_id = {REL_FILE_SUMMARY}
+                )
+                SELECT *
+                FROM summaries
+                ORDER BY symbol_hits DESC,
+                lexical_hits DESC,
+                semantic_distance,
+                entity_id, relation_id, target_id
+                LIMIT {args.top_k}
+                """,
+                lambda q: (
+                    q.query_vec,
+                    list(extract_prompt_symbols(q.prompt)),
+                    list(extract_prompt_symbols(q.prompt)),
+                    q.query_vec,
+                    list(extract_prompt_symbols(q.prompt)),
+                    list(extract_prompt_terms(q.prompt)),
+                    q.query_vec,
+                ),
             )
 
             summary_seed_summary_output_sql = base.QueryCase(
@@ -2245,9 +2335,11 @@ def main() -> int:
             for question in questions:
                 oracle_ids = ",".join(str(v) for v in question.oracle_file_ids)
                 prompt_terms = ",".join(extract_prompt_terms(question.prompt))
+                prompt_symbols = ",".join(extract_prompt_symbols(question.prompt))
                 print(
                     f"query|label={question.label}|keywords={','.join(question.keywords)}|"
-                    f"prompt_terms={prompt_terms}|oracle_files={oracle_ids}|prompt={question.prompt}"
+                    f"prompt_terms={prompt_terms}|prompt_symbols={prompt_symbols}|"
+                    f"oracle_files={oracle_ids}|prompt={question.prompt}"
                 )
             print()
 
@@ -2276,6 +2368,7 @@ def main() -> int:
             snippet_cache: dict[tuple[str, str], str] = {}
             postprocessors: dict[str, callable] = {
                 prompt_summary_snippet_sql.name: summary_snippet_postprocess,
+                prompt_symbol_summary_snippet_sql.name: summary_snippet_postprocess,
             }
 
             cases: list[tuple[str, str, base.QueryCase]] = [
@@ -2299,6 +2392,8 @@ def main() -> int:
                 ("facts_sh", "facts_sh", prompt_summary_rerank_sql),
                 ("facts_heap", "facts_heap", prompt_summary_snippet_sql),
                 ("facts_sh", "facts_sh", prompt_summary_snippet_sql),
+                ("facts_heap", "facts_heap", prompt_symbol_summary_snippet_sql),
+                ("facts_sh", "facts_sh", prompt_symbol_summary_snippet_sql),
                 ("facts_heap", "facts_heap", summary_seed_summary_output_sql),
                 ("facts_sh", "facts_sh", summary_seed_summary_output_sql),
                 ("facts_heap", "facts_heap", prompt_summary_seed_rerank_sql),
