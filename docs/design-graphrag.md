@@ -2323,3 +2323,65 @@ That means the current strongest small-budget choices are now split:
   - summaries-only remain the better contract
 - **code-aware mode**:
   - hybrid summary+chunk output is now the better contract
+
+### Fixed-ratio hybrid packing
+
+The previous hybrid branch still left one obvious ambiguity:
+
+> was the hybrid result about having both summaries and chunks at all, or just
+> about how many summary slots the tiny `top_k=4` budget reserved?
+
+That was tested with two fixed-ratio mixed-seed hybrids:
+
+- **summary-light**: `1` summary + `3` chunk slots
+- **summary-heavy**: `3` summary slots + `1` chunk slot
+
+Stable local result on the same real `40`-file / `840`-row / `6`-question
+point, `ann_k=16`, `top_k=4`, `3` runs:
+
+- generic embedding mode:
+  - prior best full-hit point:
+    - prompt summary rerank
+    - `0.337 ms`
+    - `73.3%`
+    - `50.0%`
+  - prior balanced hybrid:
+    - `1.490 ms`
+    - `84.3%`
+    - `33.3%`
+  - summary-light hybrid:
+    - `1.753 ms`
+    - `80.0%`
+    - `33.3%`
+  - summary-heavy hybrid:
+    - `1.057 ms`
+    - `86.7%`
+    - `50.0%`
+- code-aware embedding mode:
+  - prior best point:
+    - balanced hybrid
+    - `1.566 ms`
+    - `84.3%`
+    - `50.0%`
+  - summary-light hybrid:
+    - `2.246 ms`
+    - `68.1%`
+    - `33.3%`
+  - summary-heavy hybrid:
+    - `0.879 ms`
+    - `84.3%`
+    - `50.0%`
+
+This resolves the remaining hybrid ambiguity:
+
+- the hybrid win is **not** about chunks in general
+- it is specifically about reserving a small number of chunk slots while
+  keeping the budget summary-heavy
+
+So the refined tiny-budget frontier is now:
+
+- **generic mode**:
+  - best latency/full-hit tradeoff: pure prompt summary rerank
+  - best coverage at the same full-hit level: summary-heavy hybrid
+- **code-aware mode**:
+  - summary-heavy hybrid is now the strongest point

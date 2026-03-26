@@ -1090,6 +1090,181 @@ def main() -> int:
                 ),
             )
 
+            prompt_summary_chunk_hybrid_s1_sql = base.QueryCase(
+                "prompt_summary_chunk_hybrid_s1_in",
+                f"""
+                WITH ann AS MATERIALIZED (
+                    SELECT entity_id
+                    FROM {{table}}
+                    ORDER BY embedding <=> %s::svec
+                    LIMIT {args.ann_k}
+                ),
+                seeds AS MATERIALIZED (
+                    SELECT DISTINCT entity_id FROM ann
+                ),
+                summary_candidates AS MATERIALIZED (
+                    SELECT
+                        s.*,
+                        (
+                            SELECT count(*)
+                            FROM unnest(%s::text[]) kw
+                            WHERE position(lower(kw) in lower(s.payload)) > 0
+                        ) AS lexical_hits,
+                        (s.embedding <=> %s::svec) AS semantic_distance
+                    FROM {{table}} s
+                    WHERE s.entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+                      AND s.relation_id = {REL_FILE_SUMMARY}
+                    ORDER BY lexical_hits DESC, semantic_distance, entity_id
+                    LIMIT {max(1, args.top_k - 1)}
+                ),
+                summary_output AS MATERIALIZED (
+                    SELECT entity_id, relation_id, target_id, embedding, payload, lexical_hits, semantic_distance, 0 AS row_kind
+                    FROM summary_candidates
+                    ORDER BY lexical_hits DESC, semantic_distance, entity_id
+                    LIMIT 1
+                ),
+                best_chunks AS MATERIALIZED (
+                    SELECT entity_id, relation_id, target_id, embedding, payload, lexical_hits, semantic_distance, 1 AS row_kind
+                    FROM (
+                        SELECT
+                            c.entity_id,
+                            c.relation_id,
+                            c.target_id,
+                            c.embedding,
+                            c.payload,
+                            (
+                                SELECT count(*)
+                                FROM unnest(%s::text[]) kw
+                                WHERE position(lower(kw) in lower(c.payload)) > 0
+                            ) AS lexical_hits,
+                            (c.embedding <=> %s::svec) AS semantic_distance,
+                            row_number() OVER (
+                                PARTITION BY c.entity_id
+                                ORDER BY (
+                                    SELECT count(*)
+                                    FROM unnest(%s::text[]) kw
+                                    WHERE position(lower(kw) in lower(c.payload)) > 0
+                                ) DESC,
+                                c.embedding <=> %s::svec,
+                                c.target_id
+                            ) AS chunk_rank
+                        FROM {{table}} c
+                        WHERE c.entity_id = ANY (ARRAY(SELECT entity_id FROM summary_candidates))
+                          AND c.relation_id = {REL_HAS_CHUNK}
+                    ) ranked_chunks
+                    WHERE chunk_rank = 1
+                ),
+                combined AS (
+                    SELECT * FROM summary_output
+                    UNION ALL
+                    SELECT * FROM best_chunks
+                )
+                SELECT entity_id, relation_id, target_id, embedding, payload
+                FROM combined
+                ORDER BY row_kind, lexical_hits DESC, semantic_distance, entity_id, relation_id, target_id
+                LIMIT {args.top_k}
+                """,
+                lambda q: (
+                    q.query_vec,
+                    list(extract_prompt_terms(q.prompt)),
+                    q.query_vec,
+                    list(extract_prompt_terms(q.prompt)),
+                    q.query_vec,
+                    list(extract_prompt_terms(q.prompt)),
+                    q.query_vec,
+                ),
+            )
+
+            prompt_summary_chunk_hybrid_s3_sql = base.QueryCase(
+                "prompt_summary_chunk_hybrid_s3_in",
+                f"""
+                WITH ann AS MATERIALIZED (
+                    SELECT entity_id
+                    FROM {{table}}
+                    ORDER BY embedding <=> %s::svec
+                    LIMIT {args.ann_k}
+                ),
+                seeds AS MATERIALIZED (
+                    SELECT DISTINCT entity_id FROM ann
+                ),
+                summary_candidates AS MATERIALIZED (
+                    SELECT
+                        s.*,
+                        (
+                            SELECT count(*)
+                            FROM unnest(%s::text[]) kw
+                            WHERE position(lower(kw) in lower(s.payload)) > 0
+                        ) AS lexical_hits,
+                        (s.embedding <=> %s::svec) AS semantic_distance
+                    FROM {{table}} s
+                    WHERE s.entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+                      AND s.relation_id = {REL_FILE_SUMMARY}
+                    ORDER BY lexical_hits DESC, semantic_distance, entity_id
+                    LIMIT {max(1, args.top_k - 1)}
+                ),
+                summary_output AS MATERIALIZED (
+                    SELECT entity_id, relation_id, target_id, embedding, payload, lexical_hits, semantic_distance, 0 AS row_kind
+                    FROM summary_candidates
+                ),
+                best_chunks AS MATERIALIZED (
+                    SELECT entity_id, relation_id, target_id, embedding, payload, lexical_hits, semantic_distance, 1 AS row_kind
+                    FROM (
+                        SELECT
+                            c.entity_id,
+                            c.relation_id,
+                            c.target_id,
+                            c.embedding,
+                            c.payload,
+                            (
+                                SELECT count(*)
+                                FROM unnest(%s::text[]) kw
+                                WHERE position(lower(kw) in lower(c.payload)) > 0
+                            ) AS lexical_hits,
+                            (c.embedding <=> %s::svec) AS semantic_distance,
+                            row_number() OVER (
+                                PARTITION BY c.entity_id
+                                ORDER BY (
+                                    SELECT count(*)
+                                    FROM unnest(%s::text[]) kw
+                                    WHERE position(lower(kw) in lower(c.payload)) > 0
+                                ) DESC,
+                                c.embedding <=> %s::svec,
+                                c.target_id
+                            ) AS chunk_rank
+                        FROM {{table}} c
+                        WHERE c.entity_id = ANY (
+                            ARRAY(
+                                SELECT entity_id
+                                FROM summary_candidates
+                                ORDER BY lexical_hits DESC, semantic_distance, entity_id
+                                LIMIT 1
+                            )
+                        )
+                          AND c.relation_id = {REL_HAS_CHUNK}
+                    ) ranked_chunks
+                    WHERE chunk_rank = 1
+                ),
+                combined AS (
+                    SELECT * FROM summary_output
+                    UNION ALL
+                    SELECT * FROM best_chunks
+                )
+                SELECT entity_id, relation_id, target_id, embedding, payload
+                FROM combined
+                ORDER BY row_kind, lexical_hits DESC, semantic_distance, entity_id, relation_id, target_id
+                LIMIT {args.top_k}
+                """,
+                lambda q: (
+                    q.query_vec,
+                    list(extract_prompt_terms(q.prompt)),
+                    q.query_vec,
+                    list(extract_prompt_terms(q.prompt)),
+                    q.query_vec,
+                    list(extract_prompt_terms(q.prompt)),
+                    q.query_vec,
+                ),
+            )
+
             oracle_seed_expand_in = base.QueryCase(
                 "oracle_seed_expand_in",
                 f"""
@@ -1382,6 +1557,10 @@ def main() -> int:
                 ("facts_sh", "facts_sh", prompt_summary_seed_rerank_sql),
                 ("facts_heap", "facts_heap", prompt_summary_chunk_hybrid_sql),
                 ("facts_sh", "facts_sh", prompt_summary_chunk_hybrid_sql),
+                ("facts_heap", "facts_heap", prompt_summary_chunk_hybrid_s1_sql),
+                ("facts_sh", "facts_sh", prompt_summary_chunk_hybrid_s1_sql),
+                ("facts_heap", "facts_heap", prompt_summary_chunk_hybrid_s3_sql),
+                ("facts_sh", "facts_sh", prompt_summary_chunk_hybrid_s3_sql),
                 ("facts_heap", "facts_heap", prompt_summary_seed_chunk_hybrid_sql),
                 ("facts_sh", "facts_sh", prompt_summary_seed_chunk_hybrid_sql),
                 ("facts_heap", "facts_heap", oracle_seed_expand_in),
