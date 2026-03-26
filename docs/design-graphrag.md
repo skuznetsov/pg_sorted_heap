@@ -2838,9 +2838,12 @@ point (`384D`, `ann_k=16`, `top_k=4`, `ef_search=64`, `ef_construction=200`,
 `m=24`, fresh backend):
 
 - `prompt_summary_snippet_py`
-  - `p50 median 1.116 ms`, range `0.896-1.123 ms`
-  - `keyword_pct` median `100.0%`, range `90.5-100.0`
-  - `full_pct` median `100.0%`, range `83.3-100.0`
+  - `p50 median 1.030 ms`, range `0.925-1.060 ms`
+  - stable `100.0% / 100.0%`
+- `oracle_prompt_summary_snippet_py`
+  - `p50 median 1.179 ms`, range `1.095-1.315 ms`
+  - same stable `100.0% / 100.0%`
+  - therefore slower, with no quality gain
 - a bounded require-expanded summary variant was tested as a rescue for the
   hard `Lexicographic potential order` prompt
   - it did rescue that one prompt on a bad build by surfacing `folding/potential.cr`
@@ -2850,10 +2853,11 @@ point (`384D`, `ann_k=16`, `top_k=4`, `ef_search=64`, `ef_construction=200`,
 
 Interpretation:
 
-- the current generic snippet contract transfers to a second real code corpus
-  with good quality, but not with the same strict `100/100` stability seen on
-  the smaller in-repo `cogniformerus` slice
-- the remaining variance on `folding/src` is more plausibly HNSW/build
-  variability than a systematic failure of the snippet contract
+- the current generic snippet contract now transfers to a second real code
+  corpus with the same repeated-build `100/100` stability seen on the
+  in-repo `cogniformerus` slice
+- the oracle diagnostic shows that this external real-corpus point is **not**
+  seed-limited at the current operating point; exact/oracle file seeds do not
+  improve quality
 - graph-native `REQUIRES_FILE` expansion is still useful as a diagnostic
   falsifier, but not as the winning retrieval contract on this external corpus

@@ -1380,6 +1380,32 @@ def main() -> int:
                 ),
             )
 
+            oracle_prompt_summary_snippet_sql = base.QueryCase(
+                "oracle_prompt_summary_snippet_py",
+                f"""
+                WITH seeds AS MATERIALIZED (
+                    SELECT DISTINCT unnest(%s::int4[]) AS entity_id
+                ),
+                summaries AS MATERIALIZED (
+                    SELECT *
+                    FROM {{table}}
+                    WHERE entity_id = ANY (ARRAY(SELECT entity_id FROM seeds))
+                      AND relation_id = {REL_FILE_SUMMARY}
+                )
+                SELECT *
+                FROM summaries
+                ORDER BY (
+                    SELECT count(*)
+                    FROM unnest(%s::text[]) kw
+                    WHERE position(lower(kw) in lower(payload)) > 0
+                ) DESC,
+                embedding <=> %s::svec,
+                entity_id, relation_id, target_id
+                LIMIT {args.top_k}
+                """,
+                lambda q: (list(q.oracle_file_ids), list(extract_prompt_terms(q.prompt)), q.query_vec),
+            )
+
             summary_seed_summary_output_sql = base.QueryCase(
                 "summary_seed_summary_output_in",
                 f"""
@@ -2369,6 +2395,7 @@ def main() -> int:
             postprocessors: dict[str, callable] = {
                 prompt_summary_snippet_sql.name: summary_snippet_postprocess,
                 prompt_symbol_summary_snippet_sql.name: summary_snippet_postprocess,
+                oracle_prompt_summary_snippet_sql.name: summary_snippet_postprocess,
             }
 
             cases: list[tuple[str, str, base.QueryCase]] = [
@@ -2394,6 +2421,8 @@ def main() -> int:
                 ("facts_sh", "facts_sh", prompt_summary_snippet_sql),
                 ("facts_heap", "facts_heap", prompt_symbol_summary_snippet_sql),
                 ("facts_sh", "facts_sh", prompt_symbol_summary_snippet_sql),
+                ("facts_heap", "facts_heap", oracle_prompt_summary_snippet_sql),
+                ("facts_sh", "facts_sh", oracle_prompt_summary_snippet_sql),
                 ("facts_heap", "facts_heap", summary_seed_summary_output_sql),
                 ("facts_sh", "facts_sh", summary_seed_summary_output_sql),
                 ("facts_heap", "facts_heap", prompt_summary_seed_rerank_sql),
