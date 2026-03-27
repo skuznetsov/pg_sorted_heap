@@ -141,10 +141,14 @@ Reference design:
   - `sorted_heap_graph_exact_resolve(...)`
   - `sorted_heap_graph_rag_routed_exact(...)`
   - this is the exact-key router for tenant / KB style shard selection
+- and the first richer metadata filter now exists on top of both routed paths:
+  - optional `segment_group` labels at registration time
+  - optional `segment_groups text[]` filters at resolve/query time
+  - this is the first beta surface for hot/sealed or relation-family pruning
 - what is still missing:
-  - richer routing metadata than simple ranges or exact keys
+  - more than one routing dimension per registry row
   - a product-quality shard router contract for tenant / KB / relation-family
-    pruning without hand-managed range registration
+    pruning without hand-managed registration tables
 
 This is still intentionally a reference path, not the final router.
 
@@ -200,3 +204,8 @@ So the current recommendation is narrower and stronger:
 
 The current evidence now points clearly toward segmented routing as the more
 durable large-scale GraphRAG model.
+
+The newest bounded step makes that path slightly less hand-wired: routed and
+exact-key routed GraphRAG can now narrow candidate shards by an optional
+`segment_group` label. That is still beta, but it is the first direct bridge
+from registry-driven routing to practical hot/sealed or family-based pruning.

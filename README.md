@@ -265,7 +265,10 @@ layer on top of that: register shard ranges once, then route by a caller-
 supplied `int8` route value before the segmented merge runs.
 `sorted_heap_graph_rag_routed_exact(...)` is the exact-key companion for
 tenant/KB-style routing: register a key-to-shard mapping once, then route by
-an exact key instead of a numeric range.
+an exact key instead of a numeric range. Both routed wrappers now also accept
+an optional `segment_groups := ARRAY[...]` filter, which is the first beta
+surface for hot/sealed or relation-family shard narrowing without changing the
+GraphRAG scoring contract.
 
 For tuning and debugging, GraphRAG now also exposes backend-local last-call
 stats:

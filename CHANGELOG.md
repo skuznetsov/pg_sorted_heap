@@ -231,6 +231,15 @@
     - added `sorted_heap_graph_rag_routed_exact(...)`
     - local exact-key smoke stayed aligned with the exact-route segmented SQL
       merge path (`0.202 ms` vs `0.183 ms` at depth 5, both `100.0% / 100.0%`)
+  - the first richer shard-group filter on top of routed segmentation:
+    - both range-routed and exact-key routed registries now accept an optional
+      `segment_group` label
+    - both config/resolve functions now accept optional `segment_groups text[]`
+      filters
+    - both routed wrappers now accept optional `segment_groups := ARRAY[...]`
+      to narrow candidate shards before segmented GraphRAG fanout/merge
+    - this is the first beta surface for hot/sealed or relation-family shard
+      pruning without changing the GraphRAG scoring contract
 
 ### sorted_hnsw build optimization
 

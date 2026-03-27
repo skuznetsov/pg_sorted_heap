@@ -665,24 +665,30 @@ FROM sorted_heap_graph_rag_segmented(
 );
 ```
 
-### `sorted_heap_graph_segment_register(route_name, rel, route_min, route_max)`
+### `sorted_heap_graph_segment_register(route_name, rel, route_min, route_max, segment_group)`
 
 Registers a shard in the beta segment-routing registry.
 
 - `route_name` groups shards into one logical routed graph
 - `route_min` / `route_max` define an inclusive `int8` range
+- `segment_group` is an optional shard label such as `hot`, `sealed`, or a
+  relation-family name
 - overlapping ranges are allowed
 
-### `sorted_heap_graph_segment_config(route_name)`
+### `sorted_heap_graph_segment_config(route_name, segment_groups)`
 
 Lists the current registered shard ranges for one route group, ordered by
-range and relation.
+group, range, and relation.
 
-### `sorted_heap_graph_segment_resolve(route_name, route_value, fanout_limit)`
+- `segment_groups := NULL` means "all groups"
+- non-`NULL` `text[]` filters to matching shard labels only
+
+### `sorted_heap_graph_segment_resolve(route_name, route_value, fanout_limit, segment_groups)`
 
 Resolves candidate shards for a route value.
 
 - matches rows where `route_value BETWEEN route_min AND route_max`
+- optionally filters to `segment_group = ANY(segment_groups)`
 - orders narrower ranges first
 - `fanout_limit := 0` means "all matching shards"
 
@@ -691,11 +697,12 @@ Resolves candidate shards for a route value.
 Deletes one shard from a route group, or all shards for that route group when
 `rel` is `NULL`.
 
-### `sorted_heap_graph_rag_routed(route_name, route_value, query, relation_path, ann_k, top_k, score_mode, limit_rows, fanout_limit)`
+### `sorted_heap_graph_rag_routed(route_name, route_value, query, relation_path, ann_k, top_k, score_mode, limit_rows, fanout_limit, segment_groups)`
 
 Beta routed GraphRAG wrapper.
 
 - resolves candidate shards from `sorted_heap_graph_segment_registry`
+- optionally narrows those shards by `segment_group`
 - delegates to `sorted_heap_graph_rag_segmented(...)`
 - preserves the same GraphRAG scoring contract after routing
 
@@ -704,8 +711,8 @@ does not try to infer a route from the vector query itself; the caller supplies
 the route value.
 
 ```sql
-SELECT sorted_heap_graph_segment_register('tenant_facts', 'facts_t1'::regclass, 1, 1000);
-SELECT sorted_heap_graph_segment_register('tenant_facts', 'facts_t2'::regclass, 1001, 2000);
+SELECT sorted_heap_graph_segment_register('tenant_facts', 'facts_hot'::regclass, 1, 1000, 'hot');
+SELECT sorted_heap_graph_segment_register('tenant_facts', 'facts_cold'::regclass, 1, 1000, 'sealed');
 
 SELECT source_rel, entity_id, relation_id, target_id, payload, distance
 FROM sorted_heap_graph_rag_routed(
@@ -715,11 +722,12 @@ FROM sorted_heap_graph_rag_routed(
     relation_path := ARRAY[1, 2],
     ann_k := 64,
     top_k := 10,
-    score_mode := 'path'
+    score_mode := 'path',
+    segment_groups := ARRAY['hot']
 );
 ```
 
-### `sorted_heap_graph_exact_register(route_name, route_key, rel, priority)`
+### `sorted_heap_graph_exact_register(route_name, route_key, rel, priority, segment_group)`
 
 Registers an exact-key shard mapping in the beta exact-routing registry.
 
@@ -727,17 +735,19 @@ Registers an exact-key shard mapping in the beta exact-routing registry.
 - `route_key` is an exact text key such as a tenant id or knowledge-base id
 - multiple shards may share the same key
 - `priority` orders those shards when one key fans out to several shards
+- `segment_group` is an optional shard label such as `hot` or `sealed`
 
-### `sorted_heap_graph_exact_config(route_name, route_key)`
+### `sorted_heap_graph_exact_config(route_name, route_key, segment_groups)`
 
 Lists the current exact-key shard mappings ordered by
-`(route_name, route_key, priority desc, rel)`.
+`(route_name, route_key, priority desc, segment_group, rel)`.
 
-### `sorted_heap_graph_exact_resolve(route_name, route_key, fanout_limit)`
+### `sorted_heap_graph_exact_resolve(route_name, route_key, fanout_limit, segment_groups)`
 
 Resolves candidate shards for an exact route key.
 
 - matches rows where `route_key = <supplied key>`
+- optionally filters to `segment_group = ANY(segment_groups)`
 - orders by `priority DESC, rel`
 - `fanout_limit := 0` means "all matching shards"
 
@@ -748,11 +758,12 @@ Deletes exact-key shard mappings.
 - `route_key := NULL` deletes every key under that route group
 - `rel := NULL` deletes all matching shard rows for the selected route/key
 
-### `sorted_heap_graph_rag_routed_exact(route_name, route_key, query, relation_path, ann_k, top_k, score_mode, limit_rows, fanout_limit)`
+### `sorted_heap_graph_rag_routed_exact(route_name, route_key, query, relation_path, ann_k, top_k, score_mode, limit_rows, fanout_limit, segment_groups)`
 
 Beta exact-key routed GraphRAG wrapper.
 
 - resolves candidate shards from `sorted_heap_graph_exact_registry`
+- optionally narrows those shards by `segment_group`
 - delegates to `sorted_heap_graph_rag_segmented(...)`
 - keeps the same GraphRAG scoring contract after routing
 
@@ -760,8 +771,8 @@ This is the stronger fit for tenant-id / knowledge-base-id routing than the
 range-based wrapper.
 
 ```sql
-SELECT sorted_heap_graph_exact_register('tenant_facts', 'kb_alpha', 'facts_hot'::regclass, 100);
-SELECT sorted_heap_graph_exact_register('tenant_facts', 'kb_alpha', 'facts_cold'::regclass, 50);
+SELECT sorted_heap_graph_exact_register('tenant_facts', 'kb_alpha', 'facts_hot'::regclass, 100, 'hot');
+SELECT sorted_heap_graph_exact_register('tenant_facts', 'kb_alpha', 'facts_cold'::regclass, 50, 'sealed');
 
 SELECT source_rel, entity_id, relation_id, target_id, payload, distance
 FROM sorted_heap_graph_rag_routed_exact(
@@ -771,7 +782,8 @@ FROM sorted_heap_graph_rag_routed_exact(
     relation_path := ARRAY[1, 2],
     ann_k := 64,
     top_k := 10,
-    score_mode := 'path'
+    score_mode := 'path',
+    segment_groups := ARRAY['hot']
 );
 ```
 
