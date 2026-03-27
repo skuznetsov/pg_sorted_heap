@@ -212,6 +212,17 @@
       Python merge path on quality/row counts with similar latency
     - routing/pruning still stays outside the extension for now; this wrapper
       only productizes fanout/merge
+  - the first metadata-driven routed GraphRAG reference path:
+    - added `sorted_heap_graph_segment_register(...)`,
+      `sorted_heap_graph_segment_config(...)`,
+      `sorted_heap_graph_segment_resolve(...)`, and
+      `sorted_heap_graph_segment_unregister(...)`
+    - added `sorted_heap_graph_rag_routed(...)` on top of the segmented
+      wrapper
+    - this beta surface lets callers register shard ranges once and then
+      route by a supplied `int8` key before segmented GraphRAG fanout/merge
+    - local routed smoke showed the routed path matches exact-route segmented
+      SQL quality/row counts with only small extra lookup overhead
 
 ### sorted_hnsw build optimization
 

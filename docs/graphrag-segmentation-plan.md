@@ -130,9 +130,16 @@ Reference design:
   - `sorted_heap_graph_rag_segmented(regclass[], ...)`
   - executes `sorted_heap_graph_rag(...)` per shard
   - merges candidate rows in SQL
-- next step is still missing:
-  - shard routing/pruning metadata or a router contract that picks a bounded
-    shard subset before this wrapper runs
+- next step now also exists in narrow form:
+  - `sorted_heap_graph_segment_register(...)`
+  - `sorted_heap_graph_segment_resolve(...)`
+  - `sorted_heap_graph_rag_routed(...)`
+  - this is a metadata-driven `int8` range router layered on top of the
+    segmented wrapper
+- what is still missing:
+  - richer routing metadata than simple ranges
+  - a product-quality shard router contract for tenant / KB / relation-family
+    pruning without hand-managed range registration
 
 This is still intentionally a reference path, not the final router.
 

@@ -63,6 +63,90 @@ AS $$
   LEFT JOIN @extschema@.sorted_heap_graph_registry r ON r.relid = args.relid;
 $$ LANGUAGE SQL STABLE;
 
+CREATE TABLE @extschema@.sorted_heap_graph_segment_registry (
+  route_name text NOT NULL,
+  relid regclass NOT NULL,
+  route_min int8 NOT NULL,
+  route_max int8 NOT NULL,
+  PRIMARY KEY (route_name, relid),
+  CHECK (route_max >= route_min)
+);
+
+SELECT pg_catalog.pg_extension_config_dump('@extschema@.sorted_heap_graph_segment_registry', '');
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_segment_register(
+  route_name text,
+  rel regclass,
+  route_min int8,
+  route_max int8
+) RETURNS void
+AS $$
+  INSERT INTO @extschema@.sorted_heap_graph_segment_registry (
+    route_name, relid, route_min, route_max
+  )
+  VALUES ($1, $2, $3, $4)
+  ON CONFLICT (route_name, relid) DO UPDATE SET
+    route_min = EXCLUDED.route_min,
+    route_max = EXCLUDED.route_max;
+$$ LANGUAGE SQL;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_segment_unregister(
+  route_name text,
+  rel regclass DEFAULT NULL
+) RETURNS int4
+AS $$
+DECLARE
+  deleted_rows int4;
+BEGIN
+  IF rel IS NULL THEN
+    DELETE FROM @extschema@.sorted_heap_graph_segment_registry
+    WHERE sorted_heap_graph_segment_registry.route_name = sorted_heap_graph_segment_unregister.route_name;
+  ELSE
+    DELETE FROM @extschema@.sorted_heap_graph_segment_registry
+    WHERE sorted_heap_graph_segment_registry.route_name = sorted_heap_graph_segment_unregister.route_name
+      AND relid = rel;
+  END IF;
+  GET DIAGNOSTICS deleted_rows = ROW_COUNT;
+  RETURN deleted_rows;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_segment_config(route_name text DEFAULT NULL)
+RETURNS TABLE (
+  route_name text,
+  rel regclass,
+  route_min int8,
+  route_max int8
+)
+AS $$
+  SELECT s.route_name, s.relid, s.route_min, s.route_max
+  FROM @extschema@.sorted_heap_graph_segment_registry s
+  WHERE $1 IS NULL OR s.route_name = $1
+  ORDER BY s.route_name, s.route_min, s.route_max, s.relid;
+$$ LANGUAGE SQL STABLE;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_segment_resolve(
+  route_name text,
+  route_value int8,
+  fanout_limit int4 DEFAULT 0
+) RETURNS TABLE (
+  rel regclass,
+  route_min int8,
+  route_max int8
+)
+AS $$
+  SELECT chosen.relid, chosen.route_min, chosen.route_max
+  FROM (
+    SELECT s.relid, s.route_min, s.route_max
+    FROM @extschema@.sorted_heap_graph_segment_registry s
+    WHERE s.route_name = $1
+      AND $2 BETWEEN s.route_min AND s.route_max
+    ORDER BY (s.route_max - s.route_min), s.route_min, s.route_max, s.relid
+    LIMIT CASE WHEN $3 IS NULL OR $3 <= 0 THEN NULL ELSE $3 END
+  ) chosen
+  ORDER BY chosen.route_min, chosen.route_max, chosen.relid;
+$$ LANGUAGE SQL STABLE;
+
 CREATE FUNCTION @extschema@.sorted_heap_graph_rag_stats()
 RETURNS TABLE (
   calls bigint,
@@ -387,3 +471,54 @@ $$ LANGUAGE plpgsql STABLE;
 
 COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_segmented(regclass[], @extschema@.svec, int4[], int4, int4, text, int4)
 IS 'Beta segmented GraphRAG wrapper. Executes sorted_heap_graph_rag(...) across a candidate shard list, merges shard-local rows globally, and returns the top-k result set plus source_rel.';
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed(
+  route_name text,
+  route_value int8,
+  query @extschema@.svec,
+  relation_path int4[],
+  ann_k int4 DEFAULT 64,
+  top_k int4 DEFAULT 10,
+  score_mode text DEFAULT 'path',
+  limit_rows int4 DEFAULT 0,
+  fanout_limit int4 DEFAULT 0
+) RETURNS TABLE (
+  source_rel regclass,
+  entity_id int4,
+  relation_id int2,
+  target_id int4,
+  payload text,
+  distance float8
+)
+AS $$
+DECLARE
+  rels regclass[];
+BEGIN
+  IF fanout_limit < 0 THEN
+    RAISE EXCEPTION 'sorted_heap_graph_rag_routed: fanout_limit must be >= 0';
+  END IF;
+
+  SELECT array_agg(rel ORDER BY route_min, route_max, rel)
+  INTO rels
+  FROM @extschema@.sorted_heap_graph_segment_resolve(route_name, route_value, fanout_limit);
+
+  IF rels IS NULL OR array_length(rels, 1) IS NULL THEN
+    RETURN;
+  END IF;
+
+  RETURN QUERY
+  SELECT g.source_rel, g.entity_id, g.relation_id, g.target_id, g.payload, g.distance
+  FROM @extschema@.sorted_heap_graph_rag_segmented(
+    rels,
+    query,
+    relation_path,
+    ann_k,
+    top_k,
+    score_mode,
+    limit_rows
+  ) AS g;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed(text, int8, @extschema@.svec, int4[], int4, int4, text, int4, int4)
+IS 'Beta routed GraphRAG wrapper. Resolves candidate shards from sorted_heap_graph_segment_registry using a route value, then delegates to sorted_heap_graph_rag_segmented(...).';

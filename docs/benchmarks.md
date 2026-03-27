@@ -663,6 +663,26 @@ So the large-scale result now matches the local `1M` lesson:
 - segmented routing is the first constrained-memory scale path that improves
   both build viability and query latency on the same host
 
+The next local step was to move routing out of benchmark-only Python and into a
+real SQL reference path. On a kept local `5K`-row segmented smoke cluster
+(`4` shards, `64D`, `ann_k=32`, `top_k=8`, `ef_search=64`), the new
+range-routed SQL path matched the segmented SQL merge baseline on quality and
+row counts:
+
+- segmented SQL merge, `route=exact`, depth 5:
+  - `0.215 ms`, `100.0% / 100.0%`
+- metadata-routed SQL wrapper, same exact-route point:
+  - `0.245 ms`, `100.0% / 100.0%`
+
+So the current reference stack is now:
+
+- `sorted_heap_graph_rag_segmented(...)` for explicit candidate shard arrays
+- `sorted_heap_graph_rag_routed(...)` for simple metadata-driven range routing
+
+That is still not the final routing story for large knowledge bases, but it is
+the first usable SQL-level bridge from harness-side segmentation to productized
+segmented GraphRAG.
+
 ### Current AWS GraphRAG benchmark (`person -> parent -> city`, stable fact contract)
 
 Repo-owned harness:

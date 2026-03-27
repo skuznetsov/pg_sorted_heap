@@ -34,6 +34,7 @@ import bench_graph_rag_multidepth as md
 
 
 META_NAME = "multidepth_segmented_meta.json"
+SEGMENT_ROUTE_NAME = "segmented_bench"
 
 
 def meta_path(tmp: Path) -> Path:
@@ -257,6 +258,16 @@ def load_sharded_data_stream(
     return shard_counts
 
 
+def register_segment_ranges(cur, num_pairs: int, shards: int, route_name: str) -> None:
+    cur.execute("SELECT sorted_heap_graph_segment_unregister(%s)", (route_name,))
+    for shard_id in range(shards):
+        start, end = shard_person_bounds(shard_id, num_pairs, shards)
+        cur.execute(
+            "SELECT sorted_heap_graph_segment_register(%s, %s::regclass, %s, %s)",
+            (route_name, shard_table_name(shard_id), start, end),
+        )
+
+
 def build_sharded_indexes(
     cur,
     shards: int,
@@ -302,6 +313,7 @@ def merged_shard_rows(
     cur,
     tables: list[str],
     depth: int,
+    person_id: int,
     query_vec: str,
     ann_k: int,
     top_k: int,
@@ -337,6 +349,25 @@ def merged_shard_rows(
         cur.execute(sql, (query_vec,))
         return cur.fetchall()
 
+    if merge_mode == "routed":
+        path = md.relation_path_literal(depth)
+        sql = f"""
+        SELECT entity_id, relation_id, target_id, payload, distance
+        FROM sorted_heap_graph_rag_routed(
+          %s,
+          %s,
+          %s::svec,
+          relation_path := {path},
+          ann_k := {ann_k},
+          top_k := {top_k},
+          score_mode := 'path',
+          limit_rows := 0
+        )
+        ORDER BY distance, entity_id, relation_id, target_id
+        """
+        cur.execute(sql, (SEGMENT_ROUTE_NAME, person_id, query_vec))
+        return cur.fetchall()
+
     raise ValueError(f"unsupported merge_mode: {merge_mode}")
 
 
@@ -362,7 +393,7 @@ def measure_segmented_case(
             tables = route_tables(query, num_pairs, shards, route_mode)
             t0 = time.perf_counter()
             rows = merged_shard_rows(
-                cur, tables, depth, query.vectors[depth], ann_k, top_k, merge_mode
+                cur, tables, depth, query.person_id, query.vectors[depth], ann_k, top_k, merge_mode
             )
             t1 = time.perf_counter()
 
@@ -444,7 +475,7 @@ def main() -> None:
     ap.add_argument("--post-load-op", choices=("compact", "merge", "none"), default="compact")
     ap.add_argument("--shards", type=int, default=4)
     ap.add_argument("--route", choices=("all", "exact", "both"), default="both")
-    ap.add_argument("--merge-mode", choices=("python", "sql"), default="python")
+    ap.add_argument("--merge-mode", choices=("python", "sql", "routed"), default="python")
     ap.add_argument("--backend-mode", choices=("fresh", "reuse"), default="fresh")
     ap.add_argument(
         "--stop-after",
@@ -459,6 +490,8 @@ def main() -> None:
 
     if args.shards < 1:
         raise ValueError("--shards must be >= 1")
+    if args.merge_mode == "routed" and args.route == "all":
+        raise ValueError("--merge-mode routed requires --route exact or --route both")
 
     root_dir = Path(__file__).resolve().parent.parent
     tmp_root = Path(args.tmp_root).resolve()
@@ -603,6 +636,7 @@ def main() -> None:
                     t_load_end - t_load_start,
                     f"csv_removed={'false' if stream_copy else 'true'}|streamed={'true' if stream_copy else 'false'}",
                 )
+                register_segment_ranges(cur, num_pairs, shards, SEGMENT_ROUTE_NAME)
                 write_meta(tmp, {**read_meta(tmp), "stage_reached": "load_data", "shard_counts": shard_counts})
                 if args.stop_after == "load_data":
                     return
@@ -667,6 +701,8 @@ def main() -> None:
 
             routes = ["all", "exact"] if args.route == "both" else [args.route]
             for route_mode in routes:
+                if args.merge_mode == "routed" and route_mode != "exact":
+                    continue
                 for depth in range(1, max_depth + 1):
                     print(
                         f"running|table=segmented|route={route_mode}|depth={depth}|shards={shards}",

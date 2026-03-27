@@ -37,7 +37,12 @@ plus planner-integrated HNSW search.
   - `sorted_heap_expand_twohop_path_rerank(...)`
   - `sorted_heap_expand_multihop_rerank(...)`
   - `sorted_heap_expand_multihop_path_rerank(...)`
+  - `sorted_heap_graph_segment_register(...)`
+  - `sorted_heap_graph_segment_config(...)`
+  - `sorted_heap_graph_segment_resolve(...)`
+  - `sorted_heap_graph_segment_unregister(...)`
   - `sorted_heap_graph_rag_segmented(...)`
+  - `sorted_heap_graph_rag_routed(...)`
   - `sorted_heap_graph_rag_scan(...)`
   - `sorted_heap_graph_rag_twohop_scan(...)`
   - `sorted_heap_graph_rag_twohop_path_scan(...)`
@@ -226,7 +231,12 @@ The older helper/wrapper family is still available for lower-level control:
 - `sorted_heap_expand_twohop_path_rerank(...)`
 - `sorted_heap_expand_multihop_rerank(...)`
 - `sorted_heap_expand_multihop_path_rerank(...)`
+- `sorted_heap_graph_segment_register(...)`
+- `sorted_heap_graph_segment_config(...)`
+- `sorted_heap_graph_segment_resolve(...)`
+- `sorted_heap_graph_segment_unregister(...)`
 - `sorted_heap_graph_rag_segmented(...)`
+- `sorted_heap_graph_rag_routed(...)`
 - `sorted_heap_graph_rag_scan(...)`
 - `sorted_heap_graph_rag_twohop_scan(...)`
 - `sorted_heap_graph_rag_twohop_path_scan(...)`
@@ -240,6 +250,9 @@ Those building blocks remain beta. In particular,
 reference path: it takes a candidate shard array, executes
 `sorted_heap_graph_rag(...)` per shard, and merges shard-local top-k rows
 globally. Routing/pruning is still the caller's job.
+`sorted_heap_graph_rag_routed(...)` adds the first metadata-driven routing
+layer on top of that: register shard ranges once, then route by a caller-
+supplied `int8` route value before the segmented merge runs.
 
 For tuning and debugging, GraphRAG now also exposes backend-local last-call
 stats:

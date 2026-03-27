@@ -665,6 +665,60 @@ FROM sorted_heap_graph_rag_segmented(
 );
 ```
 
+### `sorted_heap_graph_segment_register(route_name, rel, route_min, route_max)`
+
+Registers a shard in the beta segment-routing registry.
+
+- `route_name` groups shards into one logical routed graph
+- `route_min` / `route_max` define an inclusive `int8` range
+- overlapping ranges are allowed
+
+### `sorted_heap_graph_segment_config(route_name)`
+
+Lists the current registered shard ranges for one route group, ordered by
+range and relation.
+
+### `sorted_heap_graph_segment_resolve(route_name, route_value, fanout_limit)`
+
+Resolves candidate shards for a route value.
+
+- matches rows where `route_value BETWEEN route_min AND route_max`
+- orders narrower ranges first
+- `fanout_limit := 0` means "all matching shards"
+
+### `sorted_heap_graph_segment_unregister(route_name, rel)`
+
+Deletes one shard from a route group, or all shards for that route group when
+`rel` is `NULL`.
+
+### `sorted_heap_graph_rag_routed(route_name, route_value, query, relation_path, ann_k, top_k, score_mode, limit_rows, fanout_limit)`
+
+Beta routed GraphRAG wrapper.
+
+- resolves candidate shards from `sorted_heap_graph_segment_registry`
+- delegates to `sorted_heap_graph_rag_segmented(...)`
+- preserves the same GraphRAG scoring contract after routing
+
+This is the first metadata-driven routing surface for segmented GraphRAG. It
+does not try to infer a route from the vector query itself; the caller supplies
+the route value.
+
+```sql
+SELECT sorted_heap_graph_segment_register('tenant_facts', 'facts_t1'::regclass, 1, 1000);
+SELECT sorted_heap_graph_segment_register('tenant_facts', 'facts_t2'::regclass, 1001, 2000);
+
+SELECT source_rel, entity_id, relation_id, target_id, payload, distance
+FROM sorted_heap_graph_rag_routed(
+    'tenant_facts',
+    812,
+    '[0.1,0.2,0.3,...]'::svec,
+    relation_path := ARRAY[1, 2],
+    ann_k := 64,
+    top_k := 10,
+    score_mode := 'path'
+);
+```
+
 ### Lower-level GraphRAG building blocks (beta)
 
 ### `sorted_heap_expand_ids(rel, seed_ids, relation_filter, limit_rows)`

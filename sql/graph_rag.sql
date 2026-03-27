@@ -772,6 +772,30 @@ ANALYZE facts_chain_seg_a;
 ANALYZE facts_chain_seg_b;
 
 COPY (
+  SELECT 'ok'
+  FROM (
+    SELECT sorted_heap_graph_segment_register('chain_route', 'facts_chain_seg_a'::regclass, 1, 8)
+  ) s
+) TO STDOUT;
+
+COPY (
+  SELECT 'ok'
+  FROM (
+    SELECT sorted_heap_graph_segment_register('chain_route', 'facts_chain_seg_b'::regclass, 9, 16)
+  ) s
+) TO STDOUT;
+
+COPY (
+  SELECT route_name, rel::text, route_min, route_max
+  FROM sorted_heap_graph_segment_config('chain_route')
+) TO STDOUT;
+
+COPY (
+  SELECT rel::text, route_min, route_max
+  FROM sorted_heap_graph_segment_resolve('chain_route', 8, 0)
+) TO STDOUT;
+
+COPY (
   SELECT source_rel::text, entity_id, relation_id, target_id, payload,
          round(distance::numeric, 6) AS distance
   FROM sorted_heap_graph_rag_segmented(
@@ -882,6 +906,60 @@ COPY (
     UNION ALL
     (SELECT * FROM baseline EXCEPT ALL SELECT * FROM helper)
   ) diff
+) TO STDOUT;
+
+COPY (
+  SELECT source_rel::text, entity_id, relation_id, target_id, payload,
+         round(distance::numeric, 6) AS distance
+  FROM sorted_heap_graph_rag_routed(
+    'chain_route',
+    8,
+    '[-1,0,0,0]'::svec,
+    relation_path := ARRAY[1,2,3],
+    ann_k := 1,
+    top_k := 2,
+    score_mode := 'path',
+    limit_rows := 0
+  )
+  ORDER BY distance, entity_id, relation_id, target_id, source_rel::text
+) TO STDOUT;
+
+COPY (
+  WITH helper AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_graph_rag_routed(
+      'chain_route',
+      8,
+      '[-1,0,0,0]'::svec,
+      relation_path := ARRAY[1,2,3],
+      ann_k := 1,
+      top_k := 2,
+      score_mode := 'path',
+      limit_rows := 0
+    )
+  ),
+  baseline AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_graph_rag(
+      'facts_chain_seg_a'::regclass,
+      '[-1,0,0,0]'::svec,
+      relation_path := ARRAY[1,2,3],
+      ann_k := 1,
+      top_k := 2,
+      score_mode := 'path',
+      limit_rows := 0
+    )
+  )
+  SELECT count(*) AS routed_multihop_path_diff_rows
+  FROM (
+    (SELECT * FROM helper EXCEPT ALL SELECT * FROM baseline)
+    UNION ALL
+    (SELECT * FROM baseline EXCEPT ALL SELECT * FROM helper)
+  ) diff
+) TO STDOUT;
+
+COPY (
+  SELECT sorted_heap_graph_segment_unregister('chain_route')
 ) TO STDOUT;
 
 DROP TABLE facts_chain_seg_a;
