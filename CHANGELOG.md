@@ -126,9 +126,11 @@
     quality
   - a local `1M x 64D` calibration showing the same widened contract reaches
     `65.6% hit@1 / 96.9% hit@k` and ANN matches exact seeds there
-  - an attempted AWS `10M x 64D` run showing the current `4 vCPU / 8 GiB` host
-    runs out of disk headroom before query measurement, so that branch now
-    needs a larger box or a lower-footprint build path
+  - a lower-footprint `10M x 64D` AWS rerun that clears ingest on the same
+    `4 vCPU / 8 GiB` host via streamed `COPY` and `sorted_heap_only`, then
+    fails later in `sorted_hnsw` build with `ERROR: invalid memory alloc
+    request size 1280000000`, moving the frontier from disk headroom to a
+    build-time allocator limit
 
 ### sorted_hnsw build optimization
 

@@ -385,21 +385,39 @@ wider query contract (`ann_k=256`, `top_k=32`, `ef_search=128`) gave:
 At `top_k=10`, the same `1M x 64D` point already held `96.9% hit@k`, so unlike
 `32D`, the result-budget cliff largely disappeared there.
 
-I then attempted the corresponding `10M x 64D` AWS build on the current
-`ubuntu@dev.rigelstar.com` host (`4 vCPU`, `8 GiB RAM`) at the same cheap
-build point (`m=16`, `ef_construction=64`). It was aborted for operational
-safety before query timing:
+The first file-backed `10M x 64D` AWS attempt on the current
+`ubuntu@dev.rigelstar.com` host (`4 vCPU`, `8 GiB RAM`) failed for operational
+reasons before query timing:
 
 - `generate_csv`: `414.397 s`
 - CSV size: `6.67 GiB`
 - temp dir grew to about `28 GiB`
 - `/tmp` fell to `1.3 GiB` free (`99%` used) while the run was still active
 
-So the next `10M x 64D` step is blocked not by a known query-quality failure,
-but by the footprint of the current AWS box. That branch now needs either:
+That led to a footprint reduction pass in the harness:
 
-- a larger machine, or
-- a lower-footprint large-scale build path
+- stream fact rows directly into `COPY` instead of materializing a giant CSV
+- drop `facts_heap` after loading `facts_sh` in `sorted_heap_only` mode
+- allow query-only reuse from a kept temp cluster
+
+With that lower-footprint path, the same `10M x 64D` AWS point advanced
+materially further on the same host:
+
+- streamed `generate_csv`: `0.000 s` (`csv_bytes=0`, no materialized CSV)
+- `load_data`: `916.030 s`
+- temp dir plateaued around `19 GiB`
+- filesystem still had about `11 GiB` free at the start of `CREATE INDEX`
+
+The next frontier is therefore no longer disk headroom. On the same
+`10M x 64D` cheap-build point (`m=16`, `ef_construction=64`), the
+`sorted_hnsw` build then failed inside PostgreSQL:
+
+- `CREATE INDEX facts_sh_ann_idx ON facts_sh USING sorted_hnsw (embedding) WITH (m = 16, ef_construction = 64)`
+- `ERROR: invalid memory alloc request size 1280000000`
+
+So the current `10M x 64D` branch is now blocked by a build-time allocator
+frontier inside `sorted_hnsw`, not by Python memory, not by `COPY`, and not by
+the host running out of disk during ingest.
 
 So the narrow conclusion is:
 
@@ -414,9 +432,9 @@ So the narrow conclusion is:
 - the stronger falsifier is that even exact seeds fail at that scale and
   dimensionality, so the next branch is a different scale contract, not a
   narrower HNSW tuning loop
-- `64D` is the first scale contract that looks healthy locally at `1M`, but
-  the current AWS host does not have enough disk headroom to carry the full
-  `10M x 64D` run safely
+- `64D` is the first scale contract that looks healthy locally at `1M`
+- on the current AWS host, the `10M x 64D` branch now clears ingest safely and
+  fails later inside `sorted_hnsw` build with a `1.28 GB` allocation request
 
 ### Current AWS GraphRAG benchmark (`person -> parent -> city`, stable fact contract)
 

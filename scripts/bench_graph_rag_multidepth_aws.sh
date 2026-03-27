@@ -49,6 +49,7 @@ SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
 
 echo "== aws multidepth preflight =="
 ssh "${SSH_OPTS[@]}" "$HOST" "sudo -n true >/dev/null && command -v python3 >/dev/null && command -v psql >/dev/null"
+ssh "${SSH_OPTS[@]}" "$HOST" "mkdir -p '$TMP_ROOT'"
 
 echo "== sync repo subset =="
 rsync -az --delete --delete-excluded \

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import math
 import random
@@ -95,6 +96,63 @@ def generate_csv(path: Path, num_pairs: int, max_depth: int, dim: int) -> None:
                 payload = f"Person_{person_id} rel_{hop} node_{hop}_{person_id}."
                 writer.writerow([prev, hop, target_id, vec_to_svec(vals), payload])
                 prev = target_id
+
+
+class FactCsvStream(io.TextIOBase):
+    def __init__(self, num_pairs: int, max_depth: int, dim: int) -> None:
+        self.num_pairs = num_pairs
+        self.max_depth = max_depth
+        self.dim = dim
+        self.hop_cache = {h: hop_base(h, dim) for h in range(1, max_depth + 1)}
+        self.person_id = 1
+        self.hop = 1
+        self.person_vals: list[float] | None = None
+        self.buf = ""
+        self.done = False
+
+    def readable(self) -> bool:
+        return True
+
+    def _next_line(self) -> str | None:
+        if self.person_id > self.num_pairs:
+            return None
+
+        if self.person_vals is None:
+            self.person_vals = person_base(self.person_id, self.dim)
+
+        hop = self.hop
+        prev = self.person_id if hop == 1 else (hop - 1) * self.num_pairs + self.person_id
+        target_id = hop * self.num_pairs + self.person_id
+        vals = [
+            self.person_vals[idx] + 0.15 * self.hop_cache[hop][idx]
+            for idx in range(self.dim)
+        ]
+        payload = f"Person_{self.person_id} rel_{hop} node_{hop}_{self.person_id}."
+        line = f'{prev},{hop},{target_id},"{vec_to_svec(vals)}",{payload}\n'
+
+        if self.hop == self.max_depth:
+            self.person_id += 1
+            self.hop = 1
+            self.person_vals = None
+        else:
+            self.hop += 1
+
+        return line
+
+    def read(self, size: int = -1) -> str:
+        if self.done and not self.buf:
+            return ""
+        if size is None or size < 0:
+            size = 1 << 20
+        while len(self.buf) < size and not self.done:
+            line = self._next_line()
+            if line is None:
+                self.done = True
+                break
+            self.buf += line
+        out = self.buf[:size]
+        self.buf = self.buf[size:]
+        return out
 
 
 def build_queries(num_pairs: int, query_count: int, max_depth: int, dim: int, seed: int) -> list[DeepQuery]:
@@ -269,6 +327,7 @@ def main() -> None:
     ap.add_argument("--install-cmd", default="")
     ap.add_argument("--reuse-temp", default="")
     ap.add_argument("--keep-temp", action="store_true")
+    ap.add_argument("--stream-copy", action="store_true")
     args = ap.parse_args()
 
     root_dir = Path(__file__).resolve().parent.parent
@@ -286,6 +345,8 @@ def main() -> None:
         build_ef_construction = int(meta.get("ef_construction", args.ef_construction))
         build_m = int(meta.get("m", args.m))
         build_table_scope = str(meta.get("table_scope", args.table_scope))
+        build_heap_retained = bool(meta.get("heap_retained", True))
+        build_stream_copy = bool(meta.get("stream_copy", False))
         build_shared_buffers_mb = int(meta.get("shared_buffers_mb", args.shared_buffers_mb))
         build_max_wal_size_gb = int(meta.get("max_wal_size_gb", args.max_wal_size_gb))
         build_maintenance_work_mem_mb = int(meta.get("maintenance_work_mem_mb", args.maintenance_work_mem_mb))
@@ -307,6 +368,8 @@ def main() -> None:
         build_ef_construction = args.ef_construction
         build_m = args.m
         build_table_scope = args.table_scope
+        build_heap_retained = build_table_scope == "all"
+        build_stream_copy = args.stream_copy
         build_shared_buffers_mb = args.shared_buffers_mb
         build_max_wal_size_gb = args.max_wal_size_gb
         build_maintenance_work_mem_mb = args.maintenance_work_mem_mb
@@ -321,6 +384,8 @@ def main() -> None:
                 "ef_construction": build_ef_construction,
                 "m": build_m,
                 "table_scope": build_table_scope,
+                "heap_retained": build_heap_retained,
+                "stream_copy": build_stream_copy,
                 "shared_buffers_mb": build_shared_buffers_mb,
                 "max_wal_size_gb": build_max_wal_size_gb,
                 "maintenance_work_mem_mb": build_maintenance_work_mem_mb,
@@ -330,21 +395,29 @@ def main() -> None:
 
     try:
         if not reusing:
-            t_gen_start = time.perf_counter()
-            generate_csv(csv_path, num_pairs, max_depth, dim)
-            t_gen_end = time.perf_counter()
-            print(
-                "stage|name=generate_csv|"
-                f"elapsed_s={t_gen_end - t_gen_start:.3f}|"
-                f"csv_bytes={csv_path.stat().st_size}",
-                flush=True,
-            )
+            if build_stream_copy:
+                print(
+                    "stage|name=generate_csv|elapsed_s=0.000|csv_bytes=0|streamed=true",
+                    flush=True,
+                )
+                csv_bytes = 0
+            else:
+                t_gen_start = time.perf_counter()
+                generate_csv(csv_path, num_pairs, max_depth, dim)
+                t_gen_end = time.perf_counter()
+                csv_bytes = csv_path.stat().st_size
+                print(
+                    "stage|name=generate_csv|"
+                    f"elapsed_s={t_gen_end - t_gen_start:.3f}|"
+                    f"csv_bytes={csv_bytes}",
+                    flush=True,
+                )
             write_meta(
                 tmp,
                 {
                     **read_meta(tmp),
                     "stage_reached": "generate_csv",
-                    "csv_bytes": csv_path.stat().st_size,
+                    "csv_bytes": csv_bytes,
                 },
             )
             if args.stop_after == "generate_csv":
@@ -371,14 +444,34 @@ def main() -> None:
 
             if not reusing:
                 t_load_start = time.perf_counter()
-                base.load_data(cur, csv_path)
+                if build_stream_copy:
+                    base.load_data_fileobj(
+                        cur,
+                        FactCsvStream(num_pairs, max_depth, dim),
+                        retain_heap=build_heap_retained,
+                    )
+                else:
+                    base.load_data(cur, csv_path, retain_heap=build_heap_retained)
                 t_load_end = time.perf_counter()
+                csv_removed = False
+                if not build_stream_copy and csv_path.exists():
+                    csv_path.unlink()
+                    csv_removed = True
                 print(
                     "stage|name=load_data|"
-                    f"elapsed_s={t_load_end - t_load_start:.3f}",
+                    f"elapsed_s={t_load_end - t_load_start:.3f}|"
+                    f"csv_removed={str(csv_removed).lower()}|"
+                    f"streamed={str(build_stream_copy).lower()}",
                     flush=True,
                 )
-                write_meta(tmp, {**read_meta(tmp), "stage_reached": "load_data"})
+                write_meta(
+                    tmp,
+                    {
+                        **read_meta(tmp),
+                        "stage_reached": "load_data",
+                        "csv_removed_after_load": csv_removed,
+                    },
+                )
                 if args.stop_after == "load_data":
                     return
 
@@ -408,7 +501,8 @@ def main() -> None:
                     )
 
             t_analyze_start = time.perf_counter()
-            cur.execute("ANALYZE facts_heap")
+            if build_heap_retained:
+                cur.execute("ANALYZE facts_heap")
             cur.execute("ANALYZE facts_sh")
             t_analyze_end = time.perf_counter()
             print(
@@ -448,6 +542,7 @@ def main() -> None:
             print(f"max_wal_size:     {build_max_wal_size_gb}GB")
             print(f"maintenance_work_mem: {build_maintenance_work_mem_mb}MB")
             print(f"table_scope:      {build_table_scope}")
+            print(f"heap_retained:    {'yes' if build_heap_retained else 'no'}")
             print(f"reuse_temp:       {str(tmp) if reusing else 'no'}")
             print(f"backend_mode:     {args.backend_mode}")
             print()
@@ -457,7 +552,7 @@ def main() -> None:
                     verify_unified_equivalence(cur, queries, depth, args.ann_k, args.top_k)
 
                 cases: list[tuple[str, base.QueryCase]]
-                if args.table_scope == "all":
+                if build_table_scope == "all":
                     cases = [
                         ("facts_heap", make_sql_path_case(depth, args.ann_k, args.top_k)),
                         ("facts_sh", make_sql_path_case(depth, args.ann_k, args.top_k)),
@@ -472,7 +567,7 @@ def main() -> None:
                 for table, case in cases:
                     print(f"running|table={table}|case={case.name}|depth={depth}", flush=True)
                     p50, avg, hits, reads, root, rows = base.measure_case(cur, table, case, queries, args.runs)
-                    hit1, hitk = measure_quality(cur, table, case, queries, args.num_pairs, depth)
+                    hit1, hitk = measure_quality(cur, table, case, queries, num_pairs, depth)
                     print_result(table, case.name, depth, p50, avg, hits, reads, root, rows, hit1, hitk)
         finally:
             cur.close()

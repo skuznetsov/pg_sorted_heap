@@ -200,15 +200,14 @@ def bootstrap_schema(cur: Cursor, dim: int) -> None:
     )
 
 
-def load_data(cur: Cursor, csv_path: Path) -> None:
-    with open(csv_path, "r", encoding="utf-8") as f:
-        cur.copy_expert(
-            """
-            COPY facts_heap (entity_id, relation_id, target_id, embedding, payload)
-            FROM STDIN WITH (FORMAT csv)
-            """,
-            f,
-        )
+def load_data_fileobj(cur: Cursor, src, retain_heap: bool = True) -> None:
+    cur.copy_expert(
+        """
+        COPY facts_heap (entity_id, relation_id, target_id, embedding, payload)
+        FROM STDIN WITH (FORMAT csv)
+        """,
+        src,
+    )
     cur.execute(
         """
         INSERT INTO facts_sh (entity_id, relation_id, target_id, embedding, payload)
@@ -218,8 +217,16 @@ def load_data(cur: Cursor, csv_path: Path) -> None:
         """
     )
     cur.execute("SELECT sorted_heap_compact('facts_sh'::regclass)")
-    cur.execute("ANALYZE facts_heap")
     cur.execute("ANALYZE facts_sh")
+    if retain_heap:
+        cur.execute("ANALYZE facts_heap")
+    else:
+        cur.execute("DROP TABLE facts_heap")
+
+
+def load_data(cur: Cursor, csv_path: Path, retain_heap: bool = True) -> None:
+    with open(csv_path, "r", encoding="utf-8") as f:
+        load_data_fileobj(cur, f, retain_heap=retain_heap)
 
 
 def build_indexes(
@@ -237,7 +244,8 @@ def build_indexes(
         cur.execute(
             f"CREATE INDEX facts_sh_ann_idx ON facts_sh USING sorted_hnsw (embedding) WITH (m = {m}, ef_construction = {ef_construction})"
         )
-    cur.execute("ANALYZE facts_heap")
+    if build_heap_index:
+        cur.execute("ANALYZE facts_heap")
     cur.execute("ANALYZE facts_sh")
 
 
