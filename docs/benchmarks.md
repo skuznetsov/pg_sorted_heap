@@ -583,6 +583,36 @@ So the current `1M x 64D` depth cost is not expansion-bound. On the widened
 contract, almost all measured time is already in the ANN seed stage; the
 multi-hop expansion and rerank work remain sub-millisecond.
 
+I then added an opt-in low-memory `sorted_hnsw` build path via
+`SET sorted_hnsw.build_sq8 = on`. This keeps the final on-disk/index-query
+contract the same, but the graph is built from SQ8-compressed build vectors
+instead of a full float32 build slab. The tradeoff is one extra heap scan
+during `CREATE INDEX`.
+
+Bounded local A/B on the same `1M x 64D` lower-hop point (`m=16`,
+`ef_construction=64`, `ann_k=256`, `top_k=32`, `ef_search=128`,
+`sorted_heap_only`, streamed load):
+
+- `build_sq8=off`
+  - `load_data`: `28.044 s`
+  - `build_indexes`: `48.606 s`
+  - unified depth-5 GraphRAG: `111.578 ms`, `87.5% / 100.0%`
+- `build_sq8=on`
+  - `load_data`: `27.935 s`
+  - `build_indexes`: `46.541 s`
+  - unified depth-5 GraphRAG: `110.541 ms`, `87.5% / 100.0%`
+
+So the first retained result is narrow but real:
+
+- the low-memory build path did **not** regress the measured `1M x 64D`
+  GraphRAG quality point
+- it slightly improved build time on that point instead of paying a visible
+  penalty for the extra heap scan
+- and by construction it cuts the build-vector slab from `4 * N * D` bytes to
+  `1 * N * D`
+  - `10M x 64D`: about `2.56 GiB -> 0.64 GiB`
+  - `10M x 384D`: about `15.36 GiB -> 3.84 GiB`
+
 So the narrow conclusion is:
 
 - the multi-hop GraphRAG path itself survives to at least `1M` rows and gives

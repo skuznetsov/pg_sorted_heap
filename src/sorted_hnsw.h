@@ -190,6 +190,7 @@ typedef struct ShnswOptions
 
 extern int	sorted_hnsw_ef_search;
 extern bool	sorted_hnsw_sq8;
+extern bool	sorted_hnsw_build_sq8;
 extern bool	sorted_hnsw_shared_cache;
 
 /* ---- AM handler ---- */
@@ -204,6 +205,12 @@ extern void sorted_hnsw_init(void);
 /* Opaque build state — defined in hnsw_build.c */
 typedef struct HnswBuildState HnswBuildState;
 
+typedef enum HnswBuildVectorMode
+{
+	SHNSW_BUILD_VECTOR_F32 = 0,
+	SHNSW_BUILD_VECTOR_SQ8 = 1
+} HnswBuildVectorMode;
+
 /* In-memory node info, for reading back after build */
 typedef struct HnswBuiltNode
 {
@@ -214,9 +221,14 @@ typedef struct HnswBuiltNode
 	int16		   *n_neighbors;	/* count per level */
 } HnswBuiltNode;
 
-extern HnswBuildState *shnsw_build_graph(float *vectors, ItemPointer tids,
+extern HnswBuildState *shnsw_build_graph(float *vectors_f32,
+										  const uint8 *vectors_sq8,
+										  const float *sq8_mins,
+										  const float *sq8_scales,
+										  ItemPointer tids,
 										  int n_nodes, int dim,
 										  int M, int ef_construction,
+										  HnswBuildVectorMode vector_mode,
 										  MemoryContext build_ctx);
 
 /* Accessors for build state */

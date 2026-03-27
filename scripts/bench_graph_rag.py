@@ -257,18 +257,25 @@ def build_indexes(
     m: int = 16,
     build_heap_index: bool = True,
     build_sorted_heap_index: bool = True,
+    build_sq8: bool | None = None,
 ) -> None:
-    if build_heap_index:
-        cur.execute(
-            f"CREATE INDEX facts_heap_ann_idx ON facts_heap USING sorted_hnsw (embedding) WITH (m = {m}, ef_construction = {ef_construction})"
-        )
-    if build_sorted_heap_index:
-        cur.execute(
-            f"CREATE INDEX facts_sh_ann_idx ON facts_sh USING sorted_hnsw (embedding) WITH (m = {m}, ef_construction = {ef_construction})"
-        )
-    if build_heap_index:
-        cur.execute("ANALYZE facts_heap")
-    cur.execute("ANALYZE facts_sh")
+    if build_sq8 is not None:
+        cur.execute(f"SET sorted_hnsw.build_sq8 = {'on' if build_sq8 else 'off'}")
+    try:
+        if build_heap_index:
+            cur.execute(
+                f"CREATE INDEX facts_heap_ann_idx ON facts_heap USING sorted_hnsw (embedding) WITH (m = {m}, ef_construction = {ef_construction})"
+            )
+        if build_sorted_heap_index:
+            cur.execute(
+                f"CREATE INDEX facts_sh_ann_idx ON facts_sh USING sorted_hnsw (embedding) WITH (m = {m}, ef_construction = {ef_construction})"
+            )
+        if build_heap_index:
+            cur.execute("ANALYZE facts_heap")
+        cur.execute("ANALYZE facts_sh")
+    finally:
+        if build_sq8 is not None:
+            cur.execute("RESET sorted_hnsw.build_sq8")
 
 
 def load_queries(cur: Cursor, query_count: int) -> list[tuple[int, int, str]]:

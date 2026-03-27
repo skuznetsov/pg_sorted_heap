@@ -110,6 +110,13 @@
 - Added `--hop-weight` to `scripts/bench_graph_rag_multidepth.py` so large
   synthetic multihop runs can vary the relative hop contribution without
   changing the SQL/GraphRAG contract.
+- Added `sorted_hnsw.build_sq8` for constrained-memory index builds.
+  - builds the graph from SQ8-compressed build vectors instead of a full
+    float32 build slab
+  - costs an extra heap scan during `CREATE INDEX`
+  - first bounded local result on `1M x 64D`:
+    - `build_indexes`: `48.606 s -> 46.541 s`
+    - depth-5 unified GraphRAG stayed `87.5% / 100.0%`
 - Added `scripts/bench_graph_rag_multidepth_aws.sh` to run the synthetic
   multi-hop depth benchmark on a remote AWS host using the same sync/install
   pattern as the existing multihop AWS runners.

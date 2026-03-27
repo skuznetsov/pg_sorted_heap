@@ -271,6 +271,7 @@ shnsw_cosine_distance_query_hsvec_prenorm(const float *query, int dim,
 
 int		sorted_hnsw_ef_search = 96;
 bool	sorted_hnsw_sq8 = true;
+bool	sorted_hnsw_build_sq8 = false;
 bool	sorted_hnsw_shared_cache = true;
 
 static relopt_kind shnsw_relopt_kind = 0;
@@ -395,7 +396,9 @@ static bool shnsw_shared_scan_cache_publish(Relation index,
 static bool shnsw_shared_scan_cache_matches(Relation index, uint64 cache_gen);
 static void shnsw_scan_cache_seed_from_build(Relation index,
 											 HnswBuildState *graph,
-											 const float *vectors,
+											 const float *vectors_f32,
+											 const uint8 *vectors_sq8,
+											 HnswBuildVectorMode vector_mode,
 											 const float *sq8_mins,
 											 const float *sq8_scales,
 											 int n_nodes, int dim, int M);
@@ -470,11 +473,21 @@ static bool shnsw_bootstrap_first_node(Relation index, const float *vec,
 										ItemPointer heap_tid,
 										int M, int ef_construction, int dim);
 static Size shnsw_vector_buffer_bytes(int n_nodes, int dim);
+static Size shnsw_sq8_buffer_bytes(int n_nodes, int dim);
+static inline void shnsw_quantize_f32_to_sq8(const float *src, uint8 *dst,
+											 const float *mins,
+											 const float *scales, int dim);
 
 static Size
 shnsw_vector_buffer_bytes(int n_nodes, int dim)
 {
 	return mul_size(mul_size((Size) n_nodes, (Size) dim), sizeof(float));
+}
+
+static Size
+shnsw_sq8_buffer_bytes(int n_nodes, int dim)
+{
+	return mul_size((Size) n_nodes, (Size) dim);
 }
 
 /* ================================================================
@@ -559,6 +572,15 @@ sorted_hnsw_init(void)
 		NULL,
 		&sorted_hnsw_sq8,
 		true,
+		PGC_USERSET, 0,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"sorted_hnsw.build_sq8",
+		"Build sorted_hnsw graphs from SQ8-compressed build vectors instead of a full float32 slab.",
+		"Reduces build-time memory substantially at the cost of an extra heap scan and potentially lower graph quality on some corpora.",
+		&sorted_hnsw_build_sq8,
+		false,
 		PGC_USERSET, 0,
 		NULL, NULL, NULL);
 
@@ -982,7 +1004,9 @@ shnsw_scan_cache_relcache_callback(Datum arg, Oid relid)
 static void
 shnsw_scan_cache_seed_from_build(Relation index,
 								 HnswBuildState *graph,
-								 const float *vectors,
+								 const float *vectors_f32,
+								 const uint8 *vectors_sq8,
+								 HnswBuildVectorMode vector_mode,
 								 const float *sq8_mins,
 								 const float *sq8_scales,
 								 int n_nodes, int dim, int M)
@@ -1071,11 +1095,15 @@ shnsw_scan_cache_seed_from_build(Relation index,
 			nbrs[d] = -1;
 
 		sq8_slot = shnsw_cache_sq8_slot(cache, i);
-		for (d = 0; d < dim; d++)
-		{
-			sq8_slot[d] = sq8_quantize(vectors[(Size) i * dim + d],
-									   sq8_mins[d], sq8_scales[d]);
-		}
+		if (vector_mode == SHNSW_BUILD_VECTOR_SQ8)
+			memcpy(sq8_slot, vectors_sq8 + (Size) i * (Size) dim, dim);
+		else
+			shnsw_quantize_f32_to_sq8(
+				vectors_f32 + (Size) i * (Size) dim,
+				sq8_slot,
+				sq8_mins,
+				sq8_scales,
+				dim);
 	}
 
 	cache->upper = palloc0(sizeof(ShnswUpperNbr *) * (max_level + 1));
@@ -1585,6 +1613,16 @@ sq8_quantize(float val, float min_val, float scale)
 	return (uint8) (normalized + 0.5f);
 }
 
+static inline void
+shnsw_quantize_f32_to_sq8(const float *src, uint8 *dst,
+						  const float *mins, const float *scales, int dim)
+{
+	int d;
+
+	for (d = 0; d < dim; d++)
+		dst[d] = sq8_quantize(src[d], mins[d], scales[d]);
+}
+
 static IndexBuildResult *
 shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 {
@@ -1594,12 +1632,14 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	HnswBuildState	   *graph;
 	ShnswOptions	   *opts;
 	ShnswVectorKind		vector_kind;
+	HnswBuildVectorMode build_vector_mode;
 	int					M, ef_construction, dim;
 	int					n_nodes;
 	int					max_level;
 
 	/* Vectors + TIDs collected from heap scan */
-	float			   *vectors = NULL;
+	float			   *vectors_f32 = NULL;
+	uint8			   *vectors_sq8 = NULL;
 	ItemPointerData	   *tids = NULL;
 	int					alloc_nodes = 0;
 
@@ -1617,6 +1657,8 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	opts = (ShnswOptions *) index->rd_options;
 	M = opts ? opts->m : SHNSW_DEFAULT_M;
 	ef_construction = opts ? opts->ef_construction : SHNSW_DEFAULT_EF_CONSTRUCTION;
+	build_vector_mode = sorted_hnsw_build_sq8 ?
+		SHNSW_BUILD_VECTOR_SQ8 : SHNSW_BUILD_VECTOR_F32;
 
 	/* Determine supported vector type and explicit dimension. */
 	vector_kind = shnsw_index_vector_kind(index, &dim);
@@ -1625,7 +1667,65 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 									  "sorted_hnsw build",
 									  ALLOCSET_DEFAULT_SIZES);
 
-	/* ---- Phase 1: Scan heap, collect vectors ---- */
+	/* ---- Phase 1: Scan heap, collect build vectors ---- */
+	if (build_vector_mode == SHNSW_BUILD_VECTOR_SQ8)
+	{
+		TableScanDesc	scan;
+		TupleTableSlot *slot;
+		Snapshot		snapshot;
+		int				vec_attno;
+		float		   *scratch;
+
+		elog(NOTICE, "sorted_hnsw: scanning heap for SQ8 build ranges (dim=%d)", dim);
+
+		old_ctx = MemoryContextSwitchTo(build_ctx);
+		sq8_mins = palloc(sizeof(float) * dim);
+		sq8_scales = palloc(sizeof(float) * dim);
+		scratch = palloc(sizeof(float) * dim);
+		MemoryContextSwitchTo(old_ctx);
+
+		for (d = 0; d < dim; d++)
+		{
+			sq8_mins[d] = FLT_MAX;
+			sq8_scales[d] = -FLT_MAX;	/* temporarily stores max */
+		}
+
+		vec_attno = indexInfo->ii_IndexAttrNumbers[0];
+		snapshot = RegisterSnapshot(GetLatestSnapshot());
+		scan = table_beginscan(heap, snapshot, 0, NULL);
+		slot = table_slot_create(heap, NULL);
+		n_nodes = 0;
+
+		while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+		{
+			bool	isnull;
+			Datum	val;
+
+			CHECK_FOR_INTERRUPTS();
+
+			val = slot_getattr(slot, vec_attno, &isnull);
+			if (isnull)
+				continue;
+
+			shnsw_copy_datum_to_float4(val, vector_kind, dim, scratch);
+			for (d = 0; d < dim; d++)
+			{
+				if (scratch[d] < sq8_mins[d])
+					sq8_mins[d] = scratch[d];
+				if (scratch[d] > sq8_scales[d])
+					sq8_scales[d] = scratch[d];
+			}
+			n_nodes++;
+			ExecClearTuple(slot);
+		}
+
+		ExecDropSingleTupleTableSlot(slot);
+		table_endscan(scan);
+		UnregisterSnapshot(snapshot);
+
+		elog(NOTICE, "sorted_hnsw: range scan counted %d vectors", n_nodes);
+	}
+	else
 	{
 		TableScanDesc	scan;
 		TupleTableSlot *slot;
@@ -1642,8 +1742,8 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 		n_nodes = 0;
 		alloc_nodes = 1024;
 		old_ctx = MemoryContextSwitchTo(build_ctx);
-		vectors = (float *) MemoryContextAllocHuge(build_ctx,
-												   shnsw_vector_buffer_bytes(alloc_nodes, dim));
+		vectors_f32 = (float *) MemoryContextAllocHuge(build_ctx,
+													   shnsw_vector_buffer_bytes(alloc_nodes, dim));
 		tids = palloc(sizeof(ItemPointerData) * alloc_nodes);
 		MemoryContextSwitchTo(old_ctx);
 
@@ -1658,19 +1758,18 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 			if (isnull)
 				continue;
 
-			/* Grow arrays if needed */
 			if (n_nodes >= alloc_nodes)
 			{
 				alloc_nodes *= 2;
 				old_ctx = MemoryContextSwitchTo(build_ctx);
-				vectors = (float *) repalloc_huge(vectors,
-												  shnsw_vector_buffer_bytes(alloc_nodes, dim));
+				vectors_f32 = (float *) repalloc_huge(vectors_f32,
+													  shnsw_vector_buffer_bytes(alloc_nodes, dim));
 				tids = repalloc(tids, sizeof(ItemPointerData) * alloc_nodes);
 				MemoryContextSwitchTo(old_ctx);
 			}
 
 			shnsw_copy_datum_to_float4(val, vector_kind, dim,
-									   vectors + (Size) n_nodes * dim);
+									   vectors_f32 + (Size) n_nodes * dim);
 			ItemPointerCopy(&slot->tts_tid, &tids[n_nodes]);
 			n_nodes++;
 
@@ -1692,35 +1791,98 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 		return result;
 	}
 
-	/* ---- Phase 2: Build HNSW graph in memory ---- */
-	graph = shnsw_build_graph(vectors, tids, n_nodes, dim,
-							  M, ef_construction, build_ctx);
-	max_level = shnsw_build_max_level(graph);
-
-	/* ---- Phase 3: Compute SQ8 min/max ---- */
-	old_ctx = MemoryContextSwitchTo(build_ctx);
-	sq8_mins = palloc(sizeof(float) * dim);
-	sq8_scales = palloc(sizeof(float) * dim);
-	MemoryContextSwitchTo(old_ctx);
-
-	for (d = 0; d < dim; d++)
+	if (build_vector_mode == SHNSW_BUILD_VECTOR_SQ8)
 	{
-		sq8_mins[d] = FLT_MAX;
-		sq8_scales[d] = -FLT_MAX;	/* temporarily store max here */
-	}
-	for (i = 0; i < n_nodes; i++)
-	{
-		const float *v = vectors + (Size)i * dim;
+		TableScanDesc	scan;
+		TupleTableSlot *slot;
+		Snapshot		snapshot;
+		int				vec_attno;
+		float		   *scratch;
+
 		for (d = 0; d < dim; d++)
 		{
-			if (v[d] < sq8_mins[d]) sq8_mins[d] = v[d];
-			if (v[d] > sq8_scales[d]) sq8_scales[d] = v[d];
+			float range = sq8_scales[d] - sq8_mins[d];
+			sq8_scales[d] = (range > 0.0f) ? (range / 255.0f) : 0.0f;
 		}
+
+		old_ctx = MemoryContextSwitchTo(build_ctx);
+		vectors_sq8 = (uint8 *) MemoryContextAllocHuge(build_ctx,
+													 shnsw_sq8_buffer_bytes(n_nodes, dim));
+		tids = palloc(sizeof(ItemPointerData) * n_nodes);
+		scratch = palloc(sizeof(float) * dim);
+		MemoryContextSwitchTo(old_ctx);
+
+		elog(NOTICE, "sorted_hnsw: rescanning heap for SQ8 build vectors (dim=%d)", dim);
+
+		vec_attno = indexInfo->ii_IndexAttrNumbers[0];
+		snapshot = RegisterSnapshot(GetLatestSnapshot());
+		scan = table_beginscan(heap, snapshot, 0, NULL);
+		slot = table_slot_create(heap, NULL);
+		i = 0;
+
+		while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+		{
+			bool	isnull;
+			Datum	val;
+
+			CHECK_FOR_INTERRUPTS();
+
+			val = slot_getattr(slot, vec_attno, &isnull);
+			if (isnull)
+				continue;
+
+			shnsw_copy_datum_to_float4(val, vector_kind, dim, scratch);
+			shnsw_quantize_f32_to_sq8(
+				scratch,
+				vectors_sq8 + (Size) i * (Size) dim,
+				sq8_mins,
+				sq8_scales,
+				dim);
+			ItemPointerCopy(&slot->tts_tid, &tids[i]);
+			i++;
+			ExecClearTuple(slot);
+		}
+
+		ExecDropSingleTupleTableSlot(slot);
+		table_endscan(scan);
+		UnregisterSnapshot(snapshot);
+
+		elog(NOTICE, "sorted_hnsw: collected %d SQ8 build vectors", i);
 	}
-	for (d = 0; d < dim; d++)
+
+	/* ---- Phase 2: Build HNSW graph in memory ---- */
+	graph = shnsw_build_graph(vectors_f32, vectors_sq8, sq8_mins, sq8_scales,
+							  tids, n_nodes, dim, M, ef_construction,
+							  build_vector_mode, build_ctx);
+	max_level = shnsw_build_max_level(graph);
+
+	/* ---- Phase 3: Compute SQ8 min/max (float32 build mode only) ---- */
+	if (build_vector_mode == SHNSW_BUILD_VECTOR_F32)
 	{
-		float range = sq8_scales[d] - sq8_mins[d];
-		sq8_scales[d] = (range > 0.0f) ? (range / 255.0f) : 0.0f;
+		old_ctx = MemoryContextSwitchTo(build_ctx);
+		sq8_mins = palloc(sizeof(float) * dim);
+		sq8_scales = palloc(sizeof(float) * dim);
+		MemoryContextSwitchTo(old_ctx);
+
+		for (d = 0; d < dim; d++)
+		{
+			sq8_mins[d] = FLT_MAX;
+			sq8_scales[d] = -FLT_MAX;	/* temporarily store max here */
+		}
+		for (i = 0; i < n_nodes; i++)
+		{
+			const float *v = vectors_f32 + (Size)i * dim;
+			for (d = 0; d < dim; d++)
+			{
+				if (v[d] < sq8_mins[d]) sq8_mins[d] = v[d];
+				if (v[d] > sq8_scales[d]) sq8_scales[d] = v[d];
+			}
+		}
+		for (d = 0; d < dim; d++)
+		{
+			float range = sq8_scales[d] - sq8_mins[d];
+			sq8_scales[d] = (range > 0.0f) ? (range / 255.0f) : 0.0f;
+		}
 	}
 
 	/* ---- Phase 4: Write index pages ---- */
@@ -1819,7 +1981,6 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 			ShnswNodeHeader *nh;
 			int32  *nbrs;
 			uint8  *sq8;
-			const float *vec;
 			int		n;
 
 			CHECK_FOR_INTERRUPTS();
@@ -1870,9 +2031,19 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 
 			/* SQ8 quantized vector */
 			sq8 = ShnswNodeSQ8Vec(nh, M);
-			vec = vectors + (Size)i * dim;
-			for (d = 0; d < dim; d++)
-				sq8[d] = sq8_quantize(vec[d], sq8_mins[d], sq8_scales[d]);
+			if (build_vector_mode == SHNSW_BUILD_VECTOR_SQ8)
+			{
+				memcpy(sq8, vectors_sq8 + (Size) i * (Size) dim, dim);
+			}
+			else
+			{
+				shnsw_quantize_f32_to_sq8(
+					vectors_f32 + (Size) i * (Size) dim,
+					sq8,
+					sq8_mins,
+					sq8_scales,
+					dim);
+			}
 
 			page_nodes++;
 			shnsw_page_set_payload_end(page, (Size) page_nodes * node_size);
@@ -2031,7 +2202,8 @@ shnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	/* Ensure all index pages are flushed to disk */
 	FlushRelationBuffers(index);
-	shnsw_scan_cache_seed_from_build(index, graph, vectors, sq8_mins, sq8_scales,
+	shnsw_scan_cache_seed_from_build(index, graph, vectors_f32, vectors_sq8,
+									 build_vector_mode, sq8_mins, sq8_scales,
 									 n_nodes, dim, M);
 
 	MemoryContextDelete(build_ctx);

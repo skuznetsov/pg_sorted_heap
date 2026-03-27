@@ -432,6 +432,7 @@ def main() -> None:
     ap.add_argument("--ef-search", type=int, default=128)
     ap.add_argument("--ef-construction", type=int, default=200)
     ap.add_argument("--m", type=int, default=24)
+    ap.add_argument("--build-sq8", choices=("default", "on", "off"), default="default")
     ap.add_argument("--shared-buffers-mb", type=int, default=64)
     ap.add_argument("--max-wal-size-gb", type=int, default=4)
     ap.add_argument("--maintenance-work-mem-mb", type=int, default=0)
@@ -465,6 +466,7 @@ def main() -> None:
         build_hop_weight = float(meta.get("hop_weight", args.hop_weight))
         build_ef_construction = int(meta.get("ef_construction", args.ef_construction))
         build_m = int(meta.get("m", args.m))
+        build_build_sq8 = str(meta.get("build_sq8", args.build_sq8))
         build_table_scope = str(meta.get("table_scope", args.table_scope))
         build_heap_retained = bool(meta.get("heap_retained", True))
         build_stream_copy = bool(meta.get("stream_copy", False))
@@ -490,6 +492,7 @@ def main() -> None:
         build_hop_weight = args.hop_weight
         build_ef_construction = args.ef_construction
         build_m = args.m
+        build_build_sq8 = args.build_sq8
         build_table_scope = args.table_scope
         build_heap_retained = build_table_scope == "all"
         build_stream_copy = args.stream_copy
@@ -508,6 +511,7 @@ def main() -> None:
                 "hop_weight": build_hop_weight,
                 "ef_construction": build_ef_construction,
                 "m": build_m,
+                "build_sq8": build_build_sq8,
                 "table_scope": build_table_scope,
                 "heap_retained": build_heap_retained,
                 "stream_copy": build_stream_copy,
@@ -615,6 +619,11 @@ def main() -> None:
                     m=build_m,
                     build_heap_index=(build_table_scope == "all"),
                     build_sorted_heap_index=True,
+                    build_sq8=(
+                        True if build_build_sq8 == "on"
+                        else False if build_build_sq8 == "off"
+                        else None
+                    ),
                 )
                 t_build_end = time.perf_counter()
                 print(
@@ -671,6 +680,7 @@ def main() -> None:
             print(f"ef_search:        {args.ef_search}")
             print(f"ef_construction:  {build_ef_construction}")
             print(f"m:                {build_m}")
+            print(f"build_sq8:        {build_build_sq8}")
             print(f"shared_buffers:   {build_shared_buffers_mb}MB")
             print(f"max_wal_size:     {build_max_wal_size_gb}GB")
             print(f"maintenance_work_mem: {build_maintenance_work_mem_mb}MB")

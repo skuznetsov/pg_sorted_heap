@@ -129,6 +129,17 @@ ORDER BY embedding <=> '[0.1,0.2,0.3,...]'::svec
 LIMIT 10;
 ```
 
+On constrained builders, the current low-memory build knob is:
+
+```sql
+SET sorted_hnsw.build_sq8 = on;
+```
+
+That builds `sorted_hnsw` from SQ8-compressed build vectors instead of a full
+float32 build slab. It costs one extra heap scan during `CREATE INDEX`, but on
+the current local `1M x 64D` GraphRAG point it preserved quality and slightly
+improved build time.
+
 This is planner-integrated KNN search: no sidecar prefix argument, no manual
 rerank knob, and exact rerank happens inside the index scan.
 

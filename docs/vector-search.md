@@ -93,6 +93,18 @@ ORDER BY embedding <=> '[0.1,0.2,0.3,...]'::pg_sorted_heap.svec
 LIMIT 10;
 ```
 
+On constrained builders, the current low-memory build knob is:
+
+```sql
+SET sorted_hnsw.build_sq8 = on;
+```
+
+That makes `CREATE INDEX ... USING sorted_hnsw` build the graph from
+SQ8-compressed build vectors instead of a full float32 build slab. The tradeoff
+is one extra heap scan during build and a possible graph-quality loss on some
+corpora, but on the current local `1M x 64D` multidepth GraphRAG point it
+preserved quality and slightly improved build time.
+
 Compact-storage variant:
 
 ```sql

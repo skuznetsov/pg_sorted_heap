@@ -128,6 +128,30 @@ SELECT count(*) AS empty_query_count FROM (
   SELECT id FROM hnsw_empty ORDER BY v <=> '[1,0,0,0]'::svec LIMIT 1
 ) x;
 
+-- Low-memory SQ8 build path
+SET sorted_hnsw.build_sq8 = on;
+CREATE TABLE hnsw_buildsq8 (id serial PRIMARY KEY, v svec(4));
+INSERT INTO hnsw_buildsq8 (v)
+SELECT format('[%s,%s,%s,%s]',
+  round((sin(id * 1.0))::numeric, 4),
+  round((cos(id * 1.0))::numeric, 4),
+  round((sin(id * 2.0))::numeric, 4),
+  round((cos(id * 2.0))::numeric, 4))::svec
+FROM generate_series(1, 80) AS id;
+CREATE INDEX hnsw_buildsq8_idx ON hnsw_buildsq8 USING sorted_hnsw (v) WITH (m = 16, ef_construction = 64);
+COPY (
+  SELECT count(*) AS buildsq8_result_count FROM (
+    SELECT id FROM hnsw_buildsq8 ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec LIMIT 5
+  ) x
+) TO STDOUT;
+COPY (
+  SELECT round(min(v <=> (SELECT v FROM hnsw_buildsq8 WHERE id = 1))::numeric, 6) AS buildsq8_self_dist FROM (
+    SELECT v FROM hnsw_buildsq8 ORDER BY v <=> (SELECT v FROM hnsw_buildsq8 WHERE id = 1) LIMIT 5
+  ) x
+) TO STDOUT;
+DROP TABLE hnsw_buildsq8;
+RESET sorted_hnsw.build_sq8;
+
 -- Native hsvec path: no upcasted storage contract
 CREATE TABLE hnsw_half (id serial PRIMARY KEY, v hsvec(4));
 INSERT INTO hnsw_half (v)

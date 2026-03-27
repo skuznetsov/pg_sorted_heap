@@ -40,6 +40,7 @@ typedef struct HnswBuildState
 	int			ef_construction;
 	double		ml;				/* level multiplier: 1/ln(M) */
 	int			dim;
+	HnswBuildVectorMode vector_mode;
 
 	/* Graph */
 	int			n_nodes;
@@ -47,8 +48,12 @@ typedef struct HnswBuildState
 	int			entry_nid;		/* entry point node */
 	HnswNode   *nodes;			/* array[n_nodes] */
 
-	/* Vectors (float32, row-major) */
-	float	   *vectors;		/* n_nodes * dim */
+	/* Build-time vector storage */
+	float	   *vectors_f32;	/* n_nodes * dim (float32 mode) */
+	const uint8 *vectors_sq8;	/* n_nodes * dim (SQ8 mode) */
+	const float *sq8_mins;
+	const float *sq8_scales;
+	float	   *query_buf;		/* dequantized scratch for SQ8 mode */
 
 	/* Reusable visitation marks for build-time searches */
 	uint32	   *visit_marks;	/* array[n_nodes], zero means unvisited */
@@ -192,6 +197,116 @@ cosine_distance_f32(const float *a, const float *b, int dim)
 	return (float)(1.0 - dot / (sqrt(norm_a) * sqrt(norm_b)));
 }
 
+static float
+cosine_distance_query_sq8(const float *query, const uint8 *sq8_vec,
+						  const float *mins, const float *scales, int dim)
+{
+	double dot = 0.0, norm_a = 0.0, norm_b = 0.0;
+	int i;
+
+	for (i = 0; i < dim; i++)
+	{
+		double qa = (double) query[i];
+		double qb = (double) mins[i] + (double) sq8_vec[i] * (double) scales[i];
+
+		dot += qa * qb;
+		norm_a += qa * qa;
+		norm_b += qb * qb;
+	}
+
+	if (norm_a == 0.0 || norm_b == 0.0)
+		return 2.0f;
+
+	return (float)(1.0 - dot / (sqrt(norm_a) * sqrt(norm_b)));
+}
+
+static float
+cosine_distance_sq8_sq8(const uint8 *a, const uint8 *b,
+						const float *mins, const float *scales, int dim)
+{
+	double dot = 0.0, norm_a = 0.0, norm_b = 0.0;
+	int i;
+
+	for (i = 0; i < dim; i++)
+	{
+		double va = (double) mins[i] + (double) a[i] * (double) scales[i];
+		double vb = (double) mins[i] + (double) b[i] * (double) scales[i];
+
+		dot += va * vb;
+		norm_a += va * va;
+		norm_b += vb * vb;
+	}
+
+	if (norm_a == 0.0 || norm_b == 0.0)
+		return 2.0f;
+
+	return (float)(1.0 - dot / (sqrt(norm_a) * sqrt(norm_b)));
+}
+
+static inline const uint8 *
+hnsw_build_sq8_slot(HnswBuildState *state, int32 nid)
+{
+	return state->vectors_sq8 + (Size) nid * (Size) state->dim;
+}
+
+static inline void
+hnsw_build_dequantize_node(HnswBuildState *state, int32 nid, float *dst)
+{
+	const uint8 *src = hnsw_build_sq8_slot(state, nid);
+	int i;
+
+	for (i = 0; i < state->dim; i++)
+		dst[i] = state->sq8_mins[i] + src[i] * state->sq8_scales[i];
+}
+
+static inline const float *
+hnsw_build_query_vector(HnswBuildState *state, int32 nid)
+{
+	if (state->vector_mode == SHNSW_BUILD_VECTOR_F32)
+		return state->vectors_f32 + (Size) nid * (Size) state->dim;
+
+	hnsw_build_dequantize_node(state, nid, state->query_buf);
+	return state->query_buf;
+}
+
+static inline float
+hnsw_build_distance_query_node(HnswBuildState *state, const float *query, int32 nid)
+{
+	if (state->vector_mode == SHNSW_BUILD_VECTOR_F32)
+	{
+		return cosine_distance_f32(
+			query,
+			state->vectors_f32 + (Size) nid * (Size) state->dim,
+			state->dim);
+	}
+
+	return cosine_distance_query_sq8(
+		query,
+		hnsw_build_sq8_slot(state, nid),
+		state->sq8_mins,
+		state->sq8_scales,
+		state->dim);
+}
+
+static inline float
+hnsw_build_distance_nodes(HnswBuildState *state, int32 a_nid, int32 b_nid)
+{
+	if (state->vector_mode == SHNSW_BUILD_VECTOR_F32)
+	{
+		return cosine_distance_f32(
+			state->vectors_f32 + (Size) a_nid * (Size) state->dim,
+			state->vectors_f32 + (Size) b_nid * (Size) state->dim,
+			state->dim);
+	}
+
+	return cosine_distance_sq8_sq8(
+		hnsw_build_sq8_slot(state, a_nid),
+		hnsw_build_sq8_slot(state, b_nid),
+		state->sq8_mins,
+		state->sq8_scales,
+		state->dim);
+}
+
 /* ---- Level selection ---- */
 
 static int
@@ -232,13 +347,10 @@ search_layer(HnswBuildState *state, const float *query,
 	PQueue	   *candidates;		/* min-heap: next to explore */
 	PQueue	   *result;			/* max-heap: ef nearest */
 	float		entry_dist;
-	int			dim = state->dim;
 	uint32		visit_token = next_visit_token(state);
 	uint32	   *visited = state->visit_marks;
 
-	entry_dist = cosine_distance_f32(query,
-									 state->vectors + (Size)entry_nid * dim,
-									 dim);
+	entry_dist = hnsw_build_distance_query_node(state, query, entry_nid);
 
 	candidates = pq_create(ef * 2, false);	/* min-heap */
 	result = pq_create(ef + 1, true);		/* max-heap */
@@ -277,9 +389,7 @@ search_layer(HnswBuildState *state, const float *query,
 				continue;
 			visited[nbr_nid] = visit_token;
 
-			nbr_dist = cosine_distance_f32(query,
-										   state->vectors + (Size)nbr_nid * dim,
-										   dim);
+			nbr_dist = hnsw_build_distance_query_node(state, query, nbr_nid);
 
 			furthest_dist = pq_top_dist(result);
 			if (nbr_dist < furthest_dist || result->size < ef)
@@ -318,7 +428,6 @@ select_neighbors_heuristic(HnswBuildState *state,
 	int			n_cand;
 	int			n_selected = 0;
 	int			i, j;
-	int			dim = state->dim;
 
 	/* Extract all candidates sorted by distance (ascending) */
 	n_cand = candidates->size;
@@ -346,10 +455,8 @@ select_neighbors_heuristic(HnswBuildState *state,
 
 		for (j = 0; j < n_selected; j++)
 		{
-			float inter_dist = cosine_distance_f32(
-				state->vectors + (Size)cand_nid * dim,
-				state->vectors + (Size)out_nids[j] * dim,
-				dim);
+			float inter_dist = hnsw_build_distance_nodes(state, cand_nid,
+														 out_nids[j]);
 
 			if (inter_dist < cand_dist)
 			{
@@ -390,7 +497,6 @@ static void
 shrink_connections(HnswBuildState *state, int32 nid, int level, int max_nbrs)
 {
 	HnswNode   *node = &state->nodes[nid];
-	int			dim = state->dim;
 	int			n = node->n_neighbors[level];
 	PQueue	   *candidates;
 	int32	   *new_nbrs;
@@ -405,10 +511,7 @@ shrink_connections(HnswBuildState *state, int32 nid, int level, int max_nbrs)
 	for (i = 0; i < n; i++)
 	{
 		int32	nbr = node->neighbors[level][i];
-		float	d = cosine_distance_f32(
-			state->vectors + (Size)nid * dim,
-			state->vectors + (Size)nbr * dim,
-			dim);
+		float	d = hnsw_build_distance_nodes(state, nid, nbr);
 		pq_push(candidates, d, nbr);
 	}
 
@@ -435,8 +538,7 @@ hnsw_insert_node(HnswBuildState *state, int32 nid)
 	int			level;
 	int			ep_nid;
 	int			max_level;
-	int			dim = state->dim;
-	const float *query = state->vectors + (Size)nid * dim;
+	const float *query = hnsw_build_query_vector(state, nid);
 	HnswNode   *node = &state->nodes[nid];
 	int32	   *selected;
 
@@ -560,9 +662,11 @@ hnsw_insert_node(HnswBuildState *state, int32 nid)
  *   Caller uses this to write index pages.
  */
 HnswBuildState *
-shnsw_build_graph(float *vectors, ItemPointer tids,
-				  int n_nodes, int dim,
+shnsw_build_graph(float *vectors_f32, const uint8 *vectors_sq8,
+				  const float *sq8_mins, const float *sq8_scales,
+				  ItemPointer tids, int n_nodes, int dim,
 				  int M, int ef_construction,
+				  HnswBuildVectorMode vector_mode,
 				  MemoryContext build_ctx)
 {
 	HnswBuildState *state;
@@ -577,10 +681,16 @@ shnsw_build_graph(float *vectors, ItemPointer tids,
 	state->ef_construction = ef_construction;
 	state->ml = 1.0 / log((double)M);
 	state->dim = dim;
+	state->vector_mode = vector_mode;
 	state->n_nodes = n_nodes;
 	state->max_level = -1;
 	state->entry_nid = -1;
-	state->vectors = vectors;
+	state->vectors_f32 = vectors_f32;
+	state->vectors_sq8 = vectors_sq8;
+	state->sq8_mins = sq8_mins;
+	state->sq8_scales = sq8_scales;
+	if (vector_mode == SHNSW_BUILD_VECTOR_SQ8)
+		state->query_buf = palloc(sizeof(float) * dim);
 	state->visit_marks = palloc0(sizeof(uint32) * (Size) n_nodes);
 	state->visit_token = 0;
 	state->build_ctx = build_ctx;
@@ -596,8 +706,10 @@ shnsw_build_graph(float *vectors, ItemPointer tids,
 	MemoryContextSwitchTo(old_ctx);
 
 	/* Insert nodes one by one */
-	elog(NOTICE, "sorted_hnsw: building HNSW graph (%d nodes, dim=%d, M=%d, ef=%d)",
-		 n_nodes, dim, M, ef_construction);
+	elog(NOTICE,
+		 "sorted_hnsw: building HNSW graph (%d nodes, dim=%d, M=%d, ef=%d, build_vectors=%s)",
+		 n_nodes, dim, M, ef_construction,
+		 vector_mode == SHNSW_BUILD_VECTOR_SQ8 ? "sq8" : "float32");
 
 	for (i = 0; i < n_nodes; i++)
 	{

@@ -275,6 +275,39 @@ doing low-level experiments.
 SET sorted_hnsw.sq8 = on;
 ```
 
+### `sorted_hnsw.build_sq8`
+
+| Property | Value |
+|----------|-------|
+| Type | boolean |
+| Default | `off` |
+| Context | user (SET) |
+
+Builds `sorted_hnsw` from SQ8-compressed build vectors instead of keeping a
+full float32 build slab resident. This lowers build-time memory materially for
+large indexes at the cost of an extra heap scan and possible graph-quality
+loss on some corpora.
+
+The narrow verified point so far:
+
+- local `1M x 64D` multidepth build (`m=16`, `ef_construction=64`)
+- `build_indexes`: `48.606 s -> 46.541 s`
+- depth-5 unified GraphRAG stayed `87.5% / 100.0%`
+
+The memory saving is by construction:
+
+- float32 build slab: `4 * N * D` bytes
+- SQ8 build slab: `1 * N * D` bytes
+
+So, for example:
+
+- `10M x 64D`: about `2.56 GiB -> 0.64 GiB`
+- `10M x 384D`: about `15.36 GiB -> 3.84 GiB`
+
+```sql
+SET sorted_hnsw.build_sq8 = on;
+```
+
 ### `sorted_hnsw.shared_cache`
 
 | Property | Value |
