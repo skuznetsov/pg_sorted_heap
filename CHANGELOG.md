@@ -39,6 +39,20 @@
   - one-hop `score_mode := 'path'` being intentionally equivalent to
     `endpoint`
 
+### sorted_hnsw shared cache fix
+
+- Fixed a multi-index shared-cache corruption bug where
+  `shnsw_shared_scan_cache_attach()` held bare pointers into shared
+  memory. A subsequent publish for a different index overwrote the shared
+  region, silently corrupting the first index's cached HNSW graph.
+- The attach path now deep-copies all bulk data (L0 neighbors, SQ8
+  vectors, upper-level neighbor slabs) into local palloc'd buffers.
+- Added a multi-index overwrite regression phase (B5) to
+  `scripts/test_hnsw_chunked_cache.sh`.
+- Verified: `shared_cache=on` and `off` produce identical retrieval
+  quality on the 5K x 384D and 10K x 384D multihop benchmarks.
+  `shared_cache=off` is no longer needed as a correctness workaround.
+
 ### GraphRAG syntax unification
 
 - Added `sorted_heap_graph_rag(...)` as the new unified fact-shaped GraphRAG

@@ -225,6 +225,57 @@ So on the local balanced point, the current `sorted_heap` path-aware rows are
 not a fragile one-off. The latency band is tight, and the answer quality did
 not drift across the three rebuilds.
 
+### `shared_cache=on` vs `off` for multihop (post-fix, 0490cc4)
+
+A multi-index shared-cache corruption bug was fixed in commit `0490cc4`.
+Previously, when two or more `sorted_hnsw` indexes existed in the same
+database and `shared_cache=on`, a publish for the second index could
+overwrite shared memory that an attached cache for the first index was
+still reading through bare pointers. This caused silent data corruption
+and 0% retrieval quality on the affected index.
+
+The fix deep-copies all data (L0 neighbors, SQ8 vectors, upper-level
+neighbor slabs) from shared memory into local palloc'd buffers on attach.
+The exact failure mode is regression-guarded by the multi-index overwrite
+phase (B5) in `scripts/test_hnsw_chunked_cache.sh`.
+
+Post-fix verification on the `5K x 384D` multihop benchmark (fresh
+backends, 3 runs, `ann_k=64`, `ef_search=128`, `m=24`):
+
+```
+python3 scripts/bench_graph_rag_multihop.py \
+  --num-pairs 5000 --dim 384 --query-count 64 --runs 3 \
+  --ann-k 64 --top-k 10 --ef-search 128 --ef-construction 200 --m 24 \
+  --shared-cache {on,off} --backend-mode fresh \
+  --skip-zvec --skip-qdrant --skip-pgvector
+```
+
+| Method | shared_cache | p50 | hit@1 | hit@k |
+|--------|:----------:|:------:|:-----:|:-----:|
+| sorted_heap_expand_twohop_path_rerank() | off | 0.780 ms | 98.4% | 98.4% |
+| sorted_heap_expand_twohop_path_rerank() | on | 0.766 ms | 98.4% | 98.4% |
+| sorted_heap_graph_rag_twohop_path_scan() | off | 0.804 ms | 98.4% | 98.4% |
+| sorted_heap_graph_rag_twohop_path_scan() | on | 0.786 ms | 98.4% | 98.4% |
+
+Also verified at `10K x 384D`:
+
+```
+python3 scripts/bench_graph_rag_multihop.py \
+  --num-pairs 10000 --dim 384 --query-count 64 --runs 3 \
+  --ann-k 64 --top-k 10 --ef-search 128 --ef-construction 200 --m 24 \
+  --shared-cache {on,off} --backend-mode fresh \
+  --skip-zvec --skip-qdrant --skip-pgvector
+```
+
+| Method | shared_cache | p50 | hit@1 | hit@k |
+|--------|:----------:|:------:|:-----:|:-----:|
+| sorted_heap_graph_rag_twohop_path_scan() | off | 0.904 ms | 95.3% | 96.9% |
+| sorted_heap_graph_rag_twohop_path_scan() | on | 0.972 ms | 95.3% | 96.9% |
+
+Quality is identical between `on` and `off` at both measured scales.
+Latency at these measured scales is mixed rather than a clear universal win.
+`shared_cache=off` is no longer needed as a correctness workaround.
+
 ### Synthetic multi-hop depth scaling (`relation_path` depth 1..5)
 
 Repo-owned harness:
