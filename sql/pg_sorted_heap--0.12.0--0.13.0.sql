@@ -384,6 +384,106 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql STABLE;
 
+CREATE TABLE @extschema@.sorted_heap_graph_route_profile_registry (
+  route_name text NOT NULL,
+  profile_name text NOT NULL,
+  policy_name text,
+  relation_family text,
+  fanout_limit int4 NOT NULL DEFAULT 0,
+  PRIMARY KEY (route_name, profile_name)
+);
+
+SELECT pg_catalog.pg_extension_config_dump('@extschema@.sorted_heap_graph_route_profile_registry', '');
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_route_profile_register(
+  route_name text,
+  profile_name text,
+  policy_name text DEFAULT NULL,
+  relation_family text DEFAULT NULL,
+  fanout_limit int4 DEFAULT 0
+) RETURNS void
+AS $$
+BEGIN
+  IF fanout_limit < 0 THEN
+    RAISE EXCEPTION 'sorted_heap_graph_route_profile_register: fanout_limit must be >= 0';
+  END IF;
+
+  INSERT INTO @extschema@.sorted_heap_graph_route_profile_registry (
+    route_name, profile_name, policy_name, relation_family, fanout_limit
+  )
+  VALUES ($1, $2, $3, $4, $5)
+  ON CONFLICT ON CONSTRAINT sorted_heap_graph_route_profile_registry_pkey DO UPDATE SET
+    policy_name = EXCLUDED.policy_name,
+    relation_family = EXCLUDED.relation_family,
+    fanout_limit = EXCLUDED.fanout_limit;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_route_profile_unregister(
+  route_name text,
+  profile_name text DEFAULT NULL
+) RETURNS int4
+AS $$
+DECLARE
+  deleted_rows int4;
+BEGIN
+  DELETE FROM @extschema@.sorted_heap_graph_route_profile_registry
+  WHERE sorted_heap_graph_route_profile_registry.route_name = sorted_heap_graph_route_profile_unregister.route_name
+    AND (sorted_heap_graph_route_profile_unregister.profile_name IS NULL
+         OR sorted_heap_graph_route_profile_registry.profile_name = sorted_heap_graph_route_profile_unregister.profile_name);
+  GET DIAGNOSTICS deleted_rows = ROW_COUNT;
+  RETURN deleted_rows;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_route_profile_config(
+  route_name text DEFAULT NULL,
+  profile_name text DEFAULT NULL
+) RETURNS TABLE (
+  route_name text,
+  profile_name text,
+  policy_name text,
+  relation_family text,
+  fanout_limit int4
+)
+AS $$
+  SELECT p.route_name, p.profile_name, p.policy_name, p.relation_family, p.fanout_limit
+  FROM @extschema@.sorted_heap_graph_route_profile_registry p
+  WHERE ($1 IS NULL OR p.route_name = $1)
+    AND ($2 IS NULL OR p.profile_name = $2)
+  ORDER BY p.route_name, p.profile_name;
+$$ LANGUAGE SQL STABLE;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_route_profile_resolve(
+  route_name text,
+  profile_name text
+) RETURNS TABLE (
+  policy_name text,
+  relation_family text,
+  fanout_limit int4
+)
+AS $$
+DECLARE
+  resolved_policy_name text;
+  resolved_relation_family text;
+  resolved_fanout_limit int4;
+BEGIN
+  SELECT p.policy_name, p.relation_family, p.fanout_limit
+  INTO resolved_policy_name, resolved_relation_family, resolved_fanout_limit
+  FROM @extschema@.sorted_heap_graph_route_profile_registry p
+  WHERE p.route_name = sorted_heap_graph_route_profile_resolve.route_name
+    AND p.profile_name = sorted_heap_graph_route_profile_resolve.profile_name;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'sorted_heap_graph_route_profile_resolve: no profile % registered under route %',
+      profile_name, route_name;
+  END IF;
+
+  RETURN QUERY
+  SELECT resolved_policy_name, resolved_relation_family, resolved_fanout_limit;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
 CREATE FUNCTION @extschema@.sorted_heap_graph_rag_stats()
 RETURNS TABLE (
   calls bigint,
@@ -908,3 +1008,137 @@ $$ LANGUAGE plpgsql STABLE;
 
 COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact_policy(text, text, text, @extschema@.svec, int4[], int4, int4, text, int4, int4, text)
 IS 'Beta exact-key routed GraphRAG wrapper. Resolves a named segment-group policy from sorted_heap_graph_route_policy_registry, then delegates to sorted_heap_graph_rag_routed_exact(...) with optional relation-family filtering.';
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_profile(
+  route_name text,
+  route_value int8,
+  profile_name text,
+  query @extschema@.svec,
+  relation_path int4[],
+  ann_k int4 DEFAULT 64,
+  top_k int4 DEFAULT 10,
+  score_mode text DEFAULT 'path',
+  limit_rows int4 DEFAULT 0
+) RETURNS TABLE (
+  source_rel regclass,
+  entity_id int4,
+  relation_id int2,
+  target_id int4,
+  payload text,
+  distance float8
+)
+AS $$
+DECLARE
+  resolved_policy_name text;
+  resolved_relation_family text;
+  resolved_fanout_limit int4;
+BEGIN
+  SELECT p.policy_name, p.relation_family, p.fanout_limit
+  INTO resolved_policy_name, resolved_relation_family, resolved_fanout_limit
+  FROM @extschema@.sorted_heap_graph_route_profile_resolve(route_name, profile_name) AS p;
+
+  IF resolved_policy_name IS NULL THEN
+    RETURN QUERY
+    SELECT g.source_rel, g.entity_id, g.relation_id, g.target_id, g.payload, g.distance
+    FROM @extschema@.sorted_heap_graph_rag_routed(
+      route_name,
+      route_value,
+      query,
+      relation_path,
+      ann_k,
+      top_k,
+      score_mode,
+      limit_rows,
+      resolved_fanout_limit,
+      NULL,
+      resolved_relation_family
+    ) AS g;
+  ELSE
+    RETURN QUERY
+    SELECT g.source_rel, g.entity_id, g.relation_id, g.target_id, g.payload, g.distance
+    FROM @extschema@.sorted_heap_graph_rag_routed_policy(
+      route_name,
+      route_value,
+      resolved_policy_name,
+      query,
+      relation_path,
+      ann_k,
+      top_k,
+      score_mode,
+      limit_rows,
+      resolved_fanout_limit,
+      resolved_relation_family
+    ) AS g;
+  END IF;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_profile(text, int8, text, @extschema@.svec, int4[], int4, int4, text, int4)
+IS 'Beta routed GraphRAG wrapper. Resolves a named route profile containing policy_name, relation_family, and fanout_limit, then delegates to the existing routed GraphRAG path.';
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact_profile(
+  route_name text,
+  route_key text,
+  profile_name text,
+  query @extschema@.svec,
+  relation_path int4[],
+  ann_k int4 DEFAULT 64,
+  top_k int4 DEFAULT 10,
+  score_mode text DEFAULT 'path',
+  limit_rows int4 DEFAULT 0
+) RETURNS TABLE (
+  source_rel regclass,
+  entity_id int4,
+  relation_id int2,
+  target_id int4,
+  payload text,
+  distance float8
+)
+AS $$
+DECLARE
+  resolved_policy_name text;
+  resolved_relation_family text;
+  resolved_fanout_limit int4;
+BEGIN
+  SELECT p.policy_name, p.relation_family, p.fanout_limit
+  INTO resolved_policy_name, resolved_relation_family, resolved_fanout_limit
+  FROM @extschema@.sorted_heap_graph_route_profile_resolve(route_name, profile_name) AS p;
+
+  IF resolved_policy_name IS NULL THEN
+    RETURN QUERY
+    SELECT g.source_rel, g.entity_id, g.relation_id, g.target_id, g.payload, g.distance
+    FROM @extschema@.sorted_heap_graph_rag_routed_exact(
+      route_name,
+      route_key,
+      query,
+      relation_path,
+      ann_k,
+      top_k,
+      score_mode,
+      limit_rows,
+      resolved_fanout_limit,
+      NULL,
+      resolved_relation_family
+    ) AS g;
+  ELSE
+    RETURN QUERY
+    SELECT g.source_rel, g.entity_id, g.relation_id, g.target_id, g.payload, g.distance
+    FROM @extschema@.sorted_heap_graph_rag_routed_exact_policy(
+      route_name,
+      route_key,
+      resolved_policy_name,
+      query,
+      relation_path,
+      ann_k,
+      top_k,
+      score_mode,
+      limit_rows,
+      resolved_fanout_limit,
+      resolved_relation_family
+    ) AS g;
+  END IF;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact_profile(text, text, text, @extschema@.svec, int4[], int4, int4, text, int4)
+IS 'Beta exact-key routed GraphRAG wrapper. Resolves a named route profile containing policy_name, relation_family, and fanout_limit, then delegates to the existing exact-key routed GraphRAG path.';

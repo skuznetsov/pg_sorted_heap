@@ -240,20 +240,26 @@ The older helper/wrapper family is still available for lower-level control:
 - `sorted_heap_graph_segment_config(...)`
 - `sorted_heap_graph_segment_resolve(...)`
 - `sorted_heap_graph_segment_unregister(...)`
-- `sorted_heap_graph_route_policy_register(...)`
-- `sorted_heap_graph_route_policy_config(...)`
-- `sorted_heap_graph_route_policy_groups(...)`
-- `sorted_heap_graph_route_policy_unregister(...)`
-- `sorted_heap_graph_exact_register(...)`
-- `sorted_heap_graph_exact_config(...)`
-- `sorted_heap_graph_exact_resolve(...)`
-- `sorted_heap_graph_exact_unregister(...)`
-- `sorted_heap_graph_rag_segmented(...)`
-- `sorted_heap_graph_rag_routed(...)`
-- `sorted_heap_graph_rag_routed_policy(...)`
-- `sorted_heap_graph_rag_routed_exact(...)`
-- `sorted_heap_graph_rag_routed_exact_policy(...)`
-- `sorted_heap_graph_rag_scan(...)`
+  - `sorted_heap_graph_route_policy_register(...)`
+  - `sorted_heap_graph_route_policy_config(...)`
+  - `sorted_heap_graph_route_policy_groups(...)`
+  - `sorted_heap_graph_route_policy_unregister(...)`
+  - `sorted_heap_graph_route_profile_register(...)`
+  - `sorted_heap_graph_route_profile_config(...)`
+  - `sorted_heap_graph_route_profile_resolve(...)`
+  - `sorted_heap_graph_route_profile_unregister(...)`
+  - `sorted_heap_graph_exact_register(...)`
+  - `sorted_heap_graph_exact_config(...)`
+  - `sorted_heap_graph_exact_resolve(...)`
+  - `sorted_heap_graph_exact_unregister(...)`
+  - `sorted_heap_graph_rag_segmented(...)`
+  - `sorted_heap_graph_rag_routed(...)`
+  - `sorted_heap_graph_rag_routed_policy(...)`
+  - `sorted_heap_graph_rag_routed_profile(...)`
+  - `sorted_heap_graph_rag_routed_exact(...)`
+  - `sorted_heap_graph_rag_routed_exact_policy(...)`
+  - `sorted_heap_graph_rag_routed_exact_profile(...)`
+  - `sorted_heap_graph_rag_scan(...)`
 - `sorted_heap_graph_rag_twohop_scan(...)`
 - `sorted_heap_graph_rag_twohop_path_scan(...)`
 - `sorted_heap_graph_rag_multihop_scan(...)`
@@ -282,7 +288,11 @@ and `sorted_heap_graph_rag_routed_exact_policy(...)`. The newest narrow
 extension on top of that is an optional `relation_family := ...` filter on the
 range registry, exact-key registry, and both policy-backed wrappers, so beta
 segmented GraphRAG can now combine route key/range + shard-group policy + one
-extra family dimension without changing the scoring contract.
+extra family dimension without changing the scoring contract. The next
+ergonomic layer now exists too: named route profiles can bundle
+`policy_name + relation_family + fanout_limit` once and feed
+`sorted_heap_graph_rag_routed_profile(...)` or
+`sorted_heap_graph_rag_routed_exact_profile(...)` directly.
 
 For tuning and debugging, GraphRAG now also exposes backend-local last-call
 stats:

@@ -158,10 +158,17 @@ Reference design:
   - optional `relation_family := ...` filtering in config/resolve functions
     and in both raw/policy-backed routed GraphRAG wrappers
   - this is still narrow beta metadata, not a finished general router
+- and the first reusable route-profile layer now exists on top of that:
+  - `sorted_heap_graph_route_profile_register(...)`
+  - `sorted_heap_graph_route_profile_resolve(...)`
+  - `sorted_heap_graph_rag_routed_profile(...)`
+  - `sorted_heap_graph_rag_routed_exact_profile(...)`
+  - this bundles `policy_name + relation_family + fanout_limit` once instead
+    of repeating that combination in every query
 - what is still missing:
   - more than one optional text metadata dimension per registry row
   - a product-quality shard router contract for tenant / KB / relation-family
-    pruning without hand-managed registration tables or ad hoc naming
+    pruning without hand-managed registration tables
 
 This is still intentionally a reference path, not the final router.
 
@@ -225,7 +232,14 @@ exact-key routed GraphRAG can now combine:
 - stored shard-group policy order
 - one optional `relation_family` filter
 
+And the newest ergonomic layer removes one more repeated query burden:
+
+- a named route profile can now store that policy/family/fanout combination
+- profile-backed wrappers reuse the existing routed paths instead of adding a
+  new scoring contract
+
 That is still beta, but it is the first real multi-dimensional routing surface
 inside the extension. The next honest step is no longer “can we add metadata?”
 but “which metadata should become first-class beyond shard group + one family
-label?”
+label, and how much routing can move from ad hoc registries into a cleaner
+operator model?”

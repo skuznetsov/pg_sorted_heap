@@ -261,6 +261,18 @@
       resolution but before segmented GraphRAG fanout/merge
     - regression coverage now proves route+family and route+policy+family
       filtering for both range and exact-key routing
+  - the first route-profile convenience layer on top of that:
+    - added `sorted_heap_graph_route_profile_register(...)`,
+      `sorted_heap_graph_route_profile_config(...)`,
+      `sorted_heap_graph_route_profile_resolve(...)`, and
+      `sorted_heap_graph_route_profile_unregister(...)`
+    - added `sorted_heap_graph_rag_routed_profile(...)` and
+      `sorted_heap_graph_rag_routed_exact_profile(...)`
+    - this stores `policy_name + relation_family + fanout_limit` once and
+      reuses the existing routed wrappers instead of repeating that trio in
+      every query
+    - regression coverage now proves both profile-backed wrappers match the
+      existing sealed/right routed baselines
 
 ### sorted_hnsw build optimization
 
