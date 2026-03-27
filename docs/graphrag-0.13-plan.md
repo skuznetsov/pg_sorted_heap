@@ -107,7 +107,8 @@ All of the following are now covered for the narrow fact-shaped contract:
      building blocks
 
 2. Lifecycle hardening
-   - dump/restore coverage
+   - dump/restore coverage, including shared/default `segment_labels`
+     persistence in the segmented/routed control plane
    - crash recovery coverage
    - extension upgrade coverage
    - concurrent DML/compact interaction checks on GraphRAG-shaped tables
@@ -177,11 +178,13 @@ Implemented in this branch:
 - persistence coverage for the segmented/routed GraphRAG control plane across
   pg_dump/restore:
   - shared shard metadata
+  - shared `segment_labels`
   - range routing
   - exact-key routing
   - route policies
   - route profiles
   - route defaults
+  - effective default `segment_labels`
 - crash recovery coverage for registered GraphRAG alias schemas
 - concurrent DML / online compact / online merge coverage for registered
   GraphRAG alias schemas

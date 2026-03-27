@@ -82,11 +82,13 @@
   - registry persistence across dump/restore
   - persistence of segmented/routed GraphRAG registries across dump/restore:
     - shared shard metadata
+    - shared `segment_labels`
     - range routing
     - exact-key routing
     - route policies
     - route profiles
     - route defaults
+    - effective default `segment_labels`
   - post-restore GraphRAG query correctness on registered alias schemas
   - post-restore GraphRAG query correctness on routed/default-backed segmented
     GraphRAG queries

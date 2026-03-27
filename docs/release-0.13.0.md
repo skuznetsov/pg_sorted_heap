@@ -80,7 +80,9 @@ The fact-shaped GraphRAG path now has dedicated coverage for:
 
 - `0.12.0 -> 0.13.0` extension upgrade
 - dump/restore persistence of graph registration metadata
-- dump/restore persistence of segmented/routed GraphRAG registries
+- dump/restore persistence of segmented/routed GraphRAG registries, including
+  shared shard metadata, shared `segment_labels`, and effective default
+  `segment_labels`
 - crash recovery for registered/indexed graph tables
 - concurrent DML with `sorted_heap_compact_online(...)`
 - concurrent DML with `sorted_heap_merge_online(...)`
@@ -150,7 +152,7 @@ bundle, including the narrower GraphRAG bundle.
 
 ## Release-candidate verification
 
-Fresh `0.13.0` release-candidate checks run on `2026-03-26`:
+Fresh `0.13.0` release-candidate checks run on `2026-03-27`:
 
 ```bash
 make test-graphrag-release
@@ -159,7 +161,7 @@ make test-graphrag-release
 Observed signals:
 
 - `make installcheck ...` -> `All 3 tests passed`
-- `make test-graphrag-lifecycle` -> `status=ok pass=40 fail=0 total=40`
+- `make test-graphrag-lifecycle` -> `status=ok pass=48 fail=0 total=48`
 - `make test-graphrag-crash` -> `status=ok pass=22 fail=0 total=22`
 - `make test-graphrag-concurrent` -> `status=ok pass=40 fail=0 total=40`
 - `make test-graphrag-release` -> wrapper target verified end-to-end with the
@@ -169,7 +171,8 @@ This bundle covers the narrow stable GraphRAG surface directly:
 
 - SQL regression coverage for unified syntax, schema registration, and stats
 - upgrade + dump/restore lifecycle for registered fact graphs and the
-  segmented/routed GraphRAG control plane
+  segmented/routed GraphRAG control plane, including shared/default
+  `segment_labels` persistence
 - crash recovery for registered/indexed graph tables
 - concurrent DML with online compact / online merge on registered fact graphs
 
