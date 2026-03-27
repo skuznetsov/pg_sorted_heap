@@ -117,6 +117,13 @@
   - retained-temp query-only sweeps on the AWS `10M x 32D` cheap-build point,
     which showed that raising `ef_search`/`ann_k` as high as `256/256` still
     does not recover depth-5 quality on the same weak graph
+  - a follow-up `1M x 32D` calibration showing that wider query budgets
+    (`ann_k=256`, `top_k=32`) can recover `96.9% hit@k` on smaller graphs even
+    with a cheaper build
+  - a stronger AWS `10M x 32D` falsifier showing that even exact heap seeds
+    still return `0.0% / 0.0%` at `ann_k=256`, `top_k=32`, so the remaining
+    problem there is the low-dimensional scale contract, not just HNSW build
+    quality
 
 ### sorted_hnsw build optimization
 

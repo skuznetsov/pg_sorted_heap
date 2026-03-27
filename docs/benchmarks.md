@@ -336,10 +336,42 @@ not:
 - one pathological point, `ef_search=32`, `ann_k=64`, spiked to
   `1833.809 ms` and `259709.5` shared reads while still returning `0.0% / 0.0%`
 
-So the cheap-build `10M` graph can produce latency numbers, but its quality is
-not recoverable by query-time knobs alone. The next meaningful scale branch is
-better build quality at `10M`, not more `ef_search`/`ann_k` tuning on the same
-weak graph.
+I then ran the same question on a smaller but shape-matched local
+`1M x 32D` graph (`200K` pairs x `5` hops) to separate build quality from
+query contract:
+
+- cheap local build points (`m=8`, `ef_construction=8/32`, `m=16`,
+  `ef_construction=32/64`) stayed weak at the old narrow query contract
+  (`ann_k=64`, `top_k=10`), topping out around `25.0% hit@k`
+- but with a wider query contract on the same `1M x 32D` graph
+  (`ann_k=256`, `top_k=32`, `ef_search=128`), both
+  - the strong build (`m=24`, `ef_construction=200`), and
+  - the much cheaper build (`m=16`, `ef_construction=64`)
+  reached the same `96.9% hit@k` over `32` queries
+- exact heap seeds on that `1M x 32D` graph matched the ANN result exactly at
+  the widened point, so once the query budget is large enough, heavier builds
+  were no longer the decisive lever there
+
+That suggested a second AWS `10M x 32D` probe on the same cheap build but with
+the widened local winner (`ann_k=256`, `top_k=32`, `ef_search=128`). The
+result still failed:
+
+- ANN path-aware `sorted_heap_graph_rag(...)`:
+  - `top_k=10` -> `1832.345 ms`, `0.0% / 0.0%`
+  - `top_k=32` -> `1832.755 ms`, `0.0% / 0.0%`
+- exact heap seeds + the same path-aware expansion/rerank contract:
+  - `ann_k=256`, `top_k=32` -> `0.0% / 0.0%`
+
+So the cheap-build `10M x 32D` graph can produce latency numbers, but its
+quality is not recoverable by either:
+
+- larger query-time ANN budgets, or
+- exact heap seeds on the same low-dimensional corpus
+
+The `10M x 32D` frontier is therefore no longer "weak HNSW build quality."
+It is the low-dimensional scale contract itself. The next meaningful scale
+branch is a higher-dimensional `10M` point or a different retrieval contract,
+not another `m/ef_construction` tweak on the same `32D` setup.
 
 So the narrow conclusion is:
 
@@ -349,9 +381,11 @@ So the narrow conclusion is:
   not CSV-generation-bound, and not an early PostgreSQL failure
 - the current build optimization moved that frontier enough to obtain the
   first real `10M` query numbers on a cheap-build point
-- the next remaining scale problem is no longer "can it finish?" but
-  "how much quality can we recover at `10M` without giving back too much
-  build/query cost?"
+- the remaining `10M x 32D` problem is no longer "can it finish?" and no
+  longer just "is the HNSW build too weak?"
+- the stronger falsifier is that even exact seeds fail at that scale and
+  dimensionality, so the next branch is a different scale contract, not a
+  narrower HNSW tuning loop
 
 ### Current AWS GraphRAG benchmark (`person -> parent -> city`, stable fact contract)
 
