@@ -494,6 +494,7 @@ CREATE TABLE @extschema@.sorted_heap_graph_segment_registry (
   route_min int8 NOT NULL,
   route_max int8 NOT NULL,
   segment_group text,
+  relation_family text,
   PRIMARY KEY (route_name, relid),
   CHECK (route_max >= route_min)
 );
@@ -505,17 +506,19 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_segment_register(
   rel regclass,
   route_min int8,
   route_max int8,
-  segment_group text DEFAULT NULL
+  segment_group text DEFAULT NULL,
+  relation_family text DEFAULT NULL
 ) RETURNS void
 AS $$
   INSERT INTO @extschema@.sorted_heap_graph_segment_registry (
-    route_name, relid, route_min, route_max, segment_group
+    route_name, relid, route_min, route_max, segment_group, relation_family
   )
-  VALUES ($1, $2, $3, $4, $5)
+  VALUES ($1, $2, $3, $4, $5, $6)
   ON CONFLICT (route_name, relid) DO UPDATE SET
     route_min = EXCLUDED.route_min,
     route_max = EXCLUDED.route_max,
-    segment_group = EXCLUDED.segment_group;
+    segment_group = EXCLUDED.segment_group,
+    relation_family = EXCLUDED.relation_family;
 $$ LANGUAGE SQL;
 
 CREATE FUNCTION @extschema@.sorted_heap_graph_segment_unregister(
@@ -541,23 +544,27 @@ $$ LANGUAGE plpgsql;
 
 CREATE FUNCTION @extschema@.sorted_heap_graph_segment_config(
   route_name text DEFAULT NULL,
-  segment_groups text[] DEFAULT NULL
+  segment_groups text[] DEFAULT NULL,
+  relation_family text DEFAULT NULL
 )
 RETURNS TABLE (
   route_name text,
   rel regclass,
   route_min int8,
   route_max int8,
-  segment_group text
+  segment_group text,
+  relation_family text
 )
 AS $$
-  SELECT s.route_name, s.relid, s.route_min, s.route_max, s.segment_group
+  SELECT s.route_name, s.relid, s.route_min, s.route_max, s.segment_group, s.relation_family
   FROM @extschema@.sorted_heap_graph_segment_registry s
   WHERE ($1 IS NULL OR s.route_name = $1)
     AND ($2 IS NULL OR s.segment_group = ANY($2))
+    AND ($3 IS NULL OR s.relation_family = $3)
   ORDER BY s.route_name,
            CASE WHEN $2 IS NULL THEN 0 ELSE array_position($2, s.segment_group) END,
            s.segment_group,
+           s.relation_family,
            s.route_min,
            s.route_max,
            s.relid;
@@ -567,26 +574,30 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_segment_resolve(
   route_name text,
   route_value int8,
   fanout_limit int4 DEFAULT 0,
-  segment_groups text[] DEFAULT NULL
+  segment_groups text[] DEFAULT NULL,
+  relation_family text DEFAULT NULL
 ) RETURNS TABLE (
   rel regclass,
   route_min int8,
   route_max int8,
-  segment_group text
+  segment_group text,
+  relation_family text
 )
 AS $$
-  SELECT chosen.relid, chosen.route_min, chosen.route_max, chosen.segment_group
+  SELECT chosen.relid, chosen.route_min, chosen.route_max, chosen.segment_group, chosen.relation_family
   FROM (
-    SELECT s.relid, s.route_min, s.route_max, s.segment_group
+    SELECT s.relid, s.route_min, s.route_max, s.segment_group, s.relation_family
     FROM @extschema@.sorted_heap_graph_segment_registry s
     WHERE s.route_name = $1
       AND $2 BETWEEN s.route_min AND s.route_max
       AND ($4 IS NULL OR s.segment_group = ANY($4))
+      AND ($5 IS NULL OR s.relation_family = $5)
     ORDER BY CASE WHEN $4 IS NULL THEN 0 ELSE array_position($4, s.segment_group) END,
              (s.route_max - s.route_min),
              s.route_min,
              s.route_max,
              s.segment_group,
+             s.relation_family,
              s.relid
     LIMIT CASE WHEN $3 IS NULL OR $3 <= 0 THEN NULL ELSE $3 END
   ) chosen
@@ -594,6 +605,7 @@ AS $$
            chosen.route_min,
            chosen.route_max,
            chosen.segment_group,
+           chosen.relation_family,
            chosen.relid;
 $$ LANGUAGE SQL STABLE;
 
@@ -603,6 +615,7 @@ CREATE TABLE @extschema@.sorted_heap_graph_exact_registry (
   relid regclass NOT NULL,
   priority int4 NOT NULL DEFAULT 0,
   segment_group text,
+  relation_family text,
   PRIMARY KEY (route_name, route_key, relid)
 );
 
@@ -613,16 +626,18 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_exact_register(
   route_key text,
   rel regclass,
   priority int4 DEFAULT 0,
-  segment_group text DEFAULT NULL
+  segment_group text DEFAULT NULL,
+  relation_family text DEFAULT NULL
 ) RETURNS void
 AS $$
   INSERT INTO @extschema@.sorted_heap_graph_exact_registry (
-    route_name, route_key, relid, priority, segment_group
+    route_name, route_key, relid, priority, segment_group, relation_family
   )
-  VALUES ($1, $2, $3, $4, $5)
+  VALUES ($1, $2, $3, $4, $5, $6)
   ON CONFLICT (route_name, route_key, relid) DO UPDATE SET
     priority = EXCLUDED.priority,
-    segment_group = EXCLUDED.segment_group;
+    segment_group = EXCLUDED.segment_group,
+    relation_family = EXCLUDED.relation_family;
 $$ LANGUAGE SQL;
 
 CREATE FUNCTION @extschema@.sorted_heap_graph_exact_unregister(
@@ -648,25 +663,29 @@ $$ LANGUAGE plpgsql;
 CREATE FUNCTION @extschema@.sorted_heap_graph_exact_config(
   route_name text DEFAULT NULL,
   route_key text DEFAULT NULL,
-  segment_groups text[] DEFAULT NULL
+  segment_groups text[] DEFAULT NULL,
+  relation_family text DEFAULT NULL
 ) RETURNS TABLE (
   route_name text,
   route_key text,
   rel regclass,
   priority int4,
-  segment_group text
+  segment_group text,
+  relation_family text
 )
 AS $$
-  SELECT s.route_name, s.route_key, s.relid, s.priority, s.segment_group
+  SELECT s.route_name, s.route_key, s.relid, s.priority, s.segment_group, s.relation_family
   FROM @extschema@.sorted_heap_graph_exact_registry s
   WHERE ($1 IS NULL OR s.route_name = $1)
     AND ($2 IS NULL OR s.route_key = $2)
     AND ($3 IS NULL OR s.segment_group = ANY($3))
+    AND ($4 IS NULL OR s.relation_family = $4)
   ORDER BY s.route_name,
            s.route_key,
            CASE WHEN $3 IS NULL THEN 0 ELSE array_position($3, s.segment_group) END,
            s.priority DESC,
            s.segment_group,
+           s.relation_family,
            s.relid;
 $$ LANGUAGE SQL STABLE;
 
@@ -674,29 +693,34 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_exact_resolve(
   route_name text,
   route_key text,
   fanout_limit int4 DEFAULT 0,
-  segment_groups text[] DEFAULT NULL
+  segment_groups text[] DEFAULT NULL,
+  relation_family text DEFAULT NULL
 ) RETURNS TABLE (
   rel regclass,
   priority int4,
-  segment_group text
+  segment_group text,
+  relation_family text
 )
 AS $$
-  SELECT chosen.relid, chosen.priority, chosen.segment_group
+  SELECT chosen.relid, chosen.priority, chosen.segment_group, chosen.relation_family
   FROM (
-    SELECT s.relid, s.priority, s.segment_group
+    SELECT s.relid, s.priority, s.segment_group, s.relation_family
     FROM @extschema@.sorted_heap_graph_exact_registry s
     WHERE s.route_name = $1
       AND s.route_key = $2
       AND ($4 IS NULL OR s.segment_group = ANY($4))
+      AND ($5 IS NULL OR s.relation_family = $5)
     ORDER BY CASE WHEN $4 IS NULL THEN 0 ELSE array_position($4, s.segment_group) END,
              s.priority DESC,
              s.segment_group,
+             s.relation_family,
              s.relid
     LIMIT CASE WHEN $3 IS NULL OR $3 <= 0 THEN NULL ELSE $3 END
   ) chosen
   ORDER BY CASE WHEN $4 IS NULL THEN 0 ELSE array_position($4, chosen.segment_group) END,
            chosen.priority DESC,
            chosen.segment_group,
+           chosen.relation_family,
            chosen.relid;
 $$ LANGUAGE SQL STABLE;
 
@@ -1241,7 +1265,8 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed(
   score_mode text DEFAULT 'path',
   limit_rows int4 DEFAULT 0,
   fanout_limit int4 DEFAULT 0,
-  segment_groups text[] DEFAULT NULL
+  segment_groups text[] DEFAULT NULL,
+  relation_family text DEFAULT NULL
 ) RETURNS TABLE (
   source_rel regclass,
   entity_id int4,
@@ -1260,7 +1285,7 @@ BEGIN
 
   SELECT array_agg(rel ORDER BY route_min, route_max, rel)
   INTO rels
-  FROM @extschema@.sorted_heap_graph_segment_resolve(route_name, route_value, fanout_limit, segment_groups);
+  FROM @extschema@.sorted_heap_graph_segment_resolve(route_name, route_value, fanout_limit, segment_groups, relation_family);
 
   IF rels IS NULL OR array_length(rels, 1) IS NULL THEN
     RETURN;
@@ -1280,8 +1305,8 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql STABLE;
 
-COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed(text, int8, @extschema@.svec, int4[], int4, int4, text, int4, int4, text[])
-IS 'Beta routed GraphRAG wrapper. Resolves candidate shards from sorted_heap_graph_segment_registry using a route value plus optional segment-group filtering, then delegates to sorted_heap_graph_rag_segmented(...).';
+COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed(text, int8, @extschema@.svec, int4[], int4, int4, text, int4, int4, text[], text)
+IS 'Beta routed GraphRAG wrapper. Resolves candidate shards from sorted_heap_graph_segment_registry using a route value plus optional segment-group and relation-family filtering, then delegates to sorted_heap_graph_rag_segmented(...).';
 
 CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact(
   route_name text,
@@ -1293,7 +1318,8 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact(
   score_mode text DEFAULT 'path',
   limit_rows int4 DEFAULT 0,
   fanout_limit int4 DEFAULT 0,
-  segment_groups text[] DEFAULT NULL
+  segment_groups text[] DEFAULT NULL,
+  relation_family text DEFAULT NULL
 ) RETURNS TABLE (
   source_rel regclass,
   entity_id int4,
@@ -1312,7 +1338,7 @@ BEGIN
 
   SELECT array_agg(rel ORDER BY priority DESC, rel)
   INTO rels
-  FROM @extschema@.sorted_heap_graph_exact_resolve(route_name, route_key, fanout_limit, segment_groups);
+  FROM @extschema@.sorted_heap_graph_exact_resolve(route_name, route_key, fanout_limit, segment_groups, relation_family);
 
   IF rels IS NULL OR array_length(rels, 1) IS NULL THEN
     RETURN;
@@ -1332,8 +1358,8 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql STABLE;
 
-COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact(text, text, @extschema@.svec, int4[], int4, int4, text, int4, int4, text[])
-IS 'Beta exact-key routed GraphRAG wrapper. Resolves candidate shards from sorted_heap_graph_exact_registry using an exact route key plus optional segment-group filtering, then delegates to sorted_heap_graph_rag_segmented(...).';
+COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact(text, text, @extschema@.svec, int4[], int4, int4, text, int4, int4, text[], text)
+IS 'Beta exact-key routed GraphRAG wrapper. Resolves candidate shards from sorted_heap_graph_exact_registry using an exact route key plus optional segment-group and relation-family filtering, then delegates to sorted_heap_graph_rag_segmented(...).';
 
 CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_policy(
   route_name text,
@@ -1345,7 +1371,8 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_policy(
   top_k int4 DEFAULT 10,
   score_mode text DEFAULT 'path',
   limit_rows int4 DEFAULT 0,
-  fanout_limit int4 DEFAULT 0
+  fanout_limit int4 DEFAULT 0,
+  relation_family text DEFAULT NULL
 ) RETURNS TABLE (
   source_rel regclass,
   entity_id int4,
@@ -1372,13 +1399,14 @@ BEGIN
     score_mode,
     limit_rows,
     fanout_limit,
-    groups
+    groups,
+    relation_family
   ) AS g;
 END;
 $$ LANGUAGE plpgsql STABLE;
 
-COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_policy(text, int8, text, @extschema@.svec, int4[], int4, int4, text, int4, int4)
-IS 'Beta routed GraphRAG wrapper. Resolves a named segment-group policy from sorted_heap_graph_route_policy_registry, then delegates to sorted_heap_graph_rag_routed(...).';
+COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_policy(text, int8, text, @extschema@.svec, int4[], int4, int4, text, int4, int4, text)
+IS 'Beta routed GraphRAG wrapper. Resolves a named segment-group policy from sorted_heap_graph_route_policy_registry, then delegates to sorted_heap_graph_rag_routed(...) with optional relation-family filtering.';
 
 CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact_policy(
   route_name text,
@@ -1390,7 +1418,8 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact_policy(
   top_k int4 DEFAULT 10,
   score_mode text DEFAULT 'path',
   limit_rows int4 DEFAULT 0,
-  fanout_limit int4 DEFAULT 0
+  fanout_limit int4 DEFAULT 0,
+  relation_family text DEFAULT NULL
 ) RETURNS TABLE (
   source_rel regclass,
   entity_id int4,
@@ -1417,13 +1446,14 @@ BEGIN
     score_mode,
     limit_rows,
     fanout_limit,
-    groups
+    groups,
+    relation_family
   ) AS g;
 END;
 $$ LANGUAGE plpgsql STABLE;
 
-COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact_policy(text, text, text, @extschema@.svec, int4[], int4, int4, text, int4, int4)
-IS 'Beta exact-key routed GraphRAG wrapper. Resolves a named segment-group policy from sorted_heap_graph_route_policy_registry, then delegates to sorted_heap_graph_rag_routed_exact(...).';
+COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact_policy(text, text, text, @extschema@.svec, int4[], int4, int4, text, int4, int4, text)
+IS 'Beta exact-key routed GraphRAG wrapper. Resolves a named segment-group policy from sorted_heap_graph_route_policy_registry, then delegates to sorted_heap_graph_rag_routed_exact(...) with optional relation-family filtering.';
 
 -- ----------------------------------------------------------------
 -- SimHash: 12-bit locality-sensitive hash for svec columns

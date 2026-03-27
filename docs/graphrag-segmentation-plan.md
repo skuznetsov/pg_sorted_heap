@@ -152,10 +152,16 @@ Reference design:
   - `sorted_heap_graph_rag_routed_policy(...)`
   - `sorted_heap_graph_rag_routed_exact_policy(...)`
   - this keeps hot/sealed preference out of ad hoc query literals
+- and the first second routing dimension now exists too:
+  - optional `relation_family text` on both range-routed and exact-key shard
+    registry rows
+  - optional `relation_family := ...` filtering in config/resolve functions
+    and in both raw/policy-backed routed GraphRAG wrappers
+  - this is still narrow beta metadata, not a finished general router
 - what is still missing:
-  - more than one routing dimension per registry row
+  - more than one optional text metadata dimension per registry row
   - a product-quality shard router contract for tenant / KB / relation-family
-    pruning without hand-managed registration tables
+    pruning without hand-managed registration tables or ad hoc naming
 
 This is still intentionally a reference path, not the final router.
 
@@ -213,9 +219,13 @@ The current evidence now points clearly toward segmented routing as the more
 durable large-scale GraphRAG model.
 
 The newest bounded step makes that path slightly less hand-wired: routed and
-exact-key routed GraphRAG can now narrow candidate shards by an optional
-`segment_group` label. That is still beta, but it is the first direct bridge
-from registry-driven routing to practical hot/sealed or family-based pruning.
+exact-key routed GraphRAG can now combine:
 
-The next bounded step makes that less repetitive too: named route policies can
-now store segment-group order once and feed the routed wrappers directly.
+- route range or exact route key
+- stored shard-group policy order
+- one optional `relation_family` filter
+
+That is still beta, but it is the first real multi-dimensional routing surface
+inside the extension. The next honest step is no longer “can we add metadata?”
+but “which metadata should become first-class beyond shard group + one family
+label?”

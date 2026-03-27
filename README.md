@@ -278,7 +278,11 @@ GraphRAG scoring contract. When that array is present, its order is also used
 as the shard preference order before bounded fanout is applied. The next beta
 convenience layer now exists too: named route policies can store that group
 order once and be reused through `sorted_heap_graph_rag_routed_policy(...)`
-and `sorted_heap_graph_rag_routed_exact_policy(...)`.
+and `sorted_heap_graph_rag_routed_exact_policy(...)`. The newest narrow
+extension on top of that is an optional `relation_family := ...` filter on the
+range registry, exact-key registry, and both policy-backed wrappers, so beta
+segmented GraphRAG can now combine route key/range + shard-group policy + one
+extra family dimension without changing the scoring contract.
 
 For tuning and debugging, GraphRAG now also exposes backend-local last-call
 stats:

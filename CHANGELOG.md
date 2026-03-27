@@ -251,6 +251,16 @@
       `sorted_heap_graph_rag_routed_exact_policy(...)`
     - this keeps hot/sealed preference in route metadata instead of repeating
       raw `segment_groups := ARRAY[...]` literals in every query
+  - the first second routing dimension on top of that policy layer:
+    - both range-routed and exact-key shard registries now accept an optional
+      `relation_family` label
+    - both config/resolve functions now accept optional
+      `relation_family := ...` filtering
+    - both raw and policy-backed routed wrappers now accept optional
+      `relation_family := ...` to narrow candidate shards after route
+      resolution but before segmented GraphRAG fanout/merge
+    - regression coverage now proves route+family and route+policy+family
+      filtering for both range and exact-key routing
 
 ### sorted_hnsw build optimization
 
