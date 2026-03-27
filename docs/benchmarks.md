@@ -408,16 +408,48 @@ materially further on the same host:
 - temp dir plateaued around `19 GiB`
 - filesystem still had about `11 GiB` free at the start of `CREATE INDEX`
 
-The next frontier is therefore no longer disk headroom. On the same
-`10M x 64D` cheap-build point (`m=16`, `ef_construction=64`), the
-`sorted_hnsw` build then failed inside PostgreSQL:
+The next frontier was no longer disk headroom. On the same `10M x 64D`
+cheap-build point (`m=16`, `ef_construction=64`), the old local scan-cache
+seeding path then failed inside PostgreSQL:
 
 - `CREATE INDEX facts_sh_ann_idx ON facts_sh USING sorted_hnsw (embedding) WITH (m = 16, ef_construction = 64)`
 - `ERROR: invalid memory alloc request size 1280000000`
 
-So the current `10M x 64D` branch is now blocked by a build-time allocator
-frontier inside `sorted_hnsw`, not by Python memory, not by `COPY`, and not by
-the host running out of disk during ingest.
+That request size matched the old contiguous local L0 neighbor cache layout
+(`n_nodes * 2 * M * sizeof(int32)` at `10M x M=16`), so the next fix was to
+replace local `l0_neighbors + sq8_data` slabs with page-backed storage. Shared
+immutable scan caches remain contiguous; local build seeding and local
+`shnsw_load_cache()` no longer require a single giant L0 allocation.
+
+With that chunked local-cache fix, the same AWS `10M x 64D` point now clears
+build and query on the current host:
+
+- `load_data`: `916.380 s`
+- `build_indexes`: `801.944 s`
+- `analyze`: `8.689 s`
+
+First real `10M x 64D` query-only pass (`query_count=4`, `runs=1`,
+`ann_k=256`, `top_k=32`, `ef_search=128`, `sorted_heap_only`):
+
+- depth 1
+  - SQL path: `1067.860 ms`, `100.0% / 100.0%`
+  - unified GraphRAG path: `842.811 ms`, `100.0% / 100.0%`
+- depth 2
+  - SQL path: `1113.197 ms`, `25.0% / 100.0%`
+  - unified GraphRAG path: `2054.068 ms`, `25.0% / 100.0%`
+- depth 3
+  - SQL path: `1060.660 ms`, `0.0% / 100.0%`
+  - unified GraphRAG path: `2062.050 ms`, `0.0% / 100.0%`
+- depth 4
+  - SQL path: `1057.823 ms`, `0.0% / 0.0%`
+  - unified GraphRAG path: `2053.423 ms`, `0.0% / 0.0%`
+- depth 5
+  - SQL path: `1072.383 ms`, `0.0% / 0.0%`
+  - unified GraphRAG path: `2053.305 ms`, `0.0% / 0.0%`
+
+So the `10M x 64D` branch is no longer blocked by allocator failures. The
+remaining problem at this cheap-build point is answer quality on deeper paths,
+not build reliability.
 
 So the narrow conclusion is:
 
@@ -433,8 +465,9 @@ So the narrow conclusion is:
   dimensionality, so the next branch is a different scale contract, not a
   narrower HNSW tuning loop
 - `64D` is the first scale contract that looks healthy locally at `1M`
-- on the current AWS host, the `10M x 64D` branch now clears ingest safely and
-  fails later inside `sorted_hnsw` build with a `1.28 GB` allocation request
+- on the current AWS host, the `10M x 64D` branch now clears ingest, build,
+  and the first query pass; the remaining cheap-build frontier is deep-path
+  quality, not allocator failure
 
 ### Current AWS GraphRAG benchmark (`person -> parent -> city`, stable fact contract)
 

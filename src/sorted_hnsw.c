@@ -324,6 +324,9 @@ typedef struct ShnswScanCache
 	int			nodes_per_page;
 	int			node_size;
 	uint8	   *l0_page_loaded;
+	int32	  **l0_neighbor_pages;
+	uint8	  **sq8_pages;
+	MemoryContext owner_ctx;
 	ShnswUpperNbr **upper;
 	int		   *upper_count;
 	int		  **upper_nbr_idx;
@@ -410,7 +413,11 @@ static bool shnsw_scan_cache_is_warm(Relation index);
 static uint64 shnsw_read_cache_generation(Relation index);
 static inline uint8 sq8_quantize(float val, float min_val, float scale);
 static Size shnsw_l0_neighbors_bytes(int n_nodes, int M);
+static int shnsw_cache_l0_page_count(const ShnswScanCache *cache, int page_idx);
+static int32 *shnsw_cache_l0_page_neighbors(ShnswScanCache *cache, int page_idx);
+static uint8 *shnsw_cache_l0_page_sq8(ShnswScanCache *cache, int page_idx);
 static int32 *shnsw_cache_l0_neighbors_slot(ShnswScanCache *cache, int32 nid);
+static uint8 *shnsw_cache_sq8_slot(ShnswScanCache *cache, int32 nid);
 static void shnsw_cache_refresh_l0_neighbor_ptrs(ShnswScanCache *cache,
 												 int start_nid);
 static void shnsw_cache_load_l0_page(Relation index, ShnswScanCache *cache,
@@ -779,7 +786,7 @@ shnsw_shared_scan_cache_publish(Relation index, const ShnswScanCache *cache,
 	Size		l0_neighbors_bytes;
 	Size		sq8_data_bytes;
 	ShnswScanCache *mutable_cache = (ShnswScanCache *) cache;
-	int			lev;
+	int			i, lev;
 
 	if (!shnsw_shared_scan_cache_available())
 		return false;
@@ -854,11 +861,39 @@ shnsw_shared_scan_cache_publish(Relation index, const ShnswScanCache *cache,
 	off += MAXALIGN(nodes_bytes);
 
 	shnsw_shared_scan_ctl->l0_neighbors_off = off;
-	memcpy(shnsw_shared_scan_ptr(off), cache->l0_neighbors, l0_neighbors_bytes);
+	if (cache->l0_neighbors != NULL)
+		memcpy(shnsw_shared_scan_ptr(off), cache->l0_neighbors, l0_neighbors_bytes);
+	else
+	{
+		int32 *shared_l0_neighbors = (int32 *) shnsw_shared_scan_ptr(off);
+
+		for (i = 0; i < cache->n_nodes; i++)
+		{
+			int32 *src_neighbors = shnsw_cache_l0_neighbors_slot(mutable_cache, i);
+
+			memcpy(shared_l0_neighbors + (Size) i * (Size) (2 * cache->M),
+				   src_neighbors,
+				   sizeof(int32) * 2 * cache->M);
+		}
+	}
 	off += MAXALIGN(l0_neighbors_bytes);
 
 	shnsw_shared_scan_ctl->sq8_data_off = off;
-	memcpy(shnsw_shared_scan_ptr(off), cache->sq8_data, sq8_data_bytes);
+	if (cache->sq8_data != NULL)
+		memcpy(shnsw_shared_scan_ptr(off), cache->sq8_data, sq8_data_bytes);
+	else
+	{
+		uint8 *shared_sq8 = (uint8 *) shnsw_shared_scan_ptr(off);
+
+		for (i = 0; i < cache->n_nodes; i++)
+		{
+			uint8 *src_sq8 = shnsw_cache_sq8_slot(mutable_cache, i);
+
+			memcpy(shared_sq8 + (Size) i * (Size) cache->dim,
+				   src_sq8,
+				   cache->dim);
+		}
+	}
 	off += MAXALIGN(sq8_data_bytes);
 
 	{
@@ -1003,7 +1038,10 @@ shnsw_scan_cache_seed_from_build(Relation index,
 	if (cache->nodes_per_page < 1)
 		cache->nodes_per_page = 1;
 	cache->node_size = MAXALIGN(ShnswNodeSize(M, dim));
+	cache->owner_ctx = cache_ctx;
 	cache->l0_page_loaded = palloc0(Max(l0_npages, 1));
+	cache->l0_neighbor_pages = palloc0(sizeof(int32 *) * Max(l0_npages, 1));
+	cache->sq8_pages = palloc0(sizeof(uint8 *) * Max(l0_npages, 1));
 
 	cache->sq8_mins = palloc(sizeof(float) * dim);
 	cache->sq8_scales = palloc(sizeof(float) * dim);
@@ -1011,14 +1049,13 @@ shnsw_scan_cache_seed_from_build(Relation index,
 	memcpy(cache->sq8_scales, sq8_scales, sizeof(float) * dim);
 
 	cache->nodes = palloc0(sizeof(ShnswCacheNode) * n_nodes);
-	cache->l0_neighbors = palloc(shnsw_l0_neighbors_bytes(n_nodes, M));
-	cache->sq8_data = palloc((Size) n_nodes * dim);
 
 	for (i = 0; i < n_nodes; i++)
 	{
 		HnswBuiltNode   *bn = shnsw_build_get_node(graph, i);
 		ShnswCacheNode  *cn = &cache->nodes[i];
 		int32		   *nbrs;
+		uint8		   *sq8_slot;
 		int				n_l0;
 
 		ItemPointerCopy(&bn->heap_tid, &cn->heap_tid);
@@ -1033,11 +1070,11 @@ shnsw_scan_cache_seed_from_build(Relation index,
 		for (d = n_l0; d < 2 * M; d++)
 			nbrs[d] = -1;
 
+		sq8_slot = shnsw_cache_sq8_slot(cache, i);
 		for (d = 0; d < dim; d++)
 		{
-			cache->sq8_data[(Size) i * dim + d] =
-				sq8_quantize(vectors[(Size) i * dim + d],
-							 sq8_mins[d], sq8_scales[d]);
+			sq8_slot[d] = sq8_quantize(vectors[(Size) i * dim + d],
+									   sq8_mins[d], sq8_scales[d]);
 		}
 	}
 
@@ -1123,10 +1160,106 @@ shnsw_l0_neighbors_bytes(int n_nodes, int M)
 	return (Size) Max(n_nodes, 1) * (Size) (2 * M) * sizeof(int32);
 }
 
+static int
+shnsw_cache_l0_page_count(const ShnswScanCache *cache, int page_idx)
+{
+	int start_nid;
+
+	if (page_idx < 0 || page_idx >= cache->l0_npages)
+		return 0;
+
+	start_nid = page_idx * cache->nodes_per_page;
+	return Min(cache->nodes_per_page, cache->n_nodes - start_nid);
+}
+
+static int32 *
+shnsw_cache_l0_page_neighbors(ShnswScanCache *cache, int page_idx)
+{
+	MemoryContext old_ctx;
+	int page_count;
+
+	if (cache->l0_neighbor_pages == NULL ||
+		page_idx < 0 ||
+		page_idx >= cache->l0_npages)
+		return NULL;
+
+	if (cache->l0_neighbor_pages[page_idx] != NULL)
+		return cache->l0_neighbor_pages[page_idx];
+
+	page_count = shnsw_cache_l0_page_count(cache, page_idx);
+	if (page_count <= 0)
+		return NULL;
+
+	old_ctx = MemoryContextSwitchTo(cache->owner_ctx);
+	cache->l0_neighbor_pages[page_idx] = palloc0(sizeof(int32) *
+												 (Size) page_count *
+												 (Size) (2 * cache->M));
+	MemoryContextSwitchTo(old_ctx);
+
+	return cache->l0_neighbor_pages[page_idx];
+}
+
+static uint8 *
+shnsw_cache_l0_page_sq8(ShnswScanCache *cache, int page_idx)
+{
+	MemoryContext old_ctx;
+	int page_count;
+
+	if (cache->sq8_pages == NULL ||
+		page_idx < 0 ||
+		page_idx >= cache->l0_npages)
+		return NULL;
+
+	if (cache->sq8_pages[page_idx] != NULL)
+		return cache->sq8_pages[page_idx];
+
+	page_count = shnsw_cache_l0_page_count(cache, page_idx);
+	if (page_count <= 0)
+		return NULL;
+
+	old_ctx = MemoryContextSwitchTo(cache->owner_ctx);
+	cache->sq8_pages[page_idx] = palloc0((Size) page_count * (Size) cache->dim);
+	MemoryContextSwitchTo(old_ctx);
+
+	return cache->sq8_pages[page_idx];
+}
+
 static int32 *
 shnsw_cache_l0_neighbors_slot(ShnswScanCache *cache, int32 nid)
 {
-	return cache->l0_neighbors + (Size) nid * (Size) (2 * cache->M);
+	int page_idx;
+	int slot_idx;
+	int32 *page_neighbors;
+
+	if (cache->l0_neighbors != NULL)
+		return cache->l0_neighbors + (Size) nid * (Size) (2 * cache->M);
+
+	page_idx = nid / cache->nodes_per_page;
+	slot_idx = nid % cache->nodes_per_page;
+	page_neighbors = shnsw_cache_l0_page_neighbors(cache, page_idx);
+	if (page_neighbors == NULL)
+		return NULL;
+
+	return page_neighbors + (Size) slot_idx * (Size) (2 * cache->M);
+}
+
+static uint8 *
+shnsw_cache_sq8_slot(ShnswScanCache *cache, int32 nid)
+{
+	int page_idx;
+	int slot_idx;
+	uint8 *page_sq8;
+
+	if (cache->sq8_data != NULL)
+		return cache->sq8_data + (Size) nid * (Size) cache->dim;
+
+	page_idx = nid / cache->nodes_per_page;
+	slot_idx = nid % cache->nodes_per_page;
+	page_sq8 = shnsw_cache_l0_page_sq8(cache, page_idx);
+	if (page_sq8 == NULL)
+		return NULL;
+
+	return page_sq8 + (Size) slot_idx * (Size) cache->dim;
 }
 
 static void
@@ -1172,6 +1305,7 @@ shnsw_cache_load_l0_page(Relation index, ShnswScanCache *cache, int page_idx)
 		int32			nid = nh->nid;
 		ShnswCacheNode *cn;
 		int32		   *src_nbrs;
+		uint8		   *sq8_slot;
 
 		if (nid < 0 || nid >= cache->n_nodes)
 			continue;
@@ -1186,9 +1320,8 @@ shnsw_cache_load_l0_page(Relation index, ShnswScanCache *cache, int page_idx)
 
 		src_nbrs = ShnswNodeNeighbors(nh);
 		memcpy(cn->neighbors, src_nbrs, sizeof(int32) * 2 * cache->M);
-		memcpy(cache->sq8_data + (Size) nid * cache->dim,
-			   ShnswNodeSQ8Vec(nh, cache->M),
-			   cache->dim);
+		sq8_slot = shnsw_cache_sq8_slot(cache, nid);
+		memcpy(sq8_slot, ShnswNodeSQ8Vec(nh, cache->M), cache->dim);
 	}
 
 	UnlockReleaseBuffer(buf);
@@ -1263,6 +1396,11 @@ shnsw_scan_cache_record_insert(Relation index, uint64 cache_gen,
 
 	cache = entry->cache;
 	if (cache->shared_immutable)
+	{
+		shnsw_scan_cache_invalidate(entry);
+		return;
+	}
+	if (cache->l0_neighbor_pages != NULL || cache->sq8_pages != NULL)
 	{
 		shnsw_scan_cache_invalidate(entry);
 		return;
@@ -2527,13 +2665,14 @@ shnsw_load_cache(Relation index)
 	if (cache->nodes_per_page < 1)
 		cache->nodes_per_page = 1;
 	cache->node_size = MAXALIGN(ShnswNodeSize(M, dim));
+	cache->owner_ctx = CurrentMemoryContext;
 
 	/* L0 nodes are decoded lazily page-by-page on first touch. */
 	elog(DEBUG1, "shnsw_load_cache: SQ8 metadata loaded, deferring L0 decode");
 	cache->nodes = palloc0(sizeof(ShnswCacheNode) * n_nodes);
-	cache->l0_neighbors = palloc(shnsw_l0_neighbors_bytes(n_nodes, M));
-	cache->sq8_data = palloc0(n_nodes * (Size) dim);
 	cache->l0_page_loaded = palloc0(Max(l0_npages, 1));
+	cache->l0_neighbor_pages = palloc0(sizeof(int32 *) * Max(l0_npages, 1));
+	cache->sq8_pages = palloc0(sizeof(uint8 *) * Max(l0_npages, 1));
 
 	/* Load upper levels */
 	cache->upper = palloc0(sizeof(ShnswUpperNbr *) * (cache->max_level + 1));
@@ -2780,13 +2919,15 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 	/* Seed with entry point */
 	{
 		float d;
+		uint8 *entry_sq8;
 		elog(DEBUG1, "shnsw_search: seeding entry_nid=%d, sq8_mins=%p, sq8_scales=%p, nodes[%d].nbrs=%p n_nbrs=%d",
 			 entry_nid, cache->sq8_mins, cache->sq8_scales,
 			 entry_nid, cache->nodes[entry_nid].neighbors,
 			 cache->nodes[entry_nid].n_neighbors);
+		entry_sq8 = shnsw_cache_sq8_slot(cache, entry_nid);
 		d = sq8_cosine_distance(query, dim,
 								query_inv_norm,
-								cache->sq8_data + (Size)entry_nid * dim,
+								entry_sq8,
 								cache->sq8_mins, cache->sq8_scales, dim);
 		candidates[0].dist = d;
 		candidates[0].nid = entry_nid;
@@ -2832,6 +2973,7 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 			{
 				int32 nbr = cn->neighbors[k];
 				float nbr_dist;
+				uint8 *nbr_sq8;
 
 				if (nbr < 0 || nbr >= cache->n_nodes ||
 					shnsw_visited_test(visited_bits, visited_nwords, nbr))
@@ -2845,10 +2987,11 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 				if (cache->nodes[nbr].flags & SHNSW_NODE_DELETED)
 					continue;
 
+				nbr_sq8 = shnsw_cache_sq8_slot(cache, nbr);
 				nbr_dist = sq8_cosine_distance(
 					query, dim,
 					query_inv_norm,
-					cache->sq8_data + (Size)nbr * dim,
+					nbr_sq8,
 					cache->sq8_mins, cache->sq8_scales, dim);
 
 				if (nbr_dist < worst_dist || n_best < ef)
@@ -2898,6 +3041,7 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 				{
 					int32 nbr = un->neighbors[k];
 					float nbr_dist;
+					uint8 *nbr_sq8;
 
 					if (nbr < 0 || nbr >= cache->n_nodes ||
 						shnsw_visited_test(visited_bits, visited_nwords, nbr))
@@ -2910,10 +3054,11 @@ shnsw_search_level(Relation index, ShnswScanCache *cache, const float *query,
 					if (cache->nodes[nbr].flags & SHNSW_NODE_DELETED)
 						continue;
 
+					nbr_sq8 = shnsw_cache_sq8_slot(cache, nbr);
 					nbr_dist = sq8_cosine_distance(
 						query, dim,
 						query_inv_norm,
-						cache->sq8_data + (Size)nbr * dim,
+						nbr_sq8,
 						cache->sq8_mins, cache->sq8_scales, dim);
 
 					if (nbr_dist < worst_dist || n_best < ef)

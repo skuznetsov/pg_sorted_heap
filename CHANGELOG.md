@@ -126,11 +126,16 @@
     quality
   - a local `1M x 64D` calibration showing the same widened contract reaches
     `65.6% hit@1 / 96.9% hit@k` and ANN matches exact seeds there
-  - a lower-footprint `10M x 64D` AWS rerun that clears ingest on the same
-    `4 vCPU / 8 GiB` host via streamed `COPY` and `sorted_heap_only`, then
-    fails later in `sorted_hnsw` build with `ERROR: invalid memory alloc
-    request size 1280000000`, moving the frontier from disk headroom to a
-    build-time allocator limit
+  - a follow-up `10M x 64D` allocator diagnosis showing the failure came from
+    the old contiguous local L0 scan-cache slabs, not from HNSW graph build
+    itself
+  - a chunked local scan-cache fix that replaces giant local `l0_neighbors`
+    and `sq8_data` allocations with page-backed storage for build seeding and
+    `shnsw_load_cache()`
+  - an AWS `10M x 64D` rerun on the same `4 vCPU / 8 GiB` host that now clears
+    `load_data` (`916.380 s`), `build_indexes` (`801.944 s`), and the first
+    real query-only pass; the remaining cheap-build frontier is deep-path
+    quality, not allocator failure
 
 ### sorted_hnsw build optimization
 
