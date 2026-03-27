@@ -172,6 +172,12 @@
     `none` is much slower at query time, while `merge` is viable but does not
     materially beat `compact` on the larger `1M` load point (`28.142 s`
     versus `28.108 s`)
+  - an opt-in stage-breakdown path `--report-stage-stats` for the multidepth
+    harness, backed by `sorted_heap_graph_rag_stats()`
+  - a local `1M x 64D` lower-hop stage diagnosis showing that the widened
+    multihop path is ANN-bound, not expansion-bound: at depth 5 the unified
+    path took `110.507 ms` end-to-end, of which about `109.178 ms` was ANN,
+    `0.691 ms` expansion, and `0.011 ms` rerank
 
 ### sorted_hnsw build optimization
 

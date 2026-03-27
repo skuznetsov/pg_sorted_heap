@@ -560,6 +560,29 @@ top-1 cliff comes from the synthetic contract itself, not from query latency
 or build instability. Lowering hop weight sharpens top-1 without changing the
 basic GraphRAG execution path.
 
+I then added an opt-in stage breakdown path to the multidepth harness via
+`--report-stage-stats`, using `sorted_heap_graph_rag_stats()` after each
+unified path-aware call. On the local `1M x 64D` lower-hop point
+(`hop_weight=0.05`, `ann_k=256`, `top_k=32`, `ef_search=128`), that narrowed
+the runtime picture sharply:
+
+- depth 2:
+  - end-to-end unified GraphRAG: `109.222 ms`
+  - internal stage stats:
+    - `ann_ms = 107.590`
+    - `expand_ms = 0.369`
+    - `rerank_ms = 0.004`
+- depth 5:
+  - end-to-end unified GraphRAG: `110.507 ms`
+  - internal stage stats:
+    - `ann_ms = 109.178`
+    - `expand_ms = 0.691`
+    - `rerank_ms = 0.011`
+
+So the current `1M x 64D` depth cost is not expansion-bound. On the widened
+contract, almost all measured time is already in the ANN seed stage; the
+multi-hop expansion and rerank work remain sub-millisecond.
+
 So the narrow conclusion is:
 
 - the multi-hop GraphRAG path itself survives to at least `1M` rows and gives

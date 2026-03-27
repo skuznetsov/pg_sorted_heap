@@ -39,6 +39,19 @@ class DeepQuery:
     vectors: dict[int, str]
 
 
+@dataclass(frozen=True)
+class GraphRagStageStats:
+    api: str
+    seed_count: float
+    expanded_rows: float
+    reranked_rows: float
+    returned_rows: float
+    ann_ms: float
+    expand_ms: float
+    rerank_ms: float
+    total_ms: float
+
+
 META_NAME = "multidepth_meta.json"
 
 
@@ -300,6 +313,109 @@ def print_result(table: str, case: str, depth: int, p50: float, avg: float, hits
     )
 
 
+def print_stage_result(table: str, case: str, depth: int, stats: GraphRagStageStats) -> None:
+    print(
+        "stage_stats|"
+        f"table={table}|case={case}|depth={depth}|"
+        f"api={stats.api}|seed_count={stats.seed_count:.1f}|"
+        f"expanded_rows={stats.expanded_rows:.1f}|"
+        f"reranked_rows={stats.reranked_rows:.1f}|"
+        f"returned_rows={stats.returned_rows:.1f}|"
+        f"ann_ms={stats.ann_ms:.3f}|expand_ms={stats.expand_ms:.3f}|"
+        f"rerank_ms={stats.rerank_ms:.3f}|total_ms={stats.total_ms:.3f}"
+    )
+
+
+def fetch_graph_rag_stage_stats(cur) -> GraphRagStageStats:
+    cur.execute(
+        """
+        SELECT api, seed_count, expanded_rows, reranked_rows, returned_rows,
+               ann_ms, expand_ms, rerank_ms, total_ms
+        FROM sorted_heap_graph_rag_stats()
+        """
+    )
+    row = cur.fetchone()
+    return GraphRagStageStats(
+        api=row[0] or "",
+        seed_count=float(row[1]),
+        expanded_rows=float(row[2]),
+        reranked_rows=float(row[3]),
+        returned_rows=float(row[4]),
+        ann_ms=float(row[5]),
+        expand_ms=float(row[6]),
+        rerank_ms=float(row[7]),
+        total_ms=float(row[8]),
+    )
+
+
+def measure_case_with_stage_stats(
+    cur,
+    table_name: str,
+    case: base.QueryCase,
+    queries: list[DeepQuery],
+    runs: int,
+) -> tuple[float, float, float, float, str, int, GraphRagStageStats]:
+    all_times: list[float] = []
+    all_hits: list[int] = []
+    all_reads: list[int] = []
+    root = ""
+    rowcount = 0
+
+    ann_ms: list[float] = []
+    expand_ms: list[float] = []
+    rerank_ms: list[float] = []
+    total_ms: list[float] = []
+    seed_counts: list[float] = []
+    expanded_rows: list[float] = []
+    reranked_rows: list[float] = []
+    returned_rows: list[float] = []
+    api_name = ""
+
+    sql = case.sql_template.format(table=table_name)
+    params = case.params_builder(queries[0])
+    cur.execute(sql, params)
+    rowcount = len(cur.fetchall())
+
+    for _ in range(runs):
+        for q in queries:
+            params = case.params_builder(q)
+            cur.execute("SELECT sorted_heap_graph_rag_reset_stats()")
+            t, h, r, root = base.explain_json(cur, sql, params)
+            stats = fetch_graph_rag_stage_stats(cur)
+            all_times.append(t)
+            all_hits.append(h)
+            all_reads.append(r)
+            ann_ms.append(stats.ann_ms)
+            expand_ms.append(stats.expand_ms)
+            rerank_ms.append(stats.rerank_ms)
+            total_ms.append(stats.total_ms)
+            seed_counts.append(stats.seed_count)
+            expanded_rows.append(stats.expanded_rows)
+            reranked_rows.append(stats.reranked_rows)
+            returned_rows.append(stats.returned_rows)
+            api_name = stats.api or api_name
+
+    return (
+        statistics.median(all_times),
+        statistics.fmean(all_times),
+        statistics.fmean(all_hits),
+        statistics.fmean(all_reads),
+        root,
+        rowcount,
+        GraphRagStageStats(
+            api=api_name,
+            seed_count=statistics.fmean(seed_counts),
+            expanded_rows=statistics.fmean(expanded_rows),
+            reranked_rows=statistics.fmean(reranked_rows),
+            returned_rows=statistics.fmean(returned_rows),
+            ann_ms=statistics.fmean(ann_ms),
+            expand_ms=statistics.fmean(expand_ms),
+            rerank_ms=statistics.fmean(rerank_ms),
+            total_ms=statistics.fmean(total_ms),
+        ),
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tmp-root", default="/tmp")
@@ -321,6 +437,7 @@ def main() -> None:
     ap.add_argument("--maintenance-work-mem-mb", type=int, default=0)
     ap.add_argument("--table-scope", choices=("all", "sorted_heap_only"), default="all")
     ap.add_argument("--post-load-op", choices=("compact", "merge", "none"), default="compact")
+    ap.add_argument("--report-stage-stats", action="store_true")
     ap.add_argument(
         "--stop-after",
         choices=("none", "generate_csv", "load_data", "build_indexes", "analyze"),
@@ -583,9 +700,17 @@ def main() -> None:
 
                 for table, case in cases:
                     print(f"running|table={table}|case={case.name}|depth={depth}", flush=True)
-                    p50, avg, hits, reads, root, rows = base.measure_case(cur, table, case, queries, args.runs)
+                    if args.report_stage_stats and table == "facts_sh" and case.name.startswith("graph_rag_path_depth_"):
+                        p50, avg, hits, reads, root, rows, stage_stats = measure_case_with_stage_stats(
+                            cur, table, case, queries, args.runs
+                        )
+                    else:
+                        p50, avg, hits, reads, root, rows = base.measure_case(cur, table, case, queries, args.runs)
+                        stage_stats = None
                     hit1, hitk = measure_quality(cur, table, case, queries, num_pairs, depth)
                     print_result(table, case.name, depth, p50, avg, hits, reads, root, rows, hit1, hitk)
+                    if stage_stats is not None:
+                        print_stage_result(table, case.name, depth, stage_stats)
         finally:
             cur.close()
             conn.close()
