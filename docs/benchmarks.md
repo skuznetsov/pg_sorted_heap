@@ -276,6 +276,32 @@ Quality is identical between `on` and `off` at both measured scales.
 Latency at these measured scales is mixed rather than a clear universal win.
 `shared_cache=off` is no longer needed as a correctness workaround.
 
+**Larger-scale cold-start measurement (`100K x 32D`, 200K rows, 47 MB index):**
+
+The deep-copy fix means attach now copies all L0 neighbors (~38 MB), SQ8
+data (~6 MB), and node metadata (~6 MB) from shared memory into local
+buffers on each fresh backend's first query. At 200K nodes, this upfront
+cost exceeds the lazy page-decode path used by `shared_cache=off`:
+
+```
+# 100K pairs, 32D, m=24, ef_construction=200, ef_search=128, 20 fresh backends per mode
+# PG buffer cache warm (shared_buffers=256MB):
+shared_cache=off: cold KNN p50=6.31ms
+shared_cache=on:  cold KNN p50=8.68ms
+
+# PG buffer cache cold (PG restarted between modes, shared_buffers=64MB):
+shared_cache=off: cold KNN first=5.3ms  p50=5.7ms
+shared_cache=on:  cold KNN first=8.6ms  p50=9.5ms
+```
+
+The `off` path loads L0 pages lazily (only pages visited by beam search).
+The `on` path deep-copies all bulk data upfront under LWLock. At 200K
+nodes, the upfront copy dominates. Quality remains identical.
+
+Current conclusion: `shared_cache=on` is a correctness-safe default but
+not a performance feature at the measured scales. The deep-copy overhead
+from the multi-index fix neutralized the original latency benefit.
+
 ### Synthetic multi-hop depth scaling (`relation_path` depth 1..5)
 
 Repo-owned harness:
