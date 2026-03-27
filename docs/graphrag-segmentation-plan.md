@@ -158,14 +158,23 @@ Reference design:
   - optional `relation_family := ...` filtering in config/resolve functions
     and in both raw/policy-backed routed GraphRAG wrappers
   - this is still narrow beta metadata, not a finished general router
+- and the first multi-valued shard-label filter now exists too:
+  - optional shared `segment_labels text[]` in
+    `sorted_heap_graph_segment_meta_registry`
+  - optional `segment_labels := ARRAY[...]` filtering in range/exact
+    config/resolve functions and in raw/policy/profile/default routed wrappers
+  - route profiles can now bundle `segment_labels` alongside
+    `policy_name or segment_groups + relation_family + fanout_limit`
+  - this is the first richer metadata dimension beyond
+    `segment_group + relation_family`
 - and the first reusable route-profile layer now exists on top of that:
   - `sorted_heap_graph_route_profile_register(...)`
   - `sorted_heap_graph_route_profile_resolve(...)`
   - `sorted_heap_graph_rag_routed_profile(...)`
   - `sorted_heap_graph_rag_routed_exact_profile(...)`
   - this now bundles either:
-    - `policy_name + relation_family + fanout_limit`, or
-    - inline `segment_groups + relation_family + fanout_limit`
+    - `policy_name + relation_family + fanout_limit + segment_labels`, or
+    - inline `segment_groups + relation_family + fanout_limit + segment_labels`
   - so the operator no longer needs a separate policy row just to save one
     shard-group ordering
 - and the next operator shortcut now exists on top of profiles:
@@ -194,19 +203,20 @@ Reference design:
 - and the next operator-facing profile/default catalog now exists too:
   - `sorted_heap_graph_route_profile_catalog(...)`
   - this exposes profile-local `policy_name`, inline `segment_groups`,
-    policy-backed `segment_groups`, effective group order, the source marker
-    (`inline|policy|unset`), and whether the profile is currently the route
-    default
+    policy-backed `segment_groups`, effective group order, optional
+    profile-level `segment_labels`, the source marker (`inline|policy|unset`),
+    and whether the profile is currently the route default
   - this also does not change routing behavior; it makes the profile/default
     layer easier to inspect and debug
 - and the next route-level operator summary now exists on top of that:
   - `sorted_heap_graph_route_catalog(...)`
   - this gives one row per route with range-shard count, exact-binding count,
-    policy/profile counts, and the effective default-profile contract
+    policy/profile counts, and the effective default-profile contract,
+    including default `segment_labels`
   - this also does not change routing behavior; it makes the whole routed
     control plane easier to inspect at a glance
 - what is still missing:
-  - more than one optional text metadata dimension per registry row
+  - richer metadata than one shared `text[]` label dimension
   - a product-quality shard router contract for tenant / KB / relation-family
     pruning without hand-managed registration tables
 

@@ -292,19 +292,23 @@ supplied `int8` route value before the segmented merge runs.
 tenant/KB-style routing: register a key-to-shard mapping once, then route by
 an exact key instead of a numeric range. Both routed wrappers now also accept
 an optional `segment_groups := ARRAY[...]` filter, which is the first beta
-surface for hot/sealed or relation-family shard narrowing without changing the
-GraphRAG scoring contract. When that array is present, its order is also used
-as the shard preference order before bounded fanout is applied. The next beta
-convenience layer now exists too: named route policies can store that group
-order once and be reused through `sorted_heap_graph_rag_routed_policy(...)`
-and `sorted_heap_graph_rag_routed_exact_policy(...)`. The newest narrow
-extension on top of that is an optional `relation_family := ...` filter on the
-range registry, exact-key registry, and both policy-backed wrappers, so beta
+surface for hot/sealed shard narrowing without changing the GraphRAG scoring
+contract. When that array is present, its order is also used as the shard
+preference order before bounded fanout is applied. The next beta convenience
+layer now exists too: named route policies can store that group order once and
+be reused through `sorted_heap_graph_rag_routed_policy(...)` and
+`sorted_heap_graph_rag_routed_exact_policy(...)`. The next narrow extension on
+top of that is an optional `relation_family := ...` filter on the range
+registry, exact-key registry, and both policy-backed wrappers, so beta
 segmented GraphRAG can now combine route key/range + shard-group policy + one
-extra family dimension without changing the scoring contract. The next
+extra family dimension without changing the scoring contract. And the next
+metadata dimension now exists beyond that: shared per-shard
+`segment_labels text[]` plus optional `segment_labels := ARRAY[...]` filtering
+on the raw, policy-backed, profile-backed, and default-backed routed paths.
+This is the first multi-valued shard-label filter in the beta surface. The next
 ergonomic layer now exists too: named route profiles can bundle
-`policy_name or segment_groups + relation_family + fanout_limit` once and feed
-`sorted_heap_graph_rag_routed_profile(...)` or
+`policy_name or segment_groups + relation_family + fanout_limit +
+segment_labels` once and feed `sorted_heap_graph_rag_routed_profile(...)` or
 `sorted_heap_graph_rag_routed_exact_profile(...)` directly. And the newest
 operator-facing shortcut removes one more repeated query argument: a route can
 now bind one default profile and call
@@ -326,13 +330,15 @@ Those catalog functions show route-local labels, shared shard metadata,
 effective resolved labels, and whether each effective value came from
 `route`, `shared`, or stayed `unset`. `sorted_heap_graph_route_profile_catalog(...)`
 does the same for route profiles and defaults: it shows inline profile groups,
-policy-backed groups, effective group order, whether those effective groups
-came from `inline`, `policy`, or stayed `unset`, and whether the profile is
-currently the route default. None of these catalog helpers change routing or
-scoring; they only make the current registry model easier to inspect.
+policy-backed groups, effective group order, optional profile-level
+`segment_labels`, whether those effective groups came from `inline`, `policy`,
+or stayed `unset`, and whether the profile is currently the route default.
+None of these catalog helpers change routing or scoring; they only make the
+current registry model easier to inspect.
 `sorted_heap_graph_route_catalog(...)` is the one-row-per-route summary on top
 of that: it shows range-shard count, exact-binding count, policy/profile
-counts, and the effective default profile contract for that route.
+counts, and the effective default profile contract for that route, including
+default `segment_labels`.
 
 For tuning and debugging, GraphRAG now also exposes backend-local last-call
 stats:

@@ -306,11 +306,22 @@
       both are present
     - regression coverage now proves both routed wrappers work when those
       labels live only in the shared shard-metadata registry
+  - the first multi-valued shard-label filter on top of that:
+    - shared shard metadata now also accepts optional `segment_labels text[]`
+    - range/exact config, catalog, and resolve functions now accept optional
+      `segment_labels := ARRAY[...]` filters
+    - raw, policy-backed, profile-backed, and default-backed routed wrappers
+      now propagate that filter without changing GraphRAG scoring semantics
+    - route profiles and route/default catalogs now expose profile-level and
+      default effective `segment_labels`
+    - regression coverage now proves label-based pruning through the shared
+      shard-metadata path for both range and exact-key routing
   - a first operator-facing shard catalog on top of that:
     - added `sorted_heap_graph_segment_catalog(...)` and
       `sorted_heap_graph_exact_catalog(...)`
     - both show route-local metadata, shared shard metadata, effective
-      resolved metadata, and per-column source markers (`route|shared|unset`)
+      resolved metadata, optional shared/effective `segment_labels`, and
+      per-column source markers (`route|shared|unset`)
     - this is introspection-only and does not change the routed GraphRAG
       execution contract
   - a first operator-facing route-profile catalog on top of that:
@@ -318,13 +329,15 @@
     - it shows profile-local `policy_name`, inline `segment_groups`,
       policy-backed `segment_groups`, effective group order,
       `segment_groups_source` (`inline|policy|unset`), `relation_family`,
-      `fanout_limit`, and whether the profile is the current route default
+      `fanout_limit`, optional profile-level `segment_labels`, and whether the
+      profile is the current route default
     - this is introspection-only and does not change the routed GraphRAG
       execution contract
   - a first route-level operator summary on top of that:
     - added `sorted_heap_graph_route_catalog(...)`
     - it shows one row per route with range-shard count, exact-binding count,
-      policy/profile counts, and the effective default-profile contract
+      policy/profile counts, and the effective default-profile contract,
+      including default `segment_labels`
     - this is introspection-only and does not change the routed GraphRAG
       execution contract
 

@@ -773,23 +773,23 @@ ANALYZE facts_chain_seg_b;
 COPY (
   SELECT 'ok'
   FROM (
-    SELECT sorted_heap_graph_segment_meta_register('facts_chain_seg_a'::regclass, 'hot', 'left')
+    SELECT sorted_heap_graph_segment_meta_register('facts_chain_seg_a'::regclass, 'hot', 'left', ARRAY['hot','mutable'])
   ) s
 ) TO STDOUT;
 ok
 COPY (
   SELECT 'ok'
   FROM (
-    SELECT sorted_heap_graph_segment_meta_register('facts_chain_seg_b'::regclass, 'sealed', 'right')
+    SELECT sorted_heap_graph_segment_meta_register('facts_chain_seg_b'::regclass, 'sealed', 'right', ARRAY['sealed','archive'])
   ) s
 ) TO STDOUT;
 ok
 COPY (
-  SELECT rel::text, coalesce(segment_group, ''), coalesce(relation_family, '')
+  SELECT rel::text, coalesce(segment_group, ''), coalesce(relation_family, ''), coalesce(array_to_string(segment_labels, ','), '')
   FROM sorted_heap_graph_segment_meta_config()
 ) TO STDOUT;
-facts_chain_seg_a	hot	left
-facts_chain_seg_b	sealed	right
+facts_chain_seg_a	hot	left	hot,mutable
+facts_chain_seg_b	sealed	right	sealed,archive
 COPY (
   SELECT 'ok'
   FROM (
@@ -829,11 +829,13 @@ COPY (
          coalesce(route_segment_group, ''), coalesce(route_relation_family, ''),
          coalesce(shared_segment_group, ''), coalesce(shared_relation_family, ''),
          coalesce(effective_segment_group, ''), coalesce(effective_relation_family, ''),
-         segment_group_source, relation_family_source
+         coalesce(array_to_string(shared_segment_labels, ','), ''),
+         coalesce(array_to_string(effective_segment_labels, ','), ''),
+         segment_group_source, relation_family_source, segment_labels_source
   FROM sorted_heap_graph_segment_catalog('chain_grouped')
 ) TO STDOUT;
-chain_grouped	facts_chain_seg_a	1	16	hot	left	hot	left	hot	left	route	route
-chain_grouped	facts_chain_seg_b	1	16	sealed	right	sealed	right	sealed	right	route	route
+chain_grouped	facts_chain_seg_a	1	16	hot	left	hot	left	hot	left	hot,mutable	hot,mutable	route	route	shared
+chain_grouped	facts_chain_seg_b	1	16	sealed	right	sealed	right	sealed	right	sealed,archive	sealed,archive	route	route	shared
 COPY (
   SELECT 'ok'
   FROM (
@@ -849,51 +851,58 @@ COPY (
 ) TO STDOUT;
 ok
 COPY (
-  SELECT route_name, rel::text, route_min, route_max, coalesce(segment_group, ''), coalesce(relation_family, '')
+  SELECT route_name, rel::text, route_min, route_max, coalesce(segment_group, ''), coalesce(relation_family, ''), coalesce(array_to_string(segment_labels, ','), '')
   FROM sorted_heap_graph_segment_config('chain_meta_grouped')
 ) TO STDOUT;
-chain_meta_grouped	facts_chain_seg_a	1	16	hot	left
-chain_meta_grouped	facts_chain_seg_b	1	16	sealed	right
+chain_meta_grouped	facts_chain_seg_a	1	16	hot	left	hot,mutable
+chain_meta_grouped	facts_chain_seg_b	1	16	sealed	right	sealed,archive
 COPY (
   SELECT route_name, rel::text, route_min, route_max,
          coalesce(route_segment_group, ''), coalesce(route_relation_family, ''),
          coalesce(shared_segment_group, ''), coalesce(shared_relation_family, ''),
          coalesce(effective_segment_group, ''), coalesce(effective_relation_family, ''),
-         segment_group_source, relation_family_source
+         coalesce(array_to_string(shared_segment_labels, ','), ''),
+         coalesce(array_to_string(effective_segment_labels, ','), ''),
+         segment_group_source, relation_family_source, segment_labels_source
   FROM sorted_heap_graph_segment_catalog('chain_meta_grouped')
 ) TO STDOUT;
-chain_meta_grouped	facts_chain_seg_a	1	16			hot	left	hot	left	shared	shared
-chain_meta_grouped	facts_chain_seg_b	1	16			sealed	right	sealed	right	shared	shared
+chain_meta_grouped	facts_chain_seg_a	1	16			hot	left	hot	left	hot,mutable	hot,mutable	shared	shared	shared
+chain_meta_grouped	facts_chain_seg_b	1	16			sealed	right	sealed	right	sealed,archive	sealed,archive	shared	shared	shared
 COPY (
-  SELECT rel::text, route_min, route_max, coalesce(segment_group, ''), coalesce(relation_family, '')
+  SELECT rel::text, route_min, route_max, coalesce(segment_group, ''), coalesce(relation_family, ''), coalesce(array_to_string(segment_labels, ','), '')
   FROM sorted_heap_graph_segment_resolve('chain_route', 8, 0)
 ) TO STDOUT;
-facts_chain_seg_a	1	8	hot	left
+facts_chain_seg_a	1	8	hot	left	hot,mutable
 COPY (
-  SELECT rel::text, route_min, route_max, coalesce(segment_group, ''), coalesce(relation_family, '')
+  SELECT rel::text, route_min, route_max, coalesce(segment_group, ''), coalesce(relation_family, ''), coalesce(array_to_string(segment_labels, ','), '')
   FROM sorted_heap_graph_segment_resolve('chain_grouped', 8, 0, ARRAY['hot'])
 ) TO STDOUT;
-facts_chain_seg_a	1	16	hot	left
+facts_chain_seg_a	1	16	hot	left	hot,mutable
 COPY (
-  SELECT rel::text, route_min, route_max, coalesce(segment_group, ''), coalesce(relation_family, '')
+  SELECT rel::text, route_min, route_max, coalesce(segment_group, ''), coalesce(relation_family, ''), coalesce(array_to_string(segment_labels, ','), '')
   FROM sorted_heap_graph_segment_resolve('chain_grouped', 8, 1, ARRAY['sealed','hot'])
 ) TO STDOUT;
-facts_chain_seg_b	1	16	sealed	right
+facts_chain_seg_b	1	16	sealed	right	sealed,archive
 COPY (
-  SELECT rel::text, route_min, route_max, coalesce(segment_group, ''), coalesce(relation_family, '')
+  SELECT rel::text, route_min, route_max, coalesce(segment_group, ''), coalesce(relation_family, ''), coalesce(array_to_string(segment_labels, ','), '')
   FROM sorted_heap_graph_segment_resolve('chain_grouped', 8, 0, ARRAY['hot','sealed'], 'right')
 ) TO STDOUT;
-facts_chain_seg_b	1	16	sealed	right
+facts_chain_seg_b	1	16	sealed	right	sealed,archive
 COPY (
-  SELECT rel::text, route_min, route_max, coalesce(segment_group, ''), coalesce(relation_family, '')
+  SELECT rel::text, route_min, route_max, coalesce(segment_group, ''), coalesce(relation_family, ''), coalesce(array_to_string(segment_labels, ','), '')
   FROM sorted_heap_graph_segment_resolve('chain_meta_grouped', 8, 0, ARRAY['hot'])
 ) TO STDOUT;
-facts_chain_seg_a	1	16	hot	left
+facts_chain_seg_a	1	16	hot	left	hot,mutable
 COPY (
-  SELECT rel::text, route_min, route_max, coalesce(segment_group, ''), coalesce(relation_family, '')
+  SELECT rel::text, route_min, route_max, coalesce(segment_group, ''), coalesce(relation_family, ''), coalesce(array_to_string(segment_labels, ','), '')
   FROM sorted_heap_graph_segment_resolve('chain_meta_grouped', 8, 0, ARRAY['hot','sealed'], 'right')
 ) TO STDOUT;
-facts_chain_seg_b	1	16	sealed	right
+facts_chain_seg_b	1	16	sealed	right	sealed,archive
+COPY (
+  SELECT rel::text, route_min, route_max, coalesce(segment_group, ''), coalesce(relation_family, ''), coalesce(array_to_string(segment_labels, ','), '')
+  FROM sorted_heap_graph_segment_resolve('chain_meta_grouped', 8, 0, NULL, NULL, ARRAY['archive'])
+) TO STDOUT;
+facts_chain_seg_b	1	16	sealed	right	sealed,archive
 COPY (
   SELECT 'ok'
   FROM (
@@ -926,33 +935,33 @@ sealed,hot
 COPY (
   SELECT 'ok'
   FROM (
-    SELECT sorted_heap_graph_route_profile_register('chain_grouped', 'sealed_right', 'prefer_sealed', NULL, 'right', 1)
+    SELECT sorted_heap_graph_route_profile_register('chain_grouped', 'sealed_right', 'prefer_sealed', NULL, 'right', 1, ARRAY['archive'])
   ) s
 ) TO STDOUT;
 ok
 COPY (
   SELECT 'ok'
   FROM (
-    SELECT sorted_heap_graph_route_profile_register('chain_grouped', 'inline_sealed_right', NULL, ARRAY['sealed','hot'], 'right', 1)
+    SELECT sorted_heap_graph_route_profile_register('chain_grouped', 'inline_sealed_right', NULL, ARRAY['sealed','hot'], 'right', 1, ARRAY['archive'])
   ) s
 ) TO STDOUT;
 ok
 COPY (
-  SELECT route_name, profile_name, coalesce(policy_name, ''), coalesce(array_to_string(segment_groups, ','), ''), coalesce(relation_family, ''), fanout_limit
+  SELECT route_name, profile_name, coalesce(policy_name, ''), coalesce(array_to_string(segment_groups, ','), ''), coalesce(relation_family, ''), fanout_limit, coalesce(array_to_string(segment_labels, ','), '')
   FROM sorted_heap_graph_route_profile_config('chain_grouped')
 ) TO STDOUT;
-chain_grouped	inline_sealed_right		sealed,hot	right	1
-chain_grouped	sealed_right	prefer_sealed		right	1
+chain_grouped	inline_sealed_right		sealed,hot	right	1	archive
+chain_grouped	sealed_right	prefer_sealed		right	1	archive
 COPY (
-  SELECT coalesce(policy_name, ''), coalesce(array_to_string(segment_groups, ','), ''), coalesce(relation_family, ''), fanout_limit
+  SELECT coalesce(policy_name, ''), coalesce(array_to_string(segment_groups, ','), ''), coalesce(relation_family, ''), fanout_limit, coalesce(array_to_string(segment_labels, ','), '')
   FROM sorted_heap_graph_route_profile_resolve('chain_grouped', 'sealed_right')
 ) TO STDOUT;
-prefer_sealed		right	1
+prefer_sealed		right	1	archive
 COPY (
-  SELECT coalesce(policy_name, ''), coalesce(array_to_string(segment_groups, ','), ''), coalesce(relation_family, ''), fanout_limit
+  SELECT coalesce(policy_name, ''), coalesce(array_to_string(segment_groups, ','), ''), coalesce(relation_family, ''), fanout_limit, coalesce(array_to_string(segment_labels, ','), '')
   FROM sorted_heap_graph_route_profile_resolve('chain_grouped', 'inline_sealed_right')
 ) TO STDOUT;
-	sealed,hot	right	1
+	sealed,hot	right	1	archive
 COPY (
   SELECT 'ok'
   FROM (
@@ -977,11 +986,12 @@ COPY (
          segment_groups_source,
          coalesce(relation_family, ''),
          fanout_limit,
+         coalesce(array_to_string(segment_labels, ','), ''),
          is_default
   FROM sorted_heap_graph_route_profile_catalog('chain_grouped')
 ) TO STDOUT;
-chain_grouped	inline_sealed_right		sealed,hot		sealed,hot	inline	right	1	t
-chain_grouped	sealed_right	prefer_sealed		sealed,hot	sealed,hot	policy	right	1	f
+chain_grouped	inline_sealed_right		sealed,hot		sealed,hot	inline	right	1	archive	t
+chain_grouped	sealed_right	prefer_sealed		sealed,hot	sealed,hot	policy	right	1	archive	f
 COPY (
   SELECT route_name,
          range_shard_count,
@@ -992,10 +1002,11 @@ COPY (
          coalesce(array_to_string(default_effective_segment_groups, ','), ''),
          coalesce(default_segment_groups_source, ''),
          coalesce(default_relation_family, ''),
-         coalesce(default_fanout_limit::text, '')
+         coalesce(default_fanout_limit::text, ''),
+         coalesce(array_to_string(default_segment_labels, ','), '')
   FROM sorted_heap_graph_route_catalog('chain_grouped')
 ) TO STDOUT;
-chain_grouped	2	0	2	2	inline_sealed_right	sealed,hot	inline	right	1
+chain_grouped	2	0	2	2	inline_sealed_right	sealed,hot	inline	right	1	archive
 COPY (
   SELECT source_rel::text, entity_id, relation_id, target_id, payload,
          round(distance::numeric, 6) AS distance
@@ -1559,72 +1570,81 @@ COPY (
 ) TO STDOUT;
 ok
 COPY (
-  SELECT route_name, route_key, rel::text, priority, coalesce(segment_group, ''), coalesce(relation_family, '')
+  SELECT route_name, route_key, rel::text, priority, coalesce(segment_group, ''), coalesce(relation_family, ''), coalesce(array_to_string(segment_labels, ','), '')
   FROM sorted_heap_graph_exact_config('chain_exact')
 ) TO STDOUT;
-chain_exact	both	facts_chain_seg_a	100	hot	left
-chain_exact	both	facts_chain_seg_b	50	sealed	right
-chain_exact	left	facts_chain_seg_a	100	hot	left
+chain_exact	both	facts_chain_seg_a	100	hot	left	hot,mutable
+chain_exact	both	facts_chain_seg_b	50	sealed	right	sealed,archive
+chain_exact	left	facts_chain_seg_a	100	hot	left	hot,mutable
 COPY (
   SELECT route_name, route_key, rel::text, priority,
          coalesce(route_segment_group, ''), coalesce(route_relation_family, ''),
          coalesce(shared_segment_group, ''), coalesce(shared_relation_family, ''),
          coalesce(effective_segment_group, ''), coalesce(effective_relation_family, ''),
-         segment_group_source, relation_family_source
+         coalesce(array_to_string(shared_segment_labels, ','), ''),
+         coalesce(array_to_string(effective_segment_labels, ','), ''),
+         segment_group_source, relation_family_source, segment_labels_source
   FROM sorted_heap_graph_exact_catalog('chain_exact')
 ) TO STDOUT;
-chain_exact	both	facts_chain_seg_a	100	hot	left	hot	left	hot	left	route	route
-chain_exact	both	facts_chain_seg_b	50	sealed	right	sealed	right	sealed	right	route	route
-chain_exact	left	facts_chain_seg_a	100	hot	left	hot	left	hot	left	route	route
+chain_exact	both	facts_chain_seg_a	100	hot	left	hot	left	hot	left	hot,mutable	hot,mutable	route	route	shared
+chain_exact	both	facts_chain_seg_b	50	sealed	right	sealed	right	sealed	right	sealed,archive	sealed,archive	route	route	shared
+chain_exact	left	facts_chain_seg_a	100	hot	left	hot	left	hot	left	hot,mutable	hot,mutable	route	route	shared
 COPY (
-  SELECT route_name, route_key, rel::text, priority, coalesce(segment_group, ''), coalesce(relation_family, '')
+  SELECT route_name, route_key, rel::text, priority, coalesce(segment_group, ''), coalesce(relation_family, ''), coalesce(array_to_string(segment_labels, ','), '')
   FROM sorted_heap_graph_exact_config('chain_meta_exact')
 ) TO STDOUT;
-chain_meta_exact	both	facts_chain_seg_a	100	hot	left
-chain_meta_exact	both	facts_chain_seg_b	50	sealed	right
-chain_meta_exact	left	facts_chain_seg_a	100	hot	left
+chain_meta_exact	both	facts_chain_seg_a	100	hot	left	hot,mutable
+chain_meta_exact	both	facts_chain_seg_b	50	sealed	right	sealed,archive
+chain_meta_exact	left	facts_chain_seg_a	100	hot	left	hot,mutable
 COPY (
   SELECT route_name, route_key, rel::text, priority,
          coalesce(route_segment_group, ''), coalesce(route_relation_family, ''),
          coalesce(shared_segment_group, ''), coalesce(shared_relation_family, ''),
          coalesce(effective_segment_group, ''), coalesce(effective_relation_family, ''),
-         segment_group_source, relation_family_source
+         coalesce(array_to_string(shared_segment_labels, ','), ''),
+         coalesce(array_to_string(effective_segment_labels, ','), ''),
+         segment_group_source, relation_family_source, segment_labels_source
   FROM sorted_heap_graph_exact_catalog('chain_meta_exact')
 ) TO STDOUT;
-chain_meta_exact	both	facts_chain_seg_a	100			hot	left	hot	left	shared	shared
-chain_meta_exact	both	facts_chain_seg_b	50			sealed	right	sealed	right	shared	shared
-chain_meta_exact	left	facts_chain_seg_a	100			hot	left	hot	left	shared	shared
+chain_meta_exact	both	facts_chain_seg_a	100			hot	left	hot	left	hot,mutable	hot,mutable	shared	shared	shared
+chain_meta_exact	both	facts_chain_seg_b	50			sealed	right	sealed	right	sealed,archive	sealed,archive	shared	shared	shared
+chain_meta_exact	left	facts_chain_seg_a	100			hot	left	hot	left	hot,mutable	hot,mutable	shared	shared	shared
 COPY (
-  SELECT rel::text, priority, coalesce(segment_group, ''), coalesce(relation_family, '')
+  SELECT rel::text, priority, coalesce(segment_group, ''), coalesce(relation_family, ''), coalesce(array_to_string(segment_labels, ','), '')
   FROM sorted_heap_graph_exact_resolve('chain_exact', 'left', 0)
 ) TO STDOUT;
-facts_chain_seg_a	100	hot	left
+facts_chain_seg_a	100	hot	left	hot,mutable
 COPY (
-  SELECT rel::text, priority, coalesce(segment_group, ''), coalesce(relation_family, '')
+  SELECT rel::text, priority, coalesce(segment_group, ''), coalesce(relation_family, ''), coalesce(array_to_string(segment_labels, ','), '')
   FROM sorted_heap_graph_exact_resolve('chain_exact', 'both', 0)
 ) TO STDOUT;
-facts_chain_seg_a	100	hot	left
-facts_chain_seg_b	50	sealed	right
+facts_chain_seg_a	100	hot	left	hot,mutable
+facts_chain_seg_b	50	sealed	right	sealed,archive
 COPY (
-  SELECT rel::text, priority, coalesce(segment_group, ''), coalesce(relation_family, '')
+  SELECT rel::text, priority, coalesce(segment_group, ''), coalesce(relation_family, ''), coalesce(array_to_string(segment_labels, ','), '')
   FROM sorted_heap_graph_exact_resolve('chain_exact', 'both', 0, ARRAY['sealed'])
 ) TO STDOUT;
-facts_chain_seg_b	50	sealed	right
+facts_chain_seg_b	50	sealed	right	sealed,archive
 COPY (
-  SELECT rel::text, priority, coalesce(segment_group, ''), coalesce(relation_family, '')
+  SELECT rel::text, priority, coalesce(segment_group, ''), coalesce(relation_family, ''), coalesce(array_to_string(segment_labels, ','), '')
   FROM sorted_heap_graph_exact_resolve('chain_exact', 'both', 1, ARRAY['sealed','hot'])
 ) TO STDOUT;
-facts_chain_seg_b	50	sealed	right
+facts_chain_seg_b	50	sealed	right	sealed,archive
 COPY (
-  SELECT rel::text, priority, coalesce(segment_group, ''), coalesce(relation_family, '')
+  SELECT rel::text, priority, coalesce(segment_group, ''), coalesce(relation_family, ''), coalesce(array_to_string(segment_labels, ','), '')
   FROM sorted_heap_graph_exact_resolve('chain_exact', 'both', 0, ARRAY['hot','sealed'], 'right')
 ) TO STDOUT;
-facts_chain_seg_b	50	sealed	right
+facts_chain_seg_b	50	sealed	right	sealed,archive
 COPY (
-  SELECT rel::text, priority, coalesce(segment_group, ''), coalesce(relation_family, '')
+  SELECT rel::text, priority, coalesce(segment_group, ''), coalesce(relation_family, ''), coalesce(array_to_string(segment_labels, ','), '')
   FROM sorted_heap_graph_exact_resolve('chain_meta_exact', 'both', 1, ARRAY['sealed','hot'])
 ) TO STDOUT;
-facts_chain_seg_b	50	sealed	right
+facts_chain_seg_b	50	sealed	right	sealed,archive
+COPY (
+  SELECT rel::text, priority, coalesce(segment_group, ''), coalesce(relation_family, ''), coalesce(array_to_string(segment_labels, ','), '')
+  FROM sorted_heap_graph_exact_resolve('chain_meta_exact', 'both', 0, NULL, NULL, ARRAY['archive'])
+) TO STDOUT;
+facts_chain_seg_b	50	sealed	right	sealed,archive
 COPY (
   SELECT 'ok'
   FROM (
@@ -1652,33 +1672,33 @@ sealed,hot
 COPY (
   SELECT 'ok'
   FROM (
-    SELECT sorted_heap_graph_route_profile_register('chain_exact', 'sealed_right', 'prefer_sealed', NULL, 'right', 1)
+    SELECT sorted_heap_graph_route_profile_register('chain_exact', 'sealed_right', 'prefer_sealed', NULL, 'right', 1, ARRAY['archive'])
   ) s
 ) TO STDOUT;
 ok
 COPY (
   SELECT 'ok'
   FROM (
-    SELECT sorted_heap_graph_route_profile_register('chain_exact', 'inline_sealed_right', NULL, ARRAY['sealed','hot'], 'right', 1)
+    SELECT sorted_heap_graph_route_profile_register('chain_exact', 'inline_sealed_right', NULL, ARRAY['sealed','hot'], 'right', 1, ARRAY['archive'])
   ) s
 ) TO STDOUT;
 ok
 COPY (
-  SELECT route_name, profile_name, coalesce(policy_name, ''), coalesce(array_to_string(segment_groups, ','), ''), coalesce(relation_family, ''), fanout_limit
+  SELECT route_name, profile_name, coalesce(policy_name, ''), coalesce(array_to_string(segment_groups, ','), ''), coalesce(relation_family, ''), fanout_limit, coalesce(array_to_string(segment_labels, ','), '')
   FROM sorted_heap_graph_route_profile_config('chain_exact')
 ) TO STDOUT;
-chain_exact	inline_sealed_right		sealed,hot	right	1
-chain_exact	sealed_right	prefer_sealed		right	1
+chain_exact	inline_sealed_right		sealed,hot	right	1	archive
+chain_exact	sealed_right	prefer_sealed		right	1	archive
 COPY (
-  SELECT coalesce(policy_name, ''), coalesce(array_to_string(segment_groups, ','), ''), coalesce(relation_family, ''), fanout_limit
+  SELECT coalesce(policy_name, ''), coalesce(array_to_string(segment_groups, ','), ''), coalesce(relation_family, ''), fanout_limit, coalesce(array_to_string(segment_labels, ','), '')
   FROM sorted_heap_graph_route_profile_resolve('chain_exact', 'sealed_right')
 ) TO STDOUT;
-prefer_sealed		right	1
+prefer_sealed		right	1	archive
 COPY (
-  SELECT coalesce(policy_name, ''), coalesce(array_to_string(segment_groups, ','), ''), coalesce(relation_family, ''), fanout_limit
+  SELECT coalesce(policy_name, ''), coalesce(array_to_string(segment_groups, ','), ''), coalesce(relation_family, ''), fanout_limit, coalesce(array_to_string(segment_labels, ','), '')
   FROM sorted_heap_graph_route_profile_resolve('chain_exact', 'inline_sealed_right')
 ) TO STDOUT;
-	sealed,hot	right	1
+	sealed,hot	right	1	archive
 COPY (
   SELECT 'ok'
   FROM (
@@ -1703,11 +1723,12 @@ COPY (
          segment_groups_source,
          coalesce(relation_family, ''),
          fanout_limit,
+         coalesce(array_to_string(segment_labels, ','), ''),
          is_default
   FROM sorted_heap_graph_route_profile_catalog('chain_exact')
 ) TO STDOUT;
-chain_exact	inline_sealed_right		sealed,hot		sealed,hot	inline	right	1	t
-chain_exact	sealed_right	prefer_sealed		sealed,hot	sealed,hot	policy	right	1	f
+chain_exact	inline_sealed_right		sealed,hot		sealed,hot	inline	right	1	archive	t
+chain_exact	sealed_right	prefer_sealed		sealed,hot	sealed,hot	policy	right	1	archive	f
 COPY (
   SELECT route_name,
          range_shard_count,
@@ -1718,10 +1739,11 @@ COPY (
          coalesce(array_to_string(default_effective_segment_groups, ','), ''),
          coalesce(default_segment_groups_source, ''),
          coalesce(default_relation_family, ''),
-         coalesce(default_fanout_limit::text, '')
+         coalesce(default_fanout_limit::text, ''),
+         coalesce(array_to_string(default_segment_labels, ','), '')
   FROM sorted_heap_graph_route_catalog('chain_exact')
 ) TO STDOUT;
-chain_exact	0	3	2	2	inline_sealed_right	sealed,hot	inline	right	1
+chain_exact	0	3	2	2	inline_sealed_right	sealed,hot	inline	right	1	archive
 COPY (
   SELECT source_rel::text, entity_id, relation_id, target_id, payload,
          round(distance::numeric, 6) AS distance

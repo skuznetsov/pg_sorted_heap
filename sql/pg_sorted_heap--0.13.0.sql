@@ -491,7 +491,8 @@ $$ LANGUAGE SQL STABLE;
 CREATE TABLE @extschema@.sorted_heap_graph_segment_meta_registry (
   relid regclass PRIMARY KEY,
   segment_group text,
-  relation_family text
+  relation_family text,
+  segment_labels text[]
 );
 
 SELECT pg_catalog.pg_extension_config_dump('@extschema@.sorted_heap_graph_segment_meta_registry', '');
@@ -499,17 +500,28 @@ SELECT pg_catalog.pg_extension_config_dump('@extschema@.sorted_heap_graph_segmen
 CREATE FUNCTION @extschema@.sorted_heap_graph_segment_meta_register(
   rel regclass,
   segment_group text DEFAULT NULL,
-  relation_family text DEFAULT NULL
+  relation_family text DEFAULT NULL,
+  segment_labels text[] DEFAULT NULL
 ) RETURNS void
 AS $$
+BEGIN
+  IF segment_labels IS NOT NULL
+     AND (array_ndims(segment_labels) <> 1
+          OR array_length(segment_labels, 1) IS NULL
+          OR array_length(segment_labels, 1) < 1) THEN
+    RAISE EXCEPTION 'sorted_heap_graph_segment_meta_register: segment_labels must be a non-empty one-dimensional text[]';
+  END IF;
+
   INSERT INTO @extschema@.sorted_heap_graph_segment_meta_registry (
-    relid, segment_group, relation_family
+    relid, segment_group, relation_family, segment_labels
   )
-  VALUES ($1, $2, $3)
+  VALUES ($1, $2, $3, $4)
   ON CONFLICT (relid) DO UPDATE SET
     segment_group = EXCLUDED.segment_group,
-    relation_family = EXCLUDED.relation_family;
-$$ LANGUAGE SQL;
+    relation_family = EXCLUDED.relation_family,
+    segment_labels = EXCLUDED.segment_labels;
+END;
+$$ LANGUAGE plpgsql;
 
 CREATE FUNCTION @extschema@.sorted_heap_graph_segment_meta_unregister(
   rel regclass DEFAULT NULL
@@ -530,10 +542,11 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_segment_meta_config(
 ) RETURNS TABLE (
   rel regclass,
   segment_group text,
-  relation_family text
+  relation_family text,
+  segment_labels text[]
 )
 AS $$
-  SELECT m.relid, m.segment_group, m.relation_family
+  SELECT m.relid, m.segment_group, m.relation_family, m.segment_labels
   FROM @extschema@.sorted_heap_graph_segment_meta_registry m
   WHERE ($1 IS NULL OR m.relid = $1)
   ORDER BY m.relid;
@@ -596,7 +609,8 @@ $$ LANGUAGE plpgsql;
 CREATE FUNCTION @extschema@.sorted_heap_graph_segment_config(
   route_name text DEFAULT NULL,
   segment_groups text[] DEFAULT NULL,
-  relation_family text DEFAULT NULL
+  relation_family text DEFAULT NULL,
+  segment_labels text[] DEFAULT NULL
 )
 RETURNS TABLE (
   route_name text,
@@ -604,23 +618,26 @@ RETURNS TABLE (
   route_min int8,
   route_max int8,
   segment_group text,
-  relation_family text
+  relation_family text,
+  segment_labels text[]
 )
 AS $$
-  SELECT x.route_name, x.relid, x.route_min, x.route_max, x.segment_group, x.relation_family
+  SELECT x.route_name, x.relid, x.route_min, x.route_max, x.segment_group, x.relation_family, x.segment_labels
   FROM (
     SELECT s.route_name,
            s.relid,
            s.route_min,
            s.route_max,
            COALESCE(s.segment_group, m.segment_group) AS segment_group,
-           COALESCE(s.relation_family, m.relation_family) AS relation_family
+           COALESCE(s.relation_family, m.relation_family) AS relation_family,
+           m.segment_labels AS segment_labels
     FROM @extschema@.sorted_heap_graph_segment_registry s
     LEFT JOIN @extschema@.sorted_heap_graph_segment_meta_registry m ON m.relid = s.relid
   ) x
   WHERE ($1 IS NULL OR x.route_name = $1)
     AND ($2 IS NULL OR x.segment_group = ANY($2))
     AND ($3 IS NULL OR x.relation_family = $3)
+    AND ($4 IS NULL OR COALESCE(x.segment_labels, ARRAY[]::text[]) @> $4)
   ORDER BY x.route_name,
            CASE WHEN $2 IS NULL THEN 0 ELSE array_position($2, x.segment_group) END,
            x.segment_group,
@@ -633,7 +650,8 @@ $$ LANGUAGE SQL STABLE;
 CREATE FUNCTION @extschema@.sorted_heap_graph_segment_catalog(
   route_name text DEFAULT NULL,
   segment_groups text[] DEFAULT NULL,
-  relation_family text DEFAULT NULL
+  relation_family text DEFAULT NULL,
+  segment_labels text[] DEFAULT NULL
 )
 RETURNS TABLE (
   route_name text,
@@ -646,8 +664,11 @@ RETURNS TABLE (
   shared_relation_family text,
   effective_segment_group text,
   effective_relation_family text,
+  shared_segment_labels text[],
+  effective_segment_labels text[],
   segment_group_source text,
-  relation_family_source text
+  relation_family_source text,
+  segment_labels_source text
 )
 AS $$
   SELECT x.route_name,
@@ -660,8 +681,11 @@ AS $$
          x.shared_relation_family,
          x.effective_segment_group,
          x.effective_relation_family,
+         x.shared_segment_labels,
+         x.effective_segment_labels,
          x.segment_group_source,
-         x.relation_family_source
+         x.relation_family_source,
+         x.segment_labels_source
   FROM (
     SELECT s.route_name,
            s.relid,
@@ -673,6 +697,8 @@ AS $$
            m.relation_family AS shared_relation_family,
            COALESCE(s.segment_group, m.segment_group) AS effective_segment_group,
            COALESCE(s.relation_family, m.relation_family) AS effective_relation_family,
+           m.segment_labels AS shared_segment_labels,
+           m.segment_labels AS effective_segment_labels,
            CASE
              WHEN s.segment_group IS NOT NULL THEN 'route'
              WHEN m.segment_group IS NOT NULL THEN 'shared'
@@ -682,13 +708,18 @@ AS $$
              WHEN s.relation_family IS NOT NULL THEN 'route'
              WHEN m.relation_family IS NOT NULL THEN 'shared'
              ELSE 'unset'
-           END AS relation_family_source
+           END AS relation_family_source,
+           CASE
+             WHEN m.segment_labels IS NOT NULL THEN 'shared'
+             ELSE 'unset'
+           END AS segment_labels_source
     FROM @extschema@.sorted_heap_graph_segment_registry s
     LEFT JOIN @extschema@.sorted_heap_graph_segment_meta_registry m ON m.relid = s.relid
   ) x
   WHERE ($1 IS NULL OR x.route_name = $1)
     AND ($2 IS NULL OR x.effective_segment_group = ANY($2))
     AND ($3 IS NULL OR x.effective_relation_family = $3)
+    AND ($4 IS NULL OR COALESCE(x.effective_segment_labels, ARRAY[]::text[]) @> $4)
   ORDER BY x.route_name,
            CASE WHEN $2 IS NULL THEN 0 ELSE array_position($2, x.effective_segment_group) END,
            x.effective_segment_group,
@@ -703,28 +734,32 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_segment_resolve(
   route_value int8,
   fanout_limit int4 DEFAULT 0,
   segment_groups text[] DEFAULT NULL,
-  relation_family text DEFAULT NULL
+  relation_family text DEFAULT NULL,
+  segment_labels text[] DEFAULT NULL
 ) RETURNS TABLE (
   rel regclass,
   route_min int8,
   route_max int8,
   segment_group text,
-  relation_family text
+  relation_family text,
+  segment_labels text[]
 )
 AS $$
-  SELECT chosen.relid, chosen.route_min, chosen.route_max, chosen.segment_group, chosen.relation_family
+  SELECT chosen.relid, chosen.route_min, chosen.route_max, chosen.segment_group, chosen.relation_family, chosen.segment_labels
   FROM (
     SELECT s.relid,
            s.route_min,
            s.route_max,
            COALESCE(s.segment_group, m.segment_group) AS segment_group,
-           COALESCE(s.relation_family, m.relation_family) AS relation_family
+           COALESCE(s.relation_family, m.relation_family) AS relation_family,
+           m.segment_labels AS segment_labels
     FROM @extschema@.sorted_heap_graph_segment_registry s
     LEFT JOIN @extschema@.sorted_heap_graph_segment_meta_registry m ON m.relid = s.relid
     WHERE s.route_name = $1
       AND $2 BETWEEN s.route_min AND s.route_max
       AND ($4 IS NULL OR COALESCE(s.segment_group, m.segment_group) = ANY($4))
       AND ($5 IS NULL OR COALESCE(s.relation_family, m.relation_family) = $5)
+      AND ($6 IS NULL OR COALESCE(m.segment_labels, ARRAY[]::text[]) @> $6)
     ORDER BY CASE WHEN $4 IS NULL THEN 0 ELSE array_position($4, COALESCE(s.segment_group, m.segment_group)) END,
              (s.route_max - s.route_min),
              s.route_min,
@@ -797,24 +832,27 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_exact_config(
   route_name text DEFAULT NULL,
   route_key text DEFAULT NULL,
   segment_groups text[] DEFAULT NULL,
-  relation_family text DEFAULT NULL
+  relation_family text DEFAULT NULL,
+  segment_labels text[] DEFAULT NULL
 ) RETURNS TABLE (
   route_name text,
   route_key text,
   rel regclass,
   priority int4,
   segment_group text,
-  relation_family text
+  relation_family text,
+  segment_labels text[]
 )
 AS $$
-  SELECT x.route_name, x.route_key, x.relid, x.priority, x.segment_group, x.relation_family
+  SELECT x.route_name, x.route_key, x.relid, x.priority, x.segment_group, x.relation_family, x.segment_labels
   FROM (
     SELECT s.route_name,
            s.route_key,
            s.relid,
            s.priority,
            COALESCE(s.segment_group, m.segment_group) AS segment_group,
-           COALESCE(s.relation_family, m.relation_family) AS relation_family
+           COALESCE(s.relation_family, m.relation_family) AS relation_family,
+           m.segment_labels AS segment_labels
     FROM @extschema@.sorted_heap_graph_exact_registry s
     LEFT JOIN @extschema@.sorted_heap_graph_segment_meta_registry m ON m.relid = s.relid
   ) x
@@ -822,6 +860,7 @@ AS $$
     AND ($2 IS NULL OR x.route_key = $2)
     AND ($3 IS NULL OR x.segment_group = ANY($3))
     AND ($4 IS NULL OR x.relation_family = $4)
+    AND ($5 IS NULL OR COALESCE(x.segment_labels, ARRAY[]::text[]) @> $5)
   ORDER BY x.route_name,
            x.route_key,
            CASE WHEN $3 IS NULL THEN 0 ELSE array_position($3, x.segment_group) END,
@@ -835,7 +874,8 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_exact_catalog(
   route_name text DEFAULT NULL,
   route_key text DEFAULT NULL,
   segment_groups text[] DEFAULT NULL,
-  relation_family text DEFAULT NULL
+  relation_family text DEFAULT NULL,
+  segment_labels text[] DEFAULT NULL
 )
 RETURNS TABLE (
   route_name text,
@@ -848,8 +888,11 @@ RETURNS TABLE (
   shared_relation_family text,
   effective_segment_group text,
   effective_relation_family text,
+  shared_segment_labels text[],
+  effective_segment_labels text[],
   segment_group_source text,
-  relation_family_source text
+  relation_family_source text,
+  segment_labels_source text
 )
 AS $$
   SELECT x.route_name,
@@ -862,8 +905,11 @@ AS $$
          x.shared_relation_family,
          x.effective_segment_group,
          x.effective_relation_family,
+         x.shared_segment_labels,
+         x.effective_segment_labels,
          x.segment_group_source,
-         x.relation_family_source
+         x.relation_family_source,
+         x.segment_labels_source
   FROM (
     SELECT s.route_name,
            s.route_key,
@@ -875,6 +921,8 @@ AS $$
            m.relation_family AS shared_relation_family,
            COALESCE(s.segment_group, m.segment_group) AS effective_segment_group,
            COALESCE(s.relation_family, m.relation_family) AS effective_relation_family,
+           m.segment_labels AS shared_segment_labels,
+           m.segment_labels AS effective_segment_labels,
            CASE
              WHEN s.segment_group IS NOT NULL THEN 'route'
              WHEN m.segment_group IS NOT NULL THEN 'shared'
@@ -884,7 +932,11 @@ AS $$
              WHEN s.relation_family IS NOT NULL THEN 'route'
              WHEN m.relation_family IS NOT NULL THEN 'shared'
              ELSE 'unset'
-           END AS relation_family_source
+           END AS relation_family_source,
+           CASE
+             WHEN m.segment_labels IS NOT NULL THEN 'shared'
+             ELSE 'unset'
+           END AS segment_labels_source
     FROM @extschema@.sorted_heap_graph_exact_registry s
     LEFT JOIN @extschema@.sorted_heap_graph_segment_meta_registry m ON m.relid = s.relid
   ) x
@@ -892,6 +944,7 @@ AS $$
     AND ($2 IS NULL OR x.route_key = $2)
     AND ($3 IS NULL OR x.effective_segment_group = ANY($3))
     AND ($4 IS NULL OR x.effective_relation_family = $4)
+    AND ($5 IS NULL OR COALESCE(x.effective_segment_labels, ARRAY[]::text[]) @> $5)
   ORDER BY x.route_name,
            x.route_key,
            CASE WHEN $3 IS NULL THEN 0 ELSE array_position($3, x.effective_segment_group) END,
@@ -906,26 +959,30 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_exact_resolve(
   route_key text,
   fanout_limit int4 DEFAULT 0,
   segment_groups text[] DEFAULT NULL,
-  relation_family text DEFAULT NULL
+  relation_family text DEFAULT NULL,
+  segment_labels text[] DEFAULT NULL
 ) RETURNS TABLE (
   rel regclass,
   priority int4,
   segment_group text,
-  relation_family text
+  relation_family text,
+  segment_labels text[]
 )
 AS $$
-  SELECT chosen.relid, chosen.priority, chosen.segment_group, chosen.relation_family
+  SELECT chosen.relid, chosen.priority, chosen.segment_group, chosen.relation_family, chosen.segment_labels
   FROM (
     SELECT s.relid,
            s.priority,
            COALESCE(s.segment_group, m.segment_group) AS segment_group,
-           COALESCE(s.relation_family, m.relation_family) AS relation_family
+           COALESCE(s.relation_family, m.relation_family) AS relation_family,
+           m.segment_labels AS segment_labels
     FROM @extschema@.sorted_heap_graph_exact_registry s
     LEFT JOIN @extschema@.sorted_heap_graph_segment_meta_registry m ON m.relid = s.relid
     WHERE s.route_name = $1
       AND s.route_key = $2
       AND ($4 IS NULL OR COALESCE(s.segment_group, m.segment_group) = ANY($4))
       AND ($5 IS NULL OR COALESCE(s.relation_family, m.relation_family) = $5)
+      AND ($6 IS NULL OR COALESCE(m.segment_labels, ARRAY[]::text[]) @> $6)
     ORDER BY CASE WHEN $4 IS NULL THEN 0 ELSE array_position($4, COALESCE(s.segment_group, m.segment_group)) END,
              s.priority DESC,
              COALESCE(s.segment_group, m.segment_group),
@@ -1032,6 +1089,7 @@ CREATE TABLE @extschema@.sorted_heap_graph_route_profile_registry (
   segment_groups text[],
   relation_family text,
   fanout_limit int4 NOT NULL DEFAULT 0,
+  segment_labels text[],
   PRIMARY KEY (route_name, profile_name)
 );
 
@@ -1043,7 +1101,8 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_route_profile_register(
   policy_name text DEFAULT NULL,
   segment_groups text[] DEFAULT NULL,
   relation_family text DEFAULT NULL,
-  fanout_limit int4 DEFAULT 0
+  fanout_limit int4 DEFAULT 0,
+  segment_labels text[] DEFAULT NULL
 ) RETURNS void
 AS $$
 BEGIN
@@ -1062,15 +1121,23 @@ BEGIN
     RAISE EXCEPTION 'sorted_heap_graph_route_profile_register: segment_groups must be a non-empty one-dimensional text[]';
   END IF;
 
+  IF segment_labels IS NOT NULL
+     AND (array_ndims(segment_labels) <> 1
+          OR array_length(segment_labels, 1) IS NULL
+          OR array_length(segment_labels, 1) < 1) THEN
+    RAISE EXCEPTION 'sorted_heap_graph_route_profile_register: segment_labels must be a non-empty one-dimensional text[]';
+  END IF;
+
   INSERT INTO @extschema@.sorted_heap_graph_route_profile_registry (
-    route_name, profile_name, policy_name, segment_groups, relation_family, fanout_limit
+    route_name, profile_name, policy_name, segment_groups, relation_family, fanout_limit, segment_labels
   )
-  VALUES ($1, $2, $3, $4, $5, $6)
+  VALUES ($1, $2, $3, $4, $5, $6, $7)
   ON CONFLICT ON CONSTRAINT sorted_heap_graph_route_profile_registry_pkey DO UPDATE SET
     policy_name = EXCLUDED.policy_name,
     segment_groups = EXCLUDED.segment_groups,
     relation_family = EXCLUDED.relation_family,
-    fanout_limit = EXCLUDED.fanout_limit;
+    fanout_limit = EXCLUDED.fanout_limit,
+    segment_labels = EXCLUDED.segment_labels;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -1100,10 +1167,11 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_route_profile_config(
   policy_name text,
   segment_groups text[],
   relation_family text,
-  fanout_limit int4
+  fanout_limit int4,
+  segment_labels text[]
 )
 AS $$
-  SELECT p.route_name, p.profile_name, p.policy_name, p.segment_groups, p.relation_family, p.fanout_limit
+  SELECT p.route_name, p.profile_name, p.policy_name, p.segment_groups, p.relation_family, p.fanout_limit, p.segment_labels
   FROM @extschema@.sorted_heap_graph_route_profile_registry p
   WHERE ($1 IS NULL OR p.route_name = $1)
     AND ($2 IS NULL OR p.profile_name = $2)
@@ -1117,7 +1185,8 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_route_profile_resolve(
   policy_name text,
   segment_groups text[],
   relation_family text,
-  fanout_limit int4
+  fanout_limit int4,
+  segment_labels text[]
 )
 AS $$
 DECLARE
@@ -1125,9 +1194,10 @@ DECLARE
   resolved_segment_groups text[];
   resolved_relation_family text;
   resolved_fanout_limit int4;
+  resolved_segment_labels text[];
 BEGIN
-  SELECT p.policy_name, p.segment_groups, p.relation_family, p.fanout_limit
-  INTO resolved_policy_name, resolved_segment_groups, resolved_relation_family, resolved_fanout_limit
+  SELECT p.policy_name, p.segment_groups, p.relation_family, p.fanout_limit, p.segment_labels
+  INTO resolved_policy_name, resolved_segment_groups, resolved_relation_family, resolved_fanout_limit, resolved_segment_labels
   FROM @extschema@.sorted_heap_graph_route_profile_registry p
   WHERE p.route_name = sorted_heap_graph_route_profile_resolve.route_name
     AND p.profile_name = sorted_heap_graph_route_profile_resolve.profile_name;
@@ -1138,7 +1208,7 @@ BEGIN
   END IF;
 
   RETURN QUERY
-  SELECT resolved_policy_name, resolved_segment_groups, resolved_relation_family, resolved_fanout_limit;
+  SELECT resolved_policy_name, resolved_segment_groups, resolved_relation_family, resolved_fanout_limit, resolved_segment_labels;
 END;
 $$ LANGUAGE plpgsql STABLE;
 
@@ -1238,6 +1308,7 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_route_profile_catalog(
   segment_groups_source text,
   relation_family text,
   fanout_limit int4,
+  segment_labels text[],
   is_default boolean
 )
 AS $$
@@ -1254,6 +1325,7 @@ AS $$
          END AS segment_groups_source,
          p.relation_family,
          p.fanout_limit,
+         p.segment_labels,
          (d.route_name IS NOT NULL) AS is_default
   FROM @extschema@.sorted_heap_graph_route_profile_registry p
   LEFT JOIN @extschema@.sorted_heap_graph_route_policy_registry pol
@@ -1281,7 +1353,8 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_route_catalog(
   default_effective_segment_groups text[],
   default_segment_groups_source text,
   default_relation_family text,
-  default_fanout_limit int4
+  default_fanout_limit int4,
+  default_segment_labels text[]
 )
 AS $$
   WITH routes AS (
@@ -1326,7 +1399,8 @@ AS $$
            c.effective_segment_groups AS default_effective_segment_groups,
            c.segment_groups_source AS default_segment_groups_source,
            c.relation_family AS default_relation_family,
-           c.fanout_limit AS default_fanout_limit
+           c.fanout_limit AS default_fanout_limit,
+           c.segment_labels AS default_segment_labels
     FROM @extschema@.sorted_heap_graph_route_profile_catalog() c
     WHERE c.is_default
   )
@@ -1339,7 +1413,8 @@ AS $$
          d.default_effective_segment_groups,
          d.default_segment_groups_source,
          d.default_relation_family,
-         d.default_fanout_limit
+         d.default_fanout_limit,
+         d.default_segment_labels
   FROM routes r
   LEFT JOIN range_counts rc ON rc.route_name = r.route_name
   LEFT JOIN exact_counts ec ON ec.route_name = r.route_name
@@ -1807,7 +1882,8 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed(
   limit_rows int4 DEFAULT 0,
   fanout_limit int4 DEFAULT 0,
   segment_groups text[] DEFAULT NULL,
-  relation_family text DEFAULT NULL
+  relation_family text DEFAULT NULL,
+  segment_labels text[] DEFAULT NULL
 ) RETURNS TABLE (
   source_rel regclass,
   entity_id int4,
@@ -1826,7 +1902,7 @@ BEGIN
 
   SELECT array_agg(rel ORDER BY route_min, route_max, rel)
   INTO rels
-  FROM @extschema@.sorted_heap_graph_segment_resolve(route_name, route_value, fanout_limit, segment_groups, relation_family);
+  FROM @extschema@.sorted_heap_graph_segment_resolve(route_name, route_value, fanout_limit, segment_groups, relation_family, segment_labels);
 
   IF rels IS NULL OR array_length(rels, 1) IS NULL THEN
     RETURN;
@@ -1846,8 +1922,8 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql STABLE;
 
-COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed(text, int8, @extschema@.svec, int4[], int4, int4, text, int4, int4, text[], text)
-IS 'Beta routed GraphRAG wrapper. Resolves candidate shards from sorted_heap_graph_segment_registry using a route value plus optional segment-group and relation-family filtering, then delegates to sorted_heap_graph_rag_segmented(...).';
+COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed(text, int8, @extschema@.svec, int4[], int4, int4, text, int4, int4, text[], text, text[])
+IS 'Beta routed GraphRAG wrapper. Resolves candidate shards from sorted_heap_graph_segment_registry using a route value plus optional segment-group, relation-family, and shared segment-label filtering, then delegates to sorted_heap_graph_rag_segmented(...).';
 
 CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact(
   route_name text,
@@ -1860,7 +1936,8 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact(
   limit_rows int4 DEFAULT 0,
   fanout_limit int4 DEFAULT 0,
   segment_groups text[] DEFAULT NULL,
-  relation_family text DEFAULT NULL
+  relation_family text DEFAULT NULL,
+  segment_labels text[] DEFAULT NULL
 ) RETURNS TABLE (
   source_rel regclass,
   entity_id int4,
@@ -1879,7 +1956,7 @@ BEGIN
 
   SELECT array_agg(rel ORDER BY priority DESC, rel)
   INTO rels
-  FROM @extschema@.sorted_heap_graph_exact_resolve(route_name, route_key, fanout_limit, segment_groups, relation_family);
+  FROM @extschema@.sorted_heap_graph_exact_resolve(route_name, route_key, fanout_limit, segment_groups, relation_family, segment_labels);
 
   IF rels IS NULL OR array_length(rels, 1) IS NULL THEN
     RETURN;
@@ -1899,8 +1976,8 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql STABLE;
 
-COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact(text, text, @extschema@.svec, int4[], int4, int4, text, int4, int4, text[], text)
-IS 'Beta exact-key routed GraphRAG wrapper. Resolves candidate shards from sorted_heap_graph_exact_registry using an exact route key plus optional segment-group and relation-family filtering, then delegates to sorted_heap_graph_rag_segmented(...).';
+COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact(text, text, @extschema@.svec, int4[], int4, int4, text, int4, int4, text[], text, text[])
+IS 'Beta exact-key routed GraphRAG wrapper. Resolves candidate shards from sorted_heap_graph_exact_registry using an exact route key plus optional segment-group, relation-family, and shared segment-label filtering, then delegates to sorted_heap_graph_rag_segmented(...).';
 
 CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_policy(
   route_name text,
@@ -1913,7 +1990,8 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_policy(
   score_mode text DEFAULT 'path',
   limit_rows int4 DEFAULT 0,
   fanout_limit int4 DEFAULT 0,
-  relation_family text DEFAULT NULL
+  relation_family text DEFAULT NULL,
+  segment_labels text[] DEFAULT NULL
 ) RETURNS TABLE (
   source_rel regclass,
   entity_id int4,
@@ -1941,13 +2019,14 @@ BEGIN
     limit_rows,
     fanout_limit,
     groups,
-    relation_family
+    relation_family,
+    segment_labels
   ) AS g;
 END;
 $$ LANGUAGE plpgsql STABLE;
 
-COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_policy(text, int8, text, @extschema@.svec, int4[], int4, int4, text, int4, int4, text)
-IS 'Beta routed GraphRAG wrapper. Resolves a named segment-group policy from sorted_heap_graph_route_policy_registry, then delegates to sorted_heap_graph_rag_routed(...) with optional relation-family filtering.';
+COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_policy(text, int8, text, @extschema@.svec, int4[], int4, int4, text, int4, int4, text, text[])
+IS 'Beta routed GraphRAG wrapper. Resolves a named segment-group policy from sorted_heap_graph_route_policy_registry, then delegates to sorted_heap_graph_rag_routed(...) with optional relation-family and shared segment-label filtering.';
 
 CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact_policy(
   route_name text,
@@ -1960,7 +2039,8 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact_policy(
   score_mode text DEFAULT 'path',
   limit_rows int4 DEFAULT 0,
   fanout_limit int4 DEFAULT 0,
-  relation_family text DEFAULT NULL
+  relation_family text DEFAULT NULL,
+  segment_labels text[] DEFAULT NULL
 ) RETURNS TABLE (
   source_rel regclass,
   entity_id int4,
@@ -1988,13 +2068,14 @@ BEGIN
     limit_rows,
     fanout_limit,
     groups,
-    relation_family
+    relation_family,
+    segment_labels
   ) AS g;
 END;
 $$ LANGUAGE plpgsql STABLE;
 
-COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact_policy(text, text, text, @extschema@.svec, int4[], int4, int4, text, int4, int4, text)
-IS 'Beta exact-key routed GraphRAG wrapper. Resolves a named segment-group policy from sorted_heap_graph_route_policy_registry, then delegates to sorted_heap_graph_rag_routed_exact(...) with optional relation-family filtering.';
+COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact_policy(text, text, text, @extschema@.svec, int4[], int4, int4, text, int4, int4, text, text[])
+IS 'Beta exact-key routed GraphRAG wrapper. Resolves a named segment-group policy from sorted_heap_graph_route_policy_registry, then delegates to sorted_heap_graph_rag_routed_exact(...) with optional relation-family and shared segment-label filtering.';
 
 CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_profile(
   route_name text,
@@ -2020,9 +2101,10 @@ DECLARE
   resolved_segment_groups text[];
   resolved_relation_family text;
   resolved_fanout_limit int4;
+  resolved_segment_labels text[];
 BEGIN
-  SELECT p.policy_name, p.segment_groups, p.relation_family, p.fanout_limit
-  INTO resolved_policy_name, resolved_segment_groups, resolved_relation_family, resolved_fanout_limit
+  SELECT p.policy_name, p.segment_groups, p.relation_family, p.fanout_limit, p.segment_labels
+  INTO resolved_policy_name, resolved_segment_groups, resolved_relation_family, resolved_fanout_limit, resolved_segment_labels
   FROM @extschema@.sorted_heap_graph_route_profile_resolve(route_name, profile_name) AS p;
 
   IF resolved_segment_groups IS NOT NULL THEN
@@ -2039,7 +2121,8 @@ BEGIN
       limit_rows,
       resolved_fanout_limit,
       resolved_segment_groups,
-      resolved_relation_family
+      resolved_relation_family,
+      resolved_segment_labels
     ) AS g;
   ELSIF resolved_policy_name IS NULL THEN
     RETURN QUERY
@@ -2055,7 +2138,8 @@ BEGIN
       limit_rows,
       resolved_fanout_limit,
       NULL,
-      resolved_relation_family
+      resolved_relation_family,
+      resolved_segment_labels
     ) AS g;
   ELSE
     RETURN QUERY
@@ -2071,14 +2155,15 @@ BEGIN
       score_mode,
       limit_rows,
       resolved_fanout_limit,
-      resolved_relation_family
+      resolved_relation_family,
+      resolved_segment_labels
     ) AS g;
   END IF;
 END;
 $$ LANGUAGE plpgsql STABLE;
 
 COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_profile(text, int8, text, @extschema@.svec, int4[], int4, int4, text, int4)
-IS 'Beta routed GraphRAG wrapper. Resolves a named route profile containing policy_name, relation_family, and fanout_limit, then delegates to the existing routed GraphRAG path.';
+IS 'Beta routed GraphRAG wrapper. Resolves a named route profile containing policy_name or inline segment_groups, relation_family, fanout_limit, and optional shared segment-label filtering, then delegates to the existing routed GraphRAG path.';
 
 CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact_profile(
   route_name text,
@@ -2104,9 +2189,10 @@ DECLARE
   resolved_segment_groups text[];
   resolved_relation_family text;
   resolved_fanout_limit int4;
+  resolved_segment_labels text[];
 BEGIN
-  SELECT p.policy_name, p.segment_groups, p.relation_family, p.fanout_limit
-  INTO resolved_policy_name, resolved_segment_groups, resolved_relation_family, resolved_fanout_limit
+  SELECT p.policy_name, p.segment_groups, p.relation_family, p.fanout_limit, p.segment_labels
+  INTO resolved_policy_name, resolved_segment_groups, resolved_relation_family, resolved_fanout_limit, resolved_segment_labels
   FROM @extschema@.sorted_heap_graph_route_profile_resolve(route_name, profile_name) AS p;
 
   IF resolved_segment_groups IS NOT NULL THEN
@@ -2123,7 +2209,8 @@ BEGIN
       limit_rows,
       resolved_fanout_limit,
       resolved_segment_groups,
-      resolved_relation_family
+      resolved_relation_family,
+      resolved_segment_labels
     ) AS g;
   ELSIF resolved_policy_name IS NULL THEN
     RETURN QUERY
@@ -2139,7 +2226,8 @@ BEGIN
       limit_rows,
       resolved_fanout_limit,
       NULL,
-      resolved_relation_family
+      resolved_relation_family,
+      resolved_segment_labels
     ) AS g;
   ELSE
     RETURN QUERY
@@ -2155,14 +2243,15 @@ BEGIN
       score_mode,
       limit_rows,
       resolved_fanout_limit,
-      resolved_relation_family
+      resolved_relation_family,
+      resolved_segment_labels
     ) AS g;
   END IF;
 END;
 $$ LANGUAGE plpgsql STABLE;
 
 COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact_profile(text, text, text, @extschema@.svec, int4[], int4, int4, text, int4)
-IS 'Beta exact-key routed GraphRAG wrapper. Resolves a named route profile containing policy_name, relation_family, and fanout_limit, then delegates to the existing exact-key routed GraphRAG path.';
+IS 'Beta exact-key routed GraphRAG wrapper. Resolves a named route profile containing policy_name or inline segment_groups, relation_family, fanout_limit, and optional shared segment-label filtering, then delegates to the existing exact-key routed GraphRAG path.';
 
 CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_default(
   route_name text,

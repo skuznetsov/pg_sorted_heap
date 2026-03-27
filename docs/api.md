@@ -665,7 +665,7 @@ FROM sorted_heap_graph_rag_segmented(
 );
 ```
 
-### `sorted_heap_graph_segment_meta_register(rel, segment_group, relation_family)`
+### `sorted_heap_graph_segment_meta_register(rel, segment_group, relation_family, segment_labels)`
 
 Registers shared per-shard routing metadata.
 
@@ -673,6 +673,8 @@ Registers shared per-shard routing metadata.
 - `segment_group` is optional shared shard labeling such as `hot` or `sealed`
 - `relation_family` is optional shared shard labeling such as `claims`,
   `citations`, or `right`
+- `segment_labels` is optional shared multi-valued shard labeling such as
+  `ARRAY['sealed','archive']`
 - this is mainly for reducing repeated registry data when several route rows
   point at the same shard
 - if a routed row also stores `segment_group` or `relation_family`, the
@@ -700,7 +702,7 @@ Registers a shard in the beta segment-routing registry.
   `sorted_heap_graph_segment_meta_registry`
 - overlapping ranges are allowed
 
-### `sorted_heap_graph_segment_config(route_name, segment_groups, relation_family)`
+### `sorted_heap_graph_segment_config(route_name, segment_groups, relation_family, segment_labels)`
 
 Lists the current registered shard ranges for one route group, ordered by
 group, range, and relation.
@@ -709,13 +711,16 @@ group, range, and relation.
 - non-`NULL` `text[]` filters to matching shard labels only
 - `relation_family := NULL` means "all families"
 - non-`NULL` `relation_family` narrows rows to one family value
+- `segment_labels := NULL` means "all label sets"
+- non-`NULL` `segment_labels` requires the effective shared shard labels to
+  contain all supplied labels
 - effective labels come from the route row first, then from
   `sorted_heap_graph_segment_meta_registry` for the same shard when the
   route-local label is `NULL`
 - when `segment_groups` is non-`NULL`, its array order also becomes the
   preferred group order in the result set
 
-### `sorted_heap_graph_segment_catalog(route_name, segment_groups, relation_family)`
+### `sorted_heap_graph_segment_catalog(route_name, segment_groups, relation_family, segment_labels)`
 
 Lists range-routed shard rows with both raw and effective metadata.
 
@@ -727,12 +732,15 @@ Returned fields include:
 - shared shard metadata:
   - `shared_segment_group`
   - `shared_relation_family`
+  - `shared_segment_labels`
 - effective resolved values:
   - `effective_segment_group`
   - `effective_relation_family`
+  - `effective_segment_labels`
 - source markers:
   - `segment_group_source`
   - `relation_family_source`
+  - `segment_labels_source`
 
 Source markers are one of:
 
@@ -743,13 +751,15 @@ Source markers are one of:
 This is an introspection helper only. It does not affect shard routing or
 GraphRAG scoring.
 
-### `sorted_heap_graph_segment_resolve(route_name, route_value, fanout_limit, segment_groups, relation_family)`
+### `sorted_heap_graph_segment_resolve(route_name, route_value, fanout_limit, segment_groups, relation_family, segment_labels)`
 
 Resolves candidate shards for a route value.
 
 - matches rows where `route_value BETWEEN route_min AND route_max`
 - optionally filters to `segment_group = ANY(segment_groups)`
 - optionally filters to `relation_family = <supplied family>`
+- optionally filters to shards whose shared `segment_labels` contain all
+  supplied labels
 - effective labels come from the route row first, then from
   `sorted_heap_graph_segment_meta_registry` for the same shard when the
   route-local label is `NULL`
@@ -788,7 +798,7 @@ Returns the stored `segment_groups text[]` for one named policy.
 Deletes one named policy, or all policies under that route group when
 `policy_name` is `NULL`.
 
-### `sorted_heap_graph_route_profile_register(route_name, profile_name, policy_name, segment_groups, relation_family, fanout_limit)`
+### `sorted_heap_graph_route_profile_register(route_name, profile_name, policy_name, segment_groups, relation_family, fanout_limit, segment_labels)`
 
 Registers a named routed profile that bundles the current beta routing knobs.
 
@@ -801,6 +811,8 @@ Registers a named routed profile that bundles the current beta routing knobs.
 - `policy_name` and `segment_groups` cannot both be non-`NULL`
 - `relation_family` may be `NULL`
 - `fanout_limit` must be `>= 0`
+- `segment_labels` may be `NULL`; when non-`NULL` it must be a non-empty
+  one-dimensional `text[]`
 
 ### `sorted_heap_graph_route_profile_config(route_name, profile_name)`
 
@@ -814,6 +826,7 @@ Resolves one routed profile into:
 - `segment_groups`
 - `relation_family`
 - `fanout_limit`
+- `segment_labels`
 
 This is mainly useful for inspection/testing. Query execution should normally
 go through the profile-backed wrappers below.
@@ -858,6 +871,7 @@ Returned fields include:
   - `effective_segment_groups`
   - `relation_family`
   - `fanout_limit`
+  - `segment_labels`
 - source/default markers:
   - `segment_groups_source`
   - `is_default`
@@ -889,6 +903,7 @@ Returned fields include:
   - `default_segment_groups_source`
   - `default_relation_family`
   - `default_fanout_limit`
+  - `default_segment_labels`
 
 This is the top-level operator summary:
 
@@ -905,13 +920,14 @@ GraphRAG scoring.
 Deletes one default-profile binding, or all bindings when `route_name` is
 `NULL`.
 
-### `sorted_heap_graph_rag_routed(route_name, route_value, query, relation_path, ann_k, top_k, score_mode, limit_rows, fanout_limit, segment_groups, relation_family)`
+### `sorted_heap_graph_rag_routed(route_name, route_value, query, relation_path, ann_k, top_k, score_mode, limit_rows, fanout_limit, segment_groups, relation_family, segment_labels)`
 
 Beta routed GraphRAG wrapper.
 
 - resolves candidate shards from `sorted_heap_graph_segment_registry`
 - optionally narrows those shards by `segment_group`
 - optionally narrows those shards by `relation_family`
+- optionally narrows those shards by shared `segment_labels`
 - when `segment_groups` is non-`NULL`, its array order is the shard preference
   order before `fanout_limit` is applied
 - delegates to `sorted_heap_graph_rag_segmented(...)`
@@ -939,13 +955,15 @@ FROM sorted_heap_graph_rag_routed(
 );
 ```
 
-### `sorted_heap_graph_rag_routed_policy(route_name, route_value, policy_name, query, relation_path, ann_k, top_k, score_mode, limit_rows, fanout_limit, relation_family)`
+### `sorted_heap_graph_rag_routed_policy(route_name, route_value, policy_name, query, relation_path, ann_k, top_k, score_mode, limit_rows, fanout_limit, relation_family, segment_labels)`
 
 Beta routed GraphRAG wrapper with registry-backed shard-group policy lookup.
 
 - resolves `segment_groups` from `sorted_heap_graph_route_policy_registry`
 - delegates to `sorted_heap_graph_rag_routed(...)`
 - can still add a per-query `relation_family` filter on top of the stored
+  shard-group order
+- can also add a per-query `segment_labels` filter on top of the stored
   shard-group order
 - keeps the same routing and GraphRAG scoring semantics
 
@@ -975,7 +993,8 @@ FROM sorted_heap_graph_rag_routed_policy(
 
 Beta routed GraphRAG wrapper with registry-backed profile lookup.
 
-- resolves `policy_name`, `relation_family`, and `fanout_limit` from
+- resolves `policy_name`, `relation_family`, `fanout_limit`, and optional
+  `segment_labels` from
   `sorted_heap_graph_route_profile_registry`
 - delegates to `sorted_heap_graph_rag_routed(...)` with inline
   `segment_groups` when the profile stores them directly
@@ -1047,7 +1066,7 @@ Registers an exact-key shard mapping in the beta exact-routing registry.
 - either label may be left `NULL` and resolved later from
   `sorted_heap_graph_segment_meta_registry`
 
-### `sorted_heap_graph_exact_config(route_name, route_key, segment_groups, relation_family)`
+### `sorted_heap_graph_exact_config(route_name, route_key, segment_groups, relation_family, segment_labels)`
 
 Lists the current exact-key shard mappings ordered by
 `(route_name, route_key, priority desc, segment_group, relation_family, rel)`.
@@ -1056,11 +1075,14 @@ Lists the current exact-key shard mappings ordered by
   group order before per-shard priority
 - `relation_family := NULL` means "all families"
 - non-`NULL` `relation_family` narrows rows to one family value
+- `segment_labels := NULL` means "all label sets"
+- non-`NULL` `segment_labels` requires the effective shared shard labels to
+  contain all supplied labels
 - effective labels come from the exact-route row first, then from
   `sorted_heap_graph_segment_meta_registry` for the same shard when the
   route-local label is `NULL`
 
-### `sorted_heap_graph_exact_catalog(route_name, route_key, segment_groups, relation_family)`
+### `sorted_heap_graph_exact_catalog(route_name, route_key, segment_groups, relation_family, segment_labels)`
 
 Lists exact-key routed shard rows with both raw and effective metadata.
 
@@ -1072,12 +1094,15 @@ Returned fields include:
 - shared shard metadata:
   - `shared_segment_group`
   - `shared_relation_family`
+  - `shared_segment_labels`
 - effective resolved values:
   - `effective_segment_group`
   - `effective_relation_family`
+  - `effective_segment_labels`
 - source markers:
   - `segment_group_source`
   - `relation_family_source`
+  - `segment_labels_source`
 
 Source markers are one of:
 
@@ -1088,13 +1113,15 @@ Source markers are one of:
 This is an introspection helper only. It does not affect shard routing or
 GraphRAG scoring.
 
-### `sorted_heap_graph_exact_resolve(route_name, route_key, fanout_limit, segment_groups, relation_family)`
+### `sorted_heap_graph_exact_resolve(route_name, route_key, fanout_limit, segment_groups, relation_family, segment_labels)`
 
 Resolves candidate shards for an exact route key.
 
 - matches rows where `route_key = <supplied key>`
 - optionally filters to `segment_group = ANY(segment_groups)`
 - optionally filters to `relation_family = <supplied family>`
+- optionally filters to shards whose shared `segment_labels` contain all
+  supplied labels
 - effective labels come from the exact-route row first, then from
   `sorted_heap_graph_segment_meta_registry` for the same shard when the
   route-local label is `NULL`
@@ -1110,13 +1137,14 @@ Deletes exact-key shard mappings.
 - `route_key := NULL` deletes every key under that route group
 - `rel := NULL` deletes all matching shard rows for the selected route/key
 
-### `sorted_heap_graph_rag_routed_exact(route_name, route_key, query, relation_path, ann_k, top_k, score_mode, limit_rows, fanout_limit, segment_groups, relation_family)`
+### `sorted_heap_graph_rag_routed_exact(route_name, route_key, query, relation_path, ann_k, top_k, score_mode, limit_rows, fanout_limit, segment_groups, relation_family, segment_labels)`
 
 Beta exact-key routed GraphRAG wrapper.
 
 - resolves candidate shards from `sorted_heap_graph_exact_registry`
 - optionally narrows those shards by `segment_group`
 - optionally narrows those shards by `relation_family`
+- optionally narrows those shards by shared `segment_labels`
 - when `segment_groups` is non-`NULL`, its array order is the shard preference
   order before `fanout_limit` is applied
 - delegates to `sorted_heap_graph_rag_segmented(...)`
@@ -1143,7 +1171,7 @@ FROM sorted_heap_graph_rag_routed_exact(
 );
 ```
 
-### `sorted_heap_graph_rag_routed_exact_policy(route_name, route_key, policy_name, query, relation_path, ann_k, top_k, score_mode, limit_rows, fanout_limit, relation_family)`
+### `sorted_heap_graph_rag_routed_exact_policy(route_name, route_key, policy_name, query, relation_path, ann_k, top_k, score_mode, limit_rows, fanout_limit, relation_family, segment_labels)`
 
 Beta exact-key routed GraphRAG wrapper with registry-backed shard-group policy
 lookup.
@@ -1151,6 +1179,8 @@ lookup.
 - resolves `segment_groups` from `sorted_heap_graph_route_policy_registry`
 - delegates to `sorted_heap_graph_rag_routed_exact(...)`
 - can still add a per-query `relation_family` filter on top of the stored
+  shard-group order
+- can also add a per-query `segment_labels` filter on top of the stored
   shard-group order
 - keeps the same routing and GraphRAG scoring semantics
 
@@ -1180,7 +1210,8 @@ FROM sorted_heap_graph_rag_routed_exact_policy(
 
 Beta exact-key routed GraphRAG wrapper with registry-backed profile lookup.
 
-- resolves `policy_name`, `relation_family`, and `fanout_limit` from
+- resolves `policy_name`, `relation_family`, `fanout_limit`, and optional
+  `segment_labels` from
   `sorted_heap_graph_route_profile_registry`
 - delegates to `sorted_heap_graph_rag_routed_exact(...)` with inline
   `segment_groups` when the profile stores them directly
