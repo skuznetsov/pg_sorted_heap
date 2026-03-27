@@ -637,6 +637,34 @@ FROM sorted_heap_graph_rag(
 );
 ```
 
+### `sorted_heap_graph_rag_segmented(rels, query, relation_path, ann_k, top_k, score_mode, limit_rows)`
+
+Beta segmented GraphRAG wrapper.
+
+- `rels` is the candidate shard list to search
+- each shard is queried via `sorted_heap_graph_rag(...)`
+- shard-local rows are merged globally by `(distance, entity_id, relation_id,
+  target_id)`
+- this does **not** solve routing for you; the caller still chooses which
+  shard subset to query
+
+This is the first SQL-level segmented reference path for large-scale
+fact-shaped GraphRAG. It is useful when routing/pruning already exists in the
+application or in metadata tables, and you want to move shard fanout/merge out
+of benchmark code and into SQL.
+
+```sql
+SELECT source_rel, entity_id, relation_id, target_id, payload, distance
+FROM sorted_heap_graph_rag_segmented(
+    ARRAY['facts_2025q1'::regclass, 'facts_2025q2'::regclass],
+    '[0.1,0.2,0.3,...]'::svec,
+    relation_path := ARRAY[1, 2],
+    ann_k := 64,
+    top_k := 10,
+    score_mode := 'path'
+);
+```
+
 ### Lower-level GraphRAG building blocks (beta)
 
 ### `sorted_heap_expand_ids(rel, seed_ids, relation_filter, limit_rows)`

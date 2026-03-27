@@ -734,6 +734,158 @@ COPY (
   ) diff
 ) TO STDOUT;
 0
+CREATE TABLE facts_chain_seg_a (
+  entity_id   int4 NOT NULL,
+  relation_id int2 NOT NULL,
+  target_id   int4 NOT NULL,
+  embedding   svec(4) NOT NULL,
+  payload     text NOT NULL,
+  PRIMARY KEY (entity_id, relation_id, target_id)
+) USING sorted_heap;
+CREATE TABLE facts_chain_seg_b (
+  entity_id   int4 NOT NULL,
+  relation_id int2 NOT NULL,
+  target_id   int4 NOT NULL,
+  embedding   svec(4) NOT NULL,
+  payload     text NOT NULL,
+  PRIMARY KEY (entity_id, relation_id, target_id)
+) USING sorted_heap;
+INSERT INTO facts_chain_seg_a VALUES
+  (8, 1, 18, '[-1,0,0,0]'::svec, 'm1'),
+  (18, 2, 28, '[-0.8,-0.2,0,0]'::svec, 'm2'),
+  (28, 3, 38, '[-0.6,-0.4,0,0]'::svec, 'm3');
+INSERT INTO facts_chain_seg_b VALUES
+  (9, 1, 19, '[0,1,0,0]'::svec, 'n1'),
+  (19, 2, 29, '[0,0.8,0.2,0]'::svec, 'n2'),
+  (29, 3, 39, '[0,0.6,0.4,0]'::svec, 'n3');
+COPY (
+  SELECT 'ok'
+  FROM (SELECT sorted_heap_compact('facts_chain_seg_a'::regclass)) s
+) TO STDOUT;
+ok
+COPY (
+  SELECT 'ok'
+  FROM (SELECT sorted_heap_compact('facts_chain_seg_b'::regclass)) s
+) TO STDOUT;
+ok
+ANALYZE facts_chain_seg_a;
+ANALYZE facts_chain_seg_b;
+COPY (
+  SELECT source_rel::text, entity_id, relation_id, target_id, payload,
+         round(distance::numeric, 6) AS distance
+  FROM sorted_heap_graph_rag_segmented(
+    ARRAY['facts_chain_seg_a'::regclass, 'facts_chain_seg_b'::regclass],
+    '[-1,0,0,0]'::svec,
+    relation_path := ARRAY[1,2,3],
+    ann_k := 1,
+    top_k := 2,
+    score_mode := 'path',
+    limit_rows := 0
+  )
+  ORDER BY distance, entity_id, relation_id, target_id, source_rel::text
+) TO STDOUT;
+facts_chain_seg_a	28	3	38	m3	0.197807
+facts_chain_seg_b	29	3	39	n3	3.000000
+COPY (
+  WITH helper AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_graph_rag_segmented(
+      ARRAY['facts_chain_seg_a'::regclass, 'facts_chain_seg_b'::regclass],
+      '[-1,0,0,0]'::svec,
+      relation_path := ARRAY[1,2,3],
+      ann_k := 1,
+      top_k := 2,
+      score_mode := 'endpoint',
+      limit_rows := 0
+    )
+  ),
+  baseline AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM (
+      SELECT entity_id, relation_id, target_id, payload, distance
+      FROM sorted_heap_graph_rag(
+        'facts_chain_seg_a'::regclass,
+        '[-1,0,0,0]'::svec,
+        relation_path := ARRAY[1,2,3],
+        ann_k := 1,
+        top_k := 2,
+        score_mode := 'endpoint',
+        limit_rows := 0
+      )
+      UNION ALL
+      SELECT entity_id, relation_id, target_id, payload, distance
+      FROM sorted_heap_graph_rag(
+        'facts_chain_seg_b'::regclass,
+        '[-1,0,0,0]'::svec,
+        relation_path := ARRAY[1,2,3],
+        ann_k := 1,
+        top_k := 2,
+        score_mode := 'endpoint',
+        limit_rows := 0
+      )
+    ) merged
+    ORDER BY distance, entity_id, relation_id, target_id
+    LIMIT 2
+  )
+  SELECT count(*) AS segmented_multihop_diff_rows
+  FROM (
+    (SELECT * FROM helper EXCEPT ALL SELECT * FROM baseline)
+    UNION ALL
+    (SELECT * FROM baseline EXCEPT ALL SELECT * FROM helper)
+  ) diff
+) TO STDOUT;
+0
+COPY (
+  WITH helper AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_graph_rag_segmented(
+      ARRAY['facts_chain_seg_a'::regclass, 'facts_chain_seg_b'::regclass],
+      '[-1,0,0,0]'::svec,
+      relation_path := ARRAY[1,2,3],
+      ann_k := 1,
+      top_k := 2,
+      score_mode := 'path',
+      limit_rows := 0
+    )
+  ),
+  baseline AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM (
+      SELECT entity_id, relation_id, target_id, payload, distance
+      FROM sorted_heap_graph_rag(
+        'facts_chain_seg_a'::regclass,
+        '[-1,0,0,0]'::svec,
+        relation_path := ARRAY[1,2,3],
+        ann_k := 1,
+        top_k := 2,
+        score_mode := 'path',
+        limit_rows := 0
+      )
+      UNION ALL
+      SELECT entity_id, relation_id, target_id, payload, distance
+      FROM sorted_heap_graph_rag(
+        'facts_chain_seg_b'::regclass,
+        '[-1,0,0,0]'::svec,
+        relation_path := ARRAY[1,2,3],
+        ann_k := 1,
+        top_k := 2,
+        score_mode := 'path',
+        limit_rows := 0
+      )
+    ) merged
+    ORDER BY distance, entity_id, relation_id, target_id
+    LIMIT 2
+  )
+  SELECT count(*) AS segmented_multihop_path_diff_rows
+  FROM (
+    (SELECT * FROM helper EXCEPT ALL SELECT * FROM baseline)
+    UNION ALL
+    (SELECT * FROM baseline EXCEPT ALL SELECT * FROM helper)
+  ) diff
+) TO STDOUT;
+0
+DROP TABLE facts_chain_seg_a;
+DROP TABLE facts_chain_seg_b;
 DROP TABLE facts_chain_sh;
 CREATE TABLE facts_alias (
   src_id    int4 NOT NULL,

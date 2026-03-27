@@ -37,6 +37,7 @@ plus planner-integrated HNSW search.
   - `sorted_heap_expand_twohop_path_rerank(...)`
   - `sorted_heap_expand_multihop_rerank(...)`
   - `sorted_heap_expand_multihop_path_rerank(...)`
+  - `sorted_heap_graph_rag_segmented(...)`
   - `sorted_heap_graph_rag_scan(...)`
   - `sorted_heap_graph_rag_twohop_scan(...)`
   - `sorted_heap_graph_rag_twohop_path_scan(...)`
@@ -225,6 +226,7 @@ The older helper/wrapper family is still available for lower-level control:
 - `sorted_heap_expand_twohop_path_rerank(...)`
 - `sorted_heap_expand_multihop_rerank(...)`
 - `sorted_heap_expand_multihop_path_rerank(...)`
+- `sorted_heap_graph_rag_segmented(...)`
 - `sorted_heap_graph_rag_scan(...)`
 - `sorted_heap_graph_rag_twohop_scan(...)`
 - `sorted_heap_graph_rag_twohop_path_scan(...)`
@@ -234,6 +236,10 @@ The older helper/wrapper family is still available for lower-level control:
 Those building blocks remain beta. In particular,
 `sorted_heap_graph_rag_scan(...)` seeds one-hop expansion from ANN-selected
 `target_id` values and is therefore not the preferred fact-graph contract.
+`sorted_heap_graph_rag_segmented(...)` is the first beta SQL-level segmented
+reference path: it takes a candidate shard array, executes
+`sorted_heap_graph_rag(...)` per shard, and merges shard-local top-k rows
+globally. Routing/pruning is still the caller's job.
 
 For tuning and debugging, GraphRAG now also exposes backend-local last-call
 stats:

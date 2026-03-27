@@ -204,6 +204,14 @@
       `100.0% / 100.0%` at depth 5)
     - so the constrained-memory large-scale direction is now much clearer:
       productize segmented routing, not broad all-shard fanout
+  - the first SQL-level segmented reference path:
+    - added `sorted_heap_graph_rag_segmented(regclass[], ...)`
+    - it executes `sorted_heap_graph_rag(...)` across a caller-supplied shard
+      set and merges shard-local top-k rows in SQL
+    - local segmented smoke confirmed the SQL merge path matches the older
+      Python merge path on quality/row counts with similar latency
+    - routing/pruning still stays outside the extension for now; this wrapper
+      only productizes fanout/merge
 
 ### sorted_hnsw build optimization
 

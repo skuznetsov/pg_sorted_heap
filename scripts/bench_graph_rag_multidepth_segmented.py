@@ -13,7 +13,8 @@ segmentation strategy:
        - to the owning shard only (synthetic lower bound / perfect pruning)
   4. merge shard-local top-k rows globally by path distance
 
-This is a benchmark harness, not a released extension API.
+This benchmark can compare the older Python-side shard fanout/merge path
+against the SQL-level segmented beta wrapper.
 """
 
 from __future__ import annotations
@@ -293,6 +294,10 @@ def route_tables(query: md.DeepQuery, num_pairs: int, shards: int, route_mode: s
     raise ValueError(f"unsupported route_mode: {route_mode}")
 
 
+def regclass_array_literal(tables: list[str]) -> str:
+    return "ARRAY[" + ",".join(f"'{table}'::regclass" for table in tables) + "]"
+
+
 def merged_shard_rows(
     cur,
     tables: list[str],
@@ -300,17 +305,39 @@ def merged_shard_rows(
     query_vec: str,
     ann_k: int,
     top_k: int,
+    merge_mode: str,
 ) -> list[tuple[int, int, int, str, float]]:
-    case = md.make_unified_case(depth, ann_k, top_k)
-    rows: list[tuple[int, int, int, str, float]] = []
+    if merge_mode == "python":
+        case = md.make_unified_case(depth, ann_k, top_k)
+        rows: list[tuple[int, int, int, str, float]] = []
 
-    for table in tables:
-        sql = case.sql_template.format(table=table)
+        for table in tables:
+            sql = case.sql_template.format(table=table)
+            cur.execute(sql, (query_vec,))
+            rows.extend(cur.fetchall())
+
+        rows.sort(key=lambda row: (float(row[4]), row[0], row[1], row[2]))
+        return rows[:top_k]
+
+    if merge_mode == "sql":
+        path = md.relation_path_literal(depth)
+        sql = f"""
+        SELECT entity_id, relation_id, target_id, payload, distance
+        FROM sorted_heap_graph_rag_segmented(
+          {regclass_array_literal(tables)},
+          %s::svec,
+          relation_path := {path},
+          ann_k := {ann_k},
+          top_k := {top_k},
+          score_mode := 'path',
+          limit_rows := 0
+        )
+        ORDER BY distance, entity_id, relation_id, target_id
+        """
         cur.execute(sql, (query_vec,))
-        rows.extend(cur.fetchall())
+        return cur.fetchall()
 
-    rows.sort(key=lambda row: (float(row[4]), row[0], row[1], row[2]))
-    return rows[:top_k]
+    raise ValueError(f"unsupported merge_mode: {merge_mode}")
 
 
 def measure_segmented_case(
@@ -323,6 +350,7 @@ def measure_segmented_case(
     top_k: int,
     runs: int,
     route_mode: str,
+    merge_mode: str,
 ) -> tuple[float, float, float, float, float]:
     latencies: list[float] = []
     returned_rows: list[int] = []
@@ -333,7 +361,9 @@ def measure_segmented_case(
         for query in queries:
             tables = route_tables(query, num_pairs, shards, route_mode)
             t0 = time.perf_counter()
-            rows = merged_shard_rows(cur, tables, depth, query.vectors[depth], ann_k, top_k)
+            rows = merged_shard_rows(
+                cur, tables, depth, query.vectors[depth], ann_k, top_k, merge_mode
+            )
             t1 = time.perf_counter()
 
             expected = depth * num_pairs + query.person_id
@@ -366,6 +396,7 @@ def print_stage(name: str, elapsed_s: float, extra: str = "") -> None:
 
 def print_result(
     route_mode: str,
+    merge_mode: str,
     shards: int,
     depth: int,
     p50: float,
@@ -379,6 +410,7 @@ def print_result(
         "table=segmented|"
         "case=graph_rag_path|"
         f"route={route_mode}|"
+        f"merge={merge_mode}|"
         f"shards={shards}|"
         f"depth={depth}|"
         f"p50_ms={p50:.3f}|"
@@ -412,6 +444,7 @@ def main() -> None:
     ap.add_argument("--post-load-op", choices=("compact", "merge", "none"), default="compact")
     ap.add_argument("--shards", type=int, default=4)
     ap.add_argument("--route", choices=("all", "exact", "both"), default="both")
+    ap.add_argument("--merge-mode", choices=("python", "sql"), default="python")
     ap.add_argument("--backend-mode", choices=("fresh", "reuse"), default="fresh")
     ap.add_argument(
         "--stop-after",
@@ -625,6 +658,7 @@ def main() -> None:
             print(f"build_sq8:        {build_sq8}")
             print(f"shards:           {shards}")
             print(f"route:            {args.route}")
+            print(f"merge_mode:       {args.merge_mode}")
             print(f"post_load_op:     {post_load_op}")
             print(f"stream_copy:      {'yes' if stream_copy else 'no'}")
             print(f"reuse_temp:       {str(tmp) if reusing else 'no'}")
@@ -648,8 +682,9 @@ def main() -> None:
                         args.top_k,
                         args.runs,
                         route_mode,
+                        args.merge_mode,
                     )
-                    print_result(route_mode, shards, depth, p50, avg, rows, hit1, hitk)
+                    print_result(route_mode, args.merge_mode, shards, depth, p50, avg, rows, hit1, hitk)
         finally:
             cur.close()
             conn.close()

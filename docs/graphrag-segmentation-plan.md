@@ -126,14 +126,15 @@ Goal:
 - move beyond harness-only fanout
 
 Reference design:
-- a registry of shard membership / routing metadata
-- a SQL wrapper that:
-  - resolves candidate shards
+- first step now exists as a beta wrapper:
+  - `sorted_heap_graph_rag_segmented(regclass[], ...)`
   - executes `sorted_heap_graph_rag(...)` per shard
-  - merges candidate rows
-  - applies one final exact/path-aware rerank
+  - merges candidate rows in SQL
+- next step is still missing:
+  - shard routing/pruning metadata or a router contract that picks a bounded
+    shard subset before this wrapper runs
 
-This can still be implemented as a beta wrapper before any C-level router.
+This is still intentionally a reference path, not the final router.
 
 ### Phase 3: productized router
 

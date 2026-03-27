@@ -851,6 +851,89 @@ $$ LANGUAGE plpgsql STABLE;
 COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag(regclass, @extschema@.svec, int4[], int4, int4, text, int4)
 IS 'Unified fact-shaped GraphRAG entry point. relation_path length 1 performs ANN seed on entity_id plus one-hop rerank. Longer relation_path values perform multi-hop endpoint or path-aware rerank depending on score_mode.';
 
+CREATE FUNCTION @extschema@.sorted_heap_graph_rag_segmented(
+  rels regclass[],
+  query @extschema@.svec,
+  relation_path int4[],
+  ann_k int4 DEFAULT 64,
+  top_k int4 DEFAULT 10,
+  score_mode text DEFAULT 'path',
+  limit_rows int4 DEFAULT 0
+) RETURNS TABLE (
+  source_rel regclass,
+  entity_id int4,
+  relation_id int2,
+  target_id int4,
+  payload text,
+  distance float8
+)
+AS $$
+DECLARE
+  shard regclass;
+  union_sql text := '';
+  shard_count int4 := 0;
+BEGIN
+  IF ann_k < 1 THEN
+    RAISE EXCEPTION 'sorted_heap_graph_rag_segmented: ann_k must be >= 1';
+  END IF;
+  IF top_k < 1 THEN
+    RAISE EXCEPTION 'sorted_heap_graph_rag_segmented: top_k must be >= 1';
+  END IF;
+  IF limit_rows < 0 THEN
+    RAISE EXCEPTION 'sorted_heap_graph_rag_segmented: limit_rows must be >= 0';
+  END IF;
+  IF rels IS NULL OR array_ndims(rels) <> 1 THEN
+    RAISE EXCEPTION 'sorted_heap_graph_rag_segmented: rels must be a one-dimensional regclass[]';
+  END IF;
+
+  FOREACH shard IN ARRAY rels LOOP
+    IF shard IS NULL THEN
+      RAISE EXCEPTION 'sorted_heap_graph_rag_segmented: rels must not contain NULLs';
+    END IF;
+
+    shard_count := shard_count + 1;
+    IF shard_count > 1 THEN
+      union_sql := union_sql || E'\nUNION ALL\n';
+    END IF;
+
+    union_sql := union_sql || format(
+      'SELECT %1$s::oid::regclass AS source_rel,
+              g.entity_id,
+              g.relation_id,
+              g.target_id,
+              g.payload,
+              g.distance
+       FROM @extschema@.sorted_heap_graph_rag(
+         %1$s::oid::regclass,
+         $1,
+         $2,
+         $3,
+         $4,
+         $5,
+         $6
+       ) AS g',
+      shard::oid
+    );
+  END LOOP;
+
+  IF shard_count < 1 THEN
+    RAISE EXCEPTION 'sorted_heap_graph_rag_segmented: rels must have length >= 1';
+  END IF;
+
+  RETURN QUERY EXECUTE format(
+    'SELECT source_rel, entity_id, relation_id, target_id, payload, distance
+     FROM (%s) AS merged
+     ORDER BY distance, entity_id, relation_id, target_id, source_rel
+     LIMIT $4',
+    union_sql
+  )
+  USING query, relation_path, ann_k, top_k, score_mode, limit_rows;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_segmented(regclass[], @extschema@.svec, int4[], int4, int4, text, int4)
+IS 'Beta segmented GraphRAG wrapper. Executes sorted_heap_graph_rag(...) across a candidate shard list, merges shard-local rows globally, and returns the top-k result set plus source_rel.';
+
 -- ----------------------------------------------------------------
 -- SimHash: 12-bit locality-sensitive hash for svec columns
 -- ----------------------------------------------------------------
