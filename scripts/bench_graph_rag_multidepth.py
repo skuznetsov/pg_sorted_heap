@@ -23,6 +23,7 @@ import math
 import random
 import shlex
 import statistics
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -239,6 +240,9 @@ def main() -> None:
     ap.add_argument("--ef-construction", type=int, default=200)
     ap.add_argument("--m", type=int, default=24)
     ap.add_argument("--shared-buffers-mb", type=int, default=64)
+    ap.add_argument("--max-wal-size-gb", type=int, default=4)
+    ap.add_argument("--maintenance-work-mem-mb", type=int, default=0)
+    ap.add_argument("--table-scope", choices=("all", "sorted_heap_only"), default="all")
     ap.add_argument("--backend-mode", choices=("fresh", "reuse"), default="fresh")
     ap.add_argument("--install-cmd", default="")
     ap.add_argument("--keep-temp", action="store_true")
@@ -248,12 +252,37 @@ def main() -> None:
     tmp_root = Path(args.tmp_root).resolve()
     port = args.port or base.pick_port()
     install_cmd = shlex.split(args.install_cmd) if args.install_cmd else None
-    tmp, pg_bindir = base.init_temp_cluster(root_dir, port, tmp_root, args.shared_buffers_mb, install_cmd)
+    tmp, pg_bindir = base.init_temp_cluster(
+        root_dir,
+        port,
+        tmp_root,
+        args.shared_buffers_mb,
+        install_cmd,
+        max_wal_size_gb=args.max_wal_size_gb,
+        maintenance_work_mem_mb=args.maintenance_work_mem_mb,
+    )
     csv_path = tmp / "facts_multidepth.csv"
 
     try:
+        t_gen_start = time.perf_counter()
         generate_csv(csv_path, args.num_pairs, args.max_depth, args.dim)
+        t_gen_end = time.perf_counter()
+        print(
+            "stage|name=generate_csv|"
+            f"elapsed_s={t_gen_end - t_gen_start:.3f}|"
+            f"csv_bytes={csv_path.stat().st_size}",
+            flush=True,
+        )
+
+        t_query_start = time.perf_counter()
         queries = build_queries(args.num_pairs, args.query_count, args.max_depth, args.dim, args.seed)
+        t_query_end = time.perf_counter()
+        print(
+            "stage|name=build_queries|"
+            f"elapsed_s={t_query_end - t_query_start:.3f}|"
+            f"queries={len(queries)}",
+            flush=True,
+        )
 
         conn = base.connect(tmp, port)
         cur = conn.cursor()
@@ -262,10 +291,40 @@ def main() -> None:
             cur.execute("SET sorted_hnsw.shared_cache = off")
             cur.execute(f"SET sorted_hnsw.ef_search = {args.ef_search}")
             base.bootstrap_schema(cur, args.dim)
+
+            t_load_start = time.perf_counter()
             base.load_data(cur, csv_path)
-            base.build_indexes(cur, args.ef_construction, m=args.m)
+            t_load_end = time.perf_counter()
+            print(
+                "stage|name=load_data|"
+                f"elapsed_s={t_load_end - t_load_start:.3f}",
+                flush=True,
+            )
+
+            t_build_start = time.perf_counter()
+            base.build_indexes(
+                cur,
+                args.ef_construction,
+                m=args.m,
+                build_heap_index=(args.table_scope == "all"),
+                build_sorted_heap_index=True,
+            )
+            t_build_end = time.perf_counter()
+            print(
+                "stage|name=build_indexes|"
+                f"elapsed_s={t_build_end - t_build_start:.3f}",
+                flush=True,
+            )
+
+            t_analyze_start = time.perf_counter()
             cur.execute("ANALYZE facts_heap")
             cur.execute("ANALYZE facts_sh")
+            t_analyze_end = time.perf_counter()
+            print(
+                "stage|name=analyze|"
+                f"elapsed_s={t_analyze_end - t_analyze_start:.3f}",
+                flush=True,
+            )
 
             if args.backend_mode == "fresh":
                 cur.close()
@@ -292,6 +351,9 @@ def main() -> None:
             print(f"ef_construction:  {args.ef_construction}")
             print(f"m:                {args.m}")
             print(f"shared_buffers:   {args.shared_buffers_mb}MB")
+            print(f"max_wal_size:     {args.max_wal_size_gb}GB")
+            print(f"maintenance_work_mem: {args.maintenance_work_mem_mb}MB")
+            print(f"table_scope:      {args.table_scope}")
             print(f"backend_mode:     {args.backend_mode}")
             print()
 
@@ -299,11 +361,18 @@ def main() -> None:
                 if 3 <= depth <= 5:
                     verify_unified_equivalence(cur, queries, depth, args.ann_k, args.top_k)
 
-                cases: list[tuple[str, base.QueryCase]] = [
-                    ("facts_heap", make_sql_path_case(depth, args.ann_k, args.top_k)),
-                    ("facts_sh", make_sql_path_case(depth, args.ann_k, args.top_k)),
-                    ("facts_sh", make_unified_case(depth, args.ann_k, args.top_k)),
-                ]
+                cases: list[tuple[str, base.QueryCase]]
+                if args.table_scope == "all":
+                    cases = [
+                        ("facts_heap", make_sql_path_case(depth, args.ann_k, args.top_k)),
+                        ("facts_sh", make_sql_path_case(depth, args.ann_k, args.top_k)),
+                        ("facts_sh", make_unified_case(depth, args.ann_k, args.top_k)),
+                    ]
+                else:
+                    cases = [
+                        ("facts_sh", make_sql_path_case(depth, args.ann_k, args.top_k)),
+                        ("facts_sh", make_unified_case(depth, args.ann_k, args.top_k)),
+                    ]
 
                 for table, case in cases:
                     print(f"running|table={table}|case={case.name}|depth={depth}", flush=True)

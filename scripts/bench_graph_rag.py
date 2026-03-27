@@ -54,6 +54,8 @@ def init_temp_cluster(
     tmp_root: Path,
     shared_buffers_mb: int,
     install_cmd: list[str] | None = None,
+    max_wal_size_gb: int = 4,
+    maintenance_work_mem_mb: int = 0,
 ) -> tuple[Path, str]:
     pg_bindir = subprocess.check_output(["pg_config", "--bindir"], text=True).strip()
     tmp = Path(tempfile.mkdtemp(prefix="graph_rag_", dir=str(tmp_root)))
@@ -79,13 +81,15 @@ def init_temp_cluster(
             f"shared_buffers = {shared_buffers_mb}MB\n"
             "listen_addresses = ''\n"
             "fsync = on\n"
-            "max_wal_size = 4GB\n"
+            f"max_wal_size = {max_wal_size_gb}GB\n"
             "checkpoint_timeout = 1h\n"
             "autovacuum = off\n"
             "jit = off\n"
             "log_min_messages = warning\n"
             "shared_preload_libraries = 'pg_sorted_heap'\n"
         )
+        if maintenance_work_mem_mb > 0:
+            f.write(f"maintenance_work_mem = {maintenance_work_mem_mb}MB\n")
 
     subprocess.run(
         [
@@ -218,13 +222,21 @@ def load_data(cur: Cursor, csv_path: Path) -> None:
     cur.execute("ANALYZE facts_sh")
 
 
-def build_indexes(cur: Cursor, ef_construction: int, m: int = 16) -> None:
-    cur.execute(
-        f"CREATE INDEX facts_heap_ann_idx ON facts_heap USING sorted_hnsw (embedding) WITH (m = {m}, ef_construction = {ef_construction})"
-    )
-    cur.execute(
-        f"CREATE INDEX facts_sh_ann_idx ON facts_sh USING sorted_hnsw (embedding) WITH (m = {m}, ef_construction = {ef_construction})"
-    )
+def build_indexes(
+    cur: Cursor,
+    ef_construction: int,
+    m: int = 16,
+    build_heap_index: bool = True,
+    build_sorted_heap_index: bool = True,
+) -> None:
+    if build_heap_index:
+        cur.execute(
+            f"CREATE INDEX facts_heap_ann_idx ON facts_heap USING sorted_hnsw (embedding) WITH (m = {m}, ef_construction = {ef_construction})"
+        )
+    if build_sorted_heap_index:
+        cur.execute(
+            f"CREATE INDEX facts_sh_ann_idx ON facts_sh USING sorted_hnsw (embedding) WITH (m = {m}, ef_construction = {ef_construction})"
+        )
     cur.execute("ANALYZE facts_heap")
     cur.execute("ANALYZE facts_sh")
 
