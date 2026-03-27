@@ -160,6 +160,12 @@
     `62.5% / 100.0%` to `87.5% / 100.0%` at essentially the same latency
     (`109.850 ms` -> `109.630 ms`) when only `hop_weight` changed from
     `0.15` to `0.05`
+  - a loader fast path for `sorted_heap_only` multidepth runs that copies
+    directly into `facts_sh` before `sorted_heap_compact(...)` instead of
+    staging through `facts_heap`; bounded local checks held the same compacted
+    depth-5 quality/latency while improving ingest by about `10%`
+    (`6.321 s` -> `5.638 s` at `200K` rows, `31.392 s` -> `28.231 s` at
+    `1M` rows)
 
 ### sorted_hnsw build optimization
 

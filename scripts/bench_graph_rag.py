@@ -201,6 +201,19 @@ def bootstrap_schema(cur: Cursor, dim: int) -> None:
 
 
 def load_data_fileobj(cur: Cursor, src, retain_heap: bool = True) -> None:
+    if not retain_heap:
+        cur.copy_expert(
+            """
+            COPY facts_sh (entity_id, relation_id, target_id, embedding, payload)
+            FROM STDIN WITH (FORMAT csv)
+            """,
+            src,
+        )
+        cur.execute("SELECT sorted_heap_compact('facts_sh'::regclass)")
+        cur.execute("ANALYZE facts_sh")
+        cur.execute("DROP TABLE facts_heap")
+        return
+
     cur.copy_expert(
         """
         COPY facts_heap (entity_id, relation_id, target_id, embedding, payload)

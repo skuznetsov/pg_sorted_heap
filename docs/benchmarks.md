@@ -399,6 +399,25 @@ That led to a footprint reduction pass in the harness:
 - stream fact rows directly into `COPY` instead of materializing a giant CSV
 - drop `facts_heap` after loading `facts_sh` in `sorted_heap_only` mode
 - allow query-only reuse from a kept temp cluster
+- when `facts_heap` is not needed, copy rows straight into `facts_sh` before
+  `sorted_heap_compact(...)` instead of staging through `facts_heap` and
+  `INSERT .. ORDER BY`
+
+That direct `facts_sh` load path held up on bounded local checks:
+
+- `200K` rows (`40K` pairs x `5` hops, `64D`, `hop_weight=0.05`)
+  - old staged path: `6321.453 ms` load, depth-5 unified GraphRAG
+    `24.504 ms`, `100.0% / 100.0%`
+  - direct `COPY facts_sh`: `5638.134 ms` load, depth-5 unified GraphRAG
+    `24.312 ms`, `100.0% / 100.0%`
+- `1M` rows (`200K` pairs x `5` hops, `64D`, load only)
+  - old staged path: `31.392 s`
+  - direct `COPY facts_sh`: `28.231 s`
+
+So the current conclusion is narrow but useful: for synthetic
+`sorted_heap_only` multidepth runs, direct `COPY facts_sh` is a real
+`~10%` ingest win without giving up the compacted query-time locality that
+the earlier "skip compaction" falsifier showed we still need.
 
 With that lower-footprint path, the same `10M x 64D` AWS point advanced
 materially further on the same host:
