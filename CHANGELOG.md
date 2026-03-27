@@ -124,6 +124,11 @@
     still return `0.0% / 0.0%` at `ann_k=256`, `top_k=32`, so the remaining
     problem there is the low-dimensional scale contract, not just HNSW build
     quality
+  - a local `1M x 64D` calibration showing the same widened contract reaches
+    `65.6% hit@1 / 96.9% hit@k` and ANN matches exact seeds there
+  - an attempted AWS `10M x 64D` run showing the current `4 vCPU / 8 GiB` host
+    runs out of disk headroom before query measurement, so that branch now
+    needs a larger box or a lower-footprint build path
 
 ### sorted_hnsw build optimization
 

@@ -373,6 +373,34 @@ It is the low-dimensional scale contract itself. The next meaningful scale
 branch is a higher-dimensional `10M` point or a different retrieval contract,
 not another `m/ef_construction` tweak on the same `32D` setup.
 
+The first higher-dimensional calibration point was `64D`, and it changed the
+local picture immediately. On a local `1M x 64D` graph (`200K` pairs x
+`5` hops), a relatively cheap build (`m=16`, `ef_construction=64`) plus the
+wider query contract (`ann_k=256`, `top_k=32`, `ef_search=128`) gave:
+
+- ANN path-aware `sorted_heap_graph_rag(...)`: `65.6% hit@1`, `96.9% hit@k`
+- exact heap seeds + the same path-aware expansion/rerank contract:
+  `65.6% hit@1`, `96.9% hit@k`
+
+At `top_k=10`, the same `1M x 64D` point already held `96.9% hit@k`, so unlike
+`32D`, the result-budget cliff largely disappeared there.
+
+I then attempted the corresponding `10M x 64D` AWS build on the current
+`ubuntu@dev.rigelstar.com` host (`4 vCPU`, `8 GiB RAM`) at the same cheap
+build point (`m=16`, `ef_construction=64`). It was aborted for operational
+safety before query timing:
+
+- `generate_csv`: `414.397 s`
+- CSV size: `6.67 GiB`
+- temp dir grew to about `28 GiB`
+- `/tmp` fell to `1.3 GiB` free (`99%` used) while the run was still active
+
+So the next `10M x 64D` step is blocked not by a known query-quality failure,
+but by the footprint of the current AWS box. That branch now needs either:
+
+- a larger machine, or
+- a lower-footprint large-scale build path
+
 So the narrow conclusion is:
 
 - the multi-hop GraphRAG path itself survives to at least `1M` rows and gives
@@ -386,6 +414,9 @@ So the narrow conclusion is:
 - the stronger falsifier is that even exact seeds fail at that scale and
   dimensionality, so the next branch is a different scale contract, not a
   narrower HNSW tuning loop
+- `64D` is the first scale contract that looks healthy locally at `1M`, but
+  the current AWS host does not have enough disk headroom to carry the full
+  `10M x 64D` run safely
 
 ### Current AWS GraphRAG benchmark (`person -> parent -> city`, stable fact contract)
 
