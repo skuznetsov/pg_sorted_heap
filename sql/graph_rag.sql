@@ -964,6 +964,18 @@ COPY (
 ) TO STDOUT;
 
 COPY (
+  SELECT route_name, profile_name, coalesce(policy_name, ''),
+         coalesce(array_to_string(inline_segment_groups, ','), ''),
+         coalesce(array_to_string(policy_segment_groups, ','), ''),
+         coalesce(array_to_string(effective_segment_groups, ','), ''),
+         segment_groups_source,
+         coalesce(relation_family, ''),
+         fanout_limit,
+         is_default
+  FROM sorted_heap_graph_route_profile_catalog('chain_grouped')
+) TO STDOUT;
+
+COPY (
   SELECT source_rel::text, entity_id, relation_id, target_id, payload,
          round(distance::numeric, 6) AS distance
   FROM sorted_heap_graph_rag_segmented(
@@ -1648,6 +1660,18 @@ COPY (
 
 COPY (
   SELECT sorted_heap_graph_route_default_resolve('chain_exact')
+) TO STDOUT;
+
+COPY (
+  SELECT route_name, profile_name, coalesce(policy_name, ''),
+         coalesce(array_to_string(inline_segment_groups, ','), ''),
+         coalesce(array_to_string(policy_segment_groups, ','), ''),
+         coalesce(array_to_string(effective_segment_groups, ','), ''),
+         segment_groups_source,
+         coalesce(relation_family, ''),
+         fanout_limit,
+         is_default
+  FROM sorted_heap_graph_route_profile_catalog('chain_exact')
 ) TO STDOUT;
 
 COPY (

@@ -1225,6 +1225,50 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql STABLE;
 
+CREATE FUNCTION @extschema@.sorted_heap_graph_route_profile_catalog(
+  route_name text DEFAULT NULL,
+  profile_name text DEFAULT NULL
+) RETURNS TABLE (
+  route_name text,
+  profile_name text,
+  policy_name text,
+  inline_segment_groups text[],
+  policy_segment_groups text[],
+  effective_segment_groups text[],
+  segment_groups_source text,
+  relation_family text,
+  fanout_limit int4,
+  is_default boolean
+)
+AS $$
+  SELECT p.route_name,
+         p.profile_name,
+         p.policy_name,
+         p.segment_groups AS inline_segment_groups,
+         pol.segment_groups AS policy_segment_groups,
+         COALESCE(p.segment_groups, pol.segment_groups) AS effective_segment_groups,
+         CASE
+           WHEN p.segment_groups IS NOT NULL THEN 'inline'
+           WHEN pol.segment_groups IS NOT NULL THEN 'policy'
+           ELSE 'unset'
+         END AS segment_groups_source,
+         p.relation_family,
+         p.fanout_limit,
+         (d.route_name IS NOT NULL) AS is_default
+  FROM @extschema@.sorted_heap_graph_route_profile_registry p
+  LEFT JOIN @extschema@.sorted_heap_graph_route_policy_registry pol
+    ON pol.route_name = p.route_name
+   AND pol.policy_name = p.policy_name
+  LEFT JOIN @extschema@.sorted_heap_graph_route_default_registry d
+    ON d.route_name = p.route_name
+   AND d.profile_name = p.profile_name
+  WHERE ($1 IS NULL OR p.route_name = $1)
+    AND ($2 IS NULL OR p.profile_name = $2)
+  ORDER BY p.route_name,
+           (d.route_name IS NOT NULL) DESC,
+           p.profile_name;
+$$ LANGUAGE SQL STABLE;
+
 CREATE FUNCTION @extschema@.sorted_heap_graph_rag_stats()
 RETURNS TABLE (
   calls bigint,

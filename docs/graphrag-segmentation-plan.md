@@ -191,6 +191,14 @@ Reference design:
     resolved metadata, and per-column source markers (`route|shared|unset`)
   - this does not change routing behavior; it makes the current registry model
     easier to inspect and debug
+- and the next operator-facing profile/default catalog now exists too:
+  - `sorted_heap_graph_route_profile_catalog(...)`
+  - this exposes profile-local `policy_name`, inline `segment_groups`,
+    policy-backed `segment_groups`, effective group order, the source marker
+    (`inline|policy|unset`), and whether the profile is currently the route
+    default
+  - this also does not change routing behavior; it makes the profile/default
+    layer easier to inspect and debug
 - what is still missing:
   - more than one optional text metadata dimension per registry row
   - a product-quality shard router contract for tenant / KB / relation-family

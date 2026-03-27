@@ -251,6 +251,7 @@ The older helper/wrapper family is still available for lower-level control:
 - `sorted_heap_graph_route_profile_register(...)`
 - `sorted_heap_graph_route_profile_config(...)`
 - `sorted_heap_graph_route_profile_resolve(...)`
+- `sorted_heap_graph_route_profile_catalog(...)`
 - `sorted_heap_graph_route_profile_unregister(...)`
 - `sorted_heap_graph_route_default_register(...)`
 - `sorted_heap_graph_route_default_config(...)`
@@ -317,11 +318,16 @@ layer on top of that is:
 
 - `sorted_heap_graph_segment_catalog(...)`
 - `sorted_heap_graph_exact_catalog(...)`
+- `sorted_heap_graph_route_profile_catalog(...)`
 
 Those catalog functions show route-local labels, shared shard metadata,
 effective resolved labels, and whether each effective value came from
-`route`, `shared`, or stayed `unset`. They do not change routing or scoring;
-they only make the current registry model easier to inspect.
+`route`, `shared`, or stayed `unset`. `sorted_heap_graph_route_profile_catalog(...)`
+does the same for route profiles and defaults: it shows inline profile groups,
+policy-backed groups, effective group order, whether those effective groups
+came from `inline`, `policy`, or stayed `unset`, and whether the profile is
+currently the route default. None of these catalog helpers change routing or
+scoring; they only make the current registry model easier to inspect.
 
 For tuning and debugging, GraphRAG now also exposes backend-local last-call
 stats:

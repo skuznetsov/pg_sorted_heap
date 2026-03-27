@@ -313,6 +313,14 @@
       resolved metadata, and per-column source markers (`route|shared|unset`)
     - this is introspection-only and does not change the routed GraphRAG
       execution contract
+  - a first operator-facing route-profile catalog on top of that:
+    - added `sorted_heap_graph_route_profile_catalog(...)`
+    - it shows profile-local `policy_name`, inline `segment_groups`,
+      policy-backed `segment_groups`, effective group order,
+      `segment_groups_source` (`inline|policy|unset`), `relation_family`,
+      `fanout_limit`, and whether the profile is the current route default
+    - this is introspection-only and does not change the routed GraphRAG
+      execution contract
 
 ### sorted_hnsw build optimization
 

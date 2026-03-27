@@ -843,6 +843,34 @@ Returns the `profile_name` currently marked as default for one route.
 This is mainly useful for inspection/testing. Query execution should normally
 go through the default-backed wrappers below.
 
+### `sorted_heap_graph_route_profile_catalog(route_name, profile_name)`
+
+Lists routed profiles with both raw and effective shard-group metadata.
+
+Returned fields include:
+
+- profile-local values:
+  - `policy_name`
+  - `inline_segment_groups`
+- policy-backed values:
+  - `policy_segment_groups`
+- effective resolved values:
+  - `effective_segment_groups`
+  - `relation_family`
+  - `fanout_limit`
+- source/default markers:
+  - `segment_groups_source`
+  - `is_default`
+
+`segment_groups_source` is one of:
+
+- `inline`
+- `policy`
+- `unset`
+
+This is an introspection helper only. It does not affect shard routing or
+GraphRAG scoring.
+
 ### `sorted_heap_graph_route_default_unregister(route_name)`
 
 Deletes one default-profile binding, or all bindings when `route_name` is
