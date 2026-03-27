@@ -42,6 +42,7 @@
 - The new syntax accepts:
   - `relation_path := ARRAY[hop]` for one-hop retrieval
   - `relation_path := ARRAY[hop1, hop2]` for two-hop retrieval
+  - `relation_path := ARRAY[hop1, hop2, ...]` for explicit multi-hop retrieval
   - `score_mode := 'endpoint' | 'path'`
 - One-hop semantics are now aligned with the fact-graph contract:
   ANN seed selection is on `entity_id`, not `target_id`.
@@ -49,6 +50,7 @@
   - one-hop unified syntax
   - two-hop endpoint-scored unified syntax
   - two-hop path-aware unified syntax
+  - generic path-aware multihop syntax
 - Added `docs/graphrag-0.13-plan.md` to separate the narrow stable `0.13`
   target from the broader experimental code-GraphRAG surface.
 

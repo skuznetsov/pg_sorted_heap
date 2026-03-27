@@ -577,6 +577,40 @@ CREATE FUNCTION @extschema@.sorted_heap_expand_twohop_path_rerank(
 AS '$libdir/pg_sorted_heap', 'sorted_heap_expand_twohop_path_rerank'
 LANGUAGE C STABLE;
 
+CREATE FUNCTION @extschema@.sorted_heap_expand_multihop_rerank(
+  rel regclass,
+  seed_ids int4[],
+  query @extschema@.svec,
+  top_k int4,
+  relation_path int4[],
+  limit_rows int4 DEFAULT 0
+) RETURNS TABLE (
+  entity_id int4,
+  relation_id int2,
+  target_id int4,
+  payload text,
+  distance float8
+)
+AS '$libdir/pg_sorted_heap', 'sorted_heap_expand_multihop_rerank'
+LANGUAGE C STABLE;
+
+CREATE FUNCTION @extschema@.sorted_heap_expand_multihop_path_rerank(
+  rel regclass,
+  seed_ids int4[],
+  query @extschema@.svec,
+  top_k int4,
+  relation_path int4[],
+  limit_rows int4 DEFAULT 0
+) RETURNS TABLE (
+  entity_id int4,
+  relation_id int2,
+  target_id int4,
+  payload text,
+  distance float8
+)
+AS '$libdir/pg_sorted_heap', 'sorted_heap_expand_multihop_path_rerank'
+LANGUAGE C STABLE;
+
 CREATE FUNCTION @extschema@.sorted_heap_graph_rag_scan(
   rel regclass,
   query @extschema@.svec,
@@ -630,6 +664,40 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_rag_twohop_path_scan(
 AS '$libdir/pg_sorted_heap', 'sorted_heap_graph_rag_twohop_path_scan'
 LANGUAGE C STABLE;
 
+CREATE FUNCTION @extschema@.sorted_heap_graph_rag_multihop_scan(
+  rel regclass,
+  query @extschema@.svec,
+  ann_k int4,
+  top_k int4,
+  relation_path int4[],
+  limit_rows int4 DEFAULT 0
+) RETURNS TABLE (
+  entity_id int4,
+  relation_id int2,
+  target_id int4,
+  payload text,
+  distance float8
+)
+AS '$libdir/pg_sorted_heap', 'sorted_heap_graph_rag_multihop_scan'
+LANGUAGE C STABLE;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_rag_multihop_path_scan(
+  rel regclass,
+  query @extschema@.svec,
+  ann_k int4,
+  top_k int4,
+  relation_path int4[],
+  limit_rows int4 DEFAULT 0
+) RETURNS TABLE (
+  entity_id int4,
+  relation_id int2,
+  target_id int4,
+  payload text,
+  distance float8
+)
+AS '$libdir/pg_sorted_heap', 'sorted_heap_graph_rag_multihop_path_scan'
+LANGUAGE C STABLE;
+
 CREATE FUNCTION @extschema@.sorted_heap_graph_rag(
   rel regclass,
   query @extschema@.svec,
@@ -668,8 +736,8 @@ BEGIN
   END IF;
 
   path_len := array_length(relation_path, 1);
-  IF path_len IS NULL OR path_len < 1 OR path_len > 2 THEN
-    RAISE EXCEPTION 'sorted_heap_graph_rag: relation_path must have length 1 or 2';
+  IF path_len IS NULL OR path_len < 1 THEN
+    RAISE EXCEPTION 'sorted_heap_graph_rag: relation_path must have length >= 1';
   END IF;
 
   FOREACH hop IN ARRAY relation_path LOOP
@@ -721,6 +789,19 @@ BEGIN
   END IF;
 
   IF mode = 'path' THEN
+    IF path_len > 2 THEN
+      RETURN QUERY
+      SELECT g.entity_id, g.relation_id, g.target_id, g.payload, g.distance
+      FROM @extschema@.sorted_heap_graph_rag_multihop_path_scan(
+        rel,
+        query,
+        ann_k,
+        top_k,
+        relation_path,
+        limit_rows
+      ) AS g;
+      RETURN;
+    END IF;
     RETURN QUERY
     SELECT g.entity_id, g.relation_id, g.target_id, g.payload, g.distance
     FROM @extschema@.sorted_heap_graph_rag_twohop_path_scan(
@@ -736,6 +817,19 @@ BEGIN
   END IF;
 
   IF mode = 'endpoint' THEN
+    IF path_len > 2 THEN
+      RETURN QUERY
+      SELECT g.entity_id, g.relation_id, g.target_id, g.payload, g.distance
+      FROM @extschema@.sorted_heap_graph_rag_multihop_scan(
+        rel,
+        query,
+        ann_k,
+        top_k,
+        relation_path,
+        limit_rows
+      ) AS g;
+      RETURN;
+    END IF;
     RETURN QUERY
     SELECT g.entity_id, g.relation_id, g.target_id, g.payload, g.distance
     FROM @extschema@.sorted_heap_graph_rag_twohop_scan(
@@ -755,7 +849,7 @@ END;
 $$ LANGUAGE plpgsql STABLE;
 
 COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag(regclass, @extschema@.svec, int4[], int4, int4, text, int4)
-IS 'Unified fact-shaped GraphRAG entry point. relation_path length 1 performs ANN seed on entity_id plus one-hop rerank. relation_path length 2 performs ANN seed plus two-hop endpoint or path-aware rerank depending on score_mode.';
+IS 'Unified fact-shaped GraphRAG entry point. relation_path length 1 performs ANN seed on entity_id plus one-hop rerank. Longer relation_path values perform multi-hop endpoint or path-aware rerank depending on score_mode.';
 
 -- ----------------------------------------------------------------
 -- SimHash: 12-bit locality-sensitive hash for svec columns

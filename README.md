@@ -23,7 +23,9 @@ plus planner-integrated HNSW search.
 - This stable GraphRAG surface is intentionally narrow:
   - fact rows clustered by `(entity_id, relation_id, target_id)` or an
     equivalent registered alias mapping
-  - one-hop or two-hop retrieval via `relation_path`
+  - one-hop through multi-hop retrieval via `relation_path`
+  - `relation_path` is a per-hop relation sequence such as
+    `ARRAY[1]`, `ARRAY[1, 2]`, or `ARRAY[1, 2, 3, 4, 5]`
   - `score_mode := 'endpoint' | 'path'`
 
 ### Beta
@@ -33,9 +35,13 @@ plus planner-integrated HNSW search.
   - `sorted_heap_expand_rerank(...)`
   - `sorted_heap_expand_twohop_rerank(...)`
   - `sorted_heap_expand_twohop_path_rerank(...)`
+  - `sorted_heap_expand_multihop_rerank(...)`
+  - `sorted_heap_expand_multihop_path_rerank(...)`
   - `sorted_heap_graph_rag_scan(...)`
   - `sorted_heap_graph_rag_twohop_scan(...)`
   - `sorted_heap_graph_rag_twohop_path_scan(...)`
+  - `sorted_heap_graph_rag_multihop_scan(...)`
+  - `sorted_heap_graph_rag_multihop_path_scan(...)`
 - Code-corpus and snippet-oriented GraphRAG contracts that currently live in
   benchmark/reference logic.
 - These remain useful and benchmarked, but they are still workload-sensitive
@@ -195,8 +201,10 @@ SELECT sorted_heap_graph_register(
 ```
 
 `relation_path := ARRAY[1]` gives one-hop expansion. `relation_path := ARRAY[1,2]`
-gives two-hop expansion. `score_mode := 'endpoint'` ranks only the final-hop
-facts; `score_mode := 'path'` uses hop-1 and hop-2 evidence together.
+gives two-hop expansion. `relation_path := ARRAY[1,2,3,4,5]` gives a five-hop
+path with explicit per-hop relation filters. `score_mode := 'endpoint'` ranks
+only the final-hop facts; `score_mode := 'path'` accumulates evidence across
+the whole path.
 
 The older helper/wrapper family is still available for lower-level control:
 
@@ -204,9 +212,13 @@ The older helper/wrapper family is still available for lower-level control:
 - `sorted_heap_expand_rerank(...)`
 - `sorted_heap_expand_twohop_rerank(...)`
 - `sorted_heap_expand_twohop_path_rerank(...)`
+- `sorted_heap_expand_multihop_rerank(...)`
+- `sorted_heap_expand_multihop_path_rerank(...)`
 - `sorted_heap_graph_rag_scan(...)`
 - `sorted_heap_graph_rag_twohop_scan(...)`
 - `sorted_heap_graph_rag_twohop_path_scan(...)`
+- `sorted_heap_graph_rag_multihop_scan(...)`
+- `sorted_heap_graph_rag_multihop_path_scan(...)`
 
 Those building blocks remain beta. In particular,
 `sorted_heap_graph_rag_scan(...)` seeds one-hop expansion from ANN-selected

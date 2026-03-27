@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""
+Benchmark fact-shaped GraphRAG across path depth 1..N.
+
+Dataset shape:
+  - relation 1: person -> hop1
+  - relation 2: hop1 -> hop2
+  - ...
+  - relation N: hop(N-1) -> hopN
+
+This harness measures how the ANN-seeded path-aware contract scales with depth
+for:
+  - heap SQL baseline
+  - sorted_heap SQL baseline
+  - sorted_heap_graph_rag(... relation_path := ARRAY[...], score_mode := 'path')
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+import random
+import shlex
+import statistics
+from dataclasses import dataclass
+from pathlib import Path
+
+import bench_graph_rag as base
+
+
+@dataclass(frozen=True)
+class DeepQuery:
+    person_id: int
+    vectors: dict[int, str]
+
+
+def normalize(vals: list[float]) -> list[float]:
+    norm = math.sqrt(sum(v * v for v in vals))
+    return [v / norm for v in vals]
+
+
+def person_base(person_id: int, dim: int) -> list[float]:
+    return [
+        math.sin(person_id * 0.013 * (idx + 1)) +
+        0.7 * math.cos(person_id * 0.017 * (idx + 1))
+        for idx in range(dim)
+    ]
+
+
+def hop_base(hop: int, dim: int) -> list[float]:
+    return [
+        0.6 * math.sin((1000 + hop) * 0.019 * (idx + 1)) +
+        0.4 * math.cos((2000 + hop) * 0.023 * (idx + 1))
+        for idx in range(dim)
+    ]
+
+
+def vec_to_svec(vals: list[float]) -> str:
+    return "[" + ",".join(f"{v:.6f}" for v in normalize(vals)) + "]"
+
+
+def generate_csv(path: Path, num_pairs: int, max_depth: int, dim: int) -> None:
+    person_cache = {i: person_base(i, dim) for i in range(1, num_pairs + 1)}
+    hop_cache = {h: hop_base(h, dim) for h in range(1, max_depth + 1)}
+
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        for person_id in range(1, num_pairs + 1):
+            prev = person_id
+            for hop in range(1, max_depth + 1):
+                target_id = hop * num_pairs + person_id
+                vals = [
+                    person_cache[person_id][idx] + 0.15 * hop_cache[hop][idx]
+                    for idx in range(dim)
+                ]
+                payload = f"Person_{person_id} rel_{hop} node_{hop}_{person_id}."
+                writer.writerow([prev, hop, target_id, vec_to_svec(vals), payload])
+                prev = target_id
+
+
+def build_queries(num_pairs: int, query_count: int, max_depth: int, dim: int, seed: int) -> list[DeepQuery]:
+    if query_count > num_pairs:
+        raise ValueError(f"query_count {query_count} exceeds num_pairs {num_pairs}")
+
+    rng = random.Random(seed)
+    sample = rng.sample(range(1, num_pairs + 1), query_count)
+    person_cache = {i: person_base(i, dim) for i in sample}
+    hop_cache = {h: hop_base(h, dim) for h in range(1, max_depth + 1)}
+    queries: list[DeepQuery] = []
+
+    for person_id in sample:
+        vectors: dict[int, str] = {}
+        for depth in range(1, max_depth + 1):
+            vals = [
+                person_cache[person_id][idx] +
+                0.15 * sum(hop_cache[hop][idx] for hop in range(1, depth + 1))
+                for idx in range(dim)
+            ]
+            vectors[depth] = vec_to_svec(vals)
+        queries.append(DeepQuery(person_id=person_id, vectors=vectors))
+
+    return queries
+
+
+def relation_path_literal(depth: int) -> str:
+    return "ARRAY[" + ",".join(str(hop) for hop in range(1, depth + 1)) + "]"
+
+
+def make_sql_path_case(depth: int, ann_k: int, top_k: int) -> base.QueryCase:
+    ctes = [
+        "ann AS MATERIALIZED ("
+        "SELECT entity_id FROM {table} ORDER BY embedding <=> %s::svec LIMIT "
+        f"{ann_k})",
+        "seeds AS MATERIALIZED (SELECT DISTINCT entity_id FROM ann)",
+        "hop1 AS MATERIALIZED ("
+        "SELECT t.entity_id, t.relation_id, t.target_id, t.payload, "
+        "t.target_id AS node_1, (t.embedding <=> %s::svec) AS path_distance "
+        "FROM {table} t "
+        "WHERE t.entity_id = ANY (ARRAY(SELECT entity_id FROM seeds)) "
+        "AND t.relation_id = 1)",
+    ]
+
+    for hop in range(2, depth + 1):
+        ctes.append(
+            f"hop{hop} AS MATERIALIZED ("
+            "SELECT t.entity_id, t.relation_id, t.target_id, t.payload, "
+            f"t.target_id AS node_{hop}, "
+            f"prev.path_distance + (t.embedding <=> %s::svec) AS path_distance "
+            f"FROM {{table}} t "
+            f"JOIN hop{hop - 1} prev ON prev.node_{hop - 1} = t.entity_id "
+            f"WHERE t.relation_id = {hop})"
+        )
+
+    sql = (
+        "WITH " + ",\n".join(ctes) +
+        f"\nSELECT entity_id, relation_id, target_id, payload, path_distance AS distance "
+        f"FROM hop{depth} "
+        "ORDER BY path_distance, entity_id, relation_id, target_id "
+        f"LIMIT {top_k}"
+    )
+    return base.QueryCase(
+        f"sql_path_depth_{depth}",
+        sql,
+        lambda q: tuple([q.vectors[depth]] * (depth + 1)),
+    )
+
+
+def make_unified_case(depth: int, ann_k: int, top_k: int) -> base.QueryCase:
+    path = relation_path_literal(depth)
+    return base.QueryCase(
+        f"graph_rag_path_depth_{depth}",
+        f"""
+        SELECT *
+        FROM sorted_heap_graph_rag(
+          '{{table}}'::regclass,
+          %s::svec,
+          relation_path := {path},
+          ann_k := {ann_k},
+          top_k := {top_k},
+          score_mode := 'path',
+          limit_rows := 0
+        )
+        """,
+        lambda q: (q.vectors[depth],),
+    )
+
+
+def measure_quality(cur, table_name: str, case: base.QueryCase, queries: list[DeepQuery], num_pairs: int, depth: int) -> tuple[float, float]:
+    sql = case.sql_template.format(table=table_name)
+    hit1 = 0
+    hitk = 0
+
+    for query in queries:
+        cur.execute(sql, case.params_builder(query))
+        rows = cur.fetchall()
+        targets = [row[2] for row in rows]
+        expected = depth * num_pairs + query.person_id
+        if targets:
+            if targets[0] == expected:
+                hit1 += 1
+            if expected in targets:
+                hitk += 1
+
+    n = len(queries)
+    return ((hit1 * 100.0) / n if n else 0.0, (hitk * 100.0) / n if n else 0.0)
+
+
+def verify_unified_equivalence(cur, queries: list[DeepQuery], depth: int, ann_k: int, top_k: int) -> None:
+    helper_case = make_unified_case(depth, ann_k, top_k)
+    sql_case = make_sql_path_case(depth, ann_k, top_k)
+    helper_sql = helper_case.sql_template.format(table="facts_sh")
+    sql_sql = sql_case.sql_template.format(table="facts_sh")
+
+    for idx, query in enumerate(queries, start=1):
+        cur.execute(helper_sql, helper_case.params_builder(query))
+        helper_rows = cur.fetchall()
+        cur.execute(sql_sql, sql_case.params_builder(query))
+        sql_rows = cur.fetchall()
+
+        helper_simple = [
+            (row[0], row[1], row[2], row[3], round(float(row[4]), 6))
+            for row in helper_rows
+        ]
+        sql_simple = [
+            (row[0], row[1], row[2], row[3], round(float(row[4]), 6))
+            for row in sql_rows
+        ]
+        if helper_simple != sql_simple:
+            raise RuntimeError(
+                f"sorted_heap_graph_rag(path depth={depth}) mismatch on query#{idx}: "
+                f"helper={helper_simple} sql={sql_simple}"
+            )
+
+
+def print_result(table: str, case: str, depth: int, p50: float, avg: float, hits: float, reads: float, root: str, rows: int, hit1: float, hitk: float) -> None:
+    print(
+        "result|"
+        f"table={table}|case={case}|depth={depth}|"
+        f"p50_ms={p50:.3f}|avg_ms={avg:.3f}|"
+        f"shared_hits={hits:.1f}|shared_reads={reads:.1f}|"
+        f"root={root}|rows={rows}|hit1_pct={hit1:.1f}|hitk_pct={hitk:.1f}"
+    )
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tmp-root", default="/tmp")
+    ap.add_argument("--port", type=int, default=0)
+    ap.add_argument("--num-pairs", type=int, default=5000)
+    ap.add_argument("--max-depth", type=int, default=5)
+    ap.add_argument("--query-count", type=int, default=32)
+    ap.add_argument("--runs", type=int, default=3)
+    ap.add_argument("--dim", type=int, default=384)
+    ap.add_argument("--ann-k", type=int, default=64)
+    ap.add_argument("--top-k", type=int, default=10)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--ef-search", type=int, default=128)
+    ap.add_argument("--ef-construction", type=int, default=200)
+    ap.add_argument("--m", type=int, default=24)
+    ap.add_argument("--shared-buffers-mb", type=int, default=64)
+    ap.add_argument("--backend-mode", choices=("fresh", "reuse"), default="fresh")
+    ap.add_argument("--install-cmd", default="")
+    ap.add_argument("--keep-temp", action="store_true")
+    args = ap.parse_args()
+
+    root_dir = Path(__file__).resolve().parent.parent
+    tmp_root = Path(args.tmp_root).resolve()
+    port = args.port or base.pick_port()
+    install_cmd = shlex.split(args.install_cmd) if args.install_cmd else None
+    tmp, pg_bindir = base.init_temp_cluster(root_dir, port, tmp_root, args.shared_buffers_mb, install_cmd)
+    csv_path = tmp / "facts_multidepth.csv"
+
+    try:
+        generate_csv(csv_path, args.num_pairs, args.max_depth, args.dim)
+        queries = build_queries(args.num_pairs, args.query_count, args.max_depth, args.dim, args.seed)
+
+        conn = base.connect(tmp, port)
+        cur = conn.cursor()
+        try:
+            cur.execute("SET jit = off")
+            cur.execute("SET sorted_hnsw.shared_cache = off")
+            cur.execute(f"SET sorted_hnsw.ef_search = {args.ef_search}")
+            base.bootstrap_schema(cur, args.dim)
+            base.load_data(cur, csv_path)
+            base.build_indexes(cur, args.ef_construction, m=args.m)
+            cur.execute("ANALYZE facts_heap")
+            cur.execute("ANALYZE facts_sh")
+
+            if args.backend_mode == "fresh":
+                cur.close()
+                conn.close()
+                conn = base.connect(tmp, port)
+                cur = conn.cursor()
+                cur.execute("SET jit = off")
+                cur.execute("SET sorted_hnsw.shared_cache = off")
+                cur.execute(f"SET sorted_hnsw.ef_search = {args.ef_search}")
+
+            print("============================================================")
+            print("graph rag multidepth benchmark")
+            print("============================================================")
+            print(f"port:             {port}")
+            print(f"num_pairs:        {args.num_pairs}")
+            print(f"max_depth:        {args.max_depth}")
+            print(f"rows:             {args.num_pairs * args.max_depth}")
+            print(f"dim:              {args.dim}")
+            print(f"query_count:      {args.query_count}")
+            print(f"runs:             {args.runs}")
+            print(f"ann_k:            {args.ann_k}")
+            print(f"top_k:            {args.top_k}")
+            print(f"ef_search:        {args.ef_search}")
+            print(f"ef_construction:  {args.ef_construction}")
+            print(f"m:                {args.m}")
+            print(f"shared_buffers:   {args.shared_buffers_mb}MB")
+            print(f"backend_mode:     {args.backend_mode}")
+            print()
+
+            for depth in range(1, args.max_depth + 1):
+                if 3 <= depth <= 5:
+                    verify_unified_equivalence(cur, queries, depth, args.ann_k, args.top_k)
+
+                cases: list[tuple[str, base.QueryCase]] = [
+                    ("facts_heap", make_sql_path_case(depth, args.ann_k, args.top_k)),
+                    ("facts_sh", make_sql_path_case(depth, args.ann_k, args.top_k)),
+                    ("facts_sh", make_unified_case(depth, args.ann_k, args.top_k)),
+                ]
+
+                for table, case in cases:
+                    print(f"running|table={table}|case={case.name}|depth={depth}", flush=True)
+                    p50, avg, hits, reads, root, rows = base.measure_case(cur, table, case, queries, args.runs)
+                    hit1, hitk = measure_quality(cur, table, case, queries, args.num_pairs, depth)
+                    print_result(table, case.name, depth, p50, avg, hits, reads, root, rows, hit1, hitk)
+        finally:
+            cur.close()
+            conn.close()
+    finally:
+        if args.keep_temp:
+            print(f"kept_temp_cluster={tmp}")
+        else:
+            base.stop_temp_cluster(tmp, pg_bindir)
+
+
+if __name__ == "__main__":
+    main()

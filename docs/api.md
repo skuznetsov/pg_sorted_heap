@@ -464,13 +464,17 @@ Beta API:
 - `sorted_heap_expand_rerank(...)`
 - `sorted_heap_expand_twohop_rerank(...)`
 - `sorted_heap_expand_twohop_path_rerank(...)`
+- `sorted_heap_expand_multihop_rerank(...)`
+- `sorted_heap_expand_multihop_path_rerank(...)`
 - `sorted_heap_graph_rag_scan(...)`
 - `sorted_heap_graph_rag_twohop_scan(...)`
 - `sorted_heap_graph_rag_twohop_path_scan(...)`
+- `sorted_heap_graph_rag_multihop_scan(...)`
+- `sorted_heap_graph_rag_multihop_path_scan(...)`
 
-The stable contract covers one-hop and two-hop fact retrieval. Broader
-code-corpus snippet/symbol/lexical retrieval recipes remain benchmark-side
-reference logic, not SQL-stable product surface.
+The stable contract covers fact-shaped retrieval with explicit per-hop relation
+sequences. Broader code-corpus snippet/symbol/lexical retrieval recipes remain
+benchmark-side reference logic, not SQL-stable product surface.
 
 Recommended schema shape:
 
@@ -569,15 +573,22 @@ Preferred fact-shaped GraphRAG entry point.
 - `relation_path := ARRAY[1, 2], score_mode := 'path'`
   - two-hop expansion
   - path-aware rerank using hop-1 and hop-2 evidence together
+- `relation_path := ARRAY[1, 2, 3, ...]`
+  - multi-hop expansion
+  - each array element is the relation filter for that hop
+  - `score_mode := 'endpoint'` ranks only the final hop
+  - `score_mode := 'path'` accumulates distance across the whole path
 
 Current constraints:
 
-- `relation_path` must be a one-dimensional `int4[]` of length `1` or `2`
+- `relation_path` must be a non-empty one-dimensional `int4[]`
 - supported `score_mode` values are `endpoint` and `path`
 - canonical fact columns (`entity_id`, `relation_id`, `target_id`,
   `embedding`, `payload`) need no extra setup
 - non-canonical schemas must be registered first with
   `sorted_heap_graph_register(...)`
+- current regression and benchmark coverage verifies the generic path-aware
+  contract through synthetic depth `5`
 
 ```sql
 SET sorted_hnsw.ef_search = 128;
@@ -663,6 +674,24 @@ is the preferred higher-level syntax.
 Lower-level path-aware two-hop wrapper. `sorted_heap_graph_rag(...)` with
 `relation_path := ARRAY[hop1, hop2], score_mode := 'path'` is the preferred
 higher-level syntax.
+
+### `sorted_heap_expand_multihop_rerank(rel, seed_ids, query, top_k, relation_path, limit_rows)`
+
+Lower-level endpoint-scored multi-hop helper. `relation_path` is the explicit
+per-hop relation sequence.
+
+### `sorted_heap_expand_multihop_path_rerank(rel, seed_ids, query, top_k, relation_path, limit_rows)`
+
+Lower-level path-aware multi-hop helper. This accumulates distance across the
+full explicit `relation_path`.
+
+### `sorted_heap_graph_rag_multihop_scan(rel, query, ann_k, top_k, relation_path, limit_rows)`
+
+Lower-level ANN-seeded multi-hop wrapper for endpoint-scored retrieval.
+
+### `sorted_heap_graph_rag_multihop_path_scan(rel, query, ann_k, top_k, relation_path, limit_rows)`
+
+Lower-level ANN-seeded multi-hop wrapper for path-aware retrieval.
 
 ```sql
 SET sorted_hnsw.ef_search = 128;

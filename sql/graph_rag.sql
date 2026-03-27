@@ -563,6 +563,175 @@ COPY (
   FROM sorted_heap_graph_rag_stats()
 ) TO STDOUT;
 
+CREATE TABLE facts_chain_sh (
+  entity_id   int4 NOT NULL,
+  relation_id int2 NOT NULL,
+  target_id   int4 NOT NULL,
+  embedding   svec(4) NOT NULL,
+  payload     text NOT NULL,
+  PRIMARY KEY (entity_id, relation_id, target_id)
+) USING sorted_heap;
+
+INSERT INTO facts_chain_sh VALUES
+  (8, 1, 18, '[-1,0,0,0]'::svec, 'm1'),
+  (18, 2, 28, '[-0.8,-0.2,0,0]'::svec, 'm2'),
+  (28, 3, 38, '[-0.6,-0.4,0,0]'::svec, 'm3'),
+  (9, 1, 19, '[0,1,0,0]'::svec, 'n1'),
+  (19, 2, 29, '[0,0.8,0.2,0]'::svec, 'n2'),
+  (29, 3, 39, '[0,0.6,0.4,0]'::svec, 'n3');
+
+COPY (
+  SELECT 'ok'
+  FROM (SELECT sorted_heap_compact('facts_chain_sh'::regclass)) s
+) TO STDOUT;
+
+ANALYZE facts_chain_sh;
+
+COPY (
+  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+  FROM sorted_heap_expand_multihop_rerank(
+    'facts_chain_sh'::regclass,
+    ARRAY[8],
+    '[-1,0,0,0]'::svec,
+    2,
+    ARRAY[1,2,3],
+    0
+  )
+  ORDER BY distance, entity_id, relation_id, target_id
+) TO STDOUT;
+
+COPY (
+  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+  FROM sorted_heap_expand_multihop_path_rerank(
+    'facts_chain_sh'::regclass,
+    ARRAY[8],
+    '[-1,0,0,0]'::svec,
+    2,
+    ARRAY[1,2,3],
+    0
+  )
+  ORDER BY distance, entity_id, relation_id, target_id
+) TO STDOUT;
+
+COPY (
+  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+  FROM sorted_heap_graph_rag(
+    'facts_chain_sh'::regclass,
+    '[-1,0,0,0]'::svec,
+    relation_path := ARRAY[1,2,3],
+    ann_k := 1,
+    top_k := 2,
+    score_mode := 'endpoint',
+    limit_rows := 0
+  )
+  ORDER BY distance, entity_id, relation_id, target_id
+) TO STDOUT;
+
+COPY (
+  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+  FROM sorted_heap_graph_rag(
+    'facts_chain_sh'::regclass,
+    '[-1,0,0,0]'::svec,
+    relation_path := ARRAY[1,2,3],
+    ann_k := 1,
+    top_k := 2,
+    score_mode := 'path',
+    limit_rows := 0
+  )
+  ORDER BY distance, entity_id, relation_id, target_id
+) TO STDOUT;
+
+COPY (
+  WITH helper AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_expand_multihop_rerank(
+      'facts_chain_sh'::regclass,
+      ARRAY[8],
+      '[-1,0,0,0]'::svec,
+      2,
+      ARRAY[1,2,3],
+      0
+    )
+  ),
+  hop1 AS MATERIALIZED (
+    SELECT DISTINCT target_id
+    FROM facts_chain_sh
+    WHERE entity_id = ANY (ARRAY[8]::int4[])
+      AND relation_id = 1
+  ),
+  hop2 AS MATERIALIZED (
+    SELECT DISTINCT target_id
+    FROM facts_chain_sh
+    WHERE entity_id = ANY (ARRAY(SELECT target_id FROM hop1))
+      AND relation_id = 2
+  ),
+  sql_baseline AS (
+    SELECT entity_id, relation_id, target_id, payload,
+           round((embedding <=> '[-1,0,0,0]'::svec)::numeric, 6) AS distance
+    FROM facts_chain_sh
+    WHERE entity_id = ANY (ARRAY(SELECT target_id FROM hop2))
+      AND relation_id = 3
+    ORDER BY embedding <=> '[-1,0,0,0]'::svec, entity_id, relation_id, target_id
+    LIMIT 2
+  )
+  SELECT count(*) AS multihop_rerank_diff_rows
+  FROM (
+    (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
+    UNION ALL
+    (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
+  ) diff
+) TO STDOUT;
+
+COPY (
+  WITH helper AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_expand_multihop_path_rerank(
+      'facts_chain_sh'::regclass,
+      ARRAY[8],
+      '[-1,0,0,0]'::svec,
+      2,
+      ARRAY[1,2,3],
+      0
+    )
+  ),
+  hop1 AS MATERIALIZED (
+    SELECT DISTINCT ON (target_id)
+           target_id AS node_1,
+           (embedding <=> '[-1,0,0,0]'::svec) AS d1
+    FROM facts_chain_sh
+    WHERE entity_id = ANY (ARRAY[8]::int4[])
+      AND relation_id = 1
+    ORDER BY target_id, embedding <=> '[-1,0,0,0]'::svec, entity_id
+  ),
+  hop2 AS MATERIALIZED (
+    SELECT DISTINCT ON (t.target_id)
+           t.target_id AS node_2,
+           (hop1.d1 + (t.embedding <=> '[-1,0,0,0]'::svec)) AS d2
+    FROM facts_chain_sh t
+    JOIN hop1 ON hop1.node_1 = t.entity_id
+    WHERE t.relation_id = 2
+    ORDER BY t.target_id, (hop1.d1 + (t.embedding <=> '[-1,0,0,0]'::svec)), t.entity_id
+  ),
+  sql_baseline AS (
+    SELECT t.entity_id, t.relation_id, t.target_id, t.payload,
+           round((hop2.d2 + (t.embedding <=> '[-1,0,0,0]'::svec))::numeric, 6) AS distance
+    FROM facts_chain_sh t
+    JOIN hop2 ON hop2.node_2 = t.entity_id
+    WHERE t.relation_id = 3
+    ORDER BY (hop2.d2 + (t.embedding <=> '[-1,0,0,0]'::svec)),
+             t.entity_id, t.relation_id, t.target_id
+    LIMIT 2
+  )
+  SELECT count(*) AS multihop_path_rerank_diff_rows
+  FROM (
+    (SELECT * FROM helper EXCEPT ALL SELECT * FROM sql_baseline)
+    UNION ALL
+    (SELECT * FROM sql_baseline EXCEPT ALL SELECT * FROM helper)
+  ) diff
+) TO STDOUT;
+
+DROP TABLE facts_chain_sh;
+
 CREATE TABLE facts_alias (
   src_id    int4 NOT NULL,
   edge_type int2 NOT NULL,

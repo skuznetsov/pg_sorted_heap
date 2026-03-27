@@ -37,7 +37,7 @@ Contract:
 - fact rows clustered by `(entity_id, relation_id, target_id)`, or by an
   equivalent registered alias mapping
 - ANN seed retrieval on `entity_id`
-- `relation_path` length `1` or `2`
+- `relation_path` is a non-empty per-hop relation sequence
 - `score_mode = 'endpoint' | 'path'`
 - exact rerank on the expanded candidate set
 
@@ -52,6 +52,11 @@ Semantics:
 - `relation_path := ARRAY[1, 2], score_mode := 'path'`
   - two-hop expansion
   - path-aware rerank using hop-1 and hop-2 evidence together
+- `relation_path := ARRAY[1, 2, 3, ...]`
+  - explicit multi-hop expansion
+  - each array element is the relation filter for that hop
+  - `score_mode := 'endpoint'` ranks only the final hop
+  - `score_mode := 'path'` accumulates evidence across the whole path
 
 ## What stays beta
 
@@ -62,9 +67,13 @@ These remain beta even after the new syntax lands:
   - `sorted_heap_expand_rerank(...)`
   - `sorted_heap_expand_twohop_rerank(...)`
   - `sorted_heap_expand_twohop_path_rerank(...)`
+  - `sorted_heap_expand_multihop_rerank(...)`
+  - `sorted_heap_expand_multihop_path_rerank(...)`
   - `sorted_heap_graph_rag_scan(...)`
   - `sorted_heap_graph_rag_twohop_scan(...)`
   - `sorted_heap_graph_rag_twohop_path_scan(...)`
+  - `sorted_heap_graph_rag_multihop_scan(...)`
+  - `sorted_heap_graph_rag_multihop_path_scan(...)`
 - code-corpus contracts that currently live in benchmark/harness logic:
   - prompt-focused snippet selection
   - prompt-symbol rescue

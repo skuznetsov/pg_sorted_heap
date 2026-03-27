@@ -225,6 +225,33 @@ So on the local balanced point, the current `sorted_heap` path-aware rows are
 not a fragile one-off. The latency band is tight, and the answer quality did
 not drift across the three rebuilds.
 
+### Synthetic multi-hop depth scaling (`relation_path` depth 1..5)
+
+Repo-owned harness:
+
+- `python3 scripts/bench_graph_rag_multidepth.py --num-pairs 5000 --max-depth 5 --query-count 32 --runs 3 --dim 384 --ann-k 64 --top-k 10 --ef-search 128 --ef-construction 200 --m 24 --shared-buffers-mb 64`
+
+Deterministic chain-shaped fact graph, `25K` rows total, `384D`, top-10,
+fresh backend, path-aware scorer. This is a narrow scaling check for the
+generic unified syntax:
+
+- `relation_path := ARRAY[1]`
+- `relation_path := ARRAY[1,2]`
+- `relation_path := ARRAY[1,2,3]`
+- `relation_path := ARRAY[1,2,3,4]`
+- `relation_path := ARRAY[1,2,3,4,5]`
+
+| Method | depth 1 | depth 2 | depth 3 | depth 4 | depth 5 | Quality |
+|--------|:-------:|:-------:|:-------:|:-------:|:-------:|---------|
+| Heap SQL path baseline | 0.573 ms | 0.589 ms | 0.613 ms | 0.622 ms | 0.622 ms | `100.0% / 100.0%` |
+| sorted_heap SQL path baseline | 0.774 ms | 0.732 ms | 0.776 ms | 0.712 ms | 0.772 ms | `100.0% / 100.0%` |
+| **sorted_heap_graph_rag(..., score_mode := 'path')** | **0.674 ms** | **0.651 ms** | **0.643 ms** | **0.633 ms** | **0.649 ms** | **`100.0% / 100.0%`** |
+
+On this synthetic chain benchmark, the unified path-aware function does not
+show a latency cliff through depth `5`; it stays in the same `~0.63-0.67 ms`
+band while preserving `100.0% / 100.0%` quality. This is a controlled scaling
+signal, not a claim about arbitrary deep graph workloads.
+
 ### Current AWS GraphRAG benchmark (`person -> parent -> city`, stable fact contract)
 
 Repo-owned harness:
