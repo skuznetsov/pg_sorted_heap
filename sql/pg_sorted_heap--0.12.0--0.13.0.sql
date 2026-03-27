@@ -63,6 +63,57 @@ AS $$
   LEFT JOIN @extschema@.sorted_heap_graph_registry r ON r.relid = args.relid;
 $$ LANGUAGE SQL STABLE;
 
+CREATE TABLE @extschema@.sorted_heap_graph_segment_meta_registry (
+  relid regclass PRIMARY KEY,
+  segment_group text,
+  relation_family text
+);
+
+SELECT pg_catalog.pg_extension_config_dump('@extschema@.sorted_heap_graph_segment_meta_registry', '');
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_segment_meta_register(
+  rel regclass,
+  segment_group text DEFAULT NULL,
+  relation_family text DEFAULT NULL
+) RETURNS void
+AS $$
+  INSERT INTO @extschema@.sorted_heap_graph_segment_meta_registry (
+    relid, segment_group, relation_family
+  )
+  VALUES ($1, $2, $3)
+  ON CONFLICT (relid) DO UPDATE SET
+    segment_group = EXCLUDED.segment_group,
+    relation_family = EXCLUDED.relation_family;
+$$ LANGUAGE SQL;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_segment_meta_unregister(
+  rel regclass DEFAULT NULL
+) RETURNS int4
+AS $$
+DECLARE
+  deleted_rows int4;
+BEGIN
+  DELETE FROM @extschema@.sorted_heap_graph_segment_meta_registry
+  WHERE sorted_heap_graph_segment_meta_registry.relid = COALESCE(sorted_heap_graph_segment_meta_unregister.rel, sorted_heap_graph_segment_meta_registry.relid);
+  GET DIAGNOSTICS deleted_rows = ROW_COUNT;
+  RETURN deleted_rows;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_segment_meta_config(
+  rel regclass DEFAULT NULL
+) RETURNS TABLE (
+  rel regclass,
+  segment_group text,
+  relation_family text
+)
+AS $$
+  SELECT m.relid, m.segment_group, m.relation_family
+  FROM @extschema@.sorted_heap_graph_segment_meta_registry m
+  WHERE ($1 IS NULL OR m.relid = $1)
+  ORDER BY m.relid;
+$$ LANGUAGE SQL STABLE;
+
 CREATE TABLE @extschema@.sorted_heap_graph_segment_registry (
   route_name text NOT NULL,
   relid regclass NOT NULL,
@@ -131,18 +182,27 @@ RETURNS TABLE (
   relation_family text
 )
 AS $$
-  SELECT s.route_name, s.relid, s.route_min, s.route_max, s.segment_group, s.relation_family
-  FROM @extschema@.sorted_heap_graph_segment_registry s
-  WHERE ($1 IS NULL OR s.route_name = $1)
-    AND ($2 IS NULL OR s.segment_group = ANY($2))
-    AND ($3 IS NULL OR s.relation_family = $3)
-  ORDER BY s.route_name,
-           CASE WHEN $2 IS NULL THEN 0 ELSE array_position($2, s.segment_group) END,
-           s.segment_group,
-           s.relation_family,
+  SELECT x.route_name, x.relid, x.route_min, x.route_max, x.segment_group, x.relation_family
+  FROM (
+    SELECT s.route_name,
+           s.relid,
            s.route_min,
            s.route_max,
-           s.relid;
+           COALESCE(s.segment_group, m.segment_group) AS segment_group,
+           COALESCE(s.relation_family, m.relation_family) AS relation_family
+    FROM @extschema@.sorted_heap_graph_segment_registry s
+    LEFT JOIN @extschema@.sorted_heap_graph_segment_meta_registry m ON m.relid = s.relid
+  ) x
+  WHERE ($1 IS NULL OR x.route_name = $1)
+    AND ($2 IS NULL OR x.segment_group = ANY($2))
+    AND ($3 IS NULL OR x.relation_family = $3)
+  ORDER BY x.route_name,
+           CASE WHEN $2 IS NULL THEN 0 ELSE array_position($2, x.segment_group) END,
+           x.segment_group,
+           x.relation_family,
+           x.route_min,
+           x.route_max,
+           x.relid;
 $$ LANGUAGE SQL STABLE;
 
 CREATE FUNCTION @extschema@.sorted_heap_graph_segment_resolve(
@@ -161,18 +221,23 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_segment_resolve(
 AS $$
   SELECT chosen.relid, chosen.route_min, chosen.route_max, chosen.segment_group, chosen.relation_family
   FROM (
-    SELECT s.relid, s.route_min, s.route_max, s.segment_group, s.relation_family
+    SELECT s.relid,
+           s.route_min,
+           s.route_max,
+           COALESCE(s.segment_group, m.segment_group) AS segment_group,
+           COALESCE(s.relation_family, m.relation_family) AS relation_family
     FROM @extschema@.sorted_heap_graph_segment_registry s
+    LEFT JOIN @extschema@.sorted_heap_graph_segment_meta_registry m ON m.relid = s.relid
     WHERE s.route_name = $1
       AND $2 BETWEEN s.route_min AND s.route_max
-      AND ($4 IS NULL OR s.segment_group = ANY($4))
-      AND ($5 IS NULL OR s.relation_family = $5)
-    ORDER BY CASE WHEN $4 IS NULL THEN 0 ELSE array_position($4, s.segment_group) END,
+      AND ($4 IS NULL OR COALESCE(s.segment_group, m.segment_group) = ANY($4))
+      AND ($5 IS NULL OR COALESCE(s.relation_family, m.relation_family) = $5)
+    ORDER BY CASE WHEN $4 IS NULL THEN 0 ELSE array_position($4, COALESCE(s.segment_group, m.segment_group)) END,
              (s.route_max - s.route_min),
              s.route_min,
              s.route_max,
-             s.segment_group,
-             s.relation_family,
+             COALESCE(s.segment_group, m.segment_group),
+             COALESCE(s.relation_family, m.relation_family),
              s.relid
     LIMIT CASE WHEN $3 IS NULL OR $3 <= 0 THEN NULL ELSE $3 END
   ) chosen
@@ -249,19 +314,28 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_exact_config(
   relation_family text
 )
 AS $$
-  SELECT s.route_name, s.route_key, s.relid, s.priority, s.segment_group, s.relation_family
-  FROM @extschema@.sorted_heap_graph_exact_registry s
-  WHERE ($1 IS NULL OR s.route_name = $1)
-    AND ($2 IS NULL OR s.route_key = $2)
-    AND ($3 IS NULL OR s.segment_group = ANY($3))
-    AND ($4 IS NULL OR s.relation_family = $4)
-  ORDER BY s.route_name,
+  SELECT x.route_name, x.route_key, x.relid, x.priority, x.segment_group, x.relation_family
+  FROM (
+    SELECT s.route_name,
            s.route_key,
-           CASE WHEN $3 IS NULL THEN 0 ELSE array_position($3, s.segment_group) END,
-           s.priority DESC,
-           s.segment_group,
-           s.relation_family,
-           s.relid;
+           s.relid,
+           s.priority,
+           COALESCE(s.segment_group, m.segment_group) AS segment_group,
+           COALESCE(s.relation_family, m.relation_family) AS relation_family
+    FROM @extschema@.sorted_heap_graph_exact_registry s
+    LEFT JOIN @extschema@.sorted_heap_graph_segment_meta_registry m ON m.relid = s.relid
+  ) x
+  WHERE ($1 IS NULL OR x.route_name = $1)
+    AND ($2 IS NULL OR x.route_key = $2)
+    AND ($3 IS NULL OR x.segment_group = ANY($3))
+    AND ($4 IS NULL OR x.relation_family = $4)
+  ORDER BY x.route_name,
+           x.route_key,
+           CASE WHEN $3 IS NULL THEN 0 ELSE array_position($3, x.segment_group) END,
+           x.priority DESC,
+           x.segment_group,
+           x.relation_family,
+           x.relid;
 $$ LANGUAGE SQL STABLE;
 
 CREATE FUNCTION @extschema@.sorted_heap_graph_exact_resolve(
@@ -279,16 +353,20 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_exact_resolve(
 AS $$
   SELECT chosen.relid, chosen.priority, chosen.segment_group, chosen.relation_family
   FROM (
-    SELECT s.relid, s.priority, s.segment_group, s.relation_family
+    SELECT s.relid,
+           s.priority,
+           COALESCE(s.segment_group, m.segment_group) AS segment_group,
+           COALESCE(s.relation_family, m.relation_family) AS relation_family
     FROM @extschema@.sorted_heap_graph_exact_registry s
+    LEFT JOIN @extschema@.sorted_heap_graph_segment_meta_registry m ON m.relid = s.relid
     WHERE s.route_name = $1
       AND s.route_key = $2
-      AND ($4 IS NULL OR s.segment_group = ANY($4))
-      AND ($5 IS NULL OR s.relation_family = $5)
-    ORDER BY CASE WHEN $4 IS NULL THEN 0 ELSE array_position($4, s.segment_group) END,
+      AND ($4 IS NULL OR COALESCE(s.segment_group, m.segment_group) = ANY($4))
+      AND ($5 IS NULL OR COALESCE(s.relation_family, m.relation_family) = $5)
+    ORDER BY CASE WHEN $4 IS NULL THEN 0 ELSE array_position($4, COALESCE(s.segment_group, m.segment_group)) END,
              s.priority DESC,
-             s.segment_group,
-             s.relation_family,
+             COALESCE(s.segment_group, m.segment_group),
+             COALESCE(s.relation_family, m.relation_family),
              s.relid
     LIMIT CASE WHEN $3 IS NULL OR $3 <= 0 THEN NULL ELSE $3 END
   ) chosen

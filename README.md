@@ -236,36 +236,39 @@ The older helper/wrapper family is still available for lower-level control:
 - `sorted_heap_expand_twohop_path_rerank(...)`
 - `sorted_heap_expand_multihop_rerank(...)`
 - `sorted_heap_expand_multihop_path_rerank(...)`
+- `sorted_heap_graph_segment_meta_register(...)`
+- `sorted_heap_graph_segment_meta_config(...)`
+- `sorted_heap_graph_segment_meta_unregister(...)`
 - `sorted_heap_graph_segment_register(...)`
 - `sorted_heap_graph_segment_config(...)`
 - `sorted_heap_graph_segment_resolve(...)`
 - `sorted_heap_graph_segment_unregister(...)`
-  - `sorted_heap_graph_route_policy_register(...)`
-  - `sorted_heap_graph_route_policy_config(...)`
-  - `sorted_heap_graph_route_policy_groups(...)`
-  - `sorted_heap_graph_route_policy_unregister(...)`
-  - `sorted_heap_graph_route_profile_register(...)`
-  - `sorted_heap_graph_route_profile_config(...)`
-  - `sorted_heap_graph_route_profile_resolve(...)`
-  - `sorted_heap_graph_route_profile_unregister(...)`
-  - `sorted_heap_graph_route_default_register(...)`
-  - `sorted_heap_graph_route_default_config(...)`
-  - `sorted_heap_graph_route_default_resolve(...)`
-  - `sorted_heap_graph_route_default_unregister(...)`
-  - `sorted_heap_graph_exact_register(...)`
-  - `sorted_heap_graph_exact_config(...)`
-  - `sorted_heap_graph_exact_resolve(...)`
-  - `sorted_heap_graph_exact_unregister(...)`
-  - `sorted_heap_graph_rag_segmented(...)`
-  - `sorted_heap_graph_rag_routed(...)`
-  - `sorted_heap_graph_rag_routed_policy(...)`
-  - `sorted_heap_graph_rag_routed_profile(...)`
-  - `sorted_heap_graph_rag_routed_default(...)`
-  - `sorted_heap_graph_rag_routed_exact(...)`
-  - `sorted_heap_graph_rag_routed_exact_policy(...)`
-  - `sorted_heap_graph_rag_routed_exact_profile(...)`
-  - `sorted_heap_graph_rag_routed_exact_default(...)`
-  - `sorted_heap_graph_rag_scan(...)`
+- `sorted_heap_graph_route_policy_register(...)`
+- `sorted_heap_graph_route_policy_config(...)`
+- `sorted_heap_graph_route_policy_groups(...)`
+- `sorted_heap_graph_route_policy_unregister(...)`
+- `sorted_heap_graph_route_profile_register(...)`
+- `sorted_heap_graph_route_profile_config(...)`
+- `sorted_heap_graph_route_profile_resolve(...)`
+- `sorted_heap_graph_route_profile_unregister(...)`
+- `sorted_heap_graph_route_default_register(...)`
+- `sorted_heap_graph_route_default_config(...)`
+- `sorted_heap_graph_route_default_resolve(...)`
+- `sorted_heap_graph_route_default_unregister(...)`
+- `sorted_heap_graph_exact_register(...)`
+- `sorted_heap_graph_exact_config(...)`
+- `sorted_heap_graph_exact_resolve(...)`
+- `sorted_heap_graph_exact_unregister(...)`
+- `sorted_heap_graph_rag_segmented(...)`
+- `sorted_heap_graph_rag_routed(...)`
+- `sorted_heap_graph_rag_routed_policy(...)`
+- `sorted_heap_graph_rag_routed_profile(...)`
+- `sorted_heap_graph_rag_routed_default(...)`
+- `sorted_heap_graph_rag_routed_exact(...)`
+- `sorted_heap_graph_rag_routed_exact_policy(...)`
+- `sorted_heap_graph_rag_routed_exact_profile(...)`
+- `sorted_heap_graph_rag_routed_exact_default(...)`
+- `sorted_heap_graph_rag_scan(...)`
 - `sorted_heap_graph_rag_twohop_scan(...)`
 - `sorted_heap_graph_rag_twohop_path_scan(...)`
 - `sorted_heap_graph_rag_multihop_scan(...)`
@@ -303,7 +306,11 @@ operator-facing shortcut removes one more repeated query argument: a route can
 now bind one default profile and call
 `sorted_heap_graph_rag_routed_default(...)` or
 `sorted_heap_graph_rag_routed_exact_default(...)` without passing
-`profile_name` each time.
+`profile_name` each time. The newest narrow cleanup under that beta surface is
+shared per-shard metadata via `sorted_heap_graph_segment_meta_register(...)`:
+route rows can now omit repeated `segment_group` / `relation_family` labels
+and inherit them from shard metadata instead. When both are present, the
+route-local value still wins.
 
 For tuning and debugging, GraphRAG now also exposes backend-local last-call
 stats:

@@ -665,6 +665,27 @@ FROM sorted_heap_graph_rag_segmented(
 );
 ```
 
+### `sorted_heap_graph_segment_meta_register(rel, segment_group, relation_family)`
+
+Registers shared per-shard routing metadata.
+
+- `rel` is one concrete shard relation
+- `segment_group` is optional shared shard labeling such as `hot` or `sealed`
+- `relation_family` is optional shared shard labeling such as `claims`,
+  `citations`, or `right`
+- this is mainly for reducing repeated registry data when several route rows
+  point at the same shard
+- if a routed row also stores `segment_group` or `relation_family`, the
+  row-local value wins over the shared metadata
+
+### `sorted_heap_graph_segment_meta_config(rel)`
+
+Lists current shared per-shard metadata rows.
+
+### `sorted_heap_graph_segment_meta_unregister(rel)`
+
+Deletes one shared per-shard metadata row, or all rows when `rel` is `NULL`.
+
 ### `sorted_heap_graph_segment_register(route_name, rel, route_min, route_max, segment_group, relation_family)`
 
 Registers a shard in the beta segment-routing registry.
@@ -675,6 +696,8 @@ Registers a shard in the beta segment-routing registry.
   lifecycle tier
 - `relation_family` is an optional second routing label such as
   `claims`, `citations`, or `right`
+- either label may be left `NULL` and resolved later from
+  `sorted_heap_graph_segment_meta_registry`
 - overlapping ranges are allowed
 
 ### `sorted_heap_graph_segment_config(route_name, segment_groups, relation_family)`
@@ -686,6 +709,9 @@ group, range, and relation.
 - non-`NULL` `text[]` filters to matching shard labels only
 - `relation_family := NULL` means "all families"
 - non-`NULL` `relation_family` narrows rows to one family value
+- effective labels come from the route row first, then from
+  `sorted_heap_graph_segment_meta_registry` for the same shard when the
+  route-local label is `NULL`
 - when `segment_groups` is non-`NULL`, its array order also becomes the
   preferred group order in the result set
 
@@ -696,6 +722,9 @@ Resolves candidate shards for a route value.
 - matches rows where `route_value BETWEEN route_min AND route_max`
 - optionally filters to `segment_group = ANY(segment_groups)`
 - optionally filters to `relation_family = <supplied family>`
+- effective labels come from the route row first, then from
+  `sorted_heap_graph_segment_meta_registry` for the same shard when the
+  route-local label is `NULL`
 - when `segment_groups` is non-`NULL`, its array order is preferred before the
   usual narrower-range ordering
 - orders narrower ranges first
@@ -930,6 +959,8 @@ Registers an exact-key shard mapping in the beta exact-routing registry.
 - `segment_group` is an optional shard label such as `hot` or `sealed`
 - `relation_family` is an optional second routing label such as
   `claims`, `citations`, or `right`
+- either label may be left `NULL` and resolved later from
+  `sorted_heap_graph_segment_meta_registry`
 
 ### `sorted_heap_graph_exact_config(route_name, route_key, segment_groups, relation_family)`
 
@@ -940,6 +971,9 @@ Lists the current exact-key shard mappings ordered by
   group order before per-shard priority
 - `relation_family := NULL` means "all families"
 - non-`NULL` `relation_family` narrows rows to one family value
+- effective labels come from the exact-route row first, then from
+  `sorted_heap_graph_segment_meta_registry` for the same shard when the
+  route-local label is `NULL`
 
 ### `sorted_heap_graph_exact_resolve(route_name, route_key, fanout_limit, segment_groups, relation_family)`
 
@@ -948,6 +982,9 @@ Resolves candidate shards for an exact route key.
 - matches rows where `route_key = <supplied key>`
 - optionally filters to `segment_group = ANY(segment_groups)`
 - optionally filters to `relation_family = <supplied family>`
+- effective labels come from the exact-route row first, then from
+  `sorted_heap_graph_segment_meta_registry` for the same shard when the
+  route-local label is `NULL`
 - when `segment_groups` is non-`NULL`, its array order is preferred before the
   usual `priority DESC` ordering
 - orders by `priority DESC, rel`

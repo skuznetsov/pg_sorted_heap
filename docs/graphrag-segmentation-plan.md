@@ -175,6 +175,15 @@ Reference design:
   - `sorted_heap_graph_rag_routed_exact_default(...)`
   - this lets one route bind a default profile once instead of passing
     `profile_name` in every query
+- and the next registry cleanup now exists under the routed path:
+  - `sorted_heap_graph_segment_meta_register(...)`
+  - `sorted_heap_graph_segment_meta_config(...)`
+  - `sorted_heap_graph_segment_meta_unregister(...)`
+  - range-routed and exact-key routed rows can now leave
+    `segment_group` / `relation_family` as `NULL` and inherit them from
+    shard-local metadata instead
+  - when both are present, row-local routed metadata still overrides the
+    shared shard metadata
 - what is still missing:
   - more than one optional text metadata dimension per registry row
   - a product-quality shard router contract for tenant / KB / relation-family
@@ -253,6 +262,15 @@ And the newest operator shortcut removes one more argument from the query side:
 
 - a route can now bind one default profile once
 - default-backed wrappers resolve that profile implicitly at query time
+
+And the newest narrow cleanup removes one more source of repeated registry
+state:
+
+- shard-local metadata can now be registered once per concrete shard relation
+- both range-routed and exact-key routed rows can inherit that metadata when
+  their own `segment_group` / `relation_family` values are `NULL`
+- this reduces duplicated registry data, but it still does not replace the
+  current hand-managed routing model
 
 That is still beta, but it is the first real multi-dimensional routing surface
 inside the extension. The next honest step is no longer “can we add metadata?”

@@ -286,6 +286,17 @@
       pass `profile_name` on every query
     - regression coverage now proves both default-backed wrappers match the
       same sealed/right routed baselines as the explicit profile paths
+  - a shared shard-metadata cleanup under the routed beta surface:
+    - added `sorted_heap_graph_segment_meta_register(...)`,
+      `sorted_heap_graph_segment_meta_config(...)`, and
+      `sorted_heap_graph_segment_meta_unregister(...)`
+    - range-routed and exact-key routed config/resolve paths now fall back to
+      shared per-shard `segment_group` / `relation_family` metadata when the
+      route row leaves those labels `NULL`
+    - row-local routed metadata still overrides shared shard metadata when
+      both are present
+    - regression coverage now proves both routed wrappers work when those
+      labels live only in the shared shard-metadata registry
 
 ### sorted_hnsw build optimization
 
