@@ -9,6 +9,7 @@ set -euo pipefail
 # - extension upgrade 0.12.0 -> 0.13.0
 # - alias-schema registration
 # - pg_dump / pg_restore of the registry-backed alias mapping
+# - pg_dump / pg_restore of segmented/routed GraphRAG registries
 #
 # Usage: ./scripts/test_graph_rag_lifecycle.sh [tmp_root] [port]
 
@@ -122,6 +123,52 @@ FROM sorted_heap_graph_rag_twohop_path_scan(
   ${hop1},
   ${hop2},
   0
+);
+SQL
+}
+
+routed_default_signature_sql() {
+  local route_name="$1" route_value="$2" query="$3" relation_path="$4" ann_k="$5" top_k="$6" score_mode="$7"
+  cat <<SQL
+SELECT COALESCE(
+  string_agg(
+    format('%s:%s:%s:%s:%s', source_rel::text, entity_id, relation_id, target_id, payload),
+    '|' ORDER BY distance, entity_id, relation_id, target_id, source_rel::text
+  ),
+  ''
+)
+FROM sorted_heap_graph_rag_routed_default(
+  '${route_name}',
+  ${route_value},
+  '${query}'::svec,
+  relation_path := ${relation_path},
+  ann_k := ${ann_k},
+  top_k := ${top_k},
+  score_mode := '${score_mode}',
+  limit_rows := 0
+);
+SQL
+}
+
+routed_exact_default_signature_sql() {
+  local route_name="$1" route_key="$2" query="$3" relation_path="$4" ann_k="$5" top_k="$6" score_mode="$7"
+  cat <<SQL
+SELECT COALESCE(
+  string_agg(
+    format('%s:%s:%s:%s:%s', source_rel::text, entity_id, relation_id, target_id, payload),
+    '|' ORDER BY distance, entity_id, relation_id, target_id, source_rel::text
+  ),
+  ''
+)
+FROM sorted_heap_graph_rag_routed_exact_default(
+  '${route_name}',
+  '${route_key}',
+  '${query}'::svec,
+  relation_path := ${relation_path},
+  ann_k := ${ann_k},
+  top_k := ${top_k},
+  score_mode := '${score_mode}',
+  limit_rows := 0
 );
 SQL
 }
@@ -250,6 +297,89 @@ check "alias_unified_signature_nonempty" "t" "$([ -n "$alias_unified_sig" ] && e
 alias_path_sig=$(PSQL "$DB" -c "$(path_signature_sql facts_alias '[0,0,1,0]' 2 2 1 2)")
 check "alias_path_signature" "$alias_unified_sig" "$alias_path_sig"
 
+PSQL "$DB" <<'SQL'
+CREATE TABLE facts_seg_a (
+  entity_id   int4 NOT NULL,
+  relation_id int2 NOT NULL,
+  target_id   int4 NOT NULL,
+  embedding   svec(4) NOT NULL,
+  payload     text NOT NULL,
+  PRIMARY KEY (entity_id, relation_id, target_id)
+) USING sorted_heap;
+
+CREATE TABLE facts_seg_b (
+  entity_id   int4 NOT NULL,
+  relation_id int2 NOT NULL,
+  target_id   int4 NOT NULL,
+  embedding   svec(4) NOT NULL,
+  payload     text NOT NULL,
+  PRIMARY KEY (entity_id, relation_id, target_id)
+) USING sorted_heap;
+
+INSERT INTO facts_seg_a VALUES
+  (8, 1, 18, '[-1,0,0,0]'::svec, 'm1'),
+  (18, 2, 28, '[-0.8,-0.2,0,0]'::svec, 'm2'),
+  (28, 3, 38, '[-0.6,-0.4,0,0]'::svec, 'm3');
+
+INSERT INTO facts_seg_b VALUES
+  (9, 1, 19, '[0,1,0,0]'::svec, 'n1'),
+  (19, 2, 29, '[0,0.8,0.2,0]'::svec, 'n2'),
+  (29, 3, 39, '[0,0.6,0.4,0]'::svec, 'n3');
+
+SELECT sorted_heap_compact('facts_seg_a'::regclass);
+SELECT sorted_heap_compact('facts_seg_b'::regclass);
+ANALYZE facts_seg_a;
+ANALYZE facts_seg_b;
+
+SELECT sorted_heap_graph_segment_meta_register('facts_seg_a'::regclass, 'hot', 'left');
+SELECT sorted_heap_graph_segment_meta_register('facts_seg_b'::regclass, 'sealed', 'right');
+
+SELECT sorted_heap_graph_segment_register('lifecycle_route', 'facts_seg_a'::regclass, 1, 8);
+SELECT sorted_heap_graph_segment_register('lifecycle_route', 'facts_seg_b'::regclass, 9, 16);
+
+SELECT sorted_heap_graph_exact_register('lifecycle_exact', 'both', 'facts_seg_a'::regclass, 100);
+SELECT sorted_heap_graph_exact_register('lifecycle_exact', 'both', 'facts_seg_b'::regclass, 50);
+
+SELECT sorted_heap_graph_route_policy_register('lifecycle_route', 'prefer_sealed', ARRAY['sealed','hot']);
+SELECT sorted_heap_graph_route_policy_register('lifecycle_exact', 'prefer_sealed', ARRAY['sealed','hot']);
+
+SELECT sorted_heap_graph_route_profile_register('lifecycle_route', 'sealed_right', 'prefer_sealed', NULL, 'right', 1);
+SELECT sorted_heap_graph_route_profile_register('lifecycle_exact', 'sealed_right', 'prefer_sealed', NULL, 'right', 1);
+
+SELECT sorted_heap_graph_route_default_register('lifecycle_route', 'sealed_right');
+SELECT sorted_heap_graph_route_default_register('lifecycle_exact', 'sealed_right');
+SQL
+
+segment_meta_rows=$(PSQL "$DB" -c "SELECT count(*) FROM sorted_heap_graph_segment_meta_config()")
+check "segment_meta_rows_before_dump" "2" "$segment_meta_rows"
+
+segment_rows=$(PSQL "$DB" -c "SELECT count(*) FROM sorted_heap_graph_segment_config('lifecycle_route')")
+check "segment_rows_before_dump" "2" "$segment_rows"
+
+segment_shared_sources=$(PSQL "$DB" -c "SELECT count(*) FROM sorted_heap_graph_segment_catalog('lifecycle_route') WHERE segment_group_source = 'shared' AND relation_family_source = 'shared'")
+check "segment_catalog_shared_before_dump" "2" "$segment_shared_sources"
+
+exact_rows=$(PSQL "$DB" -c "SELECT count(*) FROM sorted_heap_graph_exact_config('lifecycle_exact')")
+check "exact_rows_before_dump" "2" "$exact_rows"
+
+exact_shared_sources=$(PSQL "$DB" -c "SELECT count(*) FROM sorted_heap_graph_exact_catalog('lifecycle_exact', 'both') WHERE segment_group_source = 'shared' AND relation_family_source = 'shared'")
+check "exact_catalog_shared_before_dump" "2" "$exact_shared_sources"
+
+policy_rows=$(PSQL "$DB" -c "SELECT count(*) FROM sorted_heap_graph_route_policy_config() WHERE route_name IN ('lifecycle_route', 'lifecycle_exact')")
+check "route_policy_rows_before_dump" "2" "$policy_rows"
+
+profile_rows=$(PSQL "$DB" -c "SELECT count(*) FROM sorted_heap_graph_route_profile_config() WHERE route_name IN ('lifecycle_route', 'lifecycle_exact')")
+check "route_profile_rows_before_dump" "2" "$profile_rows"
+
+default_rows=$(PSQL "$DB" -c "SELECT count(*) FROM sorted_heap_graph_route_default_config() WHERE route_name IN ('lifecycle_route', 'lifecycle_exact')")
+check "route_default_rows_before_dump" "2" "$default_rows"
+
+lifecycle_routed_sig=$(PSQL "$DB" -c "$(routed_default_signature_sql lifecycle_route 10 '[0,1,0,0]' 'ARRAY[1,2]' 2 2 path)")
+check "routed_default_signature_nonempty" "t" "$([ -n "$lifecycle_routed_sig" ] && echo t || echo f)"
+
+lifecycle_exact_routed_sig=$(PSQL "$DB" -c "$(routed_exact_default_signature_sql lifecycle_exact both '[0,1,0,0]' 'ARRAY[1,2]' 2 2 path)")
+check "routed_exact_default_signature" "$lifecycle_routed_sig" "$lifecycle_exact_routed_sig"
+
 "$PG_BINDIR/pg_dump" -h "$TMP_DIR" -p "$PORT" -Fc "$DB" -f "$TMP_DIR/graph_rag.fc" 2>/dev/null
 "$PG_BINDIR/dropdb" -h "$TMP_DIR" -p "$PORT" "$DB"
 "$PG_BINDIR/createdb" -h "$TMP_DIR" -p "$PORT" "$DB"
@@ -272,6 +402,36 @@ check "alias_unified_signature_after_restore" "$alias_unified_sig" "$restored_al
 
 restored_alias_path_sig=$(PSQL "$DB" -c "$(path_signature_sql facts_alias '[0,0,1,0]' 2 2 1 2)")
 check "alias_path_signature_after_restore" "$alias_path_sig" "$restored_alias_path_sig"
+
+restored_segment_meta_rows=$(PSQL "$DB" -c "SELECT count(*) FROM sorted_heap_graph_segment_meta_config()")
+check "segment_meta_rows_after_restore" "2" "$restored_segment_meta_rows"
+
+restored_segment_rows=$(PSQL "$DB" -c "SELECT count(*) FROM sorted_heap_graph_segment_config('lifecycle_route')")
+check "segment_rows_after_restore" "2" "$restored_segment_rows"
+
+restored_segment_shared_sources=$(PSQL "$DB" -c "SELECT count(*) FROM sorted_heap_graph_segment_catalog('lifecycle_route') WHERE segment_group_source = 'shared' AND relation_family_source = 'shared'")
+check "segment_catalog_shared_after_restore" "2" "$restored_segment_shared_sources"
+
+restored_exact_rows=$(PSQL "$DB" -c "SELECT count(*) FROM sorted_heap_graph_exact_config('lifecycle_exact')")
+check "exact_rows_after_restore" "2" "$restored_exact_rows"
+
+restored_exact_shared_sources=$(PSQL "$DB" -c "SELECT count(*) FROM sorted_heap_graph_exact_catalog('lifecycle_exact', 'both') WHERE segment_group_source = 'shared' AND relation_family_source = 'shared'")
+check "exact_catalog_shared_after_restore" "2" "$restored_exact_shared_sources"
+
+restored_policy_rows=$(PSQL "$DB" -c "SELECT count(*) FROM sorted_heap_graph_route_policy_config() WHERE route_name IN ('lifecycle_route', 'lifecycle_exact')")
+check "route_policy_rows_after_restore" "2" "$restored_policy_rows"
+
+restored_profile_rows=$(PSQL "$DB" -c "SELECT count(*) FROM sorted_heap_graph_route_profile_config() WHERE route_name IN ('lifecycle_route', 'lifecycle_exact')")
+check "route_profile_rows_after_restore" "2" "$restored_profile_rows"
+
+restored_default_rows=$(PSQL "$DB" -c "SELECT count(*) FROM sorted_heap_graph_route_default_config() WHERE route_name IN ('lifecycle_route', 'lifecycle_exact')")
+check "route_default_rows_after_restore" "2" "$restored_default_rows"
+
+restored_lifecycle_routed_sig=$(PSQL "$DB" -c "$(routed_default_signature_sql lifecycle_route 10 '[0,1,0,0]' 'ARRAY[1,2]' 2 2 path)")
+check "routed_default_signature_after_restore" "$lifecycle_routed_sig" "$restored_lifecycle_routed_sig"
+
+restored_lifecycle_exact_routed_sig=$(PSQL "$DB" -c "$(routed_exact_default_signature_sql lifecycle_exact both '[0,1,0,0]' 'ARRAY[1,2]' 2 2 path)")
+check "routed_exact_default_signature_after_restore" "$lifecycle_exact_routed_sig" "$restored_lifecycle_exact_routed_sig"
 
 PSQL "$DB" -c "SELECT sorted_heap_compact('facts_alias'::regclass)" >/dev/null
 post_restore_compact_sig=$(PSQL "$DB" -c "$(signature_sql facts_alias '[0,0,1,0]' 'ARRAY[1,2]' 2 2 path)")

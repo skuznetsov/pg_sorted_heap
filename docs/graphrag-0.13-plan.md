@@ -174,6 +174,14 @@ Implemented in this branch:
 - dump/restore coverage for registered GraphRAG alias mappings
 - extension upgrade coverage for `0.12.0 -> 0.13.0`
 - persistence coverage for `sorted_heap_graph_registry` across pg_dump/restore
+- persistence coverage for the segmented/routed GraphRAG control plane across
+  pg_dump/restore:
+  - shared shard metadata
+  - range routing
+  - exact-key routing
+  - route policies
+  - route profiles
+  - route defaults
 - crash recovery coverage for registered GraphRAG alias schemas
 - concurrent DML / online compact / online merge coverage for registered
   GraphRAG alias schemas

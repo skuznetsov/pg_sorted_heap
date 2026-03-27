@@ -80,7 +80,16 @@
   - `0.12.0 -> 0.13.0` extension upgrade
   - alias-schema registration
   - registry persistence across dump/restore
+  - persistence of segmented/routed GraphRAG registries across dump/restore:
+    - shared shard metadata
+    - range routing
+    - exact-key routing
+    - route policies
+    - route profiles
+    - route defaults
   - post-restore GraphRAG query correctness on registered alias schemas
+  - post-restore GraphRAG query correctness on routed/default-backed segmented
+    GraphRAG queries
 - Added `scripts/test_graph_rag_crash_recovery.sh` and
   `make test-graphrag-crash` to verify crash recovery for:
   - committed registered GraphRAG tables

@@ -353,6 +353,7 @@ For `0.13` hardening, the fact-graph path now also has dedicated lifecycle
 coverage for:
 
 - upgrade + dump/restore
+- persistence of routed/segmented GraphRAG registries across dump/restore
 - crash recovery
 - concurrent DML during `sorted_heap_compact_online(...)`
 - concurrent DML during `sorted_heap_merge_online(...)`
