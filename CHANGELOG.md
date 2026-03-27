@@ -150,31 +150,20 @@
   - a chunked local scan-cache fix that replaces giant local `l0_neighbors`
     and `sq8_data` allocations with page-backed storage for build seeding and
     `shnsw_load_cache()`
-  - an AWS `10M x 64D` rerun on the same `4 vCPU / 8 GiB` host that now clears
-    `load_data` (`916.380 s`), `build_indexes` (`801.944 s`), and the first
-    real query-only pass; the remaining cheap-build frontier is deep-path
-    quality, not allocator failure
-  - a retained-temp query-budget sweep on that same AWS `10M x 64D`
-    cheap-build graph showing:
-    - `ann_k=512` already restores depth-4 `hit@k=100.0%` and depth-5
-      `hit@k=75.0%`
-    - `ann_k>=1024` restores depth-5 `hit@k=100.0%`
-    - `hit@1` still remains `0.0%`, so the remaining frontier is ranking
-      quality rather than recall or build reliability
-  - an exact synthetic-score diagnostic over all `2,000,000` person IDs for
-    the same `10M x 64D` benchmark queries showing that the expected target is
-    already not rank-1 at depths `4` and `5` under the generator/scorer
-    itself (exact ranks `6,6,3,6` at depth 4 and `7,2,2,14` at depth 5),
-    which means the observed `hit@1=0.0%` is not strong evidence of a
-    PostgreSQL ranking bug
-  - a follow-up exact synthetic-contract sweep showing that lowering
-    `hop_weight` from `0.15` to `0.05` changes the depth-5 exact ranks from
-    `7,2,2,14` to `1,1,1,4` on the same `10M x 64D` query sample
-  - a bounded PostgreSQL-backed confirmation on the local `1M x 64D`
-    cheap-build point where unified depth-5 GraphRAG improved from
-    `62.5% / 100.0%` to `87.5% / 100.0%` at essentially the same latency
-    (`109.850 ms` -> `109.630 ms`) when only `hop_weight` changed from
-    `0.15` to `0.05`
+  - a constrained-memory AWS `10M x 64D` monolithic rerun on the same
+    `4 vCPU / 8 GiB` host with `sorted_hnsw.build_sq8 = on` and
+    `hop_weight = 0.05` that now completes:
+    - `load_data`: `787.809 s`
+    - `build_indexes`: `846.795 s`
+  - the first retained query-only pass on that exact built graph showing that
+    the monolithic path is now viable but still not the final speed story:
+    - depth 1 unified GraphRAG: `840.607 ms`, `100.0% / 100.0%`
+    - depth 5 unified GraphRAG: `2084.155 ms`, `75.0% / 100.0%`
+    - depth-2+ quality stayed aligned with the SQL baseline, but latency
+      remained about `2x` slower than the SQL path baseline
+  - so the current `10M x 64D` frontier is no longer build survival or
+    quality drift; it is monolithic query cost, which pushes the next scale
+    branch toward segmentation + pruning
   - a loader fast path for `sorted_heap_only` multidepth runs that copies
     directly into `facts_sh` before `sorted_heap_compact(...)` instead of
     staging through `facts_heap`; bounded local checks held the same compacted

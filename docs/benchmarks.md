@@ -462,103 +462,54 @@ replace local `l0_neighbors + sq8_data` slabs with page-backed storage. Shared
 immutable scan caches remain contiguous; local build seeding and local
 `shnsw_load_cache()` no longer require a single giant L0 allocation.
 
-With that chunked local-cache fix, the same AWS `10M x 64D` point now clears
-build and query on the current host:
+With the chunked local-cache fix in place, the next retained branch was the
+constrained-memory rerun via:
 
-- `load_data`: `916.380 s`
-- `build_indexes`: `801.944 s`
-- `analyze`: `8.689 s`
+- `sorted_hnsw.build_sq8 = on`
+- lower-hop synthetic contract (`hop_weight = 0.05`)
 
-First real `10M x 64D` query-only pass (`query_count=4`, `runs=1`,
-`ann_k=256`, `top_k=32`, `ef_search=128`, `sorted_heap_only`):
+On the same AWS ARM64 host (`4 vCPU`, `8 GiB RAM`, `4 GiB swap`), the
+monolithic `10M x 64D` point then completed cleanly:
+
+- `load_data`: `787.809 s`
+- `build_indexes`: `846.795 s`
+- kept temp cluster: `/home/ubuntu/graphrag_tmp/graph_rag_y8cuntf9`
+
+That is a real constrained-memory result: the same host that previously hit
+early large-scale frontiers now built the full monolithic `sorted_hnsw` index
+on `10,000,000` rows without being OOM-killed.
+
+The first query-only reuse pass on that exact built graph (`query_count=4`,
+`runs=1`, `ann_k=256`, `top_k=32`, `ef_search=128`, `sorted_heap_only`) gave:
 
 - depth 1
-  - SQL path: `1067.860 ms`, `100.0% / 100.0%`
-  - unified GraphRAG path: `842.811 ms`, `100.0% / 100.0%`
+  - SQL path: `1072.525 ms`, `100.0% / 100.0%`
+  - unified GraphRAG path: `840.607 ms`, `100.0% / 100.0%`
 - depth 2
-  - SQL path: `1113.197 ms`, `25.0% / 100.0%`
-  - unified GraphRAG path: `2054.068 ms`, `25.0% / 100.0%`
+  - SQL path: `1070.437 ms`, `75.0% / 100.0%`
+  - unified GraphRAG path: `2055.479 ms`, `75.0% / 100.0%`
 - depth 3
-  - SQL path: `1060.660 ms`, `0.0% / 100.0%`
-  - unified GraphRAG path: `2062.050 ms`, `0.0% / 100.0%`
+  - SQL path: `1050.793 ms`, `50.0% / 100.0%`
+  - unified GraphRAG path: `2070.894 ms`, `50.0% / 100.0%`
 - depth 4
-  - SQL path: `1057.823 ms`, `0.0% / 0.0%`
-  - unified GraphRAG path: `2053.423 ms`, `0.0% / 0.0%`
+  - SQL path: `1080.123 ms`, `50.0% / 100.0%`
+  - unified GraphRAG path: `2066.717 ms`, `50.0% / 100.0%`
 - depth 5
-  - SQL path: `1072.383 ms`, `0.0% / 0.0%`
-  - unified GraphRAG path: `2053.305 ms`, `0.0% / 0.0%`
+  - SQL path: `1064.405 ms`, `75.0% / 100.0%`
+  - unified GraphRAG path: `2084.155 ms`, `75.0% / 100.0%`
 
-A retained-temp query-only probe on that same built graph then narrowed the
-remaining problem further by widening only the query budget for the unified
-path-aware GraphRAG call:
+So the `10M x 64D` monolithic branch is now narrowed sharply:
 
-- `ann_k=512`, `top_k=32`, `ef_search=128`
-  - depth 4: `2071.524 ms`, `32` rows, `0.0% / 100.0%`
-  - depth 5: `2063.825 ms`, `30` rows, `0.0% / 75.0%`
-- `ann_k=1024`, `top_k=32`, `ef_search=128`
-  - depth 4: `2087.284 ms`, `32` rows, `0.0% / 100.0%`
-  - depth 5: `2083.017 ms`, `32` rows, `0.0% / 100.0%`
-- `ann_k=2048`, `top_k=32`, `ef_search=128`
-  - depth 4: `2104.642 ms`, `32` rows, `0.0% / 100.0%`
-  - depth 5: `2107.789 ms`, `32` rows, `0.0% / 100.0%`
-- raising `ef_search` from `128` to `256` at `ann_k=2048` did not materially
-  change the result:
-  - depth 4: `2103.152 ms`, `32` rows, `0.0% / 100.0%`
-  - depth 5: `2106.849 ms`, `32` rows, `0.0% / 100.0%`
+- constrained-memory monolithic build is **viable**
+- quality stayed aligned between the SQL baseline and the unified GraphRAG path
+- the remaining issue is not build survival and not quality drift
+- the remaining issue is latency: at depth `2+`, the current generic unified
+  GraphRAG path is still about `2x` slower than the SQL path baseline on this
+  host and graph
 
-So the `10M x 64D` branch is no longer blocked by allocator failures, and the
-depth-4/5 cheap-build miss is no longer a pure "nothing works at scale"
-problem. On this built graph:
-
-- `ann_k=256` is too narrow for deep-path recall
-- `ann_k=512` materially recovers depth 4 and partially recovers depth 5
-- `ann_k>=1024` restores `hit@k = 100.0%` through depth 5
-- `hit@1` remains `0.0%`, so the remaining frontier is ranking quality, not
-  recall or build reliability
-
-A direct exact-score diagnostic on the same synthetic contract narrowed that
-further. Evaluating the path-aware synthetic score in Python over all
-`2,000,000` person IDs for the same four benchmark queries showed that the
-expected person is already **not rank-1** at depths `4` and `5` under the
-exact generator/scorer itself:
-
-- depth 4 exact ranks: `6, 6, 3, 6`
-- depth 5 exact ranks: `7, 2, 2, 14`
-- all four queries were still within exact top-32 at both depths
-
-So the current `hit@1 = 0.0%` at `10M x 64D` is not strong evidence of a
-PostgreSQL ranking defect. On this benchmark, the deeper-path top-1 loss is
-already present in the synthetic large-scale scoring contract itself. The real
-remaining frontier is therefore narrower:
-
-- for recall: seed breadth (`ann_k`) was the dominant knob
-- for ranking: either a stronger deep-path scorer, or a less ambiguous
-  large-scale synthetic generator/metric
-
-A bounded synthetic-contract sweep then showed that this large-scale ambiguity
-is materially affected by the generator's hop weight. On the same exact
-`10M x 64D` synthetic scorer over all `2,000,000` person IDs, depth-5 exact
-ranks for the four benchmark queries improved from:
-
-- `hop_weight=0.15`: `7, 2, 2, 14`
-
-to:
-
-- `hop_weight=0.05`: `1, 1, 1, 4`
-
-That signal survived a bounded PostgreSQL-backed rerun on the local
-`1M x 64D` cheap-build point (`ann_k=256`, `top_k=32`, `ef_search=128`,
-`m=16`, `ef_construction=64`, `query_count=8`):
-
-- unified depth-5 GraphRAG, `hop_weight=0.15`:
-  - `109.850 ms`, `62.5% / 100.0%`
-- unified depth-5 GraphRAG, `hop_weight=0.05`:
-  - `109.630 ms`, `87.5% / 100.0%`
-
-So there is now concrete evidence that a large part of the `10M x 64D`
-top-1 cliff comes from the synthetic contract itself, not from query latency
-or build instability. Lowering hop weight sharpens top-1 without changing the
-basic GraphRAG execution path.
+That is exactly why the next scale story should move toward segmentation +
+pruning rather than trying to turn one monolithic `10M` graph into the final
+operating model for small hosts.
 
 I then added an opt-in stage breakdown path to the multidepth harness via
 `--report-stage-stats`, using `sorted_heap_graph_rag_stats()` after each
