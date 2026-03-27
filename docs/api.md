@@ -731,7 +731,7 @@ Returns the stored `segment_groups text[]` for one named policy.
 Deletes one named policy, or all policies under that route group when
 `policy_name` is `NULL`.
 
-### `sorted_heap_graph_route_profile_register(route_name, profile_name, policy_name, relation_family, fanout_limit)`
+### `sorted_heap_graph_route_profile_register(route_name, profile_name, policy_name, segment_groups, relation_family, fanout_limit)`
 
 Registers a named routed profile that bundles the current beta routing knobs.
 
@@ -739,6 +739,9 @@ Registers a named routed profile that bundles the current beta routing knobs.
 - `profile_name` is an application-facing name such as `sealed_claims`
 - `policy_name` may be `NULL`; when non-`NULL` it must name a policy already
   registered under the same route
+- `segment_groups` may be `NULL`; when non-`NULL` it must be a non-empty
+  one-dimensional `text[]`
+- `policy_name` and `segment_groups` cannot both be non-`NULL`
 - `relation_family` may be `NULL`
 - `fanout_limit` must be `>= 0`
 
@@ -751,6 +754,7 @@ Lists registered routed profiles for one route group.
 Resolves one routed profile into:
 
 - `policy_name`
+- `segment_groups`
 - `relation_family`
 - `fanout_limit`
 
@@ -859,8 +863,10 @@ Beta routed GraphRAG wrapper with registry-backed profile lookup.
 
 - resolves `policy_name`, `relation_family`, and `fanout_limit` from
   `sorted_heap_graph_route_profile_registry`
-- delegates to `sorted_heap_graph_rag_routed_policy(...)` when the profile
-  names a policy
+- delegates to `sorted_heap_graph_rag_routed(...)` with inline
+  `segment_groups` when the profile stores them directly
+- otherwise delegates to `sorted_heap_graph_rag_routed_policy(...)` when the
+  profile names a policy
 - otherwise delegates to `sorted_heap_graph_rag_routed(...)`
 - keeps the same routing and GraphRAG scoring semantics
 
@@ -868,7 +874,8 @@ Beta routed GraphRAG wrapper with registry-backed profile lookup.
 SELECT sorted_heap_graph_route_profile_register(
     'tenant_facts',
     'sealed_claims',
-    'prefer_sealed',
+    NULL,
+    ARRAY['sealed', 'hot'],
     'claims',
     1
 );
@@ -1025,8 +1032,10 @@ Beta exact-key routed GraphRAG wrapper with registry-backed profile lookup.
 
 - resolves `policy_name`, `relation_family`, and `fanout_limit` from
   `sorted_heap_graph_route_profile_registry`
-- delegates to `sorted_heap_graph_rag_routed_exact_policy(...)` when the
-  profile names a policy
+- delegates to `sorted_heap_graph_rag_routed_exact(...)` with inline
+  `segment_groups` when the profile stores them directly
+- otherwise delegates to `sorted_heap_graph_rag_routed_exact_policy(...)`
+  when the profile names a policy
 - otherwise delegates to `sorted_heap_graph_rag_routed_exact(...)`
 - keeps the same routing and GraphRAG scoring semantics
 
@@ -1034,7 +1043,8 @@ Beta exact-key routed GraphRAG wrapper with registry-backed profile lookup.
 SELECT sorted_heap_graph_route_profile_register(
     'tenant_facts',
     'sealed_claims',
-    'prefer_sealed',
+    NULL,
+    ARRAY['sealed', 'hot'],
     'claims',
     1
 );

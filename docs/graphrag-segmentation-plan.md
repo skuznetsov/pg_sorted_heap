@@ -163,8 +163,11 @@ Reference design:
   - `sorted_heap_graph_route_profile_resolve(...)`
   - `sorted_heap_graph_rag_routed_profile(...)`
   - `sorted_heap_graph_rag_routed_exact_profile(...)`
-  - this bundles `policy_name + relation_family + fanout_limit` once instead
-    of repeating that combination in every query
+  - this now bundles either:
+    - `policy_name + relation_family + fanout_limit`, or
+    - inline `segment_groups + relation_family + fanout_limit`
+  - so the operator no longer needs a separate policy row just to save one
+    shard-group ordering
 - and the next operator shortcut now exists on top of profiles:
   - `sorted_heap_graph_route_default_register(...)`
   - `sorted_heap_graph_route_default_resolve(...)`
@@ -241,7 +244,8 @@ exact-key routed GraphRAG can now combine:
 
 And the newest ergonomic layer removes one more repeated query burden:
 
-- a named route profile can now store that policy/family/fanout combination
+- a named route profile can now store either a policy-backed or inline-group
+  family/fanout combination
 - profile-backed wrappers reuse the existing routed paths instead of adding a
   new scoring contract
 

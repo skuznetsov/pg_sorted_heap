@@ -855,24 +855,36 @@ COPY (
 COPY (
   SELECT 'ok'
   FROM (
-    SELECT sorted_heap_graph_route_profile_register('chain_grouped', 'sealed_right', 'prefer_sealed', 'right', 1)
+    SELECT sorted_heap_graph_route_profile_register('chain_grouped', 'sealed_right', 'prefer_sealed', NULL, 'right', 1)
   ) s
-) TO STDOUT;
-
-COPY (
-  SELECT route_name, profile_name, coalesce(policy_name, ''), coalesce(relation_family, ''), fanout_limit
-  FROM sorted_heap_graph_route_profile_config('chain_grouped')
-) TO STDOUT;
-
-COPY (
-  SELECT coalesce(policy_name, ''), coalesce(relation_family, ''), fanout_limit
-  FROM sorted_heap_graph_route_profile_resolve('chain_grouped', 'sealed_right')
 ) TO STDOUT;
 
 COPY (
   SELECT 'ok'
   FROM (
-    SELECT sorted_heap_graph_route_default_register('chain_grouped', 'sealed_right')
+    SELECT sorted_heap_graph_route_profile_register('chain_grouped', 'inline_sealed_right', NULL, ARRAY['sealed','hot'], 'right', 1)
+  ) s
+) TO STDOUT;
+
+COPY (
+  SELECT route_name, profile_name, coalesce(policy_name, ''), coalesce(array_to_string(segment_groups, ','), ''), coalesce(relation_family, ''), fanout_limit
+  FROM sorted_heap_graph_route_profile_config('chain_grouped')
+) TO STDOUT;
+
+COPY (
+  SELECT coalesce(policy_name, ''), coalesce(array_to_string(segment_groups, ','), ''), coalesce(relation_family, ''), fanout_limit
+  FROM sorted_heap_graph_route_profile_resolve('chain_grouped', 'sealed_right')
+) TO STDOUT;
+
+COPY (
+  SELECT coalesce(policy_name, ''), coalesce(array_to_string(segment_groups, ','), ''), coalesce(relation_family, ''), fanout_limit
+  FROM sorted_heap_graph_route_profile_resolve('chain_grouped', 'inline_sealed_right')
+) TO STDOUT;
+
+COPY (
+  SELECT 'ok'
+  FROM (
+    SELECT sorted_heap_graph_route_default_register('chain_grouped', 'inline_sealed_right')
   ) s
 ) TO STDOUT;
 
@@ -942,6 +954,41 @@ COPY (
     LIMIT 2
   )
   SELECT count(*) AS segmented_multihop_diff_rows
+  FROM (
+    (SELECT * FROM helper EXCEPT ALL SELECT * FROM baseline)
+    UNION ALL
+    (SELECT * FROM baseline EXCEPT ALL SELECT * FROM helper)
+  ) diff
+) TO STDOUT;
+
+COPY (
+  WITH helper AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_graph_rag_routed_profile(
+      'chain_grouped',
+      8,
+      'inline_sealed_right',
+      '[-1,0,0,0]'::svec,
+      relation_path := ARRAY[1,2,3],
+      ann_k := 1,
+      top_k := 2,
+      score_mode := 'path',
+      limit_rows := 0
+    )
+  ),
+  baseline AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_graph_rag(
+      'facts_chain_seg_b'::regclass,
+      '[-1,0,0,0]'::svec,
+      relation_path := ARRAY[1,2,3],
+      ann_k := 1,
+      top_k := 2,
+      score_mode := 'path',
+      limit_rows := 0
+    )
+  )
+  SELECT count(*) AS routed_inline_profile_multihop_path_diff_rows
   FROM (
     (SELECT * FROM helper EXCEPT ALL SELECT * FROM baseline)
     UNION ALL
@@ -1410,24 +1457,36 @@ COPY (
 COPY (
   SELECT 'ok'
   FROM (
-    SELECT sorted_heap_graph_route_profile_register('chain_exact', 'sealed_right', 'prefer_sealed', 'right', 1)
+    SELECT sorted_heap_graph_route_profile_register('chain_exact', 'sealed_right', 'prefer_sealed', NULL, 'right', 1)
   ) s
-) TO STDOUT;
-
-COPY (
-  SELECT route_name, profile_name, coalesce(policy_name, ''), coalesce(relation_family, ''), fanout_limit
-  FROM sorted_heap_graph_route_profile_config('chain_exact')
-) TO STDOUT;
-
-COPY (
-  SELECT coalesce(policy_name, ''), coalesce(relation_family, ''), fanout_limit
-  FROM sorted_heap_graph_route_profile_resolve('chain_exact', 'sealed_right')
 ) TO STDOUT;
 
 COPY (
   SELECT 'ok'
   FROM (
-    SELECT sorted_heap_graph_route_default_register('chain_exact', 'sealed_right')
+    SELECT sorted_heap_graph_route_profile_register('chain_exact', 'inline_sealed_right', NULL, ARRAY['sealed','hot'], 'right', 1)
+  ) s
+) TO STDOUT;
+
+COPY (
+  SELECT route_name, profile_name, coalesce(policy_name, ''), coalesce(array_to_string(segment_groups, ','), ''), coalesce(relation_family, ''), fanout_limit
+  FROM sorted_heap_graph_route_profile_config('chain_exact')
+) TO STDOUT;
+
+COPY (
+  SELECT coalesce(policy_name, ''), coalesce(array_to_string(segment_groups, ','), ''), coalesce(relation_family, ''), fanout_limit
+  FROM sorted_heap_graph_route_profile_resolve('chain_exact', 'sealed_right')
+) TO STDOUT;
+
+COPY (
+  SELECT coalesce(policy_name, ''), coalesce(array_to_string(segment_groups, ','), ''), coalesce(relation_family, ''), fanout_limit
+  FROM sorted_heap_graph_route_profile_resolve('chain_exact', 'inline_sealed_right')
+) TO STDOUT;
+
+COPY (
+  SELECT 'ok'
+  FROM (
+    SELECT sorted_heap_graph_route_default_register('chain_exact', 'inline_sealed_right')
   ) s
 ) TO STDOUT;
 
@@ -1483,6 +1542,41 @@ COPY (
     )
   )
   SELECT count(*) AS routed_exact_multihop_path_diff_rows
+  FROM (
+    (SELECT * FROM helper EXCEPT ALL SELECT * FROM baseline)
+    UNION ALL
+    (SELECT * FROM baseline EXCEPT ALL SELECT * FROM helper)
+  ) diff
+) TO STDOUT;
+
+COPY (
+  WITH helper AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_graph_rag_routed_exact_profile(
+      'chain_exact',
+      'both',
+      'inline_sealed_right',
+      '[-1,0,0,0]'::svec,
+      relation_path := ARRAY[1,2,3],
+      ann_k := 1,
+      top_k := 2,
+      score_mode := 'path',
+      limit_rows := 0
+    )
+  ),
+  baseline AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_graph_rag(
+      'facts_chain_seg_b'::regclass,
+      '[-1,0,0,0]'::svec,
+      relation_path := ARRAY[1,2,3],
+      ann_k := 1,
+      top_k := 2,
+      score_mode := 'path',
+      limit_rows := 0
+    )
+  )
+  SELECT count(*) AS routed_exact_inline_profile_multihop_path_diff_rows
   FROM (
     (SELECT * FROM helper EXCEPT ALL SELECT * FROM baseline)
     UNION ALL

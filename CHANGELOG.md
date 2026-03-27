@@ -268,9 +268,11 @@
       `sorted_heap_graph_route_profile_unregister(...)`
     - added `sorted_heap_graph_rag_routed_profile(...)` and
       `sorted_heap_graph_rag_routed_exact_profile(...)`
-    - this stores `policy_name + relation_family + fanout_limit` once and
-      reuses the existing routed wrappers instead of repeating that trio in
-      every query
+    - this now stores either:
+      - `policy_name + relation_family + fanout_limit`, or
+      - inline `segment_groups + relation_family + fanout_limit`
+    - so one route profile can be self-contained without a separate
+      `sorted_heap_graph_route_policy_registry` row
     - regression coverage now proves both profile-backed wrappers match the
       existing sealed/right routed baselines
   - the first default-profile operator layer on top of routed profiles:

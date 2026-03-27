@@ -813,6 +813,7 @@ CREATE TABLE @extschema@.sorted_heap_graph_route_profile_registry (
   route_name text NOT NULL,
   profile_name text NOT NULL,
   policy_name text,
+  segment_groups text[],
   relation_family text,
   fanout_limit int4 NOT NULL DEFAULT 0,
   PRIMARY KEY (route_name, profile_name)
@@ -824,6 +825,7 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_route_profile_register(
   route_name text,
   profile_name text,
   policy_name text DEFAULT NULL,
+  segment_groups text[] DEFAULT NULL,
   relation_family text DEFAULT NULL,
   fanout_limit int4 DEFAULT 0
 ) RETURNS void
@@ -833,12 +835,24 @@ BEGIN
     RAISE EXCEPTION 'sorted_heap_graph_route_profile_register: fanout_limit must be >= 0';
   END IF;
 
+  IF policy_name IS NOT NULL AND segment_groups IS NOT NULL THEN
+    RAISE EXCEPTION 'sorted_heap_graph_route_profile_register: policy_name and segment_groups cannot both be non-NULL';
+  END IF;
+
+  IF segment_groups IS NOT NULL
+     AND (array_ndims(segment_groups) <> 1
+          OR array_length(segment_groups, 1) IS NULL
+          OR array_length(segment_groups, 1) < 1) THEN
+    RAISE EXCEPTION 'sorted_heap_graph_route_profile_register: segment_groups must be a non-empty one-dimensional text[]';
+  END IF;
+
   INSERT INTO @extschema@.sorted_heap_graph_route_profile_registry (
-    route_name, profile_name, policy_name, relation_family, fanout_limit
+    route_name, profile_name, policy_name, segment_groups, relation_family, fanout_limit
   )
-  VALUES ($1, $2, $3, $4, $5)
+  VALUES ($1, $2, $3, $4, $5, $6)
   ON CONFLICT ON CONSTRAINT sorted_heap_graph_route_profile_registry_pkey DO UPDATE SET
     policy_name = EXCLUDED.policy_name,
+    segment_groups = EXCLUDED.segment_groups,
     relation_family = EXCLUDED.relation_family,
     fanout_limit = EXCLUDED.fanout_limit;
 END;
@@ -868,11 +882,12 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_route_profile_config(
   route_name text,
   profile_name text,
   policy_name text,
+  segment_groups text[],
   relation_family text,
   fanout_limit int4
 )
 AS $$
-  SELECT p.route_name, p.profile_name, p.policy_name, p.relation_family, p.fanout_limit
+  SELECT p.route_name, p.profile_name, p.policy_name, p.segment_groups, p.relation_family, p.fanout_limit
   FROM @extschema@.sorted_heap_graph_route_profile_registry p
   WHERE ($1 IS NULL OR p.route_name = $1)
     AND ($2 IS NULL OR p.profile_name = $2)
@@ -884,17 +899,19 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_route_profile_resolve(
   profile_name text
 ) RETURNS TABLE (
   policy_name text,
+  segment_groups text[],
   relation_family text,
   fanout_limit int4
 )
 AS $$
 DECLARE
   resolved_policy_name text;
+  resolved_segment_groups text[];
   resolved_relation_family text;
   resolved_fanout_limit int4;
 BEGIN
-  SELECT p.policy_name, p.relation_family, p.fanout_limit
-  INTO resolved_policy_name, resolved_relation_family, resolved_fanout_limit
+  SELECT p.policy_name, p.segment_groups, p.relation_family, p.fanout_limit
+  INTO resolved_policy_name, resolved_segment_groups, resolved_relation_family, resolved_fanout_limit
   FROM @extschema@.sorted_heap_graph_route_profile_registry p
   WHERE p.route_name = sorted_heap_graph_route_profile_resolve.route_name
     AND p.profile_name = sorted_heap_graph_route_profile_resolve.profile_name;
@@ -905,7 +922,7 @@ BEGIN
   END IF;
 
   RETURN QUERY
-  SELECT resolved_policy_name, resolved_relation_family, resolved_fanout_limit;
+  SELECT resolved_policy_name, resolved_segment_groups, resolved_relation_family, resolved_fanout_limit;
 END;
 $$ LANGUAGE plpgsql STABLE;
 
@@ -1659,14 +1676,31 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_profile(
 AS $$
 DECLARE
   resolved_policy_name text;
+  resolved_segment_groups text[];
   resolved_relation_family text;
   resolved_fanout_limit int4;
 BEGIN
-  SELECT p.policy_name, p.relation_family, p.fanout_limit
-  INTO resolved_policy_name, resolved_relation_family, resolved_fanout_limit
+  SELECT p.policy_name, p.segment_groups, p.relation_family, p.fanout_limit
+  INTO resolved_policy_name, resolved_segment_groups, resolved_relation_family, resolved_fanout_limit
   FROM @extschema@.sorted_heap_graph_route_profile_resolve(route_name, profile_name) AS p;
 
-  IF resolved_policy_name IS NULL THEN
+  IF resolved_segment_groups IS NOT NULL THEN
+    RETURN QUERY
+    SELECT g.source_rel, g.entity_id, g.relation_id, g.target_id, g.payload, g.distance
+    FROM @extschema@.sorted_heap_graph_rag_routed(
+      route_name,
+      route_value,
+      query,
+      relation_path,
+      ann_k,
+      top_k,
+      score_mode,
+      limit_rows,
+      resolved_fanout_limit,
+      resolved_segment_groups,
+      resolved_relation_family
+    ) AS g;
+  ELSIF resolved_policy_name IS NULL THEN
     RETURN QUERY
     SELECT g.source_rel, g.entity_id, g.relation_id, g.target_id, g.payload, g.distance
     FROM @extschema@.sorted_heap_graph_rag_routed(
@@ -1726,14 +1760,31 @@ CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact_profile(
 AS $$
 DECLARE
   resolved_policy_name text;
+  resolved_segment_groups text[];
   resolved_relation_family text;
   resolved_fanout_limit int4;
 BEGIN
-  SELECT p.policy_name, p.relation_family, p.fanout_limit
-  INTO resolved_policy_name, resolved_relation_family, resolved_fanout_limit
+  SELECT p.policy_name, p.segment_groups, p.relation_family, p.fanout_limit
+  INTO resolved_policy_name, resolved_segment_groups, resolved_relation_family, resolved_fanout_limit
   FROM @extschema@.sorted_heap_graph_route_profile_resolve(route_name, profile_name) AS p;
 
-  IF resolved_policy_name IS NULL THEN
+  IF resolved_segment_groups IS NOT NULL THEN
+    RETURN QUERY
+    SELECT g.source_rel, g.entity_id, g.relation_id, g.target_id, g.payload, g.distance
+    FROM @extschema@.sorted_heap_graph_rag_routed_exact(
+      route_name,
+      route_key,
+      query,
+      relation_path,
+      ann_k,
+      top_k,
+      score_mode,
+      limit_rows,
+      resolved_fanout_limit,
+      resolved_segment_groups,
+      resolved_relation_family
+    ) AS g;
+  ELSIF resolved_policy_name IS NULL THEN
     RETURN QUERY
     SELECT g.source_rel, g.entity_id, g.relation_id, g.target_id, g.payload, g.distance
     FROM @extschema@.sorted_heap_graph_rag_routed_exact(

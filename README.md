@@ -296,7 +296,7 @@ range registry, exact-key registry, and both policy-backed wrappers, so beta
 segmented GraphRAG can now combine route key/range + shard-group policy + one
 extra family dimension without changing the scoring contract. The next
 ergonomic layer now exists too: named route profiles can bundle
-`policy_name + relation_family + fanout_limit` once and feed
+`policy_name or segment_groups + relation_family + fanout_limit` once and feed
 `sorted_heap_graph_rag_routed_profile(...)` or
 `sorted_heap_graph_rag_routed_exact_profile(...)` directly. And the newest
 operator-facing shortcut removes one more repeated query argument: a route can
