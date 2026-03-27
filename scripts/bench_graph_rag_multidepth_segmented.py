@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import shlex
 import statistics
@@ -56,6 +57,12 @@ def shard_index_name(shard_id: int) -> str:
 
 def shard_for_person(person_id: int, num_pairs: int, shards: int) -> int:
     return min(shards - 1, ((person_id - 1) * shards) // num_pairs)
+
+
+def shard_person_bounds(shard_id: int, num_pairs: int, shards: int) -> tuple[int, int]:
+    start = (shard_id * num_pairs) // shards + 1
+    end = ((shard_id + 1) * num_pairs) // shards
+    return start, end
 
 
 def generate_sharded_csvs(
@@ -101,6 +108,75 @@ def generate_sharded_csvs(
     return shard_paths, shard_counts
 
 
+class ShardedFactCsvStream(io.TextIOBase):
+    def __init__(
+        self,
+        shard_id: int,
+        num_pairs: int,
+        max_depth: int,
+        dim: int,
+        hop_weight: float,
+        shards: int,
+    ) -> None:
+        self.shard_id = shard_id
+        self.num_pairs = num_pairs
+        self.max_depth = max_depth
+        self.dim = dim
+        self.hop_weight = hop_weight
+        self.shards = shards
+        self.hop_cache = {h: md.hop_base(h, dim) for h in range(1, max_depth + 1)}
+        self.person_start, self.person_end = shard_person_bounds(shard_id, num_pairs, shards)
+        self.person_id = self.person_start
+        self.hop = 1
+        self.person_vals: list[float] | None = None
+        self.buf = ""
+        self.done = False
+
+    def readable(self) -> bool:
+        return True
+
+    def _next_line(self) -> str | None:
+        if self.person_id > self.person_end:
+            return None
+
+        if self.person_vals is None:
+            self.person_vals = md.person_base(self.person_id, self.dim)
+
+        hop = self.hop
+        prev = self.person_id if hop == 1 else (hop - 1) * self.num_pairs + self.person_id
+        target_id = hop * self.num_pairs + self.person_id
+        vals = [
+            self.person_vals[idx] + self.hop_weight * self.hop_cache[hop][idx]
+            for idx in range(self.dim)
+        ]
+        payload = f"Person_{self.person_id} rel_{hop} node_{hop}_{self.person_id}."
+        line = f'{prev},{hop},{target_id},"{md.vec_to_svec(vals)}",{payload}\n'
+
+        if self.hop == self.max_depth:
+            self.person_id += 1
+            self.hop = 1
+            self.person_vals = None
+        else:
+            self.hop += 1
+
+        return line
+
+    def read(self, size: int = -1) -> str:
+        if self.done and not self.buf:
+            return ""
+        if size is None or size < 0:
+            size = 1 << 20
+        while len(self.buf) < size and not self.done:
+            line = self._next_line()
+            if line is None:
+                self.done = True
+                break
+            self.buf += line
+        out = self.buf[:size]
+        self.buf = self.buf[size:]
+        return out
+
+
 def bootstrap_sharded_schema(cur, dim: int, shards: int) -> None:
     cur.execute("CREATE EXTENSION pg_sorted_heap")
     for shard_id in range(shards):
@@ -141,6 +217,43 @@ def load_sharded_data(cur, shard_paths: list[Path], post_load_op: str) -> None:
 
         cur.execute(f"ANALYZE {shard_table_name(shard_id)}")
         path.unlink()
+
+
+def load_sharded_data_stream(
+    cur,
+    num_pairs: int,
+    max_depth: int,
+    dim: int,
+    hop_weight: float,
+    shards: int,
+    post_load_op: str,
+) -> list[int]:
+    if post_load_op not in ("compact", "merge", "none"):
+        raise ValueError(f"unsupported post_load_op: {post_load_op}")
+
+    shard_counts: list[int] = []
+    for shard_id in range(shards):
+        start, end = shard_person_bounds(shard_id, num_pairs, shards)
+        person_count = max(0, end - start + 1)
+        shard_counts.append(person_count * max_depth)
+        cur.copy_expert(
+            f"""
+            COPY {shard_table_name(shard_id)} (
+                entity_id, relation_id, target_id, embedding, payload
+            )
+            FROM STDIN WITH (FORMAT csv)
+            """,
+            ShardedFactCsvStream(shard_id, num_pairs, max_depth, dim, hop_weight, shards),
+        )
+
+        if post_load_op == "compact":
+            cur.execute(f"SELECT sorted_heap_compact('{shard_table_name(shard_id)}'::regclass)")
+        elif post_load_op == "merge":
+            cur.execute(f"SELECT sorted_heap_merge('{shard_table_name(shard_id)}'::regclass)")
+
+        cur.execute(f"ANALYZE {shard_table_name(shard_id)}")
+
+    return shard_counts
 
 
 def build_sharded_indexes(
@@ -308,6 +421,7 @@ def main() -> None:
     ap.add_argument("--install-cmd", default="")
     ap.add_argument("--reuse-temp", default="")
     ap.add_argument("--keep-temp", action="store_true")
+    ap.add_argument("--stream-copy", action="store_true")
     args = ap.parse_args()
 
     if args.shards < 1:
@@ -333,6 +447,7 @@ def main() -> None:
         max_wal_size_gb = int(meta["max_wal_size_gb"])
         maintenance_work_mem_mb = int(meta["maintenance_work_mem_mb"])
         post_load_op = str(meta["post_load_op"])
+        stream_copy = bool(meta.get("stream_copy", False))
         shards = int(meta["shards"])
         shard_counts = [int(v) for v in meta["shard_counts"]]
     else:
@@ -357,6 +472,7 @@ def main() -> None:
         max_wal_size_gb = args.max_wal_size_gb
         maintenance_work_mem_mb = args.maintenance_work_mem_mb
         post_load_op = args.post_load_op
+        stream_copy = args.stream_copy
         shards = args.shards
         shard_counts: list[int] = []
         write_meta(
@@ -374,6 +490,7 @@ def main() -> None:
                 "max_wal_size_gb": max_wal_size_gb,
                 "maintenance_work_mem_mb": maintenance_work_mem_mb,
                 "post_load_op": post_load_op,
+                "stream_copy": stream_copy,
                 "shards": shards,
                 "shard_counts": shard_counts,
                 "stage_reached": "init",
@@ -383,17 +500,21 @@ def main() -> None:
     try:
         shard_paths: list[Path] = []
         if not reusing:
-            t_gen_start = time.perf_counter()
-            shard_paths, shard_counts = generate_sharded_csvs(
-                tmp, num_pairs, max_depth, dim, hop_weight, shards
-            )
-            t_gen_end = time.perf_counter()
-            csv_bytes = sum(path.stat().st_size for path in shard_paths)
-            print_stage(
-                "generate_csv",
-                t_gen_end - t_gen_start,
-                f"csv_bytes={csv_bytes}|shards={shards}",
-            )
+            if stream_copy:
+                csv_bytes = 0
+                print_stage("generate_csv", 0.0, f"csv_bytes=0|shards={shards}|streamed=true")
+            else:
+                t_gen_start = time.perf_counter()
+                shard_paths, shard_counts = generate_sharded_csvs(
+                    tmp, num_pairs, max_depth, dim, hop_weight, shards
+                )
+                t_gen_end = time.perf_counter()
+                csv_bytes = sum(path.stat().st_size for path in shard_paths)
+                print_stage(
+                    "generate_csv",
+                    t_gen_end - t_gen_start,
+                    f"csv_bytes={csv_bytes}|shards={shards}",
+                )
             write_meta(
                 tmp,
                 {
@@ -431,14 +552,25 @@ def main() -> None:
                 bootstrap_sharded_schema(cur, dim, shards)
 
                 t_load_start = time.perf_counter()
-                load_sharded_data(cur, shard_paths, post_load_op)
+                if stream_copy:
+                    shard_counts = load_sharded_data_stream(
+                        cur,
+                        num_pairs,
+                        max_depth,
+                        dim,
+                        hop_weight,
+                        shards,
+                        post_load_op,
+                    )
+                else:
+                    load_sharded_data(cur, shard_paths, post_load_op)
                 t_load_end = time.perf_counter()
                 print_stage(
                     "load_data",
                     t_load_end - t_load_start,
-                    "csv_removed=true",
+                    f"csv_removed={'false' if stream_copy else 'true'}|streamed={'true' if stream_copy else 'false'}",
                 )
-                write_meta(tmp, {**read_meta(tmp), "stage_reached": "load_data"})
+                write_meta(tmp, {**read_meta(tmp), "stage_reached": "load_data", "shard_counts": shard_counts})
                 if args.stop_after == "load_data":
                     return
 
@@ -494,6 +626,7 @@ def main() -> None:
             print(f"shards:           {shards}")
             print(f"route:            {args.route}")
             print(f"post_load_op:     {post_load_op}")
+            print(f"stream_copy:      {'yes' if stream_copy else 'no'}")
             print(f"reuse_temp:       {str(tmp) if reusing else 'no'}")
             print(f"shard_rows:       {','.join(str(count) for count in shard_counts)}")
             print("")
