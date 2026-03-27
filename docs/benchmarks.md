@@ -252,6 +252,55 @@ show a latency cliff through depth `5`; it stays in the same `~0.63-0.67 ms`
 band while preserving `100.0% / 100.0%` quality. This is a controlled scaling
 signal, not a claim about arbitrary deep graph workloads.
 
+### Larger synthetic GraphRAG scale envelope (`1M` and `10M`)
+
+Repo-owned harnesses:
+
+- local:
+  `python3 scripts/bench_graph_rag_multidepth.py --num-pairs 200000 --max-depth 5 --query-count 8 --runs 1 --dim 384 --ann-k 64 --top-k 10 --ef-search 128 --ef-construction 64 --m 24 --shared-buffers-mb 64 --max-wal-size-gb 32 --maintenance-work-mem-mb 4096 --table-scope sorted_heap_only`
+- AWS:
+  `NUM_PAIRS=2000000 MAX_DEPTH=5 QUERY_COUNT=1 RUNS=1 DIM=32 ANN_K=16 TOP_K=10 EF_SEARCH=32 EF_CONSTRUCTION=8 M=8 SHARED_BUFFERS_MB=64 MAX_WAL_SIZE_GB=16 MAINTENANCE_WORK_MEM_MB=2048 TABLE_SCOPE=sorted_heap_only ./scripts/bench_graph_rag_multidepth_aws.sh <aws-host> /path/to/repo 65494`
+
+Current verified scale picture:
+
+- local `1M` rows (`200K` pairs x `5` hops, `384D`, cheap-build point):
+  - `generate_csv`: `162.667 s`
+  - `load_data`: `45.694 s`
+  - `build_indexes`: `377.968 s`
+  - unified path-aware `sorted_heap_graph_rag(...)` p50:
+    - depth `1`: `1.250 ms`
+    - depth `2`: `1.429 ms`
+    - depth `3`: `1.777 ms`
+    - depth `4`: `2.181 ms`
+    - depth `5`: `2.604 ms`
+  - quality stayed `100.0% / 100.0%` at every depth
+- local `10M x 384D` no longer dies in Python generation after the streaming
+  CSV change; the process stayed near `31 MiB RSS` on the early run where the
+  old generator previously blew up.
+- local `10M x 64D` and AWS `10M x 32D` both survive generation and load, but
+  the first practical frontier is still the single `sorted_hnsw CREATE INDEX`
+  build, not query execution.
+
+The strongest bounded AWS signal so far is:
+
+- `10M x 32D` (`2M` pairs x `5` hops, ultralight build point)
+  - `generate_csv`: `223.114 s`
+  - CSV size: `3.63 GiB`
+  - `load_data`: `485.177 s`
+  - then entered a long `CREATE INDEX` that was still active after `~11-12`
+    minutes in the index build phase
+  - temp-cluster footprint reached about `17-18 GiB` with `11-13 GiB` disk
+    still free on the AWS host
+
+So the narrow conclusion is:
+
+- the multi-hop GraphRAG path itself survives to at least `1M` rows and gives
+  measured query latencies there
+- the current `10M` frontier is **build-bound**, not Python-memory-bound,
+  not CSV-generation-bound, and not an early PostgreSQL failure
+- first real `10M` query numbers still require either a longer-lived build or a
+  larger benchmark box
+
 ### Current AWS GraphRAG benchmark (`person -> parent -> city`, stable fact contract)
 
 Repo-owned harness:

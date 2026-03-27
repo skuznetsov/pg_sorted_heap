@@ -105,6 +105,16 @@
   path, so unified wrapper calls report the underlying C path they dispatched
   to.
 
+### GraphRAG scale harnesses
+
+- Added `scripts/bench_graph_rag_multidepth_aws.sh` to run the synthetic
+  multi-hop depth benchmark on a remote AWS host using the same sync/install
+  pattern as the existing multihop AWS runners.
+- Added larger-scale benchmark notes for:
+  - local `1M`-row measured query latency on the synthetic multidepth graph
+  - local and AWS `10M`-row build-bound envelopes, where generation/load now
+    survive but the first practical frontier remains `sorted_hnsw` build time
+
 ### GraphRAG concurrent online-operation hardening
 
 - Added `scripts/test_graph_rag_concurrent.sh` and
