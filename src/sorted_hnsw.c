@@ -2956,7 +2956,12 @@ shnsw_get_scan_cache(Relation index)
 											 ALLOCSET_DEFAULT_SIZES);
 	old_ctx = MemoryContextSwitchTo(entry->cache_ctx);
 	entry->cache = shnsw_shared_scan_cache_attach(index, cache_gen);
-	if (entry->cache == NULL)
+	if (entry->cache != NULL)
+	{
+		elog(DEBUG1, "sorted_hnsw: attached to shared scan cache (%d nodes)",
+			 entry->cache->n_nodes);
+	}
+	else
 	{
 		entry->cache = shnsw_load_cache(index);
 		(void) shnsw_shared_scan_cache_publish(index, entry->cache, cache_gen);

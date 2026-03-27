@@ -54,6 +54,7 @@ TEST_DUMP_PORT ?= 65495
 TEST_GRAPHRAG_CRASH_PORT ?= 65498
 TEST_GRAPHRAG_CONCURRENT_PORT ?= 65499
 TEST_GRAPHRAG_RELEASE_TMP ?= $(TMP_SELFTEST_ROOT)/pg_regress.codex.graphrag_release
+TEST_HNSW_CACHE_PORT ?= 65488
 TEST_GRAPH_PORT ?= 65489
 BENCH_PORT ?= 65494
 BENCH_SCALES ?= 1000000,10000000
@@ -471,6 +472,9 @@ test-graphrag-crash:
 test-graphrag-concurrent:
 	./scripts/test_graph_rag_concurrent.sh $(TMP_SELFTEST_ROOT) $(TEST_GRAPHRAG_CONCURRENT_PORT)
 
+test-hnsw-chunked-cache:
+	./scripts/test_hnsw_chunked_cache.sh $(TMP_SELFTEST_ROOT) $(TEST_HNSW_CACHE_PORT)
+
 test-toast:
 	./scripts/test_toast_and_concurrent_compact.sh $(TMP_SELFTEST_ROOT) $(TEST_TOAST_PORT)
 
@@ -497,6 +501,7 @@ test-release:
 	$(MAKE) test-alter-table
 	$(MAKE) test-crash-recovery
 	$(MAKE) test-concurrent
+	$(MAKE) test-hnsw-chunked-cache
 	$(MAKE) test-pg-upgrade
 	$(MAKE) test-graphrag-release
 
