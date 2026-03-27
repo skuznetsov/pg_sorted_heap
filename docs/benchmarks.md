@@ -824,6 +824,66 @@ owns the query entity, which maps to tenant-id / knowledge-base-id style
 workloads. Queries that cannot be pruned to a single shard will see
 all-shard-fanout latency (~1x monolithic).
 
+### Bounded fanout: routing robustness on `1M x 64D`
+
+This measures how the segmented win degrades when routing is imperfect.
+Instead of routing to exactly one shard (exact) or all shards (all),
+bounded fanout routes to K adjacent shards (always including the correct
+one). This simulates imperfect routing where the router knows roughly
+which shard, but hedges by including neighbors.
+
+Local, `200K` pairs x `5` hops, `64D`, `8` shards, `32` queries, `3` runs,
+`ann_k=256`, `top_k=32`, `ef_search=128`, `m=16`, `ef_construction=64`,
+`build_sq8=on`, `hop_weight=0.05`:
+
+```
+python3 scripts/bench_graph_rag_multidepth_segmented.py \
+  --num-pairs 200000 --max-depth 5 --query-count 32 --runs 3 \
+  --dim 64 --ann-k 256 --top-k 32 --ef-search 128 \
+  --ef-construction 64 --m 16 --build-sq8 on \
+  --shards 8 --route {exact,bounded,all} --fanout {2,4} --hop-weight 0.05
+```
+
+Monolithic baseline (`sorted_heap_graph_rag(...)` on same workload):
+
+```
+python3 scripts/bench_graph_rag_multidepth.py \
+  --num-pairs 200000 --max-depth 5 --query-count 32 --runs 3 \
+  --dim 64 --ann-k 256 --top-k 32 --ef-search 128 \
+  --ef-construction 64 --m 16 --build-sq8 on \
+  --hop-weight 0.05 --table-scope sorted_heap_only
+```
+
+Depth-5 comparison (the hardest hop):
+
+| Route mode | Shards hit | p50 (d5) | hit@1 (d5) | hit@k (d5) | Speedup vs monolith |
+|---|:---:|:---:|:---:|:---:|:---:|
+| monolithic | 1 table | 120.7 ms | 81.2% | 100.0% | 1x |
+| segmented all (8/8) | 8 | 149.5 ms | 81.2% | 100.0% | 0.8x |
+| segmented bounded (4/8) | 4 | 74.1 ms | 93.8% | 100.0% | 1.6x |
+| segmented bounded (2/8) | 2 | 35.9 ms | 96.9% | 100.0% | 3.4x |
+| segmented exact (1/8) | 1 | 17.2 ms | 100.0% | 100.0% | **7.0x** |
+
+Depth-1 comparison:
+
+| Route mode | Shards hit | p50 (d1) | hit@1 (d1) | hit@k (d1) |
+|---|:---:|:---:|:---:|:---:|
+| monolithic | 1 table | 49.4 ms | 100.0% | 100.0% |
+| segmented all (8/8) | 8 | 94.3 ms | 100.0% | 100.0% |
+| segmented bounded (4/8) | 4 | 46.3 ms | 100.0% | 100.0% |
+| segmented bounded (2/8) | 2 | 22.8 ms | 100.0% | 100.0% |
+| segmented exact (1/8) | 1 | 11.3 ms | 100.0% | 100.0% |
+
+Observations:
+- Latency scales roughly linearly with the number of shards hit.
+- Quality degrades gracefully: bounded(2/8) still reaches 96.9% hit@1 at
+  depth 5 vs 100.0% for exact, compared to 81.2% for monolithic/all.
+- Even bounded(4/8) at half the shards is 1.6x faster than monolithic
+  and has better quality (93.8% vs 81.2% hit@1).
+- All-shard fanout is worse than monolithic (fanout overhead dominates).
+- The win is not exact-or-nothing — bounded fanout preserves most of the
+  benefit even with imperfect routing.
+
 ### Current AWS GraphRAG benchmark (`person -> parent -> city`, stable fact contract)
 
 Repo-owned harness:

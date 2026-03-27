@@ -306,12 +306,29 @@ def build_sharded_indexes(
             cur.execute("RESET sorted_hnsw.build_sq8")
 
 
-def route_tables(query: md.DeepQuery, num_pairs: int, shards: int, route_mode: str) -> list[str]:
+def route_tables(query: md.DeepQuery, num_pairs: int, shards: int, route_mode: str, fanout: int = 0) -> list[str]:
     if route_mode == "all":
         return [shard_table_name(shard_id) for shard_id in range(shards)]
     if route_mode == "exact":
         shard_id = shard_for_person(query.person_id, num_pairs, shards)
         return [shard_table_name(shard_id)]
+    if route_mode == "bounded":
+        correct = shard_for_person(query.person_id, num_pairs, shards)
+        k = min(fanout, shards) if fanout > 0 else 1
+        selected = set()
+        selected.add(correct)
+        left = correct - 1
+        right = correct + 1
+        while len(selected) < k:
+            if right < shards:
+                selected.add(right)
+                right += 1
+            if len(selected) < k and left >= 0:
+                selected.add(left)
+                left -= 1
+            if left < 0 and right >= shards:
+                break
+        return [shard_table_name(s) for s in sorted(selected)]
     raise ValueError(f"unsupported route_mode: {route_mode}")
 
 
@@ -414,6 +431,7 @@ def measure_segmented_case(
     runs: int,
     route_mode: str,
     merge_mode: str,
+    fanout: int = 0,
 ) -> tuple[float, float, float, float, float]:
     latencies: list[float] = []
     returned_rows: list[int] = []
@@ -422,7 +440,7 @@ def measure_segmented_case(
 
     for _ in range(runs):
         for query in queries:
-            tables = route_tables(query, num_pairs, shards, route_mode)
+            tables = route_tables(query, num_pairs, shards, route_mode, fanout)
             t0 = time.perf_counter()
             rows = merged_shard_rows(
                 cur,
@@ -515,7 +533,13 @@ def main() -> None:
     ap.add_argument("--maintenance-work-mem-mb", type=int, default=0)
     ap.add_argument("--post-load-op", choices=("compact", "merge", "none"), default="compact")
     ap.add_argument("--shards", type=int, default=4)
-    ap.add_argument("--route", choices=("all", "exact", "both"), default="both")
+    ap.add_argument("--route", choices=("all", "exact", "both", "bounded"), default="both")
+    ap.add_argument(
+        "--fanout",
+        type=int,
+        default=0,
+        help="Number of shards to hit in bounded route mode (required for --route bounded)",
+    )
     ap.add_argument(
         "--merge-mode",
         choices=("python", "sql", "routed", "routed_exact"),
@@ -535,8 +559,12 @@ def main() -> None:
 
     if args.shards < 1:
         raise ValueError("--shards must be >= 1")
-    if args.merge_mode in {"routed", "routed_exact"} and args.route == "all":
-        raise ValueError(f"--merge-mode {args.merge_mode} requires --route exact or --route both")
+    if args.route == "bounded" and args.fanout < 1:
+        raise ValueError("--route bounded requires --fanout >= 1")
+    if args.merge_mode in {"routed", "routed_exact"} and args.route in {"all", "bounded"}:
+        raise ValueError(
+            f"--merge-mode {args.merge_mode} supports only exact-routing benchmark modes"
+        )
 
     root_dir = Path(__file__).resolve().parent.parent
     tmp_root = Path(args.tmp_root).resolve()
@@ -749,9 +777,11 @@ def main() -> None:
             for route_mode in routes:
                 if args.merge_mode in {"routed", "routed_exact"} and route_mode != "exact":
                     continue
+                fanout = args.fanout if route_mode == "bounded" else 0
+                label = f"{route_mode}" if route_mode != "bounded" else f"bounded({fanout}/{shards})"
                 for depth in range(1, max_depth + 1):
                     print(
-                        f"running|table=segmented|route={route_mode}|depth={depth}|shards={shards}",
+                        f"running|table=segmented|route={label}|depth={depth}|shards={shards}",
                         flush=True,
                     )
                     p50, avg, rows, hit1, hitk = measure_segmented_case(
@@ -765,8 +795,9 @@ def main() -> None:
                         args.runs,
                         route_mode,
                         args.merge_mode,
+                        fanout,
                     )
-                    print_result(route_mode, args.merge_mode, shards, depth, p50, avg, rows, hit1, hitk)
+                    print_result(label, args.merge_mode, shards, depth, p50, avg, rows, hit1, hitk)
         finally:
             cur.close()
             conn.close()

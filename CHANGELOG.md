@@ -48,6 +48,12 @@
   (100%/100% vs 75%/100%) compared to the monolith.
 - All-shard fanout offers no latency benefit — the win comes entirely
   from shard pruning.
+- Added bounded-fanout mode (`--route bounded --fanout K`) to the
+  segmented benchmark harness. On the `1M x 64D` local point:
+  - bounded(2/8) is 3.4x faster than monolithic with 96.9% hit@1
+  - bounded(4/8) is 1.6x faster with 93.8% hit@1
+  - latency scales roughly linearly with shards hit
+  - the win is not exact-or-nothing — imperfect routing still helps
 
 ### sorted_hnsw shared cache fix
 
