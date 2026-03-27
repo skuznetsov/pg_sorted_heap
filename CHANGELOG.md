@@ -143,6 +143,12 @@
     - `ann_k>=1024` restores depth-5 `hit@k=100.0%`
     - `hit@1` still remains `0.0%`, so the remaining frontier is ranking
       quality rather than recall or build reliability
+  - an exact synthetic-score diagnostic over all `2,000,000` person IDs for
+    the same `10M x 64D` benchmark queries showing that the expected target is
+    already not rank-1 at depths `4` and `5` under the generator/scorer
+    itself (exact ranks `6,6,3,6` at depth 4 and `7,2,2,14` at depth 5),
+    which means the observed `hit@1=0.0%` is not strong evidence of a
+    PostgreSQL ranking bug
 
 ### sorted_hnsw build optimization
 

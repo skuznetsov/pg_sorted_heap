@@ -475,6 +475,25 @@ problem. On this built graph:
 - `hit@1` remains `0.0%`, so the remaining frontier is ranking quality, not
   recall or build reliability
 
+A direct exact-score diagnostic on the same synthetic contract narrowed that
+further. Evaluating the path-aware synthetic score in Python over all
+`2,000,000` person IDs for the same four benchmark queries showed that the
+expected person is already **not rank-1** at depths `4` and `5` under the
+exact generator/scorer itself:
+
+- depth 4 exact ranks: `6, 6, 3, 6`
+- depth 5 exact ranks: `7, 2, 2, 14`
+- all four queries were still within exact top-32 at both depths
+
+So the current `hit@1 = 0.0%` at `10M x 64D` is not strong evidence of a
+PostgreSQL ranking defect. On this benchmark, the deeper-path top-1 loss is
+already present in the synthetic large-scale scoring contract itself. The real
+remaining frontier is therefore narrower:
+
+- for recall: seed breadth (`ann_k`) was the dominant knob
+- for ranking: either a stronger deep-path scorer, or a less ambiguous
+  large-scale synthetic generator/metric
+
 So the narrow conclusion is:
 
 - the multi-hop GraphRAG path itself survives to at least `1M` rows and gives
