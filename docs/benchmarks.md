@@ -679,9 +679,22 @@ So the current reference stack is now:
 - `sorted_heap_graph_rag_segmented(...)` for explicit candidate shard arrays
 - `sorted_heap_graph_rag_routed(...)` for simple metadata-driven range routing
 
+The next local routing pass added an exact-key companion for tenant / KB style
+selection. On another kept local `5K`-row segmented smoke cluster
+(`4` shards, `64D`, `ann_k=32`, `top_k=8`, `ef_search=64`), the exact-key
+routed path stayed aligned with the exact-route segmented SQL merge path:
+
+- exact-route segmented SQL merge, depth 5:
+  - `0.183 ms`, `100.0% / 100.0%`
+- exact-key routed SQL wrapper, same point:
+  - `0.202 ms`, `100.0% / 100.0%`
+
 That is still not the final routing story for large knowledge bases, but it is
 the first usable SQL-level bridge from harness-side segmentation to productized
-segmented GraphRAG.
+segmented GraphRAG, with both:
+
+- range-based routing
+- exact-key routing
 
 ### Current AWS GraphRAG benchmark (`person -> parent -> city`, stable fact contract)
 

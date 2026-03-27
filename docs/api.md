@@ -719,6 +719,62 @@ FROM sorted_heap_graph_rag_routed(
 );
 ```
 
+### `sorted_heap_graph_exact_register(route_name, route_key, rel, priority)`
+
+Registers an exact-key shard mapping in the beta exact-routing registry.
+
+- `route_name` groups shards into one logical routed graph
+- `route_key` is an exact text key such as a tenant id or knowledge-base id
+- multiple shards may share the same key
+- `priority` orders those shards when one key fans out to several shards
+
+### `sorted_heap_graph_exact_config(route_name, route_key)`
+
+Lists the current exact-key shard mappings ordered by
+`(route_name, route_key, priority desc, rel)`.
+
+### `sorted_heap_graph_exact_resolve(route_name, route_key, fanout_limit)`
+
+Resolves candidate shards for an exact route key.
+
+- matches rows where `route_key = <supplied key>`
+- orders by `priority DESC, rel`
+- `fanout_limit := 0` means "all matching shards"
+
+### `sorted_heap_graph_exact_unregister(route_name, route_key, rel)`
+
+Deletes exact-key shard mappings.
+
+- `route_key := NULL` deletes every key under that route group
+- `rel := NULL` deletes all matching shard rows for the selected route/key
+
+### `sorted_heap_graph_rag_routed_exact(route_name, route_key, query, relation_path, ann_k, top_k, score_mode, limit_rows, fanout_limit)`
+
+Beta exact-key routed GraphRAG wrapper.
+
+- resolves candidate shards from `sorted_heap_graph_exact_registry`
+- delegates to `sorted_heap_graph_rag_segmented(...)`
+- keeps the same GraphRAG scoring contract after routing
+
+This is the stronger fit for tenant-id / knowledge-base-id routing than the
+range-based wrapper.
+
+```sql
+SELECT sorted_heap_graph_exact_register('tenant_facts', 'kb_alpha', 'facts_hot'::regclass, 100);
+SELECT sorted_heap_graph_exact_register('tenant_facts', 'kb_alpha', 'facts_cold'::regclass, 50);
+
+SELECT source_rel, entity_id, relation_id, target_id, payload, distance
+FROM sorted_heap_graph_rag_routed_exact(
+    'tenant_facts',
+    'kb_alpha',
+    '[0.1,0.2,0.3,...]'::svec,
+    relation_path := ARRAY[1, 2],
+    ann_k := 64,
+    top_k := 10,
+    score_mode := 'path'
+);
+```
+
 ### Lower-level GraphRAG building blocks (beta)
 
 ### `sorted_heap_expand_ids(rel, seed_ids, relation_filter, limit_rows)`

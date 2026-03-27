@@ -223,6 +223,14 @@
       route by a supplied `int8` key before segmented GraphRAG fanout/merge
     - local routed smoke showed the routed path matches exact-route segmented
       SQL quality/row counts with only small extra lookup overhead
+  - the exact-key routed companion for tenant / KB style routing:
+    - added `sorted_heap_graph_exact_register(...)`,
+      `sorted_heap_graph_exact_config(...)`,
+      `sorted_heap_graph_exact_resolve(...)`, and
+      `sorted_heap_graph_exact_unregister(...)`
+    - added `sorted_heap_graph_rag_routed_exact(...)`
+    - local exact-key smoke stayed aligned with the exact-route segmented SQL
+      merge path (`0.202 ms` vs `0.183 ms` at depth 5, both `100.0% / 100.0%`)
 
 ### sorted_hnsw build optimization
 

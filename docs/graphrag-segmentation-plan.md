@@ -136,8 +136,13 @@ Reference design:
   - `sorted_heap_graph_rag_routed(...)`
   - this is a metadata-driven `int8` range router layered on top of the
     segmented wrapper
+- and one more practical routing surface now exists:
+  - `sorted_heap_graph_exact_register(...)`
+  - `sorted_heap_graph_exact_resolve(...)`
+  - `sorted_heap_graph_rag_routed_exact(...)`
+  - this is the exact-key router for tenant / KB style shard selection
 - what is still missing:
-  - richer routing metadata than simple ranges
+  - richer routing metadata than simple ranges or exact keys
   - a product-quality shard router contract for tenant / KB / relation-family
     pruning without hand-managed range registration
 

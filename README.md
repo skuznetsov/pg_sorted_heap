@@ -41,8 +41,13 @@ plus planner-integrated HNSW search.
   - `sorted_heap_graph_segment_config(...)`
   - `sorted_heap_graph_segment_resolve(...)`
   - `sorted_heap_graph_segment_unregister(...)`
+  - `sorted_heap_graph_exact_register(...)`
+  - `sorted_heap_graph_exact_config(...)`
+  - `sorted_heap_graph_exact_resolve(...)`
+  - `sorted_heap_graph_exact_unregister(...)`
   - `sorted_heap_graph_rag_segmented(...)`
   - `sorted_heap_graph_rag_routed(...)`
+  - `sorted_heap_graph_rag_routed_exact(...)`
   - `sorted_heap_graph_rag_scan(...)`
   - `sorted_heap_graph_rag_twohop_scan(...)`
   - `sorted_heap_graph_rag_twohop_path_scan(...)`
@@ -235,8 +240,13 @@ The older helper/wrapper family is still available for lower-level control:
 - `sorted_heap_graph_segment_config(...)`
 - `sorted_heap_graph_segment_resolve(...)`
 - `sorted_heap_graph_segment_unregister(...)`
+- `sorted_heap_graph_exact_register(...)`
+- `sorted_heap_graph_exact_config(...)`
+- `sorted_heap_graph_exact_resolve(...)`
+- `sorted_heap_graph_exact_unregister(...)`
 - `sorted_heap_graph_rag_segmented(...)`
 - `sorted_heap_graph_rag_routed(...)`
+- `sorted_heap_graph_rag_routed_exact(...)`
 - `sorted_heap_graph_rag_scan(...)`
 - `sorted_heap_graph_rag_twohop_scan(...)`
 - `sorted_heap_graph_rag_twohop_path_scan(...)`
@@ -253,6 +263,9 @@ globally. Routing/pruning is still the caller's job.
 `sorted_heap_graph_rag_routed(...)` adds the first metadata-driven routing
 layer on top of that: register shard ranges once, then route by a caller-
 supplied `int8` route value before the segmented merge runs.
+`sorted_heap_graph_rag_routed_exact(...)` is the exact-key companion for
+tenant/KB-style routing: register a key-to-shard mapping once, then route by
+an exact key instead of a numeric range.
 
 For tuning and debugging, GraphRAG now also exposes backend-local last-call
 stats:

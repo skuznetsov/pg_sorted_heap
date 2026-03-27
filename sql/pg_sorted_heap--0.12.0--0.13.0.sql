@@ -147,6 +147,89 @@ AS $$
   ORDER BY chosen.route_min, chosen.route_max, chosen.relid;
 $$ LANGUAGE SQL STABLE;
 
+CREATE TABLE @extschema@.sorted_heap_graph_exact_registry (
+  route_name text NOT NULL,
+  route_key text NOT NULL,
+  relid regclass NOT NULL,
+  priority int4 NOT NULL DEFAULT 0,
+  PRIMARY KEY (route_name, route_key, relid)
+);
+
+SELECT pg_catalog.pg_extension_config_dump('@extschema@.sorted_heap_graph_exact_registry', '');
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_exact_register(
+  route_name text,
+  route_key text,
+  rel regclass,
+  priority int4 DEFAULT 0
+) RETURNS void
+AS $$
+  INSERT INTO @extschema@.sorted_heap_graph_exact_registry (
+    route_name, route_key, relid, priority
+  )
+  VALUES ($1, $2, $3, $4)
+  ON CONFLICT (route_name, route_key, relid) DO UPDATE SET
+    priority = EXCLUDED.priority;
+$$ LANGUAGE SQL;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_exact_unregister(
+  route_name text,
+  route_key text DEFAULT NULL,
+  rel regclass DEFAULT NULL
+) RETURNS int4
+AS $$
+DECLARE
+  deleted_rows int4;
+BEGIN
+  DELETE FROM @extschema@.sorted_heap_graph_exact_registry
+  WHERE sorted_heap_graph_exact_registry.route_name = sorted_heap_graph_exact_unregister.route_name
+    AND (sorted_heap_graph_exact_unregister.route_key IS NULL
+         OR sorted_heap_graph_exact_registry.route_key = sorted_heap_graph_exact_unregister.route_key)
+    AND (sorted_heap_graph_exact_unregister.rel IS NULL
+         OR sorted_heap_graph_exact_registry.relid = sorted_heap_graph_exact_unregister.rel);
+  GET DIAGNOSTICS deleted_rows = ROW_COUNT;
+  RETURN deleted_rows;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_exact_config(
+  route_name text DEFAULT NULL,
+  route_key text DEFAULT NULL
+) RETURNS TABLE (
+  route_name text,
+  route_key text,
+  rel regclass,
+  priority int4
+)
+AS $$
+  SELECT s.route_name, s.route_key, s.relid, s.priority
+  FROM @extschema@.sorted_heap_graph_exact_registry s
+  WHERE ($1 IS NULL OR s.route_name = $1)
+    AND ($2 IS NULL OR s.route_key = $2)
+  ORDER BY s.route_name, s.route_key, s.priority DESC, s.relid;
+$$ LANGUAGE SQL STABLE;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_exact_resolve(
+  route_name text,
+  route_key text,
+  fanout_limit int4 DEFAULT 0
+) RETURNS TABLE (
+  rel regclass,
+  priority int4
+)
+AS $$
+  SELECT chosen.relid, chosen.priority
+  FROM (
+    SELECT s.relid, s.priority
+    FROM @extschema@.sorted_heap_graph_exact_registry s
+    WHERE s.route_name = $1
+      AND s.route_key = $2
+    ORDER BY s.priority DESC, s.relid
+    LIMIT CASE WHEN $3 IS NULL OR $3 <= 0 THEN NULL ELSE $3 END
+  ) chosen
+  ORDER BY chosen.priority DESC, chosen.relid;
+$$ LANGUAGE SQL STABLE;
+
 CREATE FUNCTION @extschema@.sorted_heap_graph_rag_stats()
 RETURNS TABLE (
   calls bigint,
@@ -522,3 +605,54 @@ $$ LANGUAGE plpgsql STABLE;
 
 COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed(text, int8, @extschema@.svec, int4[], int4, int4, text, int4, int4)
 IS 'Beta routed GraphRAG wrapper. Resolves candidate shards from sorted_heap_graph_segment_registry using a route value, then delegates to sorted_heap_graph_rag_segmented(...).';
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact(
+  route_name text,
+  route_key text,
+  query @extschema@.svec,
+  relation_path int4[],
+  ann_k int4 DEFAULT 64,
+  top_k int4 DEFAULT 10,
+  score_mode text DEFAULT 'path',
+  limit_rows int4 DEFAULT 0,
+  fanout_limit int4 DEFAULT 0
+) RETURNS TABLE (
+  source_rel regclass,
+  entity_id int4,
+  relation_id int2,
+  target_id int4,
+  payload text,
+  distance float8
+)
+AS $$
+DECLARE
+  rels regclass[];
+BEGIN
+  IF fanout_limit < 0 THEN
+    RAISE EXCEPTION 'sorted_heap_graph_rag_routed_exact: fanout_limit must be >= 0';
+  END IF;
+
+  SELECT array_agg(rel ORDER BY priority DESC, rel)
+  INTO rels
+  FROM @extschema@.sorted_heap_graph_exact_resolve(route_name, route_key, fanout_limit);
+
+  IF rels IS NULL OR array_length(rels, 1) IS NULL THEN
+    RETURN;
+  END IF;
+
+  RETURN QUERY
+  SELECT g.source_rel, g.entity_id, g.relation_id, g.target_id, g.payload, g.distance
+  FROM @extschema@.sorted_heap_graph_rag_segmented(
+    rels,
+    query,
+    relation_path,
+    ann_k,
+    top_k,
+    score_mode,
+    limit_rows
+  ) AS g;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact(text, text, @extschema@.svec, int4[], int4, int4, text, int4, int4)
+IS 'Beta exact-key routed GraphRAG wrapper. Resolves candidate shards from sorted_heap_graph_exact_registry using an exact route key, then delegates to sorted_heap_graph_rag_segmented(...).';
