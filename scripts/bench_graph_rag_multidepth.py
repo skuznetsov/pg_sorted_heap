@@ -62,17 +62,17 @@ def vec_to_svec(vals: list[float]) -> str:
 
 
 def generate_csv(path: Path, num_pairs: int, max_depth: int, dim: int) -> None:
-    person_cache = {i: person_base(i, dim) for i in range(1, num_pairs + 1)}
     hop_cache = {h: hop_base(h, dim) for h in range(1, max_depth + 1)}
 
     with open(path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         for person_id in range(1, num_pairs + 1):
+            person_vals = person_base(person_id, dim)
             prev = person_id
             for hop in range(1, max_depth + 1):
                 target_id = hop * num_pairs + person_id
                 vals = [
-                    person_cache[person_id][idx] + 0.15 * hop_cache[hop][idx]
+                    person_vals[idx] + 0.15 * hop_cache[hop][idx]
                     for idx in range(dim)
                 ]
                 payload = f"Person_{person_id} rel_{hop} node_{hop}_{person_id}."
