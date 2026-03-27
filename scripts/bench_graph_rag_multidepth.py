@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import random
 import shlex
 import statistics
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +36,21 @@ import bench_graph_rag as base
 class DeepQuery:
     person_id: int
     vectors: dict[int, str]
+
+
+META_NAME = "multidepth_meta.json"
+
+
+def meta_path(tmp: Path) -> Path:
+    return tmp / META_NAME
+
+
+def write_meta(tmp: Path, payload: dict) -> None:
+    meta_path(tmp).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def read_meta(tmp: Path) -> dict:
+    return json.loads(meta_path(tmp).read_text(encoding="utf-8"))
 
 
 def normalize(vals: list[float]) -> list[float]:
@@ -250,39 +267,91 @@ def main() -> None:
     )
     ap.add_argument("--backend-mode", choices=("fresh", "reuse"), default="fresh")
     ap.add_argument("--install-cmd", default="")
+    ap.add_argument("--reuse-temp", default="")
     ap.add_argument("--keep-temp", action="store_true")
     args = ap.parse_args()
 
     root_dir = Path(__file__).resolve().parent.parent
     tmp_root = Path(args.tmp_root).resolve()
-    port = args.port or base.pick_port()
     install_cmd = shlex.split(args.install_cmd) if args.install_cmd else None
-    tmp, pg_bindir = base.init_temp_cluster(
-        root_dir,
-        port,
-        tmp_root,
-        args.shared_buffers_mb,
-        install_cmd,
-        max_wal_size_gb=args.max_wal_size_gb,
-        maintenance_work_mem_mb=args.maintenance_work_mem_mb,
-    )
-    csv_path = tmp / "facts_multidepth.csv"
+    reusing = bool(args.reuse_temp)
+    if reusing:
+        tmp = Path(args.reuse_temp).resolve()
+        meta = read_meta(tmp)
+        pg_bindir = subprocess.check_output(["pg_config", "--bindir"], text=True).strip()
+        port = int(meta["port"])
+        num_pairs = int(meta["num_pairs"])
+        max_depth = int(meta["max_depth"])
+        dim = int(meta["dim"])
+        build_ef_construction = int(meta.get("ef_construction", args.ef_construction))
+        build_m = int(meta.get("m", args.m))
+        build_table_scope = str(meta.get("table_scope", args.table_scope))
+        build_shared_buffers_mb = int(meta.get("shared_buffers_mb", args.shared_buffers_mb))
+        build_max_wal_size_gb = int(meta.get("max_wal_size_gb", args.max_wal_size_gb))
+        build_maintenance_work_mem_mb = int(meta.get("maintenance_work_mem_mb", args.maintenance_work_mem_mb))
+        csv_path = tmp / "facts_multidepth.csv"
+    else:
+        port = args.port or base.pick_port()
+        tmp, pg_bindir = base.init_temp_cluster(
+            root_dir,
+            port,
+            tmp_root,
+            args.shared_buffers_mb,
+            install_cmd,
+            max_wal_size_gb=args.max_wal_size_gb,
+            maintenance_work_mem_mb=args.maintenance_work_mem_mb,
+        )
+        num_pairs = args.num_pairs
+        max_depth = args.max_depth
+        dim = args.dim
+        build_ef_construction = args.ef_construction
+        build_m = args.m
+        build_table_scope = args.table_scope
+        build_shared_buffers_mb = args.shared_buffers_mb
+        build_max_wal_size_gb = args.max_wal_size_gb
+        build_maintenance_work_mem_mb = args.maintenance_work_mem_mb
+        csv_path = tmp / "facts_multidepth.csv"
+        write_meta(
+            tmp,
+            {
+                "port": port,
+                "num_pairs": num_pairs,
+                "max_depth": max_depth,
+                "dim": dim,
+                "ef_construction": build_ef_construction,
+                "m": build_m,
+                "table_scope": build_table_scope,
+                "shared_buffers_mb": build_shared_buffers_mb,
+                "max_wal_size_gb": build_max_wal_size_gb,
+                "maintenance_work_mem_mb": build_maintenance_work_mem_mb,
+                "stage_reached": "init",
+            },
+        )
 
     try:
-        t_gen_start = time.perf_counter()
-        generate_csv(csv_path, args.num_pairs, args.max_depth, args.dim)
-        t_gen_end = time.perf_counter()
-        print(
-            "stage|name=generate_csv|"
-            f"elapsed_s={t_gen_end - t_gen_start:.3f}|"
-            f"csv_bytes={csv_path.stat().st_size}",
-            flush=True,
-        )
-        if args.stop_after == "generate_csv":
-            return
+        if not reusing:
+            t_gen_start = time.perf_counter()
+            generate_csv(csv_path, num_pairs, max_depth, dim)
+            t_gen_end = time.perf_counter()
+            print(
+                "stage|name=generate_csv|"
+                f"elapsed_s={t_gen_end - t_gen_start:.3f}|"
+                f"csv_bytes={csv_path.stat().st_size}",
+                flush=True,
+            )
+            write_meta(
+                tmp,
+                {
+                    **read_meta(tmp),
+                    "stage_reached": "generate_csv",
+                    "csv_bytes": csv_path.stat().st_size,
+                },
+            )
+            if args.stop_after == "generate_csv":
+                return
 
         t_query_start = time.perf_counter()
-        queries = build_queries(args.num_pairs, args.query_count, args.max_depth, args.dim, args.seed)
+        queries = build_queries(num_pairs, args.query_count, max_depth, dim, args.seed)
         t_query_end = time.perf_counter()
         print(
             "stage|name=build_queries|"
@@ -297,35 +366,46 @@ def main() -> None:
             cur.execute("SET jit = off")
             cur.execute("SET sorted_hnsw.shared_cache = off")
             cur.execute(f"SET sorted_hnsw.ef_search = {args.ef_search}")
-            base.bootstrap_schema(cur, args.dim)
+            if not reusing:
+                base.bootstrap_schema(cur, dim)
 
-            t_load_start = time.perf_counter()
-            base.load_data(cur, csv_path)
-            t_load_end = time.perf_counter()
-            print(
-                "stage|name=load_data|"
-                f"elapsed_s={t_load_end - t_load_start:.3f}",
-                flush=True,
-            )
-            if args.stop_after == "load_data":
-                return
+            if not reusing:
+                t_load_start = time.perf_counter()
+                base.load_data(cur, csv_path)
+                t_load_end = time.perf_counter()
+                print(
+                    "stage|name=load_data|"
+                    f"elapsed_s={t_load_end - t_load_start:.3f}",
+                    flush=True,
+                )
+                write_meta(tmp, {**read_meta(tmp), "stage_reached": "load_data"})
+                if args.stop_after == "load_data":
+                    return
 
-            t_build_start = time.perf_counter()
-            base.build_indexes(
-                cur,
-                args.ef_construction,
-                m=args.m,
-                build_heap_index=(args.table_scope == "all"),
-                build_sorted_heap_index=True,
-            )
-            t_build_end = time.perf_counter()
-            print(
-                "stage|name=build_indexes|"
-                f"elapsed_s={t_build_end - t_build_start:.3f}",
-                flush=True,
-            )
-            if args.stop_after == "build_indexes":
-                return
+            if not reusing:
+                t_build_start = time.perf_counter()
+                base.build_indexes(
+                    cur,
+                    build_ef_construction,
+                    m=build_m,
+                    build_heap_index=(build_table_scope == "all"),
+                    build_sorted_heap_index=True,
+                )
+                t_build_end = time.perf_counter()
+                print(
+                    "stage|name=build_indexes|"
+                    f"elapsed_s={t_build_end - t_build_start:.3f}",
+                    flush=True,
+                )
+                write_meta(tmp, {**read_meta(tmp), "stage_reached": "build_indexes"})
+                if args.stop_after == "build_indexes":
+                    return
+            else:
+                meta = read_meta(tmp)
+                if meta.get("stage_reached") not in {"build_indexes", "analyze"}:
+                    raise RuntimeError(
+                        f"reuse-temp requires a temp cluster stopped after build_indexes/analyze, got stage={meta.get('stage_reached')}"
+                    )
 
             t_analyze_start = time.perf_counter()
             cur.execute("ANALYZE facts_heap")
@@ -336,6 +416,7 @@ def main() -> None:
                 f"elapsed_s={t_analyze_end - t_analyze_start:.3f}",
                 flush=True,
             )
+            write_meta(tmp, {**read_meta(tmp), "stage_reached": "analyze"})
             if args.stop_after == "analyze":
                 return
 
@@ -352,25 +433,26 @@ def main() -> None:
             print("graph rag multidepth benchmark")
             print("============================================================")
             print(f"port:             {port}")
-            print(f"num_pairs:        {args.num_pairs}")
-            print(f"max_depth:        {args.max_depth}")
-            print(f"rows:             {args.num_pairs * args.max_depth}")
-            print(f"dim:              {args.dim}")
+            print(f"num_pairs:        {num_pairs}")
+            print(f"max_depth:        {max_depth}")
+            print(f"rows:             {num_pairs * max_depth}")
+            print(f"dim:              {dim}")
             print(f"query_count:      {args.query_count}")
             print(f"runs:             {args.runs}")
             print(f"ann_k:            {args.ann_k}")
             print(f"top_k:            {args.top_k}")
             print(f"ef_search:        {args.ef_search}")
-            print(f"ef_construction:  {args.ef_construction}")
-            print(f"m:                {args.m}")
-            print(f"shared_buffers:   {args.shared_buffers_mb}MB")
-            print(f"max_wal_size:     {args.max_wal_size_gb}GB")
-            print(f"maintenance_work_mem: {args.maintenance_work_mem_mb}MB")
-            print(f"table_scope:      {args.table_scope}")
+            print(f"ef_construction:  {build_ef_construction}")
+            print(f"m:                {build_m}")
+            print(f"shared_buffers:   {build_shared_buffers_mb}MB")
+            print(f"max_wal_size:     {build_max_wal_size_gb}GB")
+            print(f"maintenance_work_mem: {build_maintenance_work_mem_mb}MB")
+            print(f"table_scope:      {build_table_scope}")
+            print(f"reuse_temp:       {str(tmp) if reusing else 'no'}")
             print(f"backend_mode:     {args.backend_mode}")
             print()
 
-            for depth in range(1, args.max_depth + 1):
+            for depth in range(1, max_depth + 1):
                 if 3 <= depth <= 5:
                     verify_unified_equivalence(cur, queries, depth, args.ann_k, args.top_k)
 
@@ -396,7 +478,7 @@ def main() -> None:
             cur.close()
             conn.close()
     finally:
-        if args.keep_temp:
+        if args.keep_temp or reusing:
             print(f"kept_temp_cluster={tmp}")
         else:
             base.stop_temp_cluster(tmp, pg_bindir)
