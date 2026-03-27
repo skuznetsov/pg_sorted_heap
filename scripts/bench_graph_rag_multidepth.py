@@ -79,7 +79,7 @@ def vec_to_svec(vals: list[float]) -> str:
     return "[" + ",".join(f"{v:.6f}" for v in normalize(vals)) + "]"
 
 
-def generate_csv(path: Path, num_pairs: int, max_depth: int, dim: int) -> None:
+def generate_csv(path: Path, num_pairs: int, max_depth: int, dim: int, hop_weight: float) -> None:
     hop_cache = {h: hop_base(h, dim) for h in range(1, max_depth + 1)}
 
     with open(path, "w", encoding="utf-8", newline="") as f:
@@ -90,7 +90,7 @@ def generate_csv(path: Path, num_pairs: int, max_depth: int, dim: int) -> None:
             for hop in range(1, max_depth + 1):
                 target_id = hop * num_pairs + person_id
                 vals = [
-                    person_vals[idx] + 0.15 * hop_cache[hop][idx]
+                    person_vals[idx] + hop_weight * hop_cache[hop][idx]
                     for idx in range(dim)
                 ]
                 payload = f"Person_{person_id} rel_{hop} node_{hop}_{person_id}."
@@ -99,10 +99,11 @@ def generate_csv(path: Path, num_pairs: int, max_depth: int, dim: int) -> None:
 
 
 class FactCsvStream(io.TextIOBase):
-    def __init__(self, num_pairs: int, max_depth: int, dim: int) -> None:
+    def __init__(self, num_pairs: int, max_depth: int, dim: int, hop_weight: float) -> None:
         self.num_pairs = num_pairs
         self.max_depth = max_depth
         self.dim = dim
+        self.hop_weight = hop_weight
         self.hop_cache = {h: hop_base(h, dim) for h in range(1, max_depth + 1)}
         self.person_id = 1
         self.hop = 1
@@ -124,7 +125,7 @@ class FactCsvStream(io.TextIOBase):
         prev = self.person_id if hop == 1 else (hop - 1) * self.num_pairs + self.person_id
         target_id = hop * self.num_pairs + self.person_id
         vals = [
-            self.person_vals[idx] + 0.15 * self.hop_cache[hop][idx]
+            self.person_vals[idx] + self.hop_weight * self.hop_cache[hop][idx]
             for idx in range(self.dim)
         ]
         payload = f"Person_{self.person_id} rel_{hop} node_{hop}_{self.person_id}."
@@ -155,7 +156,7 @@ class FactCsvStream(io.TextIOBase):
         return out
 
 
-def build_queries(num_pairs: int, query_count: int, max_depth: int, dim: int, seed: int) -> list[DeepQuery]:
+def build_queries(num_pairs: int, query_count: int, max_depth: int, dim: int, seed: int, hop_weight: float) -> list[DeepQuery]:
     if query_count > num_pairs:
         raise ValueError(f"query_count {query_count} exceeds num_pairs {num_pairs}")
 
@@ -170,7 +171,7 @@ def build_queries(num_pairs: int, query_count: int, max_depth: int, dim: int, se
         for depth in range(1, max_depth + 1):
             vals = [
                 person_cache[person_id][idx] +
-                0.15 * sum(hop_cache[hop][idx] for hop in range(1, depth + 1))
+                hop_weight * sum(hop_cache[hop][idx] for hop in range(1, depth + 1))
                 for idx in range(dim)
             ]
             vectors[depth] = vec_to_svec(vals)
@@ -308,6 +309,7 @@ def main() -> None:
     ap.add_argument("--query-count", type=int, default=32)
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--dim", type=int, default=384)
+    ap.add_argument("--hop-weight", type=float, default=0.15)
     ap.add_argument("--ann-k", type=int, default=64)
     ap.add_argument("--top-k", type=int, default=10)
     ap.add_argument("--seed", type=int, default=42)
@@ -342,6 +344,7 @@ def main() -> None:
         num_pairs = int(meta["num_pairs"])
         max_depth = int(meta["max_depth"])
         dim = int(meta["dim"])
+        build_hop_weight = float(meta.get("hop_weight", args.hop_weight))
         build_ef_construction = int(meta.get("ef_construction", args.ef_construction))
         build_m = int(meta.get("m", args.m))
         build_table_scope = str(meta.get("table_scope", args.table_scope))
@@ -365,6 +368,7 @@ def main() -> None:
         num_pairs = args.num_pairs
         max_depth = args.max_depth
         dim = args.dim
+        build_hop_weight = args.hop_weight
         build_ef_construction = args.ef_construction
         build_m = args.m
         build_table_scope = args.table_scope
@@ -381,6 +385,7 @@ def main() -> None:
                 "num_pairs": num_pairs,
                 "max_depth": max_depth,
                 "dim": dim,
+                "hop_weight": build_hop_weight,
                 "ef_construction": build_ef_construction,
                 "m": build_m,
                 "table_scope": build_table_scope,
@@ -403,7 +408,7 @@ def main() -> None:
                 csv_bytes = 0
             else:
                 t_gen_start = time.perf_counter()
-                generate_csv(csv_path, num_pairs, max_depth, dim)
+                generate_csv(csv_path, num_pairs, max_depth, dim, build_hop_weight)
                 t_gen_end = time.perf_counter()
                 csv_bytes = csv_path.stat().st_size
                 print(
@@ -424,7 +429,7 @@ def main() -> None:
                 return
 
         t_query_start = time.perf_counter()
-        queries = build_queries(num_pairs, args.query_count, max_depth, dim, args.seed)
+        queries = build_queries(num_pairs, args.query_count, max_depth, dim, args.seed, build_hop_weight)
         t_query_end = time.perf_counter()
         print(
             "stage|name=build_queries|"
@@ -447,7 +452,7 @@ def main() -> None:
                 if build_stream_copy:
                     base.load_data_fileobj(
                         cur,
-                        FactCsvStream(num_pairs, max_depth, dim),
+                        FactCsvStream(num_pairs, max_depth, dim, build_hop_weight),
                         retain_heap=build_heap_retained,
                     )
                 else:
@@ -531,6 +536,7 @@ def main() -> None:
             print(f"max_depth:        {max_depth}")
             print(f"rows:             {num_pairs * max_depth}")
             print(f"dim:              {dim}")
+            print(f"hop_weight:       {build_hop_weight}")
             print(f"query_count:      {args.query_count}")
             print(f"runs:             {args.runs}")
             print(f"ann_k:            {args.ann_k}")

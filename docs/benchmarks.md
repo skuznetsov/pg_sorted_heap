@@ -494,6 +494,31 @@ remaining frontier is therefore narrower:
 - for ranking: either a stronger deep-path scorer, or a less ambiguous
   large-scale synthetic generator/metric
 
+A bounded synthetic-contract sweep then showed that this large-scale ambiguity
+is materially affected by the generator's hop weight. On the same exact
+`10M x 64D` synthetic scorer over all `2,000,000` person IDs, depth-5 exact
+ranks for the four benchmark queries improved from:
+
+- `hop_weight=0.15`: `7, 2, 2, 14`
+
+to:
+
+- `hop_weight=0.05`: `1, 1, 1, 4`
+
+That signal survived a bounded PostgreSQL-backed rerun on the local
+`1M x 64D` cheap-build point (`ann_k=256`, `top_k=32`, `ef_search=128`,
+`m=16`, `ef_construction=64`, `query_count=8`):
+
+- unified depth-5 GraphRAG, `hop_weight=0.15`:
+  - `109.850 ms`, `62.5% / 100.0%`
+- unified depth-5 GraphRAG, `hop_weight=0.05`:
+  - `109.630 ms`, `87.5% / 100.0%`
+
+So there is now concrete evidence that a large part of the `10M x 64D`
+top-1 cliff comes from the synthetic contract itself, not from query latency
+or build instability. Lowering hop weight sharpens top-1 without changing the
+basic GraphRAG execution path.
+
 So the narrow conclusion is:
 
 - the multi-hop GraphRAG path itself survives to at least `1M` rows and gives

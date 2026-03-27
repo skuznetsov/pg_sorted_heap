@@ -454,8 +454,13 @@ hnsw_insert_node(HnswBuildState *state, int32 nid)
 	for (level = 0; level <= node_level; level++)
 	{
 		int max_nbrs = (level == 0) ? state->M_max0 : state->M;
+		/*
+		 * Reverse-link insertion allows a neighbor list to overflow by one
+		 * entry before shrink_connections() prunes it back to max_nbrs.
+		 * Reserve that scratch slot explicitly to avoid a transient OOB write.
+		 */
 		node->neighbors[level] = MemoryContextAllocZero(
-			state->build_ctx, sizeof(int32) * max_nbrs);
+			state->build_ctx, sizeof(int32) * (max_nbrs + 1));
 	}
 
 	/* First node: just set as entry point */

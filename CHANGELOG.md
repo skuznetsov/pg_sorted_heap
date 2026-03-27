@@ -107,6 +107,9 @@
 
 ### GraphRAG scale harnesses
 
+- Added `--hop-weight` to `scripts/bench_graph_rag_multidepth.py` so large
+  synthetic multihop runs can vary the relative hop contribution without
+  changing the SQL/GraphRAG contract.
 - Added `scripts/bench_graph_rag_multidepth_aws.sh` to run the synthetic
   multi-hop depth benchmark on a remote AWS host using the same sync/install
   pattern as the existing multihop AWS runners.
@@ -149,9 +152,27 @@
     itself (exact ranks `6,6,3,6` at depth 4 and `7,2,2,14` at depth 5),
     which means the observed `hit@1=0.0%` is not strong evidence of a
     PostgreSQL ranking bug
+  - a follow-up exact synthetic-contract sweep showing that lowering
+    `hop_weight` from `0.15` to `0.05` changes the depth-5 exact ranks from
+    `7,2,2,14` to `1,1,1,4` on the same `10M x 64D` query sample
+  - a bounded PostgreSQL-backed confirmation on the local `1M x 64D`
+    cheap-build point where unified depth-5 GraphRAG improved from
+    `62.5% / 100.0%` to `87.5% / 100.0%` at essentially the same latency
+    (`109.850 ms` -> `109.630 ms`) when only `hop_weight` changed from
+    `0.15` to `0.05`
 
 ### sorted_hnsw build optimization
 
+- Fixed a real build-time memory-safety bug in `src/hnsw_build.c`: reverse
+  link insertion intentionally overflows a neighbor list by one entry before
+  `shrink_connections()` prunes it, but the in-memory neighbor arrays were
+  previously allocated to only `max_nbrs` slots.
+- The build now allocates `max_nbrs + 1` slots for those transient reverse
+  inserts, removing the out-of-bounds write.
+- Local reproducer after the fix:
+  - `40K` pairs / `200K` rows / `64D` / `m=16` / `ef_construction=64`
+  - default contract `hop_weight=0.15`: `5/5` build-only passes
+  - lowered-hop contract `hop_weight=0.05`: `3/3` build-only passes
 - Removed the per-search `visited[]` allocation/zeroing from the hot HNSW
   build loop in `src/hnsw_build.c` and replaced it with a reusable visit-mark
   array.
