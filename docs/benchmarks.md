@@ -773,6 +773,57 @@ segmented GraphRAG, with both:
 - range-based routing
 - exact-key routing
 
+### Monolithic vs segmented exact-routed: constrained-memory `10M x 64D` comparison
+
+This table consolidates the AWS `10M x 64D` results already reported
+above (monolithic in "Larger synthetic GraphRAG scale envelope",
+segmented in "Segmented GraphRAG at scale") into a direct side-by-side.
+
+Both runs used the same AWS ARM64 host (`4 vCPU`, `8 GiB RAM`, `4 GiB swap`),
+the same workload (`2M` pairs x `5` hops, `hop_weight=0.05`), and the same
+build/query knobs (`m=16`, `ef_construction=64`, `build_sq8=on`, `ann_k=256`,
+`top_k=32`, `ef_search=128`). Segmented mode used `8` shards.
+
+| | Monolithic | Segmented exact | Segmented all |
+|---|:---:|:---:|:---:|
+| load_data | 787.8 s | 500.5 s | — |
+| build_indexes | 846.8 s | 784.8 s | — |
+| depth 1 p50 | 840.6 ms | **126.1 ms** | 898.4 ms |
+| depth 5 p50 | 2084.2 ms | **258.8 ms** | 2093.7 ms |
+| depth 1 hit@1/hit@k | 100%/100% | 100%/100% | 100%/100% |
+| depth 5 hit@1/hit@k | 75%/100% | **100%/100%** | 75%/100% |
+| speedup at depth 5 | 1x | **8.1x** | ~1x |
+
+Exact commands (monolithic build + query-only reuse):
+
+```
+NUM_PAIRS=2000000 MAX_DEPTH=5 QUERY_COUNT=4 RUNS=1 DIM=64 \
+  ANN_K=256 TOP_K=32 EF_SEARCH=128 EF_CONSTRUCTION=64 M=16 \
+  SHARED_BUFFERS_MB=64 MAX_WAL_SIZE_GB=16 HOP_WEIGHT=0.05 \
+  BUILD_SQ8=on TABLE_SCOPE=sorted_heap_only \
+  ./scripts/bench_graph_rag_multidepth_aws.sh <host> <dir> 65493
+```
+
+Exact commands (segmented build + query-only reuse):
+
+```
+NUM_PAIRS=2000000 MAX_DEPTH=5 QUERY_COUNT=4 RUNS=1 DIM=64 \
+  ANN_K=256 TOP_K=32 EF_SEARCH=128 EF_CONSTRUCTION=64 M=16 \
+  SHARED_BUFFERS_MB=64 MAX_WAL_SIZE_GB=16 HOP_WEIGHT=0.05 \
+  BUILD_SQ8=on SHARDS=8 ROUTE=both \
+  ./scripts/bench_graph_rag_multidepth_segmented_aws.sh <host> <dir> 65494
+```
+
+Conclusion: on the measured `10M x 64D` constrained-memory point,
+segmented exact routing is **8.1x faster** at depth 5 with **better quality**
+(100%/100% vs 75%/100%), while build time is comparable. All-shard fanout
+offers no latency benefit — the win comes entirely from shard pruning.
+
+This is not a universal claim. Exact routing requires knowing which shard
+owns the query entity, which maps to tenant-id / knowledge-base-id style
+workloads. Queries that cannot be pruned to a single shard will see
+all-shard-fanout latency (~1x monolithic).
+
 ### Current AWS GraphRAG benchmark (`person -> parent -> city`, stable fact contract)
 
 Repo-owned harness:

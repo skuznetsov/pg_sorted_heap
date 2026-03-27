@@ -39,6 +39,16 @@
   - one-hop `score_mode := 'path'` being intentionally equivalent to
     `endpoint`
 
+### Segmented GraphRAG scale verification
+
+- Consolidated the monolithic vs segmented `10M x 64D` comparison in
+  `docs/benchmarks.md` into a single side-by-side table.
+- On the constrained-memory AWS point (`4 vCPU`, `8 GiB RAM`), segmented
+  exact routing is 8.1x faster at depth 5 with better quality
+  (100%/100% vs 75%/100%) compared to the monolith.
+- All-shard fanout offers no latency benefit — the win comes entirely
+  from shard pruning.
+
 ### sorted_hnsw shared cache fix
 
 - Fixed a multi-index shared-cache corruption bug where
