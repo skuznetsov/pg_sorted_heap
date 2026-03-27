@@ -240,6 +240,7 @@ The older helper/wrapper family is still available for lower-level control:
 - `sorted_heap_graph_segment_meta_config(...)`
 - `sorted_heap_graph_segment_meta_unregister(...)`
 - `sorted_heap_graph_segment_register(...)`
+- `sorted_heap_graph_segment_catalog(...)`
 - `sorted_heap_graph_segment_config(...)`
 - `sorted_heap_graph_segment_resolve(...)`
 - `sorted_heap_graph_segment_unregister(...)`
@@ -256,6 +257,7 @@ The older helper/wrapper family is still available for lower-level control:
 - `sorted_heap_graph_route_default_resolve(...)`
 - `sorted_heap_graph_route_default_unregister(...)`
 - `sorted_heap_graph_exact_register(...)`
+- `sorted_heap_graph_exact_catalog(...)`
 - `sorted_heap_graph_exact_config(...)`
 - `sorted_heap_graph_exact_resolve(...)`
 - `sorted_heap_graph_exact_unregister(...)`
@@ -310,7 +312,16 @@ now bind one default profile and call
 shared per-shard metadata via `sorted_heap_graph_segment_meta_register(...)`:
 route rows can now omit repeated `segment_group` / `relation_family` labels
 and inherit them from shard metadata instead. When both are present, the
-route-local value still wins.
+route-local value still wins. And the newest operator-facing introspection
+layer on top of that is:
+
+- `sorted_heap_graph_segment_catalog(...)`
+- `sorted_heap_graph_exact_catalog(...)`
+
+Those catalog functions show route-local labels, shared shard metadata,
+effective resolved labels, and whether each effective value came from
+`route`, `shared`, or stayed `unset`. They do not change routing or scoring;
+they only make the current registry model easier to inspect.
 
 For tuning and debugging, GraphRAG now also exposes backend-local last-call
 stats:

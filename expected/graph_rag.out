@@ -825,6 +825,16 @@ COPY (
 chain_route	facts_chain_seg_a	1	8	hot	left
 chain_route	facts_chain_seg_b	9	16	sealed	right
 COPY (
+  SELECT route_name, rel::text, route_min, route_max,
+         coalesce(route_segment_group, ''), coalesce(route_relation_family, ''),
+         coalesce(shared_segment_group, ''), coalesce(shared_relation_family, ''),
+         coalesce(effective_segment_group, ''), coalesce(effective_relation_family, ''),
+         segment_group_source, relation_family_source
+  FROM sorted_heap_graph_segment_catalog('chain_grouped')
+) TO STDOUT;
+chain_grouped	facts_chain_seg_a	1	16	hot	left	hot	left	hot	left	route	route
+chain_grouped	facts_chain_seg_b	1	16	sealed	right	sealed	right	sealed	right	route	route
+COPY (
   SELECT 'ok'
   FROM (
     SELECT sorted_heap_graph_segment_register('chain_meta_grouped', 'facts_chain_seg_a'::regclass, 1, 16)
@@ -844,6 +854,16 @@ COPY (
 ) TO STDOUT;
 chain_meta_grouped	facts_chain_seg_a	1	16	hot	left
 chain_meta_grouped	facts_chain_seg_b	1	16	sealed	right
+COPY (
+  SELECT route_name, rel::text, route_min, route_max,
+         coalesce(route_segment_group, ''), coalesce(route_relation_family, ''),
+         coalesce(shared_segment_group, ''), coalesce(shared_relation_family, ''),
+         coalesce(effective_segment_group, ''), coalesce(effective_relation_family, ''),
+         segment_group_source, relation_family_source
+  FROM sorted_heap_graph_segment_catalog('chain_meta_grouped')
+) TO STDOUT;
+chain_meta_grouped	facts_chain_seg_a	1	16			hot	left	hot	left	shared	shared
+chain_meta_grouped	facts_chain_seg_b	1	16			sealed	right	sealed	right	shared	shared
 COPY (
   SELECT rel::text, route_min, route_max, coalesce(segment_group, ''), coalesce(relation_family, '')
   FROM sorted_heap_graph_segment_resolve('chain_route', 8, 0)
@@ -1519,12 +1539,34 @@ chain_exact	both	facts_chain_seg_a	100	hot	left
 chain_exact	both	facts_chain_seg_b	50	sealed	right
 chain_exact	left	facts_chain_seg_a	100	hot	left
 COPY (
+  SELECT route_name, route_key, rel::text, priority,
+         coalesce(route_segment_group, ''), coalesce(route_relation_family, ''),
+         coalesce(shared_segment_group, ''), coalesce(shared_relation_family, ''),
+         coalesce(effective_segment_group, ''), coalesce(effective_relation_family, ''),
+         segment_group_source, relation_family_source
+  FROM sorted_heap_graph_exact_catalog('chain_exact')
+) TO STDOUT;
+chain_exact	both	facts_chain_seg_a	100	hot	left	hot	left	hot	left	route	route
+chain_exact	both	facts_chain_seg_b	50	sealed	right	sealed	right	sealed	right	route	route
+chain_exact	left	facts_chain_seg_a	100	hot	left	hot	left	hot	left	route	route
+COPY (
   SELECT route_name, route_key, rel::text, priority, coalesce(segment_group, ''), coalesce(relation_family, '')
   FROM sorted_heap_graph_exact_config('chain_meta_exact')
 ) TO STDOUT;
 chain_meta_exact	both	facts_chain_seg_a	100	hot	left
 chain_meta_exact	both	facts_chain_seg_b	50	sealed	right
 chain_meta_exact	left	facts_chain_seg_a	100	hot	left
+COPY (
+  SELECT route_name, route_key, rel::text, priority,
+         coalesce(route_segment_group, ''), coalesce(route_relation_family, ''),
+         coalesce(shared_segment_group, ''), coalesce(shared_relation_family, ''),
+         coalesce(effective_segment_group, ''), coalesce(effective_relation_family, ''),
+         segment_group_source, relation_family_source
+  FROM sorted_heap_graph_exact_catalog('chain_meta_exact')
+) TO STDOUT;
+chain_meta_exact	both	facts_chain_seg_a	100			hot	left	hot	left	shared	shared
+chain_meta_exact	both	facts_chain_seg_b	50			sealed	right	sealed	right	shared	shared
+chain_meta_exact	left	facts_chain_seg_a	100			hot	left	hot	left	shared	shared
 COPY (
   SELECT rel::text, priority, coalesce(segment_group, ''), coalesce(relation_family, '')
   FROM sorted_heap_graph_exact_resolve('chain_exact', 'left', 0)

@@ -205,6 +205,74 @@ AS $$
            x.relid;
 $$ LANGUAGE SQL STABLE;
 
+CREATE FUNCTION @extschema@.sorted_heap_graph_segment_catalog(
+  route_name text DEFAULT NULL,
+  segment_groups text[] DEFAULT NULL,
+  relation_family text DEFAULT NULL
+)
+RETURNS TABLE (
+  route_name text,
+  rel regclass,
+  route_min int8,
+  route_max int8,
+  route_segment_group text,
+  route_relation_family text,
+  shared_segment_group text,
+  shared_relation_family text,
+  effective_segment_group text,
+  effective_relation_family text,
+  segment_group_source text,
+  relation_family_source text
+)
+AS $$
+  SELECT x.route_name,
+         x.relid,
+         x.route_min,
+         x.route_max,
+         x.route_segment_group,
+         x.route_relation_family,
+         x.shared_segment_group,
+         x.shared_relation_family,
+         x.effective_segment_group,
+         x.effective_relation_family,
+         x.segment_group_source,
+         x.relation_family_source
+  FROM (
+    SELECT s.route_name,
+           s.relid,
+           s.route_min,
+           s.route_max,
+           s.segment_group AS route_segment_group,
+           s.relation_family AS route_relation_family,
+           m.segment_group AS shared_segment_group,
+           m.relation_family AS shared_relation_family,
+           COALESCE(s.segment_group, m.segment_group) AS effective_segment_group,
+           COALESCE(s.relation_family, m.relation_family) AS effective_relation_family,
+           CASE
+             WHEN s.segment_group IS NOT NULL THEN 'route'
+             WHEN m.segment_group IS NOT NULL THEN 'shared'
+             ELSE 'unset'
+           END AS segment_group_source,
+           CASE
+             WHEN s.relation_family IS NOT NULL THEN 'route'
+             WHEN m.relation_family IS NOT NULL THEN 'shared'
+             ELSE 'unset'
+           END AS relation_family_source
+    FROM @extschema@.sorted_heap_graph_segment_registry s
+    LEFT JOIN @extschema@.sorted_heap_graph_segment_meta_registry m ON m.relid = s.relid
+  ) x
+  WHERE ($1 IS NULL OR x.route_name = $1)
+    AND ($2 IS NULL OR x.effective_segment_group = ANY($2))
+    AND ($3 IS NULL OR x.effective_relation_family = $3)
+  ORDER BY x.route_name,
+           CASE WHEN $2 IS NULL THEN 0 ELSE array_position($2, x.effective_segment_group) END,
+           x.effective_segment_group,
+           x.effective_relation_family,
+           x.route_min,
+           x.route_max,
+           x.relid;
+$$ LANGUAGE SQL STABLE;
+
 CREATE FUNCTION @extschema@.sorted_heap_graph_segment_resolve(
   route_name text,
   route_value int8,
@@ -335,6 +403,76 @@ AS $$
            x.priority DESC,
            x.segment_group,
            x.relation_family,
+           x.relid;
+$$ LANGUAGE SQL STABLE;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_exact_catalog(
+  route_name text DEFAULT NULL,
+  route_key text DEFAULT NULL,
+  segment_groups text[] DEFAULT NULL,
+  relation_family text DEFAULT NULL
+)
+RETURNS TABLE (
+  route_name text,
+  route_key text,
+  rel regclass,
+  priority int4,
+  route_segment_group text,
+  route_relation_family text,
+  shared_segment_group text,
+  shared_relation_family text,
+  effective_segment_group text,
+  effective_relation_family text,
+  segment_group_source text,
+  relation_family_source text
+)
+AS $$
+  SELECT x.route_name,
+         x.route_key,
+         x.relid,
+         x.priority,
+         x.route_segment_group,
+         x.route_relation_family,
+         x.shared_segment_group,
+         x.shared_relation_family,
+         x.effective_segment_group,
+         x.effective_relation_family,
+         x.segment_group_source,
+         x.relation_family_source
+  FROM (
+    SELECT s.route_name,
+           s.route_key,
+           s.relid,
+           s.priority,
+           s.segment_group AS route_segment_group,
+           s.relation_family AS route_relation_family,
+           m.segment_group AS shared_segment_group,
+           m.relation_family AS shared_relation_family,
+           COALESCE(s.segment_group, m.segment_group) AS effective_segment_group,
+           COALESCE(s.relation_family, m.relation_family) AS effective_relation_family,
+           CASE
+             WHEN s.segment_group IS NOT NULL THEN 'route'
+             WHEN m.segment_group IS NOT NULL THEN 'shared'
+             ELSE 'unset'
+           END AS segment_group_source,
+           CASE
+             WHEN s.relation_family IS NOT NULL THEN 'route'
+             WHEN m.relation_family IS NOT NULL THEN 'shared'
+             ELSE 'unset'
+           END AS relation_family_source
+    FROM @extschema@.sorted_heap_graph_exact_registry s
+    LEFT JOIN @extschema@.sorted_heap_graph_segment_meta_registry m ON m.relid = s.relid
+  ) x
+  WHERE ($1 IS NULL OR x.route_name = $1)
+    AND ($2 IS NULL OR x.route_key = $2)
+    AND ($3 IS NULL OR x.effective_segment_group = ANY($3))
+    AND ($4 IS NULL OR x.effective_relation_family = $4)
+  ORDER BY x.route_name,
+           x.route_key,
+           CASE WHEN $3 IS NULL THEN 0 ELSE array_position($3, x.effective_segment_group) END,
+           x.priority DESC,
+           x.effective_segment_group,
+           x.effective_relation_family,
            x.relid;
 $$ LANGUAGE SQL STABLE;
 

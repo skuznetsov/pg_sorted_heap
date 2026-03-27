@@ -297,6 +297,13 @@
       both are present
     - regression coverage now proves both routed wrappers work when those
       labels live only in the shared shard-metadata registry
+  - a first operator-facing shard catalog on top of that:
+    - added `sorted_heap_graph_segment_catalog(...)` and
+      `sorted_heap_graph_exact_catalog(...)`
+    - both show route-local metadata, shared shard metadata, effective
+      resolved metadata, and per-column source markers (`route|shared|unset`)
+    - this is introspection-only and does not change the routed GraphRAG
+      execution contract
 
 ### sorted_hnsw build optimization
 

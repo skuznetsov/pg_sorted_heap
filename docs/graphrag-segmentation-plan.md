@@ -184,6 +184,13 @@ Reference design:
     shard-local metadata instead
   - when both are present, row-local routed metadata still overrides the
     shared shard metadata
+- and the next operator-facing introspection layer now exists on top of that:
+  - `sorted_heap_graph_segment_catalog(...)`
+  - `sorted_heap_graph_exact_catalog(...)`
+  - these expose route-local metadata, shared shard metadata, effective
+    resolved metadata, and per-column source markers (`route|shared|unset`)
+  - this does not change routing behavior; it makes the current registry model
+    easier to inspect and debug
 - what is still missing:
   - more than one optional text metadata dimension per registry row
   - a product-quality shard router contract for tenant / KB / relation-family
@@ -271,6 +278,15 @@ state:
   their own `segment_group` / `relation_family` values are `NULL`
 - this reduces duplicated registry data, but it still does not replace the
   current hand-managed routing model
+
+And the newest operator-facing layer makes that model more inspectable:
+
+- range-routed and exact-key routed catalogs now show both raw and effective
+  metadata
+- each effective metadata column also reports whether it came from the route
+  row, the shared shard metadata row, or remained unset
+- this is deliberately introspection-only; it does not widen the routing
+  contract
 
 That is still beta, but it is the first real multi-dimensional routing surface
 inside the extension. The next honest step is no longer “can we add metadata?”

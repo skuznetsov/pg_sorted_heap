@@ -715,6 +715,34 @@ group, range, and relation.
 - when `segment_groups` is non-`NULL`, its array order also becomes the
   preferred group order in the result set
 
+### `sorted_heap_graph_segment_catalog(route_name, segment_groups, relation_family)`
+
+Lists range-routed shard rows with both raw and effective metadata.
+
+Returned fields include:
+
+- route-local values:
+  - `route_segment_group`
+  - `route_relation_family`
+- shared shard metadata:
+  - `shared_segment_group`
+  - `shared_relation_family`
+- effective resolved values:
+  - `effective_segment_group`
+  - `effective_relation_family`
+- source markers:
+  - `segment_group_source`
+  - `relation_family_source`
+
+Source markers are one of:
+
+- `route`
+- `shared`
+- `unset`
+
+This is an introspection helper only. It does not affect shard routing or
+GraphRAG scoring.
+
 ### `sorted_heap_graph_segment_resolve(route_name, route_value, fanout_limit, segment_groups, relation_family)`
 
 Resolves candidate shards for a route value.
@@ -974,6 +1002,34 @@ Lists the current exact-key shard mappings ordered by
 - effective labels come from the exact-route row first, then from
   `sorted_heap_graph_segment_meta_registry` for the same shard when the
   route-local label is `NULL`
+
+### `sorted_heap_graph_exact_catalog(route_name, route_key, segment_groups, relation_family)`
+
+Lists exact-key routed shard rows with both raw and effective metadata.
+
+Returned fields include:
+
+- route-local values:
+  - `route_segment_group`
+  - `route_relation_family`
+- shared shard metadata:
+  - `shared_segment_group`
+  - `shared_relation_family`
+- effective resolved values:
+  - `effective_segment_group`
+  - `effective_relation_family`
+- source markers:
+  - `segment_group_source`
+  - `relation_family_source`
+
+Source markers are one of:
+
+- `route`
+- `shared`
+- `unset`
+
+This is an introspection helper only. It does not affect shard routing or
+GraphRAG scoring.
 
 ### `sorted_heap_graph_exact_resolve(route_name, route_key, fanout_limit, segment_groups, relation_family)`
 

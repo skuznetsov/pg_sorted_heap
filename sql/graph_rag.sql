@@ -824,6 +824,15 @@ COPY (
 ) TO STDOUT;
 
 COPY (
+  SELECT route_name, rel::text, route_min, route_max,
+         coalesce(route_segment_group, ''), coalesce(route_relation_family, ''),
+         coalesce(shared_segment_group, ''), coalesce(shared_relation_family, ''),
+         coalesce(effective_segment_group, ''), coalesce(effective_relation_family, ''),
+         segment_group_source, relation_family_source
+  FROM sorted_heap_graph_segment_catalog('chain_grouped')
+) TO STDOUT;
+
+COPY (
   SELECT 'ok'
   FROM (
     SELECT sorted_heap_graph_segment_register('chain_meta_grouped', 'facts_chain_seg_a'::regclass, 1, 16)
@@ -840,6 +849,15 @@ COPY (
 COPY (
   SELECT route_name, rel::text, route_min, route_max, coalesce(segment_group, ''), coalesce(relation_family, '')
   FROM sorted_heap_graph_segment_config('chain_meta_grouped')
+) TO STDOUT;
+
+COPY (
+  SELECT route_name, rel::text, route_min, route_max,
+         coalesce(route_segment_group, ''), coalesce(route_relation_family, ''),
+         coalesce(shared_segment_group, ''), coalesce(shared_relation_family, ''),
+         coalesce(effective_segment_group, ''), coalesce(effective_relation_family, ''),
+         segment_group_source, relation_family_source
+  FROM sorted_heap_graph_segment_catalog('chain_meta_grouped')
 ) TO STDOUT;
 
 COPY (
@@ -1512,8 +1530,26 @@ COPY (
 ) TO STDOUT;
 
 COPY (
+  SELECT route_name, route_key, rel::text, priority,
+         coalesce(route_segment_group, ''), coalesce(route_relation_family, ''),
+         coalesce(shared_segment_group, ''), coalesce(shared_relation_family, ''),
+         coalesce(effective_segment_group, ''), coalesce(effective_relation_family, ''),
+         segment_group_source, relation_family_source
+  FROM sorted_heap_graph_exact_catalog('chain_exact')
+) TO STDOUT;
+
+COPY (
   SELECT route_name, route_key, rel::text, priority, coalesce(segment_group, ''), coalesce(relation_family, '')
   FROM sorted_heap_graph_exact_config('chain_meta_exact')
+) TO STDOUT;
+
+COPY (
+  SELECT route_name, route_key, rel::text, priority,
+         coalesce(route_segment_group, ''), coalesce(route_relation_family, ''),
+         coalesce(shared_segment_group, ''), coalesce(shared_relation_family, ''),
+         coalesce(effective_segment_group, ''), coalesce(effective_relation_family, ''),
+         segment_group_source, relation_family_source
+  FROM sorted_heap_graph_exact_catalog('chain_meta_exact')
 ) TO STDOUT;
 
 COPY (
