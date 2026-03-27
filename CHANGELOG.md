@@ -136,6 +136,13 @@
     `load_data` (`916.380 s`), `build_indexes` (`801.944 s`), and the first
     real query-only pass; the remaining cheap-build frontier is deep-path
     quality, not allocator failure
+  - a retained-temp query-budget sweep on that same AWS `10M x 64D`
+    cheap-build graph showing:
+    - `ann_k=512` already restores depth-4 `hit@k=100.0%` and depth-5
+      `hit@k=75.0%`
+    - `ann_k>=1024` restores depth-5 `hit@k=100.0%`
+    - `hit@1` still remains `0.0%`, so the remaining frontier is ranking
+      quality rather than recall or build reliability
 
 ### sorted_hnsw build optimization
 

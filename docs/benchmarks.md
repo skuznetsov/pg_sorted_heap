@@ -447,9 +447,33 @@ First real `10M x 64D` query-only pass (`query_count=4`, `runs=1`,
   - SQL path: `1072.383 ms`, `0.0% / 0.0%`
   - unified GraphRAG path: `2053.305 ms`, `0.0% / 0.0%`
 
-So the `10M x 64D` branch is no longer blocked by allocator failures. The
-remaining problem at this cheap-build point is answer quality on deeper paths,
-not build reliability.
+A retained-temp query-only probe on that same built graph then narrowed the
+remaining problem further by widening only the query budget for the unified
+path-aware GraphRAG call:
+
+- `ann_k=512`, `top_k=32`, `ef_search=128`
+  - depth 4: `2071.524 ms`, `32` rows, `0.0% / 100.0%`
+  - depth 5: `2063.825 ms`, `30` rows, `0.0% / 75.0%`
+- `ann_k=1024`, `top_k=32`, `ef_search=128`
+  - depth 4: `2087.284 ms`, `32` rows, `0.0% / 100.0%`
+  - depth 5: `2083.017 ms`, `32` rows, `0.0% / 100.0%`
+- `ann_k=2048`, `top_k=32`, `ef_search=128`
+  - depth 4: `2104.642 ms`, `32` rows, `0.0% / 100.0%`
+  - depth 5: `2107.789 ms`, `32` rows, `0.0% / 100.0%`
+- raising `ef_search` from `128` to `256` at `ann_k=2048` did not materially
+  change the result:
+  - depth 4: `2103.152 ms`, `32` rows, `0.0% / 100.0%`
+  - depth 5: `2106.849 ms`, `32` rows, `0.0% / 100.0%`
+
+So the `10M x 64D` branch is no longer blocked by allocator failures, and the
+depth-4/5 cheap-build miss is no longer a pure "nothing works at scale"
+problem. On this built graph:
+
+- `ann_k=256` is too narrow for deep-path recall
+- `ann_k=512` materially recovers depth 4 and partially recovers depth 5
+- `ann_k>=1024` restores `hit@k = 100.0%` through depth 5
+- `hit@1` remains `0.0%`, so the remaining frontier is ranking quality, not
+  recall or build reliability
 
 So the narrow conclusion is:
 
