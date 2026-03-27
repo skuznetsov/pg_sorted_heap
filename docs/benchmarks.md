@@ -323,6 +323,24 @@ were intentionally ultra-light (`ann_k=16`, `ef_search=32`,
 settings, answer quality on the single-query AWS probe was poor (`0.0% / 0.0%`)
 and should be treated as a scale smoke, not a publishable quality frontier.
 
+I then kept that AWS temp cluster alive and ran query-only sweeps on the same
+cheap-built `10M x 32D` graph to test whether query-time tuning alone could
+recover depth-`5` quality without paying for another `CREATE INDEX`. It did
+not:
+
+- `ef_search=128`, `ann_k=64` -> depth-`5` `2.626 ms`, `0.0% / 0.0%`
+- `ef_search=128`, `ann_k=128` -> depth-`5` `3.040 ms`, `0.0% / 0.0%`
+- `ef_search=256`, `ann_k=128` -> depth-`5` `3.284 ms`, `0.0% / 0.0%`
+- `ef_search=256`, `ann_k=256` -> depth-`5` `4.076 ms`, returned `10` rows,
+  but still `0.0% / 0.0%`
+- one pathological point, `ef_search=32`, `ann_k=64`, spiked to
+  `1833.809 ms` and `259709.5` shared reads while still returning `0.0% / 0.0%`
+
+So the cheap-build `10M` graph can produce latency numbers, but its quality is
+not recoverable by query-time knobs alone. The next meaningful scale branch is
+better build quality at `10M`, not more `ef_search`/`ann_k` tuning on the same
+weak graph.
+
 So the narrow conclusion is:
 
 - the multi-hop GraphRAG path itself survives to at least `1M` rows and gives

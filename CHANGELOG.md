@@ -114,6 +114,9 @@
   - local `1M`-row measured query latency on the synthetic multidepth graph
   - local and AWS `10M`-row build-bound envelopes, where generation/load now
     survive but the first practical frontier remains `sorted_hnsw` build time
+  - retained-temp query-only sweeps on the AWS `10M x 32D` cheap-build point,
+    which showed that raising `ef_search`/`ann_k` as high as `256/256` still
+    does not recover depth-5 quality on the same weak graph
 
 ### sorted_hnsw build optimization
 
