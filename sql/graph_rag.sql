@@ -820,6 +820,29 @@ COPY (
 ) TO STDOUT;
 
 COPY (
+  SELECT 'ok'
+  FROM (
+    SELECT sorted_heap_graph_route_policy_register('chain_grouped', 'prefer_hot', ARRAY['hot','sealed'])
+  ) s
+) TO STDOUT;
+
+COPY (
+  SELECT 'ok'
+  FROM (
+    SELECT sorted_heap_graph_route_policy_register('chain_grouped', 'prefer_sealed', ARRAY['sealed','hot'])
+  ) s
+) TO STDOUT;
+
+COPY (
+  SELECT route_name, policy_name, array_to_string(segment_groups, ',')
+  FROM sorted_heap_graph_route_policy_config('chain_grouped')
+) TO STDOUT;
+
+COPY (
+  SELECT array_to_string(sorted_heap_graph_route_policy_groups('chain_grouped', 'prefer_sealed'), ',')
+) TO STDOUT;
+
+COPY (
   SELECT source_rel::text, entity_id, relation_id, target_id, payload,
          round(distance::numeric, 6) AS distance
   FROM sorted_heap_graph_rag_segmented(
@@ -1054,6 +1077,42 @@ COPY (
 ) TO STDOUT;
 
 COPY (
+  WITH helper AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_graph_rag_routed_policy(
+      'chain_grouped',
+      8,
+      'prefer_sealed',
+      '[-1,0,0,0]'::svec,
+      relation_path := ARRAY[1,2,3],
+      ann_k := 1,
+      top_k := 2,
+      score_mode := 'path',
+      limit_rows := 0,
+      fanout_limit := 1
+    )
+  ),
+  baseline AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_graph_rag(
+      'facts_chain_seg_b'::regclass,
+      '[-1,0,0,0]'::svec,
+      relation_path := ARRAY[1,2,3],
+      ann_k := 1,
+      top_k := 2,
+      score_mode := 'path',
+      limit_rows := 0
+    )
+  )
+  SELECT count(*) AS routed_policy_multihop_path_diff_rows
+  FROM (
+    (SELECT * FROM helper EXCEPT ALL SELECT * FROM baseline)
+    UNION ALL
+    (SELECT * FROM baseline EXCEPT ALL SELECT * FROM helper)
+  ) diff
+) TO STDOUT;
+
+COPY (
   SELECT 'ok'
   FROM (
     SELECT sorted_heap_graph_exact_register('chain_exact', 'left', 'facts_chain_seg_a'::regclass, 100, 'hot')
@@ -1097,6 +1156,29 @@ COPY (
 COPY (
   SELECT rel::text, priority, coalesce(segment_group, '')
   FROM sorted_heap_graph_exact_resolve('chain_exact', 'both', 1, ARRAY['sealed','hot'])
+) TO STDOUT;
+
+COPY (
+  SELECT 'ok'
+  FROM (
+    SELECT sorted_heap_graph_route_policy_register('chain_exact', 'prefer_hot', ARRAY['hot','sealed'])
+  ) s
+) TO STDOUT;
+
+COPY (
+  SELECT 'ok'
+  FROM (
+    SELECT sorted_heap_graph_route_policy_register('chain_exact', 'prefer_sealed', ARRAY['sealed','hot'])
+  ) s
+) TO STDOUT;
+
+COPY (
+  SELECT route_name, policy_name, array_to_string(segment_groups, ',')
+  FROM sorted_heap_graph_route_policy_config('chain_exact')
+) TO STDOUT;
+
+COPY (
+  SELECT array_to_string(sorted_heap_graph_route_policy_groups('chain_exact', 'prefer_sealed'), ',')
 ) TO STDOUT;
 
 COPY (
@@ -1252,6 +1334,50 @@ COPY (
     UNION ALL
     (SELECT * FROM baseline EXCEPT ALL SELECT * FROM helper)
   ) diff
+) TO STDOUT;
+
+COPY (
+  WITH helper AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_graph_rag_routed_exact_policy(
+      'chain_exact',
+      'both',
+      'prefer_sealed',
+      '[-1,0,0,0]'::svec,
+      relation_path := ARRAY[1,2,3],
+      ann_k := 1,
+      top_k := 2,
+      score_mode := 'path',
+      limit_rows := 0,
+      fanout_limit := 1
+    )
+  ),
+  baseline AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_graph_rag(
+      'facts_chain_seg_b'::regclass,
+      '[-1,0,0,0]'::svec,
+      relation_path := ARRAY[1,2,3],
+      ann_k := 1,
+      top_k := 2,
+      score_mode := 'path',
+      limit_rows := 0
+    )
+  )
+  SELECT count(*) AS routed_exact_policy_multihop_path_diff_rows
+  FROM (
+    (SELECT * FROM helper EXCEPT ALL SELECT * FROM baseline)
+    UNION ALL
+    (SELECT * FROM baseline EXCEPT ALL SELECT * FROM helper)
+  ) diff
+) TO STDOUT;
+
+COPY (
+  SELECT sorted_heap_graph_route_policy_unregister('chain_exact')
+) TO STDOUT;
+
+COPY (
+  SELECT sorted_heap_graph_route_policy_unregister('chain_grouped')
 ) TO STDOUT;
 
 COPY (

@@ -701,6 +701,31 @@ Resolves candidate shards for a route value.
 Deletes one shard from a route group, or all shards for that route group when
 `rel` is `NULL`.
 
+### `sorted_heap_graph_route_policy_register(route_name, policy_name, segment_groups)`
+
+Registers a named shard-group preference policy.
+
+- `route_name` scopes the policy to one routed graph
+- `policy_name` is an application-facing label such as `prefer_hot`
+- `segment_groups` is a non-empty `text[]`
+- array order is preserved and becomes the preference order used by the
+  policy-backed wrappers
+
+### `sorted_heap_graph_route_policy_config(route_name, policy_name)`
+
+Lists registered shard-group policies for one route group.
+
+### `sorted_heap_graph_route_policy_groups(route_name, policy_name)`
+
+Returns the stored `segment_groups text[]` for one named policy.
+
+- raises an error if the policy does not exist
+
+### `sorted_heap_graph_route_policy_unregister(route_name, policy_name)`
+
+Deletes one named policy, or all policies under that route group when
+`policy_name` is `NULL`.
+
 ### `sorted_heap_graph_rag_routed(route_name, route_value, query, relation_path, ann_k, top_k, score_mode, limit_rows, fanout_limit, segment_groups)`
 
 Beta routed GraphRAG wrapper.
@@ -730,6 +755,35 @@ FROM sorted_heap_graph_rag_routed(
     top_k := 10,
     score_mode := 'path',
     segment_groups := ARRAY['hot']
+);
+```
+
+### `sorted_heap_graph_rag_routed_policy(route_name, route_value, policy_name, query, relation_path, ann_k, top_k, score_mode, limit_rows, fanout_limit)`
+
+Beta routed GraphRAG wrapper with registry-backed shard-group policy lookup.
+
+- resolves `segment_groups` from `sorted_heap_graph_route_policy_registry`
+- delegates to `sorted_heap_graph_rag_routed(...)`
+- keeps the same routing and GraphRAG scoring semantics
+
+```sql
+SELECT sorted_heap_graph_route_policy_register(
+    'tenant_facts',
+    'prefer_hot',
+    ARRAY['hot', 'sealed']
+);
+
+SELECT source_rel, entity_id, relation_id, target_id, payload, distance
+FROM sorted_heap_graph_rag_routed_policy(
+    'tenant_facts',
+    812,
+    'prefer_hot',
+    '[0.1,0.2,0.3,...]'::svec,
+    relation_path := ARRAY[1, 2],
+    ann_k := 64,
+    top_k := 10,
+    score_mode := 'path',
+    fanout_limit := 1
 );
 ```
 
@@ -797,6 +851,36 @@ FROM sorted_heap_graph_rag_routed_exact(
     top_k := 10,
     score_mode := 'path',
     segment_groups := ARRAY['hot']
+);
+```
+
+### `sorted_heap_graph_rag_routed_exact_policy(route_name, route_key, policy_name, query, relation_path, ann_k, top_k, score_mode, limit_rows, fanout_limit)`
+
+Beta exact-key routed GraphRAG wrapper with registry-backed shard-group policy
+lookup.
+
+- resolves `segment_groups` from `sorted_heap_graph_route_policy_registry`
+- delegates to `sorted_heap_graph_rag_routed_exact(...)`
+- keeps the same routing and GraphRAG scoring semantics
+
+```sql
+SELECT sorted_heap_graph_route_policy_register(
+    'tenant_facts',
+    'prefer_hot',
+    ARRAY['hot', 'sealed']
+);
+
+SELECT source_rel, entity_id, relation_id, target_id, payload, distance
+FROM sorted_heap_graph_rag_routed_exact_policy(
+    'tenant_facts',
+    'kb_alpha',
+    'prefer_hot',
+    '[0.1,0.2,0.3,...]'::svec,
+    relation_path := ARRAY[1, 2],
+    ann_k := 64,
+    top_k := 10,
+    score_mode := 'path',
+    fanout_limit := 1
 );
 ```
 

@@ -700,6 +700,91 @@ AS $$
            chosen.relid;
 $$ LANGUAGE SQL STABLE;
 
+CREATE TABLE @extschema@.sorted_heap_graph_route_policy_registry (
+  route_name text NOT NULL,
+  policy_name text NOT NULL,
+  segment_groups text[] NOT NULL,
+  PRIMARY KEY (route_name, policy_name)
+);
+
+SELECT pg_catalog.pg_extension_config_dump('@extschema@.sorted_heap_graph_route_policy_registry', '');
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_route_policy_register(
+  route_name text,
+  policy_name text,
+  segment_groups text[]
+) RETURNS void
+AS $$
+BEGIN
+  IF segment_groups IS NULL OR array_ndims(segment_groups) <> 1 OR array_length(segment_groups, 1) IS NULL OR array_length(segment_groups, 1) < 1 THEN
+    RAISE EXCEPTION 'sorted_heap_graph_route_policy_register: segment_groups must be a non-empty one-dimensional text[]';
+  END IF;
+
+  INSERT INTO @extschema@.sorted_heap_graph_route_policy_registry (
+    route_name, policy_name, segment_groups
+  )
+  VALUES ($1, $2, $3)
+  ON CONFLICT ON CONSTRAINT sorted_heap_graph_route_policy_registry_pkey DO UPDATE SET
+    segment_groups = EXCLUDED.segment_groups;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_route_policy_unregister(
+  route_name text,
+  policy_name text DEFAULT NULL
+) RETURNS int4
+AS $$
+DECLARE
+  deleted_rows int4;
+BEGIN
+  DELETE FROM @extschema@.sorted_heap_graph_route_policy_registry
+  WHERE sorted_heap_graph_route_policy_registry.route_name = sorted_heap_graph_route_policy_unregister.route_name
+    AND (sorted_heap_graph_route_policy_unregister.policy_name IS NULL
+         OR sorted_heap_graph_route_policy_registry.policy_name = sorted_heap_graph_route_policy_unregister.policy_name);
+  GET DIAGNOSTICS deleted_rows = ROW_COUNT;
+  RETURN deleted_rows;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_route_policy_config(
+  route_name text DEFAULT NULL,
+  policy_name text DEFAULT NULL
+) RETURNS TABLE (
+  route_name text,
+  policy_name text,
+  segment_groups text[]
+)
+AS $$
+  SELECT p.route_name, p.policy_name, p.segment_groups
+  FROM @extschema@.sorted_heap_graph_route_policy_registry p
+  WHERE ($1 IS NULL OR p.route_name = $1)
+    AND ($2 IS NULL OR p.policy_name = $2)
+  ORDER BY p.route_name, p.policy_name;
+$$ LANGUAGE SQL STABLE;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_route_policy_groups(
+  route_name text,
+  policy_name text
+) RETURNS text[]
+AS $$
+DECLARE
+  groups text[];
+BEGIN
+  SELECT p.segment_groups
+  INTO groups
+  FROM @extschema@.sorted_heap_graph_route_policy_registry p
+  WHERE p.route_name = sorted_heap_graph_route_policy_groups.route_name
+    AND p.policy_name = sorted_heap_graph_route_policy_groups.policy_name;
+
+  IF groups IS NULL THEN
+    RAISE EXCEPTION 'sorted_heap_graph_route_policy_groups: no policy % registered under route %',
+      policy_name, route_name;
+  END IF;
+
+  RETURN groups;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
 CREATE FUNCTION @extschema@.sorted_heap_graph_rag_stats()
 RETURNS TABLE (
   calls bigint,
@@ -1249,6 +1334,96 @@ $$ LANGUAGE plpgsql STABLE;
 
 COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact(text, text, @extschema@.svec, int4[], int4, int4, text, int4, int4, text[])
 IS 'Beta exact-key routed GraphRAG wrapper. Resolves candidate shards from sorted_heap_graph_exact_registry using an exact route key plus optional segment-group filtering, then delegates to sorted_heap_graph_rag_segmented(...).';
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_policy(
+  route_name text,
+  route_value int8,
+  policy_name text,
+  query @extschema@.svec,
+  relation_path int4[],
+  ann_k int4 DEFAULT 64,
+  top_k int4 DEFAULT 10,
+  score_mode text DEFAULT 'path',
+  limit_rows int4 DEFAULT 0,
+  fanout_limit int4 DEFAULT 0
+) RETURNS TABLE (
+  source_rel regclass,
+  entity_id int4,
+  relation_id int2,
+  target_id int4,
+  payload text,
+  distance float8
+)
+AS $$
+DECLARE
+  groups text[];
+BEGIN
+  groups := @extschema@.sorted_heap_graph_route_policy_groups(route_name, policy_name);
+
+  RETURN QUERY
+  SELECT g.source_rel, g.entity_id, g.relation_id, g.target_id, g.payload, g.distance
+  FROM @extschema@.sorted_heap_graph_rag_routed(
+    route_name,
+    route_value,
+    query,
+    relation_path,
+    ann_k,
+    top_k,
+    score_mode,
+    limit_rows,
+    fanout_limit,
+    groups
+  ) AS g;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_policy(text, int8, text, @extschema@.svec, int4[], int4, int4, text, int4, int4)
+IS 'Beta routed GraphRAG wrapper. Resolves a named segment-group policy from sorted_heap_graph_route_policy_registry, then delegates to sorted_heap_graph_rag_routed(...).';
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact_policy(
+  route_name text,
+  route_key text,
+  policy_name text,
+  query @extschema@.svec,
+  relation_path int4[],
+  ann_k int4 DEFAULT 64,
+  top_k int4 DEFAULT 10,
+  score_mode text DEFAULT 'path',
+  limit_rows int4 DEFAULT 0,
+  fanout_limit int4 DEFAULT 0
+) RETURNS TABLE (
+  source_rel regclass,
+  entity_id int4,
+  relation_id int2,
+  target_id int4,
+  payload text,
+  distance float8
+)
+AS $$
+DECLARE
+  groups text[];
+BEGIN
+  groups := @extschema@.sorted_heap_graph_route_policy_groups(route_name, policy_name);
+
+  RETURN QUERY
+  SELECT g.source_rel, g.entity_id, g.relation_id, g.target_id, g.payload, g.distance
+  FROM @extschema@.sorted_heap_graph_rag_routed_exact(
+    route_name,
+    route_key,
+    query,
+    relation_path,
+    ann_k,
+    top_k,
+    score_mode,
+    limit_rows,
+    fanout_limit,
+    groups
+  ) AS g;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact_policy(text, text, text, @extschema@.svec, int4[], int4, int4, text, int4, int4)
+IS 'Beta exact-key routed GraphRAG wrapper. Resolves a named segment-group policy from sorted_heap_graph_route_policy_registry, then delegates to sorted_heap_graph_rag_routed_exact(...).';
 
 -- ----------------------------------------------------------------
 -- SimHash: 12-bit locality-sensitive hash for svec columns

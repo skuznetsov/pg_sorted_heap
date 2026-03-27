@@ -242,6 +242,15 @@
       preference order before bounded fanout is applied
     - this is the first beta surface for hot/sealed or relation-family shard
       pruning without changing the GraphRAG scoring contract
+  - the first registry-backed policy layer for shard-group preference:
+    - added `sorted_heap_graph_route_policy_register(...)`,
+      `sorted_heap_graph_route_policy_config(...)`,
+      `sorted_heap_graph_route_policy_groups(...)`, and
+      `sorted_heap_graph_route_policy_unregister(...)`
+    - added `sorted_heap_graph_rag_routed_policy(...)` and
+      `sorted_heap_graph_rag_routed_exact_policy(...)`
+    - this keeps hot/sealed preference in route metadata instead of repeating
+      raw `segment_groups := ARRAY[...]` literals in every query
 
 ### sorted_hnsw build optimization
 

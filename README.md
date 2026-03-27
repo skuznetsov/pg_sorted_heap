@@ -240,13 +240,19 @@ The older helper/wrapper family is still available for lower-level control:
 - `sorted_heap_graph_segment_config(...)`
 - `sorted_heap_graph_segment_resolve(...)`
 - `sorted_heap_graph_segment_unregister(...)`
+- `sorted_heap_graph_route_policy_register(...)`
+- `sorted_heap_graph_route_policy_config(...)`
+- `sorted_heap_graph_route_policy_groups(...)`
+- `sorted_heap_graph_route_policy_unregister(...)`
 - `sorted_heap_graph_exact_register(...)`
 - `sorted_heap_graph_exact_config(...)`
 - `sorted_heap_graph_exact_resolve(...)`
 - `sorted_heap_graph_exact_unregister(...)`
 - `sorted_heap_graph_rag_segmented(...)`
 - `sorted_heap_graph_rag_routed(...)`
+- `sorted_heap_graph_rag_routed_policy(...)`
 - `sorted_heap_graph_rag_routed_exact(...)`
+- `sorted_heap_graph_rag_routed_exact_policy(...)`
 - `sorted_heap_graph_rag_scan(...)`
 - `sorted_heap_graph_rag_twohop_scan(...)`
 - `sorted_heap_graph_rag_twohop_path_scan(...)`
@@ -269,7 +275,10 @@ an exact key instead of a numeric range. Both routed wrappers now also accept
 an optional `segment_groups := ARRAY[...]` filter, which is the first beta
 surface for hot/sealed or relation-family shard narrowing without changing the
 GraphRAG scoring contract. When that array is present, its order is also used
-as the shard preference order before bounded fanout is applied.
+as the shard preference order before bounded fanout is applied. The next beta
+convenience layer now exists too: named route policies can store that group
+order once and be reused through `sorted_heap_graph_rag_routed_policy(...)`
+and `sorted_heap_graph_rag_routed_exact_policy(...)`.
 
 For tuning and debugging, GraphRAG now also exposes backend-local last-call
 stats:
