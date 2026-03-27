@@ -144,6 +144,7 @@ Reference design:
 - and the first richer metadata filter now exists on top of both routed paths:
   - optional `segment_group` labels at registration time
   - optional `segment_groups text[]` filters at resolve/query time
+  - the filter array order is also a bounded-fanout preference order
   - this is the first beta surface for hot/sealed or relation-family pruning
 - what is still missing:
   - more than one routing dimension per registry row

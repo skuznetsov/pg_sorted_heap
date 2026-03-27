@@ -682,6 +682,8 @@ group, range, and relation.
 
 - `segment_groups := NULL` means "all groups"
 - non-`NULL` `text[]` filters to matching shard labels only
+- when `segment_groups` is non-`NULL`, its array order also becomes the
+  preferred group order in the result set
 
 ### `sorted_heap_graph_segment_resolve(route_name, route_value, fanout_limit, segment_groups)`
 
@@ -689,6 +691,8 @@ Resolves candidate shards for a route value.
 
 - matches rows where `route_value BETWEEN route_min AND route_max`
 - optionally filters to `segment_group = ANY(segment_groups)`
+- when `segment_groups` is non-`NULL`, its array order is preferred before the
+  usual narrower-range ordering
 - orders narrower ranges first
 - `fanout_limit := 0` means "all matching shards"
 
@@ -703,6 +707,8 @@ Beta routed GraphRAG wrapper.
 
 - resolves candidate shards from `sorted_heap_graph_segment_registry`
 - optionally narrows those shards by `segment_group`
+- when `segment_groups` is non-`NULL`, its array order is the shard preference
+  order before `fanout_limit` is applied
 - delegates to `sorted_heap_graph_rag_segmented(...)`
 - preserves the same GraphRAG scoring contract after routing
 
@@ -742,12 +748,17 @@ Registers an exact-key shard mapping in the beta exact-routing registry.
 Lists the current exact-key shard mappings ordered by
 `(route_name, route_key, priority desc, segment_group, rel)`.
 
+- when `segment_groups` is non-`NULL`, its array order becomes the preferred
+  group order before per-shard priority
+
 ### `sorted_heap_graph_exact_resolve(route_name, route_key, fanout_limit, segment_groups)`
 
 Resolves candidate shards for an exact route key.
 
 - matches rows where `route_key = <supplied key>`
 - optionally filters to `segment_group = ANY(segment_groups)`
+- when `segment_groups` is non-`NULL`, its array order is preferred before the
+  usual `priority DESC` ordering
 - orders by `priority DESC, rel`
 - `fanout_limit := 0` means "all matching shards"
 
@@ -764,6 +775,8 @@ Beta exact-key routed GraphRAG wrapper.
 
 - resolves candidate shards from `sorted_heap_graph_exact_registry`
 - optionally narrows those shards by `segment_group`
+- when `segment_groups` is non-`NULL`, its array order is the shard preference
+  order before `fanout_limit` is applied
 - delegates to `sorted_heap_graph_rag_segmented(...)`
 - keeps the same GraphRAG scoring contract after routing
 

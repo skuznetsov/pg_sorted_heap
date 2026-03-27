@@ -238,6 +238,8 @@
       filters
     - both routed wrappers now accept optional `segment_groups := ARRAY[...]`
       to narrow candidate shards before segmented GraphRAG fanout/merge
+    - when `segment_groups` is present, its array order now becomes the shard
+      preference order before bounded fanout is applied
     - this is the first beta surface for hot/sealed or relation-family shard
       pruning without changing the GraphRAG scoring contract
 

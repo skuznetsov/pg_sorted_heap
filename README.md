@@ -268,7 +268,8 @@ tenant/KB-style routing: register a key-to-shard mapping once, then route by
 an exact key instead of a numeric range. Both routed wrappers now also accept
 an optional `segment_groups := ARRAY[...]` filter, which is the first beta
 surface for hot/sealed or relation-family shard narrowing without changing the
-GraphRAG scoring contract.
+GraphRAG scoring contract. When that array is present, its order is also used
+as the shard preference order before bounded fanout is applied.
 
 For tuning and debugging, GraphRAG now also exposes backend-local last-call
 stats:

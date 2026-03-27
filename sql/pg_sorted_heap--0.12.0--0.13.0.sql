@@ -130,7 +130,12 @@ AS $$
   FROM @extschema@.sorted_heap_graph_segment_registry s
   WHERE ($1 IS NULL OR s.route_name = $1)
     AND ($2 IS NULL OR s.segment_group = ANY($2))
-  ORDER BY s.route_name, s.segment_group, s.route_min, s.route_max, s.relid;
+  ORDER BY s.route_name,
+           CASE WHEN $2 IS NULL THEN 0 ELSE array_position($2, s.segment_group) END,
+           s.segment_group,
+           s.route_min,
+           s.route_max,
+           s.relid;
 $$ LANGUAGE SQL STABLE;
 
 CREATE FUNCTION @extschema@.sorted_heap_graph_segment_resolve(
@@ -152,10 +157,19 @@ AS $$
     WHERE s.route_name = $1
       AND $2 BETWEEN s.route_min AND s.route_max
       AND ($4 IS NULL OR s.segment_group = ANY($4))
-    ORDER BY (s.route_max - s.route_min), s.route_min, s.route_max, s.segment_group, s.relid
+    ORDER BY CASE WHEN $4 IS NULL THEN 0 ELSE array_position($4, s.segment_group) END,
+             (s.route_max - s.route_min),
+             s.route_min,
+             s.route_max,
+             s.segment_group,
+             s.relid
     LIMIT CASE WHEN $3 IS NULL OR $3 <= 0 THEN NULL ELSE $3 END
   ) chosen
-  ORDER BY chosen.route_min, chosen.route_max, chosen.segment_group, chosen.relid;
+  ORDER BY CASE WHEN $4 IS NULL THEN 0 ELSE array_position($4, chosen.segment_group) END,
+           chosen.route_min,
+           chosen.route_max,
+           chosen.segment_group,
+           chosen.relid;
 $$ LANGUAGE SQL STABLE;
 
 CREATE TABLE @extschema@.sorted_heap_graph_exact_registry (
@@ -223,7 +237,12 @@ AS $$
   WHERE ($1 IS NULL OR s.route_name = $1)
     AND ($2 IS NULL OR s.route_key = $2)
     AND ($3 IS NULL OR s.segment_group = ANY($3))
-  ORDER BY s.route_name, s.route_key, s.priority DESC, s.segment_group, s.relid;
+  ORDER BY s.route_name,
+           s.route_key,
+           CASE WHEN $3 IS NULL THEN 0 ELSE array_position($3, s.segment_group) END,
+           s.priority DESC,
+           s.segment_group,
+           s.relid;
 $$ LANGUAGE SQL STABLE;
 
 CREATE FUNCTION @extschema@.sorted_heap_graph_exact_resolve(
@@ -244,10 +263,16 @@ AS $$
     WHERE s.route_name = $1
       AND s.route_key = $2
       AND ($4 IS NULL OR s.segment_group = ANY($4))
-    ORDER BY s.priority DESC, s.segment_group, s.relid
+    ORDER BY CASE WHEN $4 IS NULL THEN 0 ELSE array_position($4, s.segment_group) END,
+             s.priority DESC,
+             s.segment_group,
+             s.relid
     LIMIT CASE WHEN $3 IS NULL OR $3 <= 0 THEN NULL ELSE $3 END
   ) chosen
-  ORDER BY chosen.priority DESC, chosen.segment_group, chosen.relid;
+  ORDER BY CASE WHEN $4 IS NULL THEN 0 ELSE array_position($4, chosen.segment_group) END,
+           chosen.priority DESC,
+           chosen.segment_group,
+           chosen.relid;
 $$ LANGUAGE SQL STABLE;
 
 CREATE FUNCTION @extschema@.sorted_heap_graph_rag_stats()
