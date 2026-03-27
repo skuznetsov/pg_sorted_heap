@@ -419,6 +419,28 @@ So the current conclusion is narrow but useful: for synthetic
 `~10%` ingest win without giving up the compacted query-time locality that
 the earlier "skip compaction" falsifier showed we still need.
 
+I also bounded the obvious follow-up on the same direct ordered load:
+parameterizing the post-load maintenance step as `none`, `merge`, or
+`compact`.
+
+- `200K` rows (`40K` pairs x `5` hops, `64D`, `hop_weight=0.05`)
+  - `none`: `5159.888 ms` load, depth-5 unified GraphRAG `62.148 ms`
+  - `merge`: `5749.190 ms` load, depth-5 unified GraphRAG `23.277 ms`
+  - `compact`: `5626.887 ms` load, depth-5 unified GraphRAG `24.591 ms`
+- `1M` rows (`200K` pairs x `5` hops, `64D`, load only)
+  - `none`: `25.820 s`
+  - `merge`: `28.142 s`
+  - `compact`: `28.108 s`
+
+So `merge` is now exposed as an experiment knob in the multidepth harness,
+but it is not a proven new default. The current evidence says:
+
+- `none` is too expensive at query time
+- `merge` is viable on ordered synthetic loads
+- `merge` does not materially beat `compact` on the larger `1M` load point
+
+That leaves `compact` as the stable default for large-scale multidepth runs.
+
 With that lower-footprint path, the same `10M x 64D` AWS point advanced
 materially further on the same host:
 

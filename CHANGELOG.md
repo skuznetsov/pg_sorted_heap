@@ -166,6 +166,12 @@
     depth-5 quality/latency while improving ingest by about `10%`
     (`6.321 s` -> `5.638 s` at `200K` rows, `31.392 s` -> `28.231 s` at
     `1M` rows)
+  - a new multidepth harness knob `--post-load-op compact|merge|none` to
+    compare post-load maintenance strategies on the same synthetic graph
+  - bounded local evidence that keeps `compact` as the default:
+    `none` is much slower at query time, while `merge` is viable but does not
+    materially beat `compact` on the larger `1M` load point (`28.142 s`
+    versus `28.108 s`)
 
 ### sorted_hnsw build optimization
 

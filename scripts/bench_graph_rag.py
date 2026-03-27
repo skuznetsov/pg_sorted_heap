@@ -200,7 +200,16 @@ def bootstrap_schema(cur: Cursor, dim: int) -> None:
     )
 
 
-def load_data_fileobj(cur: Cursor, src, retain_heap: bool = True) -> None:
+def load_data_fileobj(cur: Cursor, src, retain_heap: bool = True, post_load_op: str = "compact") -> None:
+    if post_load_op not in ("compact", "merge", "none"):
+        raise ValueError(f"unsupported post_load_op: {post_load_op}")
+
+    def apply_post_load_op() -> None:
+        if post_load_op == "compact":
+            cur.execute("SELECT sorted_heap_compact('facts_sh'::regclass)")
+        elif post_load_op == "merge":
+            cur.execute("SELECT sorted_heap_merge('facts_sh'::regclass)")
+
     if not retain_heap:
         cur.copy_expert(
             """
@@ -209,7 +218,7 @@ def load_data_fileobj(cur: Cursor, src, retain_heap: bool = True) -> None:
             """,
             src,
         )
-        cur.execute("SELECT sorted_heap_compact('facts_sh'::regclass)")
+        apply_post_load_op()
         cur.execute("ANALYZE facts_sh")
         cur.execute("DROP TABLE facts_heap")
         return
@@ -229,7 +238,7 @@ def load_data_fileobj(cur: Cursor, src, retain_heap: bool = True) -> None:
         ORDER BY entity_id, relation_id, target_id
         """
     )
-    cur.execute("SELECT sorted_heap_compact('facts_sh'::regclass)")
+    apply_post_load_op()
     cur.execute("ANALYZE facts_sh")
     if retain_heap:
         cur.execute("ANALYZE facts_heap")
@@ -237,9 +246,9 @@ def load_data_fileobj(cur: Cursor, src, retain_heap: bool = True) -> None:
         cur.execute("DROP TABLE facts_heap")
 
 
-def load_data(cur: Cursor, csv_path: Path, retain_heap: bool = True) -> None:
+def load_data(cur: Cursor, csv_path: Path, retain_heap: bool = True, post_load_op: str = "compact") -> None:
     with open(csv_path, "r", encoding="utf-8") as f:
-        load_data_fileobj(cur, f, retain_heap=retain_heap)
+        load_data_fileobj(cur, f, retain_heap=retain_heap, post_load_op=post_load_op)
 
 
 def build_indexes(

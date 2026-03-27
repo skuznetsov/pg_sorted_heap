@@ -320,6 +320,7 @@ def main() -> None:
     ap.add_argument("--max-wal-size-gb", type=int, default=4)
     ap.add_argument("--maintenance-work-mem-mb", type=int, default=0)
     ap.add_argument("--table-scope", choices=("all", "sorted_heap_only"), default="all")
+    ap.add_argument("--post-load-op", choices=("compact", "merge", "none"), default="compact")
     ap.add_argument(
         "--stop-after",
         choices=("none", "generate_csv", "load_data", "build_indexes", "analyze"),
@@ -350,6 +351,7 @@ def main() -> None:
         build_table_scope = str(meta.get("table_scope", args.table_scope))
         build_heap_retained = bool(meta.get("heap_retained", True))
         build_stream_copy = bool(meta.get("stream_copy", False))
+        build_post_load_op = str(meta.get("post_load_op", args.post_load_op))
         build_shared_buffers_mb = int(meta.get("shared_buffers_mb", args.shared_buffers_mb))
         build_max_wal_size_gb = int(meta.get("max_wal_size_gb", args.max_wal_size_gb))
         build_maintenance_work_mem_mb = int(meta.get("maintenance_work_mem_mb", args.maintenance_work_mem_mb))
@@ -374,6 +376,7 @@ def main() -> None:
         build_table_scope = args.table_scope
         build_heap_retained = build_table_scope == "all"
         build_stream_copy = args.stream_copy
+        build_post_load_op = args.post_load_op
         build_shared_buffers_mb = args.shared_buffers_mb
         build_max_wal_size_gb = args.max_wal_size_gb
         build_maintenance_work_mem_mb = args.maintenance_work_mem_mb
@@ -391,6 +394,7 @@ def main() -> None:
                 "table_scope": build_table_scope,
                 "heap_retained": build_heap_retained,
                 "stream_copy": build_stream_copy,
+                "post_load_op": build_post_load_op,
                 "shared_buffers_mb": build_shared_buffers_mb,
                 "max_wal_size_gb": build_max_wal_size_gb,
                 "maintenance_work_mem_mb": build_maintenance_work_mem_mb,
@@ -454,9 +458,15 @@ def main() -> None:
                         cur,
                         FactCsvStream(num_pairs, max_depth, dim, build_hop_weight),
                         retain_heap=build_heap_retained,
+                        post_load_op=build_post_load_op,
                     )
                 else:
-                    base.load_data(cur, csv_path, retain_heap=build_heap_retained)
+                    base.load_data(
+                        cur,
+                        csv_path,
+                        retain_heap=build_heap_retained,
+                        post_load_op=build_post_load_op,
+                    )
                 t_load_end = time.perf_counter()
                 csv_removed = False
                 if not build_stream_copy and csv_path.exists():
@@ -549,6 +559,7 @@ def main() -> None:
             print(f"maintenance_work_mem: {build_maintenance_work_mem_mb}MB")
             print(f"table_scope:      {build_table_scope}")
             print(f"heap_retained:    {'yes' if build_heap_retained else 'no'}")
+            print(f"post_load_op:     {build_post_load_op}")
             print(f"reuse_temp:       {str(tmp) if reusing else 'no'}")
             print(f"backend_mode:     {args.backend_mode}")
             print()
