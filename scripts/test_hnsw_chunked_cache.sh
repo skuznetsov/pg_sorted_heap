@@ -582,6 +582,79 @@ for w in 2 3; do
 done
 check "b4_parallel_3_backends" "t" "$parallel_ok"
 
+# ---- B5: Multi-index shared cache overwrite (the exact bug from the benchmark) ----
+# Two sorted_hnsw indexes on different tables. Backend attaches to index A via shared
+# cache, then a query on index B overwrites shared memory. Subsequent queries on A
+# must still return correct results (deep-copy protects against overwrite).
+echo "=== B5: Multi-index shared cache overwrite ==="
+
+PSQL <<SQL
+CREATE TABLE facts_b (
+  entity_id   int4 NOT NULL,
+  relation_id int2 NOT NULL,
+  target_id   int4 NOT NULL,
+  embedding   svec($DIM) NOT NULL,
+  payload     text NOT NULL,
+  PRIMARY KEY (entity_id, target_id)
+) USING sorted_heap;
+
+-- Different data: offset entity IDs so results are distinguishable
+INSERT INTO facts_b
+SELECT
+  g + 500000,
+  CASE WHEN (g % 3) = 0 THEN 1::int2
+       WHEN (g % 3) = 1 THEN 2::int2
+       ELSE 3::int2 END,
+  g + 600000,
+  format('[%s,%s,%s,%s,%s,%s,%s,%s]',
+    cos(g::float8), sin(g::float8),
+    cos(g::float8 * 0.7), sin(g::float8 * 0.7),
+    cos(g::float8 * 1.3), sin(g::float8 * 1.3),
+    cos(g::float8 * 0.3), sin(g::float8 * 0.3))::svec,
+  'b-filler-' || g
+FROM generate_series(100, $((NROWS + 99))) g;
+
+SELECT sorted_heap_compact('facts_b'::regclass);
+ANALYZE facts_b;
+
+CREATE INDEX facts_b_vec_idx
+  ON facts_b USING sorted_hnsw (embedding svec_cosine_ops)
+  WITH (m = $M_PARAM, ef_construction = $EF_CONSTRUCT);
+SQL
+
+# In one backend: attach facts, then query facts_b (overwrites shared), then query facts again
+B5_SIGS=$(PSQL <<SQL
+-- Query facts first → attaches to shared cache for facts_vec_idx
+SELECT 'A1:' || string_agg(entity_id::text, ',' ORDER BY entity_id)
+FROM (SELECT entity_id FROM facts
+      ORDER BY embedding <=> '${QUERY_VEC}'::svec LIMIT $KNN_K) t;
+
+-- Query facts_b → loads from disk, publishes facts_b to shared (overwrites facts data)
+SELECT 'B1:' || string_agg(entity_id::text, ',' ORDER BY entity_id)
+FROM (SELECT entity_id FROM facts_b
+      ORDER BY embedding <=> '${QUERY_VEC}'::svec LIMIT $KNN_K) t;
+
+-- Query facts AGAIN → must still return correct results, not facts_b data
+SELECT 'A2:' || string_agg(entity_id::text, ',' ORDER BY entity_id)
+FROM (SELECT entity_id FROM facts
+      ORDER BY embedding <=> '${QUERY_VEC}'::svec LIMIT $KNN_K) t;
+SQL
+)
+
+A1=$(echo "$B5_SIGS" | grep '^A1:' | sed 's/^A1://')
+B1=$(echo "$B5_SIGS" | grep '^B1:' | sed 's/^B1://')
+A2=$(echo "$B5_SIGS" | grep '^A2:' | sed 's/^A2://')
+
+check "b5_facts_a_first_query" "t" "$([ -n "$A1" ] && echo t || echo f)"
+check "b5_facts_b_query" "t" "$([ -n "$B1" ] && echo t || echo f)"
+check "b5_facts_a_after_overwrite" "t" "$([ -n "$A2" ] && echo t || echo f)"
+
+# The critical assertion: A1 and A2 must be identical (no corruption from B's publish)
+check "b5_facts_a_stable_across_overwrite" "$A1" "$A2"
+
+# A and B must return DIFFERENT results (they have different data)
+check "b5_a_and_b_differ" "t" "$([ "$A1" != "$B1" ] && echo t || echo f)"
+
 # ---- Summary ----
 echo ""
 echo "=== Summary ==="

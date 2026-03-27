@@ -740,7 +740,7 @@ static ShnswScanCache *
 shnsw_shared_scan_cache_attach(Relation index, uint64 cache_gen)
 {
 	ShnswScanCache *cache;
-	int				lev;
+	int				i, lev;
 
 	if (!shnsw_shared_scan_cache_available())
 		return NULL;
@@ -756,42 +756,114 @@ shnsw_shared_scan_cache_attach(Relation index, uint64 cache_gen)
 		return NULL;
 	}
 
-	cache = palloc0(sizeof(ShnswScanCache));
-	cache->M = shnsw_shared_scan_ctl->M;
-	cache->dim = shnsw_shared_scan_ctl->dim;
-	cache->n_nodes = shnsw_shared_scan_ctl->n_nodes;
-	cache->entry_nid = shnsw_shared_scan_ctl->entry_nid;
-	cache->max_level = shnsw_shared_scan_ctl->max_level;
-	cache->ef_search = sorted_hnsw_ef_search;
-	cache->l0_start = shnsw_shared_scan_ctl->l0_start;
-	cache->l0_npages = shnsw_shared_scan_ctl->l0_npages;
-	cache->nodes_per_page = shnsw_shared_scan_ctl->nodes_per_page;
-	cache->node_size = shnsw_shared_scan_ctl->node_size;
-	cache->shared_immutable = true;
-
-	cache->sq8_mins = (float *) shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->sq8_mins_off);
-	cache->sq8_scales = (float *) shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->sq8_scales_off);
-	cache->nodes = (ShnswCacheNode *)
-		shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->nodes_off);
-	cache->l0_neighbors = (int32 *)
-		shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->l0_neighbors_off);
-	cache->sq8_data = (uint8 *)
-		shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->sq8_data_off);
-	cache->l0_page_loaded = NULL;
-
-	cache->upper = palloc0(sizeof(ShnswUpperNbr *) * (cache->max_level + 1));
-	cache->upper_count = palloc0(sizeof(int) * (cache->max_level + 1));
-	cache->upper_nbr_idx = palloc0(sizeof(int *) * (cache->max_level + 1));
-
-	for (lev = 1; lev <= cache->max_level; lev++)
 	{
-		cache->upper_count[lev] = shnsw_shared_scan_ctl->upper_count[lev];
-		if (shnsw_shared_scan_ctl->upper_entries_off[lev] != 0)
-			cache->upper[lev] = (ShnswUpperNbr *)
-				shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->upper_entries_off[lev]);
-		if (shnsw_shared_scan_ctl->upper_nbr_idx_off[lev] != 0)
-			cache->upper_nbr_idx[lev] = (int *)
-				shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->upper_nbr_idx_off[lev]);
+		Size		sq8_bytes = sizeof(float) * (Size) shnsw_shared_scan_ctl->dim;
+		Size		nodes_bytes = sizeof(ShnswCacheNode) * (Size) shnsw_shared_scan_ctl->n_nodes;
+		Size		l0_nbr_bytes = (Size) shnsw_shared_scan_ctl->n_nodes *
+			(Size) (2 * shnsw_shared_scan_ctl->M) * sizeof(int32);
+		Size		sq8_data_bytes = (Size) shnsw_shared_scan_ctl->n_nodes *
+			(Size) shnsw_shared_scan_ctl->dim;
+		int			n_nodes = shnsw_shared_scan_ctl->n_nodes;
+		int			M = shnsw_shared_scan_ctl->M;
+		int			dim = shnsw_shared_scan_ctl->dim;
+
+		cache = palloc0(sizeof(ShnswScanCache));
+		cache->M = M;
+		cache->dim = dim;
+		cache->n_nodes = n_nodes;
+		cache->entry_nid = shnsw_shared_scan_ctl->entry_nid;
+		cache->max_level = shnsw_shared_scan_ctl->max_level;
+		cache->ef_search = sorted_hnsw_ef_search;
+		cache->l0_start = shnsw_shared_scan_ctl->l0_start;
+		cache->l0_npages = shnsw_shared_scan_ctl->l0_npages;
+		cache->nodes_per_page = shnsw_shared_scan_ctl->nodes_per_page;
+		cache->node_size = shnsw_shared_scan_ctl->node_size;
+
+		/*
+		 * Deep-copy all bulk data out of shared memory into local palloc'd
+		 * buffers.  A subsequent shnsw_shared_scan_cache_publish() for a
+		 * DIFFERENT index will overwrite the shared region, so holding bare
+		 * pointers into shared memory would silently corrupt this cache.
+		 */
+		cache->sq8_mins = palloc(sq8_bytes);
+		memcpy(cache->sq8_mins,
+			   shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->sq8_mins_off),
+			   sq8_bytes);
+		cache->sq8_scales = palloc(sq8_bytes);
+		memcpy(cache->sq8_scales,
+			   shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->sq8_scales_off),
+			   sq8_bytes);
+
+		cache->l0_neighbors = palloc(l0_nbr_bytes);
+		memcpy(cache->l0_neighbors,
+			   shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->l0_neighbors_off),
+			   l0_nbr_bytes);
+
+		cache->sq8_data = palloc(sq8_data_bytes);
+		memcpy(cache->sq8_data,
+			   shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->sq8_data_off),
+			   sq8_data_bytes);
+
+		cache->nodes = palloc(nodes_bytes);
+		memcpy(cache->nodes,
+			   shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->nodes_off),
+			   nodes_bytes);
+
+		/* Repoint each node's neighbors into the local l0_neighbors copy. */
+		for (i = 0; i < n_nodes; i++)
+			cache->nodes[i].neighbors = cache->l0_neighbors +
+				(Size) i * (Size) (2 * M);
+
+		cache->l0_page_loaded = palloc0(Max(cache->l0_npages, 1));
+		memset(cache->l0_page_loaded, 1, cache->l0_npages);
+		cache->shared_immutable = false;
+
+		cache->upper = palloc0(sizeof(ShnswUpperNbr *) * (cache->max_level + 1));
+		cache->upper_count = palloc0(sizeof(int) * (cache->max_level + 1));
+		cache->upper_nbr_idx = palloc0(sizeof(int *) * (cache->max_level + 1));
+
+		for (lev = 1; lev <= cache->max_level; lev++)
+		{
+			int		count;
+			Size	entries_bytes;
+			Size	nbr_bytes;
+			Size	idx_bytes = sizeof(int) * (Size) n_nodes;
+
+			cache->upper_count[lev] = shnsw_shared_scan_ctl->upper_count[lev];
+			count = cache->upper_count[lev];
+			entries_bytes = sizeof(ShnswUpperNbr) * (Size) Max(count, 1);
+			nbr_bytes = sizeof(int32) * (Size) M * (Size) Max(count, 1);
+
+			if (shnsw_shared_scan_ctl->upper_entries_off[lev] != 0 && count > 0)
+			{
+				int32  *local_nbrs;
+
+				cache->upper[lev] = palloc(entries_bytes);
+				memcpy(cache->upper[lev],
+					   shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->upper_entries_off[lev]),
+					   entries_bytes);
+
+				/* Deep-copy the upper neighbors slab and repoint. */
+				local_nbrs = palloc(nbr_bytes);
+				if (shnsw_shared_scan_ctl->upper_neighbors_off[lev] != 0)
+					memcpy(local_nbrs,
+						   shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->upper_neighbors_off[lev]),
+						   nbr_bytes);
+				else
+					memset(local_nbrs, -1, nbr_bytes);
+
+				for (i = 0; i < count; i++)
+					cache->upper[lev][i].neighbors = local_nbrs +
+						(Size) i * (Size) M;
+			}
+			if (shnsw_shared_scan_ctl->upper_nbr_idx_off[lev] != 0)
+			{
+				cache->upper_nbr_idx[lev] = palloc(idx_bytes);
+				memcpy(cache->upper_nbr_idx[lev],
+					   shnsw_shared_scan_ptr(shnsw_shared_scan_ctl->upper_nbr_idx_off[lev]),
+					   idx_bytes);
+			}
+		}
 	}
 
 	LWLockRelease(shnsw_shared_scan_lock);
