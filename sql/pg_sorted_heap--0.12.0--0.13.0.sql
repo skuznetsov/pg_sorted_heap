@@ -484,6 +484,89 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql STABLE;
 
+CREATE TABLE @extschema@.sorted_heap_graph_route_default_registry (
+  route_name text PRIMARY KEY,
+  profile_name text NOT NULL,
+  FOREIGN KEY (route_name, profile_name)
+    REFERENCES @extschema@.sorted_heap_graph_route_profile_registry(route_name, profile_name)
+    ON DELETE CASCADE
+);
+
+SELECT pg_catalog.pg_extension_config_dump('@extschema@.sorted_heap_graph_route_default_registry', '');
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_route_default_register(
+  route_name text,
+  profile_name text
+) RETURNS void
+AS $$
+BEGIN
+  PERFORM 1
+  FROM @extschema@.sorted_heap_graph_route_profile_registry p
+  WHERE p.route_name = sorted_heap_graph_route_default_register.route_name
+    AND p.profile_name = sorted_heap_graph_route_default_register.profile_name;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'sorted_heap_graph_route_default_register: no profile % registered under route %',
+      profile_name, route_name;
+  END IF;
+
+  INSERT INTO @extschema@.sorted_heap_graph_route_default_registry (
+    route_name, profile_name
+  )
+  VALUES ($1, $2)
+  ON CONFLICT ON CONSTRAINT sorted_heap_graph_route_default_registry_pkey DO UPDATE SET
+    profile_name = EXCLUDED.profile_name;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_route_default_unregister(
+  route_name text DEFAULT NULL
+) RETURNS int4
+AS $$
+DECLARE
+  deleted_rows int4;
+BEGIN
+  DELETE FROM @extschema@.sorted_heap_graph_route_default_registry
+  WHERE sorted_heap_graph_route_default_registry.route_name = COALESCE(sorted_heap_graph_route_default_unregister.route_name, sorted_heap_graph_route_default_registry.route_name);
+  GET DIAGNOSTICS deleted_rows = ROW_COUNT;
+  RETURN deleted_rows;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_route_default_config(
+  route_name text DEFAULT NULL
+) RETURNS TABLE (
+  route_name text,
+  profile_name text
+)
+AS $$
+  SELECT d.route_name, d.profile_name
+  FROM @extschema@.sorted_heap_graph_route_default_registry d
+  WHERE ($1 IS NULL OR d.route_name = $1)
+  ORDER BY d.route_name;
+$$ LANGUAGE SQL STABLE;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_route_default_resolve(
+  route_name text
+) RETURNS text
+AS $$
+DECLARE
+  resolved_profile_name text;
+BEGIN
+  SELECT d.profile_name
+  INTO resolved_profile_name
+  FROM @extschema@.sorted_heap_graph_route_default_registry d
+  WHERE d.route_name = sorted_heap_graph_route_default_resolve.route_name;
+
+  IF resolved_profile_name IS NULL THEN
+    RAISE EXCEPTION 'sorted_heap_graph_route_default_resolve: no default profile registered under route %',
+      route_name;
+  END IF;
+
+  RETURN resolved_profile_name;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
 CREATE FUNCTION @extschema@.sorted_heap_graph_rag_stats()
 RETURNS TABLE (
   calls bigint,
@@ -1142,3 +1225,87 @@ $$ LANGUAGE plpgsql STABLE;
 
 COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact_profile(text, text, text, @extschema@.svec, int4[], int4, int4, text, int4)
 IS 'Beta exact-key routed GraphRAG wrapper. Resolves a named route profile containing policy_name, relation_family, and fanout_limit, then delegates to the existing exact-key routed GraphRAG path.';
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_default(
+  route_name text,
+  route_value int8,
+  query @extschema@.svec,
+  relation_path int4[],
+  ann_k int4 DEFAULT 64,
+  top_k int4 DEFAULT 10,
+  score_mode text DEFAULT 'path',
+  limit_rows int4 DEFAULT 0
+) RETURNS TABLE (
+  source_rel regclass,
+  entity_id int4,
+  relation_id int2,
+  target_id int4,
+  payload text,
+  distance float8
+)
+AS $$
+DECLARE
+  resolved_profile_name text;
+BEGIN
+  resolved_profile_name := @extschema@.sorted_heap_graph_route_default_resolve(route_name);
+
+  RETURN QUERY
+  SELECT g.source_rel, g.entity_id, g.relation_id, g.target_id, g.payload, g.distance
+  FROM @extschema@.sorted_heap_graph_rag_routed_profile(
+    route_name,
+    route_value,
+    resolved_profile_name,
+    query,
+    relation_path,
+    ann_k,
+    top_k,
+    score_mode,
+    limit_rows
+  ) AS g;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_default(text, int8, @extschema@.svec, int4[], int4, int4, text, int4)
+IS 'Beta routed GraphRAG wrapper. Resolves the default route profile for a route and delegates to sorted_heap_graph_rag_routed_profile(...).';
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact_default(
+  route_name text,
+  route_key text,
+  query @extschema@.svec,
+  relation_path int4[],
+  ann_k int4 DEFAULT 64,
+  top_k int4 DEFAULT 10,
+  score_mode text DEFAULT 'path',
+  limit_rows int4 DEFAULT 0
+) RETURNS TABLE (
+  source_rel regclass,
+  entity_id int4,
+  relation_id int2,
+  target_id int4,
+  payload text,
+  distance float8
+)
+AS $$
+DECLARE
+  resolved_profile_name text;
+BEGIN
+  resolved_profile_name := @extschema@.sorted_heap_graph_route_default_resolve(route_name);
+
+  RETURN QUERY
+  SELECT g.source_rel, g.entity_id, g.relation_id, g.target_id, g.payload, g.distance
+  FROM @extschema@.sorted_heap_graph_rag_routed_exact_profile(
+    route_name,
+    route_key,
+    resolved_profile_name,
+    query,
+    relation_path,
+    ann_k,
+    top_k,
+    score_mode,
+    limit_rows
+  ) AS g;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact_default(text, text, @extschema@.svec, int4[], int4, int4, text, int4)
+IS 'Beta exact-key routed GraphRAG wrapper. Resolves the default route profile for a route and delegates to sorted_heap_graph_rag_routed_exact_profile(...).';

@@ -273,6 +273,17 @@
       every query
     - regression coverage now proves both profile-backed wrappers match the
       existing sealed/right routed baselines
+  - the first default-profile operator layer on top of routed profiles:
+    - added `sorted_heap_graph_route_default_register(...)`,
+      `sorted_heap_graph_route_default_config(...)`,
+      `sorted_heap_graph_route_default_resolve(...)`, and
+      `sorted_heap_graph_route_default_unregister(...)`
+    - added `sorted_heap_graph_rag_routed_default(...)` and
+      `sorted_heap_graph_rag_routed_exact_default(...)`
+    - this binds one default profile per route so callers no longer need to
+      pass `profile_name` on every query
+    - regression coverage now proves both default-backed wrappers match the
+      same sealed/right routed baselines as the explicit profile paths
 
 ### sorted_hnsw build optimization
 

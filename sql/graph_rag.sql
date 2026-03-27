@@ -870,6 +870,22 @@ COPY (
 ) TO STDOUT;
 
 COPY (
+  SELECT 'ok'
+  FROM (
+    SELECT sorted_heap_graph_route_default_register('chain_grouped', 'sealed_right')
+  ) s
+) TO STDOUT;
+
+COPY (
+  SELECT route_name, profile_name
+  FROM sorted_heap_graph_route_default_config('chain_grouped')
+) TO STDOUT;
+
+COPY (
+  SELECT sorted_heap_graph_route_default_resolve('chain_grouped')
+) TO STDOUT;
+
+COPY (
   SELECT source_rel::text, entity_id, relation_id, target_id, payload,
          round(distance::numeric, 6) AS distance
   FROM sorted_heap_graph_rag_segmented(
@@ -926,6 +942,40 @@ COPY (
     LIMIT 2
   )
   SELECT count(*) AS segmented_multihop_diff_rows
+  FROM (
+    (SELECT * FROM helper EXCEPT ALL SELECT * FROM baseline)
+    UNION ALL
+    (SELECT * FROM baseline EXCEPT ALL SELECT * FROM helper)
+  ) diff
+) TO STDOUT;
+
+COPY (
+  WITH helper AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_graph_rag_routed_default(
+      'chain_grouped',
+      8,
+      '[-1,0,0,0]'::svec,
+      relation_path := ARRAY[1,2,3],
+      ann_k := 1,
+      top_k := 2,
+      score_mode := 'path',
+      limit_rows := 0
+    )
+  ),
+  baseline AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_graph_rag(
+      'facts_chain_seg_b'::regclass,
+      '[-1,0,0,0]'::svec,
+      relation_path := ARRAY[1,2,3],
+      ann_k := 1,
+      top_k := 2,
+      score_mode := 'path',
+      limit_rows := 0
+    )
+  )
+  SELECT count(*) AS routed_default_multihop_path_diff_rows
   FROM (
     (SELECT * FROM helper EXCEPT ALL SELECT * FROM baseline)
     UNION ALL
@@ -1375,6 +1425,22 @@ COPY (
 ) TO STDOUT;
 
 COPY (
+  SELECT 'ok'
+  FROM (
+    SELECT sorted_heap_graph_route_default_register('chain_exact', 'sealed_right')
+  ) s
+) TO STDOUT;
+
+COPY (
+  SELECT route_name, profile_name
+  FROM sorted_heap_graph_route_default_config('chain_exact')
+) TO STDOUT;
+
+COPY (
+  SELECT sorted_heap_graph_route_default_resolve('chain_exact')
+) TO STDOUT;
+
+COPY (
   SELECT source_rel::text, entity_id, relation_id, target_id, payload,
          round(distance::numeric, 6) AS distance
   FROM sorted_heap_graph_rag_routed_exact(
@@ -1635,6 +1701,48 @@ COPY (
     UNION ALL
     (SELECT * FROM baseline EXCEPT ALL SELECT * FROM helper)
   ) diff
+) TO STDOUT;
+
+COPY (
+  WITH helper AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_graph_rag_routed_exact_default(
+      'chain_exact',
+      'both',
+      '[-1,0,0,0]'::svec,
+      relation_path := ARRAY[1,2,3],
+      ann_k := 1,
+      top_k := 2,
+      score_mode := 'path',
+      limit_rows := 0
+    )
+  ),
+  baseline AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_graph_rag(
+      'facts_chain_seg_b'::regclass,
+      '[-1,0,0,0]'::svec,
+      relation_path := ARRAY[1,2,3],
+      ann_k := 1,
+      top_k := 2,
+      score_mode := 'path',
+      limit_rows := 0
+    )
+  )
+  SELECT count(*) AS routed_exact_default_multihop_path_diff_rows
+  FROM (
+    (SELECT * FROM helper EXCEPT ALL SELECT * FROM baseline)
+    UNION ALL
+    (SELECT * FROM baseline EXCEPT ALL SELECT * FROM helper)
+  ) diff
+) TO STDOUT;
+
+COPY (
+  SELECT sorted_heap_graph_route_default_unregister('chain_exact')
+) TO STDOUT;
+
+COPY (
+  SELECT sorted_heap_graph_route_default_unregister('chain_grouped')
 ) TO STDOUT;
 
 COPY (

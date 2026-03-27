@@ -165,6 +165,13 @@ Reference design:
   - `sorted_heap_graph_rag_routed_exact_profile(...)`
   - this bundles `policy_name + relation_family + fanout_limit` once instead
     of repeating that combination in every query
+- and the next operator shortcut now exists on top of profiles:
+  - `sorted_heap_graph_route_default_register(...)`
+  - `sorted_heap_graph_route_default_resolve(...)`
+  - `sorted_heap_graph_rag_routed_default(...)`
+  - `sorted_heap_graph_rag_routed_exact_default(...)`
+  - this lets one route bind a default profile once instead of passing
+    `profile_name` in every query
 - what is still missing:
   - more than one optional text metadata dimension per registry row
   - a product-quality shard router contract for tenant / KB / relation-family
@@ -237,6 +244,11 @@ And the newest ergonomic layer removes one more repeated query burden:
 - a named route profile can now store that policy/family/fanout combination
 - profile-backed wrappers reuse the existing routed paths instead of adding a
   new scoring contract
+
+And the newest operator shortcut removes one more argument from the query side:
+
+- a route can now bind one default profile once
+- default-backed wrappers resolve that profile implicitly at query time
 
 That is still beta, but it is the first real multi-dimensional routing surface
 inside the extension. The next honest step is no longer “can we add metadata?”

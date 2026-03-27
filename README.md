@@ -248,6 +248,10 @@ The older helper/wrapper family is still available for lower-level control:
   - `sorted_heap_graph_route_profile_config(...)`
   - `sorted_heap_graph_route_profile_resolve(...)`
   - `sorted_heap_graph_route_profile_unregister(...)`
+  - `sorted_heap_graph_route_default_register(...)`
+  - `sorted_heap_graph_route_default_config(...)`
+  - `sorted_heap_graph_route_default_resolve(...)`
+  - `sorted_heap_graph_route_default_unregister(...)`
   - `sorted_heap_graph_exact_register(...)`
   - `sorted_heap_graph_exact_config(...)`
   - `sorted_heap_graph_exact_resolve(...)`
@@ -256,9 +260,11 @@ The older helper/wrapper family is still available for lower-level control:
   - `sorted_heap_graph_rag_routed(...)`
   - `sorted_heap_graph_rag_routed_policy(...)`
   - `sorted_heap_graph_rag_routed_profile(...)`
+  - `sorted_heap_graph_rag_routed_default(...)`
   - `sorted_heap_graph_rag_routed_exact(...)`
   - `sorted_heap_graph_rag_routed_exact_policy(...)`
   - `sorted_heap_graph_rag_routed_exact_profile(...)`
+  - `sorted_heap_graph_rag_routed_exact_default(...)`
   - `sorted_heap_graph_rag_scan(...)`
 - `sorted_heap_graph_rag_twohop_scan(...)`
 - `sorted_heap_graph_rag_twohop_path_scan(...)`
@@ -292,7 +298,12 @@ extra family dimension without changing the scoring contract. The next
 ergonomic layer now exists too: named route profiles can bundle
 `policy_name + relation_family + fanout_limit` once and feed
 `sorted_heap_graph_rag_routed_profile(...)` or
-`sorted_heap_graph_rag_routed_exact_profile(...)` directly.
+`sorted_heap_graph_rag_routed_exact_profile(...)` directly. And the newest
+operator-facing shortcut removes one more repeated query argument: a route can
+now bind one default profile and call
+`sorted_heap_graph_rag_routed_default(...)` or
+`sorted_heap_graph_rag_routed_exact_default(...)` without passing
+`profile_name` each time.
 
 For tuning and debugging, GraphRAG now also exposes backend-local last-call
 stats:

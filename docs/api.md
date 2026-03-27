@@ -762,6 +762,31 @@ go through the profile-backed wrappers below.
 Deletes one routed profile, or all profiles under that route group when
 `profile_name` is `NULL`.
 
+### `sorted_heap_graph_route_default_register(route_name, profile_name)`
+
+Registers the default routed profile for one route.
+
+- `route_name` scopes the default to one routed graph
+- `profile_name` must already exist in
+  `sorted_heap_graph_route_profile_registry` under the same route
+- later registrations replace the previous default for that route
+
+### `sorted_heap_graph_route_default_config(route_name)`
+
+Lists current default-profile bindings.
+
+### `sorted_heap_graph_route_default_resolve(route_name)`
+
+Returns the `profile_name` currently marked as default for one route.
+
+This is mainly useful for inspection/testing. Query execution should normally
+go through the default-backed wrappers below.
+
+### `sorted_heap_graph_route_default_unregister(route_name)`
+
+Deletes one default-profile binding, or all bindings when `route_name` is
+`NULL`.
+
 ### `sorted_heap_graph_rag_routed(route_name, route_value, query, relation_path, ann_k, top_k, score_mode, limit_rows, fanout_limit, segment_groups, relation_family)`
 
 Beta routed GraphRAG wrapper.
@@ -853,6 +878,32 @@ FROM sorted_heap_graph_rag_routed_profile(
     'tenant_facts',
     812,
     'sealed_claims',
+    '[0.1,0.2,0.3,...]'::svec,
+    relation_path := ARRAY[1, 2],
+    ann_k := 64,
+    top_k := 10,
+    score_mode := 'path'
+);
+```
+
+### `sorted_heap_graph_rag_routed_default(route_name, route_value, query, relation_path, ann_k, top_k, score_mode, limit_rows)`
+
+Beta routed GraphRAG wrapper with registry-backed default-profile lookup.
+
+- resolves `profile_name` from `sorted_heap_graph_route_default_registry`
+- delegates to `sorted_heap_graph_rag_routed_profile(...)`
+- keeps the same routing and GraphRAG scoring semantics
+
+```sql
+SELECT sorted_heap_graph_route_default_register(
+    'tenant_facts',
+    'sealed_claims'
+);
+
+SELECT source_rel, entity_id, relation_id, target_id, payload, distance
+FROM sorted_heap_graph_rag_routed_default(
+    'tenant_facts',
+    812,
     '[0.1,0.2,0.3,...]'::svec,
     relation_path := ARRAY[1, 2],
     ann_k := 64,
@@ -993,6 +1044,33 @@ FROM sorted_heap_graph_rag_routed_exact_profile(
     'tenant_facts',
     'kb_alpha',
     'sealed_claims',
+    '[0.1,0.2,0.3,...]'::svec,
+    relation_path := ARRAY[1, 2],
+    ann_k := 64,
+    top_k := 10,
+    score_mode := 'path'
+);
+```
+
+### `sorted_heap_graph_rag_routed_exact_default(route_name, route_key, query, relation_path, ann_k, top_k, score_mode, limit_rows)`
+
+Beta exact-key routed GraphRAG wrapper with registry-backed default-profile
+lookup.
+
+- resolves `profile_name` from `sorted_heap_graph_route_default_registry`
+- delegates to `sorted_heap_graph_rag_routed_exact_profile(...)`
+- keeps the same routing and GraphRAG scoring semantics
+
+```sql
+SELECT sorted_heap_graph_route_default_register(
+    'tenant_facts',
+    'sealed_claims'
+);
+
+SELECT source_rel, entity_id, relation_id, target_id, payload, distance
+FROM sorted_heap_graph_rag_routed_exact_default(
+    'tenant_facts',
+    'kb_alpha',
     '[0.1,0.2,0.3,...]'::svec,
     relation_path := ARRAY[1, 2],
     ann_k := 64,
