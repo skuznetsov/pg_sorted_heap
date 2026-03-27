@@ -34,6 +34,10 @@
   - dump/restore, TOAST, DDL, crash recovery, concurrent online ops
   - `pg_upgrade`
   - the narrower `make test-graphrag-release` bundle
+- Clarified the GraphRAG docs around:
+  - `limit_rows` as a work cap rather than a final result-count override
+  - one-hop `score_mode := 'path'` being intentionally equivalent to
+    `endpoint`
 
 ### GraphRAG syntax unification
 

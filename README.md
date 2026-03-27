@@ -226,7 +226,10 @@ SELECT sorted_heap_graph_register(
 gives two-hop expansion. `relation_path := ARRAY[1,2,3,4,5]` gives a five-hop
 path with explicit per-hop relation filters. `score_mode := 'endpoint'` ranks
 only the final-hop facts; `score_mode := 'path'` accumulates evidence across
-the whole path.
+the whole path. For one-hop calls, `score_mode := 'path'` is intentionally the
+same as `endpoint`. `limit_rows := 0` means unlimited work; positive values cap
+expansion/rerank work inside the current GraphRAG helper stages rather than
+changing the final `top_k` contract.
 
 The older helper/wrapper family is still available for lower-level control:
 

@@ -39,6 +39,8 @@ Contract:
 - ANN seed retrieval on `entity_id`
 - `relation_path` is a non-empty per-hop relation sequence
 - `score_mode = 'endpoint' | 'path'`
+- `limit_rows = 0` means unlimited helper work; positive values cap
+  expansion/rerank work and do not replace the final `top_k` contract
 - exact rerank on the expanded candidate set
 
 Semantics:
@@ -46,6 +48,7 @@ Semantics:
 - `relation_path := ARRAY[1]`
   - one-hop expansion
   - exact rerank on the endpoint fact
+  - `score_mode := 'path'` is intentionally equivalent to `endpoint`
 - `relation_path := ARRAY[1, 2], score_mode := 'endpoint'`
   - two-hop expansion
   - exact rerank on the second-hop endpoint only

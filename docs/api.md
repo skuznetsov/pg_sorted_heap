@@ -600,6 +600,8 @@ Preferred fact-shaped GraphRAG entry point.
   - one-hop expansion
   - ANN seed on `entity_id`
   - exact rerank on the endpoint facts
+  - `score_mode := 'endpoint'` and `score_mode := 'path'` are intentionally
+    equivalent here because there is only one hop
 - `relation_path := ARRAY[1, 2], score_mode := 'endpoint'`
   - two-hop expansion
   - rerank by the final-hop endpoint only
@@ -616,6 +618,10 @@ Current constraints:
 
 - `relation_path` must be a non-empty one-dimensional `int4[]`
 - supported `score_mode` values are `endpoint` and `path`
+- `limit_rows := 0` means unlimited expansion/rerank work
+- positive `limit_rows` values cap rows collected or scanned inside the
+  current GraphRAG helper stages; this is a work bound, not a final result
+  count override
 - canonical fact columns (`entity_id`, `relation_id`, `target_id`,
   `embedding`, `payload`) need no extra setup
 - non-canonical schemas must be registered first with
@@ -645,6 +651,9 @@ Beta segmented GraphRAG wrapper.
 - each shard is queried via `sorted_heap_graph_rag(...)`
 - shard-local rows are merged globally by `(distance, entity_id, relation_id,
   target_id)`
+- `limit_rows` keeps the same per-shard work-cap semantics as
+  `sorted_heap_graph_rag(...)`; it does not replace `top_k` as the final merge
+  limit
 - this does **not** solve routing for you; the caller still chooses which
   shard subset to query
 
@@ -1276,6 +1285,10 @@ FROM sorted_heap_graph_rag_routed_exact_default(
 
 Expands known entity seeds into fact rows without reranking.
 
+- `limit_rows := 0` means unlimited
+- positive `limit_rows` stops expansion after that many matching rows have
+  been collected
+
 ```sql
 SELECT *
 FROM sorted_heap_expand_ids(
@@ -1288,6 +1301,9 @@ FROM sorted_heap_expand_ids(
 ### `sorted_heap_expand_rerank(rel, seed_ids, query, top_k, relation_filter, limit_rows)`
 
 One-hop expansion followed by exact rerank on the expanded candidates.
+
+- `limit_rows` caps the expansion and rerank scan work before top-k selection
+- `top_k` still controls the final output size
 
 ```sql
 SELECT *
@@ -1304,11 +1320,16 @@ FROM sorted_heap_expand_rerank(
 
 Two-hop expansion with rerank on the final candidate set.
 
+- `limit_rows` caps work in the hop-expansion and final rerank scan stages
+
 ### `sorted_heap_expand_twohop_path_rerank(rel, seed_ids, query, top_k, hop1_relation_filter, hop2_relation_filter, limit_rows)`
 
 Two-hop expansion with path-aware rerank using hop-1 and hop-2 evidence
 together. This is the stronger current contract for fact-shaped multihop
 retrieval.
+
+- `limit_rows` caps work in the hop-expansion and final path-rerank scan
+  stages
 
 ```sql
 SELECT *
@@ -1329,11 +1350,15 @@ target-seeded graph shapes. This wrapper seeds one-hop expansion from
 ANN-selected `target_id` values, so it is not the preferred fact-graph
 contract.
 
+- `limit_rows` keeps the same work-cap semantics as the lower-level helpers
+
 ### `sorted_heap_graph_rag_twohop_scan(rel, query, ann_k, top_k, hop1_relation_filter, hop2_relation_filter, limit_rows)`
 
 Lower-level endpoint-scored two-hop wrapper. `sorted_heap_graph_rag(...)`
 with `relation_path := ARRAY[hop1, hop2], score_mode := 'endpoint'`
 is the preferred higher-level syntax.
+
+- `limit_rows` keeps the same work-cap semantics as the underlying helper path
 
 ### `sorted_heap_graph_rag_twohop_path_scan(rel, query, ann_k, top_k, hop1_relation_filter, hop2_relation_filter, limit_rows)`
 
@@ -1341,23 +1366,33 @@ Lower-level path-aware two-hop wrapper. `sorted_heap_graph_rag(...)` with
 `relation_path := ARRAY[hop1, hop2], score_mode := 'path'` is the preferred
 higher-level syntax.
 
+- `limit_rows` keeps the same work-cap semantics as the underlying helper path
+
 ### `sorted_heap_expand_multihop_rerank(rel, seed_ids, query, top_k, relation_path, limit_rows)`
 
 Lower-level endpoint-scored multi-hop helper. `relation_path` is the explicit
 per-hop relation sequence.
+
+- `limit_rows` caps work at each hop expansion plus the final rerank scan
 
 ### `sorted_heap_expand_multihop_path_rerank(rel, seed_ids, query, top_k, relation_path, limit_rows)`
 
 Lower-level path-aware multi-hop helper. This accumulates distance across the
 full explicit `relation_path`.
 
+- `limit_rows` caps work at each hop expansion plus the final path-rerank scan
+
 ### `sorted_heap_graph_rag_multihop_scan(rel, query, ann_k, top_k, relation_path, limit_rows)`
 
 Lower-level ANN-seeded multi-hop wrapper for endpoint-scored retrieval.
 
+- `limit_rows` keeps the same work-cap semantics as the underlying helper path
+
 ### `sorted_heap_graph_rag_multihop_path_scan(rel, query, ann_k, top_k, relation_path, limit_rows)`
 
 Lower-level ANN-seeded multi-hop wrapper for path-aware retrieval.
+
+- `limit_rows` keeps the same work-cap semantics as the underlying helper path
 
 ```sql
 SET sorted_hnsw.ef_search = 128;

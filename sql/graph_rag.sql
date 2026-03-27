@@ -312,6 +312,39 @@ COPY (
 ) TO STDOUT;
 
 COPY (
+  WITH endpoint_mode AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_graph_rag(
+      'facts_sh'::regclass,
+      '[1,0,0,0]'::svec,
+      relation_path := ARRAY[2],
+      ann_k := 2,
+      top_k := 2,
+      score_mode := 'endpoint',
+      limit_rows := 0
+    )
+  ),
+  path_mode AS (
+    SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+    FROM sorted_heap_graph_rag(
+      'facts_sh'::regclass,
+      '[1,0,0,0]'::svec,
+      relation_path := ARRAY[2],
+      ann_k := 2,
+      top_k := 2,
+      score_mode := 'path',
+      limit_rows := 0
+    )
+  )
+  SELECT count(*) AS graph_rag_unified_onehop_path_equivalence_diff_rows
+  FROM (
+    (SELECT * FROM endpoint_mode EXCEPT ALL SELECT * FROM path_mode)
+    UNION ALL
+    (SELECT * FROM path_mode EXCEPT ALL SELECT * FROM endpoint_mode)
+  ) diff
+) TO STDOUT;
+
+COPY (
   WITH helper AS (
     SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
     FROM sorted_heap_graph_rag_twohop_scan('facts_sh'::regclass, '[0,0,1,0]'::svec, 2, 2, 1, 2, 0)

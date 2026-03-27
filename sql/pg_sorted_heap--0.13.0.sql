@@ -1786,7 +1786,7 @@ END;
 $$ LANGUAGE plpgsql STABLE;
 
 COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag(regclass, @extschema@.svec, int4[], int4, int4, text, int4)
-IS 'Unified fact-shaped GraphRAG entry point. relation_path length 1 performs ANN seed on entity_id plus one-hop rerank. Longer relation_path values perform multi-hop endpoint or path-aware rerank depending on score_mode.';
+IS 'Unified fact-shaped GraphRAG entry point. relation_path length 1 performs ANN seed on entity_id plus one-hop rerank, where score_mode path is intentionally equivalent to endpoint. Longer relation_path values perform multi-hop endpoint or path-aware rerank depending on score_mode. limit_rows is an optional work cap for expansion/rerank stages; 0 means unlimited.';
 
 CREATE FUNCTION @extschema@.sorted_heap_graph_rag_segmented(
   rels regclass[],
