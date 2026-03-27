@@ -123,6 +123,11 @@
 - Added `scripts/bench_graph_rag_multidepth_segmented.py` to benchmark the
   first partitioning/segmentation path using multiple concrete `sorted_heap`
   shards plus harness-side fanout and global rerank.
+- Added `scripts/bench_graph_rag_multidepth_segmented_aws.sh` so the same
+  segmented benchmark can be run on a constrained remote host without manual
+  repo sync/install steps.
+- Added `docs/graphrag-segmentation-plan.md` to separate the post-`0.13`
+  large-scale architecture from the `0.13` release surface.
 - Added larger-scale benchmark notes for:
   - local `1M`-row measured query latency on the synthetic multidepth graph
   - local and AWS `10M`-row build-bound envelopes, where generation/load now
