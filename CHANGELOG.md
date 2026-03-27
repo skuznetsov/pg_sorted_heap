@@ -192,6 +192,18 @@
       100.0%`)
     - so the next scale contract must be "segmentation + pruning", not just
       "more shards"
+  - the first full AWS segmented `10M x 64D` rerun on the same constrained
+    `4 vCPU / 8 GiB` host using streamed shard load and `build_sq8=on`:
+    - `generate_csv`: `0.000 s`
+    - `load_data`: `500.474 s`
+    - `build_indexes`: `784.778 s`
+    - `route=all` matched the old monolithic query envelope almost exactly
+      (`898.440 ms` at depth 1, `2093.652 ms` at depth 5)
+    - `route=exact` was the real scale win
+      (`126.057 ms` at depth 1, `258.766 ms` at depth 5, stable
+      `100.0% / 100.0%` at depth 5)
+    - so the constrained-memory large-scale direction is now much clearer:
+      productize segmented routing, not broad all-shard fanout
 
 ### sorted_hnsw build optimization
 

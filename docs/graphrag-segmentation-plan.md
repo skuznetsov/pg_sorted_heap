@@ -168,18 +168,22 @@ This is a better fit for:
 
 ## Current recommendation
 
-For the next scale branch:
+The first comparison is now complete:
 
-1. finish the AWS `10M x 64D` low-memory monolith run
-2. run the same point through the segmented AWS harness
-3. compare:
-   - build completion
-   - peak memory
-   - query latency
-   - quality
-4. only then decide whether the next engineering dollar goes to:
-   - more monolithic build-memory cuts, or
-   - productizing segmented routing
+1. the low-memory monolithic AWS `10M x 64D` run completed
+2. the same point completed through the streamed segmented AWS harness
+3. the result was decisive:
+   - `route=all` looked like the monolith
+   - `route=exact` was much faster at the same quality
 
-The current evidence already leans toward segmented routing as the more durable
-path.
+So the current recommendation is narrower and stronger:
+
+1. keep monolithic low-memory work only as a survival path
+2. treat `segmentation + routing` as the primary scale direction
+3. spend the next engineering dollar on:
+   - productizing routing/pruning
+   - reducing harness-side shard fanout/merge into a real API/runtime path
+   - preserving append-friendly segmented operation
+
+The current evidence now points clearly toward segmented routing as the more
+durable large-scale GraphRAG model.

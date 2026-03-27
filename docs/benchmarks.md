@@ -620,6 +620,49 @@ This is the correct shape for large knowledge bases:
   / relation family / time window (or a future segment router), otherwise the
   system only trades one monolith for a broad fanout query
 
+That local result transferred cleanly to the constrained AWS host on the first
+full `10M x 64D` streamed segmented run (`2M` pairs, `5` hops, `8` shards,
+`hop_weight=0.05`, `ann_k=256`, `top_k=32`, `ef_search=128`,
+`m=16`, `ef_construction=64`, `build_sq8=on`):
+
+- streamed segmented build-only:
+  - `generate_csv`: `0.000 s`
+  - `load_data`: `500.474 s`
+  - `build_indexes`: `784.778 s`
+- segmented, `route=exact` query-only reuse on the same built graph:
+  - depth 1: `126.057 ms`, `100.0% / 100.0%`
+  - depth 2: `261.986 ms`, `75.0% / 100.0%`
+  - depth 3: `259.794 ms`, `75.0% / 100.0%`
+  - depth 4: `258.879 ms`, `75.0% / 100.0%`
+  - depth 5: `258.766 ms`, `100.0% / 100.0%`
+- segmented, `route=all` query-only reuse on the same built graph:
+  - depth 1: `898.440 ms`, `100.0% / 100.0%`
+  - depth 2: `2090.866 ms`, `75.0% / 100.0%`
+  - depth 3: `2089.650 ms`, `50.0% / 100.0%`
+  - depth 4: `2088.114 ms`, `50.0% / 100.0%`
+  - depth 5: `2093.652 ms`, `75.0% / 100.0%`
+
+That gives the first full large-scale constrained-memory comparison on the
+same AWS box:
+
+- monolithic `10M x 64D`, low-memory build:
+  - depth 1 unified GraphRAG: `840.607 ms`, `100.0% / 100.0%`
+  - depth 5 unified GraphRAG: `2084.155 ms`, `75.0% / 100.0%`
+- segmented `10M x 64D`, `route=all`:
+  - effectively the same latency/quality envelope as the monolith
+- segmented `10M x 64D`, `route=exact`:
+  - about `6.7x` faster than the monolith at depth 1
+  - about `8.1x` faster than the monolith at depth 5
+  - and still stable at `100.0% / 100.0%` for depth 5 on this benchmark
+
+So the large-scale result now matches the local `1M` lesson:
+
+- segmentation without pruning is not a performance story
+- streamed segmented ingest is operationally better than front-loaded shard CSV
+  materialization
+- segmented routing is the first constrained-memory scale path that improves
+  both build viability and query latency on the same host
+
 ### Current AWS GraphRAG benchmark (`person -> parent -> city`, stable fact contract)
 
 Repo-owned harness:
