@@ -631,6 +631,44 @@ So the narrow conclusion is:
   and the first query pass; the remaining cheap-build frontier is deep-path
   quality, not allocator failure
 
+I then added a segmented multidepth harness in
+`scripts/bench_graph_rag_multidepth_segmented.py`. This is the first
+partitioning benchmark, but it is intentionally **harness-side**, not an
+extension API: current GraphRAG helpers require a concrete `sorted_heap` table,
+so the benchmark fans out across multiple `sorted_heap` shards and merges the
+shard-local top-k rows in Python.
+
+The local `1M x 64D` lower-hop point (`200K` pairs, `5` hops, `32` queries,
+`ann_k=256`, `top_k=32`, `ef_search=128`, `m=16`, `ef_construction=64`,
+`build_sq8=on`) gives a clean first answer:
+
+- monolithic unified GraphRAG:
+  - depth 1: `50.104 ms`, `100.0% / 100.0%`
+  - depth 5: `121.524 ms`, `81.2% / 100.0%`
+- segmented into `8` shards, **all-shard fanout**:
+  - build_indexes: `57.885 s` versus monolithic `45.714 s`
+  - depth 1: `87.677 ms`, `100.0% / 100.0%`
+  - depth 5: `142.472 ms`, `81.2% / 100.0%`
+- segmented into `8` shards, **exact routing** to the owning shard:
+  - depth 1: `10.574 ms`, `100.0% / 100.0%`
+  - depth 5: `16.822 ms`, `100.0% / 100.0%`
+
+That makes the partitioning lesson explicit:
+
+- segmentation by itself is **not** a free latency win
+- all-shard fanout preserves quality on this benchmark, but pays a clear
+  fanout tax
+- the real win appears only when routing/pruning can avoid most shards
+- so the next scale story should be "partitioning + pruning contract", not
+  just "more shards"
+
+This is the correct shape for large knowledge bases:
+
+- on constrained hosts, sharding bounds per-index build memory
+- on real workloads, the query path must also prune by tenant / knowledge-base
+  / relation family / time window (or a future segment router), otherwise the
+  system only trades one monolith for a broad fanout query
+
 ### Current AWS GraphRAG benchmark (`person -> parent -> city`, stable fact contract)
 
 Repo-owned harness:

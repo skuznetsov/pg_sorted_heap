@@ -120,6 +120,9 @@
 - Added `scripts/bench_graph_rag_multidepth_aws.sh` to run the synthetic
   multi-hop depth benchmark on a remote AWS host using the same sync/install
   pattern as the existing multihop AWS runners.
+- Added `scripts/bench_graph_rag_multidepth_segmented.py` to benchmark the
+  first partitioning/segmentation path using multiple concrete `sorted_heap`
+  shards plus harness-side fanout and global rerank.
 - Added larger-scale benchmark notes for:
   - local `1M`-row measured query latency on the synthetic multidepth graph
   - local and AWS `10M`-row build-bound envelopes, where generation/load now
@@ -185,6 +188,16 @@
     multihop path is ANN-bound, not expansion-bound: at depth 5 the unified
     path took `110.507 ms` end-to-end, of which about `109.178 ms` was ANN,
     `0.691 ms` expansion, and `0.011 ms` rerank
+  - the first local segmented `1M x 64D` GraphRAG point (`8` shards,
+    `build_sq8=on`) showing:
+    - all-shard fanout preserves quality but is slower than the monolith
+      (`87.677 ms` vs `50.104 ms` at depth 1, `142.472 ms` vs `121.524 ms`
+      at depth 5)
+    - exact routing to the owning shard is the real partitioning win
+      (`10.574 ms` at depth 1, `16.822 ms` at depth 5, stable `100.0% /
+      100.0%`)
+    - so the next scale contract must be "segmentation + pruning", not just
+      "more shards"
 
 ### sorted_hnsw build optimization
 
