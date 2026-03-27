@@ -199,6 +199,12 @@ Reference design:
     default
   - this also does not change routing behavior; it makes the profile/default
     layer easier to inspect and debug
+- and the next route-level operator summary now exists on top of that:
+  - `sorted_heap_graph_route_catalog(...)`
+  - this gives one row per route with range-shard count, exact-binding count,
+    policy/profile counts, and the effective default-profile contract
+  - this also does not change routing behavior; it makes the whole routed
+    control plane easier to inspect at a glance
 - what is still missing:
   - more than one optional text metadata dimension per registry row
   - a product-quality shard router contract for tenant / KB / relation-family

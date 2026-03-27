@@ -844,6 +844,87 @@ AS $$
            p.profile_name;
 $$ LANGUAGE SQL STABLE;
 
+CREATE FUNCTION @extschema@.sorted_heap_graph_route_catalog(
+  route_name text DEFAULT NULL
+) RETURNS TABLE (
+  route_name text,
+  range_shard_count int8,
+  exact_binding_count int8,
+  policy_count int8,
+  profile_count int8,
+  default_profile_name text,
+  default_effective_segment_groups text[],
+  default_segment_groups_source text,
+  default_relation_family text,
+  default_fanout_limit int4
+)
+AS $$
+  WITH routes AS (
+    SELECT s.route_name
+    FROM @extschema@.sorted_heap_graph_segment_registry s
+    UNION
+    SELECT e.route_name
+    FROM @extschema@.sorted_heap_graph_exact_registry e
+    UNION
+    SELECT p.route_name
+    FROM @extschema@.sorted_heap_graph_route_policy_registry p
+    UNION
+    SELECT p.route_name
+    FROM @extschema@.sorted_heap_graph_route_profile_registry p
+    UNION
+    SELECT d.route_name
+    FROM @extschema@.sorted_heap_graph_route_default_registry d
+  ),
+  range_counts AS (
+    SELECT s.route_name, count(*)::int8 AS range_shard_count
+    FROM @extschema@.sorted_heap_graph_segment_registry s
+    GROUP BY s.route_name
+  ),
+  exact_counts AS (
+    SELECT e.route_name, count(*)::int8 AS exact_binding_count
+    FROM @extschema@.sorted_heap_graph_exact_registry e
+    GROUP BY e.route_name
+  ),
+  policy_counts AS (
+    SELECT p.route_name, count(*)::int8 AS policy_count
+    FROM @extschema@.sorted_heap_graph_route_policy_registry p
+    GROUP BY p.route_name
+  ),
+  profile_counts AS (
+    SELECT p.route_name, count(*)::int8 AS profile_count
+    FROM @extschema@.sorted_heap_graph_route_profile_registry p
+    GROUP BY p.route_name
+  ),
+  defaults AS (
+    SELECT c.route_name,
+           c.profile_name AS default_profile_name,
+           c.effective_segment_groups AS default_effective_segment_groups,
+           c.segment_groups_source AS default_segment_groups_source,
+           c.relation_family AS default_relation_family,
+           c.fanout_limit AS default_fanout_limit
+    FROM @extschema@.sorted_heap_graph_route_profile_catalog() c
+    WHERE c.is_default
+  )
+  SELECT r.route_name,
+         COALESCE(rc.range_shard_count, 0) AS range_shard_count,
+         COALESCE(ec.exact_binding_count, 0) AS exact_binding_count,
+         COALESCE(pc.policy_count, 0) AS policy_count,
+         COALESCE(pr.profile_count, 0) AS profile_count,
+         d.default_profile_name,
+         d.default_effective_segment_groups,
+         d.default_segment_groups_source,
+         d.default_relation_family,
+         d.default_fanout_limit
+  FROM routes r
+  LEFT JOIN range_counts rc ON rc.route_name = r.route_name
+  LEFT JOIN exact_counts ec ON ec.route_name = r.route_name
+  LEFT JOIN policy_counts pc ON pc.route_name = r.route_name
+  LEFT JOIN profile_counts pr ON pr.route_name = r.route_name
+  LEFT JOIN defaults d ON d.route_name = r.route_name
+  WHERE ($1 IS NULL OR r.route_name = $1)
+  ORDER BY r.route_name;
+$$ LANGUAGE SQL STABLE;
+
 CREATE FUNCTION @extschema@.sorted_heap_graph_rag_stats()
 RETURNS TABLE (
   calls bigint,

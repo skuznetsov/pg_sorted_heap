@@ -321,6 +321,12 @@
       `fanout_limit`, and whether the profile is the current route default
     - this is introspection-only and does not change the routed GraphRAG
       execution contract
+  - a first route-level operator summary on top of that:
+    - added `sorted_heap_graph_route_catalog(...)`
+    - it shows one row per route with range-shard count, exact-binding count,
+      policy/profile counts, and the effective default-profile contract
+    - this is introspection-only and does not change the routed GraphRAG
+      execution contract
 
 ### sorted_hnsw build optimization
 

@@ -871,6 +871,35 @@ Returned fields include:
 This is an introspection helper only. It does not affect shard routing or
 GraphRAG scoring.
 
+### `sorted_heap_graph_route_catalog(route_name)`
+
+Lists one summary row per route across the current segmented/routed control
+plane.
+
+Returned fields include:
+
+- control-plane counts:
+  - `range_shard_count`
+  - `exact_binding_count`
+  - `policy_count`
+  - `profile_count`
+- effective default-profile state:
+  - `default_profile_name`
+  - `default_effective_segment_groups`
+  - `default_segment_groups_source`
+  - `default_relation_family`
+  - `default_fanout_limit`
+
+This is the top-level operator summary:
+
+- range shards are counted from `sorted_heap_graph_segment_registry`
+- exact bindings are counted from `sorted_heap_graph_exact_registry`
+- policies and profiles are counted from their corresponding registries
+- default-profile fields come from the effective profile/default catalog layer
+
+This is an introspection helper only. It does not affect shard routing or
+GraphRAG scoring.
+
 ### `sorted_heap_graph_route_default_unregister(route_name)`
 
 Deletes one default-profile binding, or all bindings when `route_name` is
