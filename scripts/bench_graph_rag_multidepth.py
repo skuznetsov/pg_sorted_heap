@@ -243,6 +243,11 @@ def main() -> None:
     ap.add_argument("--max-wal-size-gb", type=int, default=4)
     ap.add_argument("--maintenance-work-mem-mb", type=int, default=0)
     ap.add_argument("--table-scope", choices=("all", "sorted_heap_only"), default="all")
+    ap.add_argument(
+        "--stop-after",
+        choices=("none", "generate_csv", "load_data", "build_indexes", "analyze"),
+        default="none",
+    )
     ap.add_argument("--backend-mode", choices=("fresh", "reuse"), default="fresh")
     ap.add_argument("--install-cmd", default="")
     ap.add_argument("--keep-temp", action="store_true")
@@ -273,6 +278,8 @@ def main() -> None:
             f"csv_bytes={csv_path.stat().st_size}",
             flush=True,
         )
+        if args.stop_after == "generate_csv":
+            return
 
         t_query_start = time.perf_counter()
         queries = build_queries(args.num_pairs, args.query_count, args.max_depth, args.dim, args.seed)
@@ -300,6 +307,8 @@ def main() -> None:
                 f"elapsed_s={t_load_end - t_load_start:.3f}",
                 flush=True,
             )
+            if args.stop_after == "load_data":
+                return
 
             t_build_start = time.perf_counter()
             base.build_indexes(
@@ -315,6 +324,8 @@ def main() -> None:
                 f"elapsed_s={t_build_end - t_build_start:.3f}",
                 flush=True,
             )
+            if args.stop_after == "build_indexes":
+                return
 
             t_analyze_start = time.perf_counter()
             cur.execute("ANALYZE facts_heap")
@@ -325,6 +336,8 @@ def main() -> None:
                 f"elapsed_s={t_analyze_end - t_analyze_start:.3f}",
                 flush=True,
             )
+            if args.stop_after == "analyze":
+                return
 
             if args.backend_mode == "fresh":
                 cur.close()
