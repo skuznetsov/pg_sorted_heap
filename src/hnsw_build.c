@@ -50,6 +50,10 @@ typedef struct HnswBuildState
 	/* Vectors (float32, row-major) */
 	float	   *vectors;		/* n_nodes * dim */
 
+	/* Reusable visitation marks for build-time searches */
+	uint32	   *visit_marks;	/* array[n_nodes], zero means unvisited */
+	uint32		visit_token;
+
 	/* Memory */
 	MemoryContext build_ctx;
 } HnswBuildState;
@@ -201,6 +205,18 @@ select_level(double ml)
 	return (int)(-log(r) * ml);
 }
 
+static inline uint32
+next_visit_token(HnswBuildState *state)
+{
+	state->visit_token++;
+	if (state->visit_token == 0)
+	{
+		memset(state->visit_marks, 0, sizeof(uint32) * (Size) state->n_nodes);
+		state->visit_token = 1;
+	}
+	return state->visit_token;
+}
+
 /* ---- Core HNSW algorithms ---- */
 
 /*
@@ -211,15 +227,14 @@ select_level(double ml)
  */
 static PQueue *
 search_layer(HnswBuildState *state, const float *query,
-			 int entry_nid, int ef, int level, bool *visited)
+			 int entry_nid, int ef, int level)
 {
 	PQueue	   *candidates;		/* min-heap: next to explore */
 	PQueue	   *result;			/* max-heap: ef nearest */
 	float		entry_dist;
-	int			max_nbrs;
 	int			dim = state->dim;
-
-	max_nbrs = (level == 0) ? state->M_max0 : state->M;
+	uint32		visit_token = next_visit_token(state);
+	uint32	   *visited = state->visit_marks;
 
 	entry_dist = cosine_distance_f32(query,
 									 state->vectors + (Size)entry_nid * dim,
@@ -230,7 +245,7 @@ search_layer(HnswBuildState *state, const float *query,
 
 	pq_push(candidates, entry_dist, entry_nid);
 	pq_push(result, entry_dist, entry_nid);
-	visited[entry_nid] = true;
+	visited[entry_nid] = visit_token;
 
 	while (candidates->size > 0)
 	{
@@ -258,9 +273,9 @@ search_layer(HnswBuildState *state, const float *query,
 
 			if (nbr_nid < 0 || nbr_nid >= state->n_nodes)
 				continue;
-			if (visited[nbr_nid])
+			if (visited[nbr_nid] == visit_token)
 				continue;
-			visited[nbr_nid] = true;
+			visited[nbr_nid] = visit_token;
 
 			nbr_dist = cosine_distance_f32(query,
 										   state->vectors + (Size)nbr_nid * dim,
@@ -420,8 +435,6 @@ hnsw_insert_node(HnswBuildState *state, int32 nid)
 	int			level;
 	int			ep_nid;
 	int			max_level;
-	float		ep_dist;
-	bool	   *visited;
 	int			dim = state->dim;
 	const float *query = state->vectors + (Size)nid * dim;
 	HnswNode   *node = &state->nodes[nid];
@@ -459,14 +472,11 @@ hnsw_insert_node(HnswBuildState *state, int32 nid)
 	/* Phase 1: Greedy search from top to node_level+1 (single nearest) */
 	for (level = max_level; level > node_level; level--)
 	{
-		visited = MemoryContextAllocZero(state->build_ctx,
-										 sizeof(bool) * state->n_nodes);
-		PQueue *result = search_layer(state, query, ep_nid, 1, level, visited);
+		PQueue *result = search_layer(state, query, ep_nid, 1, level);
 		if (result->size > 0)
 			ep_nid = result->entries[0].nid;
 		pfree(result->entries);
 		pfree(result);
-		pfree(visited);
 	}
 
 	/* Phase 2: Insert at each level from min(node_level, max_level) down to 0 */
@@ -479,11 +489,7 @@ hnsw_insert_node(HnswBuildState *state, int32 nid)
 		int		n_selected;
 		int		i;
 
-		visited = MemoryContextAllocZero(state->build_ctx,
-										 sizeof(bool) * state->n_nodes);
-		PQueue *candidates = search_layer(state, query, ep_nid, ef, level,
-										  visited);
-		pfree(visited);
+		PQueue *candidates = search_layer(state, query, ep_nid, ef, level);
 
 		/* Select neighbors using heuristic */
 		n_selected = select_neighbors_heuristic(state, candidates, max_nbrs,
@@ -570,6 +576,8 @@ shnsw_build_graph(float *vectors, ItemPointer tids,
 	state->max_level = -1;
 	state->entry_nid = -1;
 	state->vectors = vectors;
+	state->visit_marks = palloc0(sizeof(uint32) * (Size) n_nodes);
+	state->visit_token = 0;
 	state->build_ctx = build_ctx;
 
 	/* Allocate node array */

@@ -115,6 +115,18 @@
   - local and AWS `10M`-row build-bound envelopes, where generation/load now
     survive but the first practical frontier remains `sorted_hnsw` build time
 
+### sorted_hnsw build optimization
+
+- Removed the per-search `visited[]` allocation/zeroing from the hot HNSW
+  build loop in `src/hnsw_build.c` and replaced it with a reusable visit-mark
+  array.
+- On the local `500K x 32D` diagnostic point (`m=8`, `ef_construction=8`),
+  that reduced total `CREATE INDEX` time from about `18.1-18.7 s` to
+  `2.8-3.0 s`, with the isolated graph-construction phase dropping from about
+  `18.27 s` to `2.42-2.59 s`.
+- With that optimization in place, the AWS `10M x 32D` cheap-build scale run
+  progressed from "stuck in CREATE INDEX" to the first real `10M` query pass.
+
 ### GraphRAG concurrent online-operation hardening
 
 - Added `scripts/test_graph_rag_concurrent.sh` and

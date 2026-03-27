@@ -287,19 +287,53 @@ The strongest bounded AWS signal so far is:
   - `generate_csv`: `223.114 s`
   - CSV size: `3.63 GiB`
   - `load_data`: `485.177 s`
-  - then entered a long `CREATE INDEX` that was still active after `~11-12`
-    minutes in the index build phase
+  - on the old build path, it then entered a long `CREATE INDEX` that was
+    still active after `~11-12` minutes in the index-build phase
   - temp-cluster footprint reached about `17-18 GiB` with `11-13 GiB` disk
     still free on the AWS host
+
+After removing the per-search `visited[]` allocation/zeroing from the hot
+HNSW build loop, the same local diagnostic point that previously established
+the bottleneck changed materially:
+
+- local `500K x 32D` (`100K` pairs x `5` hops, `m=8`, `ef_construction=8`)
+  - old total build: `18.1-18.7 s`
+  - old graph-construction phase: about `18.27 s`
+  - new total build: `2.777-2.996 s`
+  - new graph-construction phase: about `2.42-2.59 s`
+  - page-writing tail stayed small (`~0.20-0.24 s`)
+
+That moved the AWS `10M x 32D` scale branch from "still stuck in CREATE INDEX"
+to the first real `10M` query pass on the same cheap-build point:
+
+- `generate_csv`: `222.814 s`
+- `load_data`: `468.923 s`
+- `build_indexes`: `212.553 s`
+- `analyze`: `14.562 s`
+- unified path-aware `sorted_heap_graph_rag(...)` p50:
+  - depth `1`: `2.124 ms`
+  - depth `2`: `3.433 ms`
+  - depth `3`: `4.611 ms`
+  - depth `4`: `5.846 ms`
+  - depth `5`: `5.139 ms`
+
+This is **not** a release-quality GraphRAG point. The build/query knobs here
+were intentionally ultra-light (`ann_k=16`, `ef_search=32`,
+`ef_construction=8`, `m=8`) to get the first `10M` latency envelope. At those
+settings, answer quality on the single-query AWS probe was poor (`0.0% / 0.0%`)
+and should be treated as a scale smoke, not a publishable quality frontier.
 
 So the narrow conclusion is:
 
 - the multi-hop GraphRAG path itself survives to at least `1M` rows and gives
   measured query latencies there
-- the current `10M` frontier is **build-bound**, not Python-memory-bound,
+- the old `10M` frontier was **build-bound**, not Python-memory-bound,
   not CSV-generation-bound, and not an early PostgreSQL failure
-- first real `10M` query numbers still require either a longer-lived build or a
-  larger benchmark box
+- the current build optimization moved that frontier enough to obtain the
+  first real `10M` query numbers on a cheap-build point
+- the next remaining scale problem is no longer "can it finish?" but
+  "how much quality can we recover at `10M` without giving back too much
+  build/query cost?"
 
 ### Current AWS GraphRAG benchmark (`person -> parent -> city`, stable fact contract)
 
