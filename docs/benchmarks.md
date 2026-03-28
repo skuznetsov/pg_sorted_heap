@@ -998,6 +998,55 @@ Observations:
   The segmented latency win is structural (fewer rows per shard), but the
   quality win depends entirely on the router including the correct shard.
 
+### Routing-miss tolerance at AWS `10M x 64D`
+
+Same AWS ARM64 host and workload as the bounded-fanout section above.
+Build once (`load=500.5s`, `build=803.5s`), query-only reuse.
+`4` queries, `1` run, `fanout=2`, `8` shards.
+
+```
+# Build: same as bounded-fanout section
+# Query-only reuse with bounded_recall:
+ssh <host> "cd <dir> && python3 scripts/bench_graph_rag_multidepth_segmented.py \
+  --port 65494 --num-pairs 2000000 --max-depth 5 --query-count 4 --runs 1 \
+  --dim 64 --hop-weight 0.05 --ann-k 256 --top-k 32 --ef-search 128 \
+  --ef-construction 64 --m 16 --build-sq8 on --shared-buffers-mb 64 \
+  --shards 8 --route bounded_recall --fanout 2 --recall-pct {90,75} \
+  --backend-mode fresh --reuse-temp <kept_temp>"
+```
+
+Depth-5 routing-miss tolerance at `10M`:
+
+| Route mode | Router recall | p50 (d5) | hit@1 (d5) | hit@k (d5) |
+|---|:---:|:---:|:---:|:---:|
+| bounded optimistic | 100% (4/4 hit) | 519 ms | 100% | 100% |
+| bounded_recall | 90% (3/4 hit) | 521 ms | 75% | 75% |
+| bounded_recall | 75% (3/4 hit) | 522 ms | 75% | 75% |
+| (ref: monolithic) | — | 2084 ms | 75% | 100% |
+| (ref: exact) | 100% | 259 ms | 100% | 100% |
+
+The 90% and 75% recall points produce the same result because with only
+`4` queries, SHA-256 hash gives `3/4` correct-shard inclusion at both
+settings. The `1` missed query returns wrong results, giving `75%` hit@1.
+
+Despite limited query-count resolution, the directional signal is clear:
+- Bounded(2/8) latency stays at ~520 ms regardless of recall (~4x
+  faster than monolithic)
+- One missed query out of four drops hit@1 from 100% to 75% — matching
+  the monolithic baseline's own 75% hit@1
+- hit@k drops from 100% to 75% (monolithic gets 100% hit@k because its
+  broader candidate set is more likely to include the target)
+
+This confirms the local finding: **routing quality determines answer
+quality, not latency.** The latency win is structural and survives
+routing errors. At 90% router recall on this 10M point, bounded routing
+matches the monolithic hit@1 (75%) while staying 4x faster.
+
+A higher `query_count` run would give finer crossover resolution. On the
+measured 4-query point, the evidence is narrower: at 90% recall,
+bounded routing matches the monolithic hit@1 while staying 4x faster,
+and the true crossover is not shown to be above that point.
+
 ### Current AWS GraphRAG benchmark (`person -> parent -> city`, stable fact contract)
 
 Repo-owned harness:

@@ -62,6 +62,9 @@
   Quality tracks router recall linearly; no sharp cliff. A router with
   90% recall keeps 87.5% hit@1 while remaining 2-3x faster than
   monolithic. Routing quality determines answer quality, not latency.
+- Verified routing-miss tolerance at AWS `10M x 64D`: at 90% recall,
+  bounded(2/8) matches monolithic hit@1 (75%) while staying 4x faster.
+  Finer crossover resolution remains limited by the small 4-query point.
 
 ### sorted_hnsw shared cache fix
 
