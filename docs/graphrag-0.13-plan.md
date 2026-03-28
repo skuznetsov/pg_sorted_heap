@@ -65,6 +65,11 @@ Semantics:
 
 These remain beta even after the new syntax lands:
 
+- unified routed GraphRAG dispatcher (recommended app entry point for
+  multi-shard workloads):
+  - `sorted_heap_graph_route(...)` — single query entry point
+  - `sorted_heap_graph_route_plan(...)` — routing introspection
+  - routing setup helpers (exact-key, range, policy, profile, default)
 - lower-level helper zoo:
   - `sorted_heap_expand_ids(...)`
   - `sorted_heap_expand_rerank(...)`

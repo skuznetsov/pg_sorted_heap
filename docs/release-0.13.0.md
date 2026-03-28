@@ -27,8 +27,12 @@ Stable in this release:
 
 Still beta:
 
-- lower-level GraphRAG helper/wrapper building blocks
-- code-corpus snippet/symbol/lexical retrieval contracts used by the benchmark
+- Routed GraphRAG (recommended app entry points for multi-shard workloads):
+  - `sorted_heap_graph_route(...)` — unified routed query dispatcher
+  - `sorted_heap_graph_route_plan(...)` — routing introspection/explain
+- Routing setup helpers (exact-key, range, policy, profile, default registries)
+- Lower-level GraphRAG helper/wrapper building blocks
+- Code-corpus snippet/symbol/lexical retrieval contracts used by the benchmark
   harnesses
 
 Legacy/manual:
@@ -83,9 +87,48 @@ The fact-shaped GraphRAG path now has dedicated coverage for:
 - dump/restore persistence of segmented/routed GraphRAG registries, including
   shared shard metadata, shared `segment_labels`, and effective default
   `segment_labels`
+- dump/restore persistence of the unified router flow:
+  `sorted_heap_graph_route(...)` and `sorted_heap_graph_route_plan(...)`
+  produce identical results before and after restore
 - crash recovery for registered/indexed graph tables
 - concurrent DML with `sorted_heap_compact_online(...)`
 - concurrent DML with `sorted_heap_merge_online(...)`
+- `sorted_hnsw` chunked cache integration test covering local-only,
+  shared-cache publish/attach, and multi-index overwrite scenarios
+
+### Unified routed GraphRAG dispatcher (beta)
+
+For multi-shard workloads (tenant isolation, knowledge-base routing), the
+new unified dispatcher replaces the previous zoo of per-routing-mode
+wrappers with one app-facing entry point:
+
+```sql
+SELECT *
+FROM sorted_heap_graph_route(
+    'tenants',
+    '[0.1,0.2,0.3,...]'::svec,
+    relation_path := ARRAY[1, 2],
+    route_key := 'acme',
+    ann_k := 64,
+    top_k := 10,
+    score_mode := 'path'
+);
+
+SELECT * FROM sorted_heap_graph_route_plan(
+    'tenants', route_key := 'acme');
+```
+
+Resolution order: exact/range key → explicit profile → explicit policy →
+call-site overrides → default profile → base dispatcher. See `docs/api.md`
+"Routed GraphRAG: operator recipe" for the full setup/inspect/query flow.
+
+### Shared cache correctness fix
+
+Fixed a multi-index shared-cache corruption bug where
+`shnsw_shared_scan_cache_attach()` held bare pointers into shared memory.
+A second index's publish could silently corrupt the first index's cache.
+The attach path now deep-copies all bulk data. Regression-guarded by the
+multi-index overwrite phase in `scripts/test_hnsw_chunked_cache.sh`.
 
 ### Backend-local stage observability
 
@@ -152,7 +195,7 @@ bundle, including the narrower GraphRAG bundle.
 
 ## Release-candidate verification
 
-Fresh `0.13.0` release-candidate checks run on `2026-03-27`:
+Fresh `0.13.0` release-candidate checks run on `2026-03-28`:
 
 ```bash
 make test-graphrag-release
@@ -161,20 +204,22 @@ make test-graphrag-release
 Observed signals:
 
 - `make installcheck ...` -> `All 3 tests passed`
-- `make test-graphrag-lifecycle` -> `status=ok pass=48 fail=0 total=48`
+- `make test-graphrag-lifecycle` -> `status=ok pass=60 fail=0 total=60`
 - `make test-graphrag-crash` -> `status=ok pass=22 fail=0 total=22`
 - `make test-graphrag-concurrent` -> `status=ok pass=40 fail=0 total=40`
-- `make test-graphrag-release` -> wrapper target verified end-to-end with the
-  same pass signals above
+- `make test-hnsw-chunked-cache` -> `status=ok pass=31 fail=0 total=31`
 
 This bundle covers the narrow stable GraphRAG surface directly:
 
-- SQL regression coverage for unified syntax, schema registration, and stats
-- upgrade + dump/restore lifecycle for registered fact graphs and the
-  segmented/routed GraphRAG control plane, including shared/default
+- SQL regression coverage for unified syntax, schema registration,
+  unified router, and stats
+- upgrade + dump/restore lifecycle for registered fact graphs, the
+  segmented/routed GraphRAG control plane, unified router flow, shared/default
   `segment_labels` persistence
 - crash recovery for registered/indexed graph tables
 - concurrent DML with online compact / online merge on registered fact graphs
+- `sorted_hnsw` chunked cache integration including multi-index shared-cache
+  overwrite regression
 
 ## Extension-wide release-candidate checks
 
