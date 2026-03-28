@@ -884,6 +884,74 @@ Observations:
 - The win is not exact-or-nothing — bounded fanout preserves most of the
   benefit even with imperfect routing.
 
+### Bounded fanout at AWS `10M x 64D` scale
+
+Same AWS ARM64 host (`4 vCPU`, `8 GiB RAM`, `4 GiB swap`), same
+workload as the `10M x 64D` comparison above (`2M` pairs x `5` hops,
+`hop_weight=0.05`, `8` shards, `ann_k=256`, `top_k=32`, `ef_search=128`,
+`m=16`, `ef_construction=64`, `build_sq8=on`). Build once, query-only
+reuse for each route mode. `4` queries, `1` run.
+
+Build: `load_data=500.7s`, `build_indexes=764.2s`.
+
+Query commands:
+
+```
+# Build once with --keep-temp --stop-after build_indexes
+NUM_PAIRS=2000000 MAX_DEPTH=5 QUERY_COUNT=4 RUNS=1 DIM=64 \
+  ANN_K=256 TOP_K=32 EF_SEARCH=128 EF_CONSTRUCTION=64 M=16 \
+  SHARED_BUFFERS_MB=64 MAX_WAL_SIZE_GB=16 HOP_WEIGHT=0.05 \
+  BUILD_SQ8=on SHARDS=8 ROUTE=exact \
+  EXTRA_ARGS="--stream-copy --keep-temp --stop-after build_indexes" \
+  bash scripts/bench_graph_rag_multidepth_segmented_aws.sh \
+  <host> <dir> 65494
+
+# Query-only reuse for each route mode:
+ssh <host> "cd <dir> && python3 scripts/bench_graph_rag_multidepth_segmented.py \
+  --port 65494 --num-pairs 2000000 --max-depth 5 --query-count 4 --runs 1 \
+  --dim 64 --hop-weight 0.05 --ann-k 256 --top-k 32 --ef-search 128 \
+  --ef-construction 64 --m 16 --build-sq8 on --shared-buffers-mb 64 \
+  --shards 8 --route {exact,bounded,all} [--fanout {2,4}] \
+  --backend-mode fresh --reuse-temp <kept_temp>"
+```
+
+Depth-5 comparison (monolithic baseline from prior section):
+
+| Route mode | Shards hit | p50 (d5) | hit@1 (d5) | hit@k (d5) | vs monolith |
+|---|:---:|:---:|:---:|:---:|:---:|
+| monolithic | 1 table | 2084 ms | 75% | 100% | 1x |
+| segmented all (8/8) | 8 | 2107 ms | 75% | 100% | ~1x |
+| segmented bounded (4/8) | 4 | 1042 ms | 75% | 100% | **2.0x** |
+| segmented bounded (2/8) | 2 | 520 ms | 100% | 100% | **4.0x** |
+| segmented exact (1/8) | 1 | 259 ms | 100% | 100% | **8.0x** |
+
+Depth-1 comparison:
+
+| Route mode | Shards hit | p50 (d1) | hit@1 (d1) | hit@k (d1) | vs monolith |
+|---|:---:|:---:|:---:|:---:|:---:|
+| monolithic | 1 table | 841 ms | 100% | 100% | 1x |
+| segmented all (8/8) | 8 | 920 ms | 100% | 100% | ~1x |
+| segmented bounded (4/8) | 4 | 473 ms | 100% | 100% | **1.8x** |
+| segmented bounded (2/8) | 2 | 233 ms | 100% | 100% | **3.6x** |
+| segmented exact (1/8) | 1 | 137 ms | 100% | 100% | **6.1x** |
+
+The bounded-fanout gradient from the local `1M` point transfers cleanly
+to `10M`:
+
+- Latency scales linearly with the number of shards hit at both scales.
+- bounded(2/8) at `10M` is 4.0x faster than monolithic at depth 5 —
+  close to the local 3.4x ratio.
+- Even bounded(4/8) at half the shards gives a 2.0x win.
+- Quality: hit@k stays at 100% across all modes. hit@1 varies with
+  fanout width but stays ≥75%.
+- All-shard fanout remains ~1x monolithic (fanout overhead cancels the
+  per-shard size reduction).
+
+Conclusion: bounded fanout remains materially useful on this measured
+`10M` synthetic point. A router that can narrow to 2 out of 8 candidate
+shards captures ~50% of the exact-routing speedup. The performance
+gradient is smooth on this benchmark, not a cliff.
+
 ### Current AWS GraphRAG benchmark (`person -> parent -> city`, stable fact contract)
 
 Repo-owned harness:

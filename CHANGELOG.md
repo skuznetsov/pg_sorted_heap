@@ -54,6 +54,10 @@
   - bounded(4/8) is 1.6x faster with 93.8% hit@1
   - latency scales roughly linearly with shards hit
   - the win is not exact-or-nothing — imperfect routing still helps
+- Verified bounded fanout transfers to AWS `10M x 64D`:
+  - bounded(2/8) is 4.0x faster than monolithic at depth 5
+  - bounded(4/8) is 2.0x faster
+  - gradient is smooth and linear with shards hit
 
 ### sorted_hnsw shared cache fix
 
