@@ -30,33 +30,22 @@ plus planner-integrated HNSW search.
 
 ### Beta
 
-- Lower-level GraphRAG helper/wrapper building blocks:
-  - `sorted_heap_expand_ids(...)`
-  - `sorted_heap_expand_rerank(...)`
-  - `sorted_heap_expand_twohop_rerank(...)`
-  - `sorted_heap_expand_twohop_path_rerank(...)`
-  - `sorted_heap_expand_multihop_rerank(...)`
-  - `sorted_heap_expand_multihop_path_rerank(...)`
-  - `sorted_heap_graph_segment_register(...)`
-  - `sorted_heap_graph_segment_config(...)`
-  - `sorted_heap_graph_segment_resolve(...)`
-  - `sorted_heap_graph_segment_unregister(...)`
-  - `sorted_heap_graph_exact_register(...)`
-  - `sorted_heap_graph_exact_config(...)`
-  - `sorted_heap_graph_exact_resolve(...)`
-  - `sorted_heap_graph_exact_unregister(...)`
-  - `sorted_heap_graph_rag_segmented(...)`
-  - `sorted_heap_graph_rag_routed(...)`
-  - `sorted_heap_graph_rag_routed_exact(...)`
-  - `sorted_heap_graph_rag_scan(...)`
-  - `sorted_heap_graph_rag_twohop_scan(...)`
-  - `sorted_heap_graph_rag_twohop_path_scan(...)`
-  - `sorted_heap_graph_rag_multihop_scan(...)`
-  - `sorted_heap_graph_rag_multihop_path_scan(...)`
-- Code-corpus and snippet-oriented GraphRAG contracts that currently live in
-  benchmark/reference logic.
-- These remain useful and benchmarked, but they are still workload-sensitive
-  and are not the stable release-facing GraphRAG contract.
+- Routed GraphRAG (recommended entry points for multi-shard workloads):
+  - `sorted_heap_graph_route(...)` — unified routed query dispatcher
+  - `sorted_heap_graph_route_plan(...)` — routing introspection/explain
+- Routing setup helpers:
+  - `sorted_heap_graph_exact_register(...)` / `_config(...)` / `_resolve(...)` / `_unregister(...)`
+  - `sorted_heap_graph_segment_register(...)` / `_config(...)` / `_resolve(...)` / `_unregister(...)`
+  - `sorted_heap_graph_route_profile_register(...)` / `_config(...)` / `_resolve(...)` / `_unregister(...)`
+  - `sorted_heap_graph_route_default_register(...)` / `_config(...)` / `_resolve(...)` / `_unregister(...)`
+  - `sorted_heap_graph_route_policy_register(...)` / `_config(...)` / `_groups(...)` / `_unregister(...)`
+  - `sorted_heap_graph_segment_meta_register(...)` / `_config(...)` / `_unregister(...)`
+  - Catalog helpers: `_segment_catalog(...)`, `_exact_catalog(...)`, `_route_profile_catalog(...)`, `_route_catalog(...)`
+- Lower-level GraphRAG building blocks (expand/rerank helpers, scan
+  wrappers, per-routing-mode dispatchers). These remain available for
+  advanced use cases but are not the recommended app entry points.
+- Code-corpus and snippet-oriented GraphRAG contracts that currently live
+  in benchmark/reference logic.
 
 ### Legacy/manual
 
@@ -231,132 +220,42 @@ same as `endpoint`. `limit_rows := 0` means unlimited work; positive values cap
 expansion/rerank work inside the current GraphRAG helper stages rather than
 changing the final `top_k` contract.
 
-The older helper/wrapper family is still available for lower-level control:
+For multi-shard workloads (tenant isolation, knowledge-base routing),
+use the unified routed dispatcher:
 
-- `sorted_heap_expand_ids(...)`
-- `sorted_heap_expand_rerank(...)`
-- `sorted_heap_expand_twohop_rerank(...)`
-- `sorted_heap_expand_twohop_path_rerank(...)`
-- `sorted_heap_expand_multihop_rerank(...)`
-- `sorted_heap_expand_multihop_path_rerank(...)`
-- `sorted_heap_graph_segment_meta_register(...)`
-- `sorted_heap_graph_segment_meta_config(...)`
-- `sorted_heap_graph_segment_meta_unregister(...)`
-- `sorted_heap_graph_segment_register(...)`
-- `sorted_heap_graph_segment_catalog(...)`
-- `sorted_heap_graph_segment_config(...)`
-- `sorted_heap_graph_segment_resolve(...)`
-- `sorted_heap_graph_segment_unregister(...)`
-- `sorted_heap_graph_route_policy_register(...)`
-- `sorted_heap_graph_route_policy_config(...)`
-- `sorted_heap_graph_route_policy_groups(...)`
-- `sorted_heap_graph_route_policy_unregister(...)`
-- `sorted_heap_graph_route_profile_register(...)`
-- `sorted_heap_graph_route_profile_config(...)`
-- `sorted_heap_graph_route_profile_resolve(...)`
-- `sorted_heap_graph_route_profile_catalog(...)`
-- `sorted_heap_graph_route_profile_unregister(...)`
-- `sorted_heap_graph_route(...)`
-- `sorted_heap_graph_route_plan(...)`
-- `sorted_heap_graph_route_catalog(...)`
-- `sorted_heap_graph_route_default_register(...)`
-- `sorted_heap_graph_route_default_config(...)`
-- `sorted_heap_graph_route_default_resolve(...)`
-- `sorted_heap_graph_route_default_unregister(...)`
-- `sorted_heap_graph_exact_register(...)`
-- `sorted_heap_graph_exact_catalog(...)`
-- `sorted_heap_graph_exact_config(...)`
-- `sorted_heap_graph_exact_resolve(...)`
-- `sorted_heap_graph_exact_unregister(...)`
-- `sorted_heap_graph_rag_segmented(...)`
-- `sorted_heap_graph_rag_routed(...)`
-- `sorted_heap_graph_rag_routed_policy(...)`
-- `sorted_heap_graph_rag_routed_profile(...)`
-- `sorted_heap_graph_rag_routed_default(...)`
-- `sorted_heap_graph_rag_routed_exact(...)`
-- `sorted_heap_graph_rag_routed_exact_policy(...)`
-- `sorted_heap_graph_rag_routed_exact_profile(...)`
-- `sorted_heap_graph_rag_routed_exact_default(...)`
-- `sorted_heap_graph_rag_scan(...)`
-- `sorted_heap_graph_rag_twohop_scan(...)`
-- `sorted_heap_graph_rag_twohop_path_scan(...)`
-- `sorted_heap_graph_rag_multihop_scan(...)`
-- `sorted_heap_graph_rag_multihop_path_scan(...)`
+```sql
+-- Setup: register shards and map tenant keys
+SELECT sorted_heap_graph_register('shard_a'::regclass, ...);
+SELECT sorted_heap_graph_exact_register('tenants', 'acme',
+    'shard_a'::regclass, 100);
 
-Those building blocks remain beta. In particular,
-`sorted_heap_graph_rag_scan(...)` seeds one-hop expansion from ANN-selected
-`target_id` values and is therefore not the preferred fact-graph contract.
-`sorted_heap_graph_rag_segmented(...)` is the first beta SQL-level segmented
-reference path: it takes a candidate shard array, executes
-`sorted_heap_graph_rag(...)` per shard, and merges shard-local top-k rows
-globally. Routing/pruning is still the caller's job.
-`sorted_heap_graph_rag_routed(...)` adds the first metadata-driven routing
-layer on top of that: register shard ranges once, then route by a caller-
-supplied `int8` route value before the segmented merge runs.
-`sorted_heap_graph_rag_routed_exact(...)` is the exact-key companion for
-tenant/KB-style routing: register a key-to-shard mapping once, then route by
-an exact key instead of a numeric range. Both routed wrappers now also accept
-an optional `segment_groups := ARRAY[...]` filter, which is the first beta
-surface for hot/sealed shard narrowing without changing the GraphRAG scoring
-contract. When that array is present, its order is also used as the shard
-preference order before bounded fanout is applied. The next beta convenience
-layer now exists too: named route policies can store that group order once and
-be reused through `sorted_heap_graph_rag_routed_policy(...)` and
-`sorted_heap_graph_rag_routed_exact_policy(...)`. The next narrow extension on
-top of that is an optional `relation_family := ...` filter on the range
-registry, exact-key registry, and both policy-backed wrappers, so beta
-segmented GraphRAG can now combine route key/range + shard-group policy + one
-extra family dimension without changing the scoring contract. And the next
-metadata dimension now exists beyond that: shared per-shard
-`segment_labels text[]` plus optional `segment_labels := ARRAY[...]` filtering
-on the raw, policy-backed, profile-backed, and default-backed routed paths.
-This is the first multi-valued shard-label filter in the beta surface. The next
-ergonomic layer now exists too: named route profiles can bundle
-`policy_name or segment_groups + relation_family + fanout_limit +
-segment_labels` once and feed `sorted_heap_graph_rag_routed_profile(...)` or
-`sorted_heap_graph_rag_routed_exact_profile(...)` directly. And the newest
-operator-facing shortcut removes one more repeated query argument: a route can
-now bind one default profile and call
-`sorted_heap_graph_rag_routed_default(...)` or
-`sorted_heap_graph_rag_routed_exact_default(...)` without passing
-`profile_name` each time. The newest narrow cleanup under that beta surface is
-shared per-shard metadata via `sorted_heap_graph_segment_meta_register(...)`:
-route rows can now omit repeated `segment_group` / `relation_family` labels
-and inherit them from shard metadata instead. When both are present, the
-route-local value still wins. And the newest operator-facing introspection
-layer on top of that is:
+-- Query: one entry point for all routing modes
+SELECT *
+FROM sorted_heap_graph_route(
+    'tenants',
+    '[0.1,0.2,0.3,...]'::svec,
+    relation_path := ARRAY[1, 2],
+    route_key := 'acme',
+    ann_k := 64,
+    top_k := 10,
+    score_mode := 'path'
+);
 
-- `sorted_heap_graph_segment_catalog(...)`
-- `sorted_heap_graph_exact_catalog(...)`
-- `sorted_heap_graph_route_profile_catalog(...)`
-- `sorted_heap_graph_route_catalog(...)`
+-- Inspect: see which shards would be selected
+SELECT * FROM sorted_heap_graph_route_plan(
+    'tenants', route_key := 'acme');
+```
 
-Those catalog functions show route-local labels, shared shard metadata,
-effective resolved labels, and whether each effective value came from
-`route`, `shared`, or stayed `unset`. `sorted_heap_graph_route_profile_catalog(...)`
-does the same for route profiles and defaults: it shows inline profile groups,
-policy-backed groups, effective group order, optional profile-level
-`segment_labels`, whether those effective groups came from `inline`, `policy`,
-or stayed `unset`, and whether the profile is currently the route default.
-None of these catalog helpers change routing or scoring; they only make the
-current registry model easier to inspect.
-`sorted_heap_graph_route_catalog(...)` is the one-row-per-route summary on top
-of that: it shows range-shard count, exact-binding count, policy/profile
-counts, and the effective default profile contract for that route, including
-default `segment_labels`.
+`sorted_heap_graph_route(...)` dispatches to the appropriate routing path
+(exact-key, range, profile, policy, or default) based on the provided
+parameters. See `docs/api.md` for the full resolution order and operator
+recipe.
 
-The newest operator-facing layer above those beta routed helpers is:
-
-- `sorted_heap_graph_route(...)`
-- `sorted_heap_graph_route_plan(...)`
-
-`sorted_heap_graph_route(...)` is a thin unified dispatcher over the existing
-range/exact + profile/policy/default routed paths. It does not introduce a new
-scoring contract; it only chooses the existing routed entry point according to
-the supplied route key/value and optional registry-backed routing contract.
-`sorted_heap_graph_route_plan(...)` exposes the same resolution order without
-running GraphRAG, so operators can see the chosen routing mode, effective
-profile/policy/default, and candidate shard list before executing a query.
+The lower-level routing building blocks (`_routed`, `_routed_exact`,
+`_routed_policy`, `_routed_profile`, `_routed_default`, `_segmented`,
+expand/rerank helpers, scan wrappers, catalog/config/resolve functions)
+remain available as beta APIs for advanced use cases. See the Beta
+section above for the full list.
 
 For tuning and debugging, GraphRAG now also exposes backend-local last-call
 stats:

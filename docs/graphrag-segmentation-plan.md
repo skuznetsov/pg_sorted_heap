@@ -215,12 +215,23 @@ Reference design:
     including default `segment_labels`
   - this also does not change routing behavior; it makes the whole routed
     control plane easier to inspect at a glance
+- and the unified operator-facing dispatcher now exists on top of all of
+  the above:
+  - `sorted_heap_graph_route(...)` — single query entry point that
+    dispatches to the appropriate routed path (exact-key or range,
+    with optional profile/policy/default resolution)
+  - `sorted_heap_graph_route_plan(...)` — explains the routing
+    resolution without executing GraphRAG
+  - see `docs/api.md` "Routed GraphRAG: operator recipe" for the
+    recommended app-facing setup/inspect/query flow
 - what is still missing:
   - richer metadata than one shared `text[]` label dimension
   - a product-quality shard router contract for tenant / KB / relation-family
     pruning without hand-managed registration tables
 
-This is still intentionally a reference path, not the final router.
+The Phase 2 reference path is now usable as an operator-facing beta
+surface through `sorted_heap_graph_route(...)`. The lower-level routed
+wrappers remain available as building blocks.
 
 ### Phase 3: productized router
 
