@@ -173,6 +173,61 @@ FROM sorted_heap_graph_rag_routed_exact_default(
 SQL
 }
 
+unified_route_range_signature_sql() {
+  local route_name="$1" route_value="$2" query="$3" relation_path="$4" ann_k="$5" top_k="$6" score_mode="$7"
+  cat <<SQL
+SELECT COALESCE(
+  string_agg(
+    format('%s:%s:%s:%s:%s', source_rel::text, entity_id, relation_id, target_id, payload),
+    '|' ORDER BY distance, entity_id, relation_id, target_id, source_rel::text
+  ),
+  ''
+)
+FROM sorted_heap_graph_route(
+  '${route_name}',
+  '${query}'::svec,
+  relation_path := ${relation_path},
+  route_value := ${route_value},
+  ann_k := ${ann_k},
+  top_k := ${top_k},
+  score_mode := '${score_mode}',
+  limit_rows := 0
+);
+SQL
+}
+
+unified_route_exact_signature_sql() {
+  local route_name="$1" route_key="$2" query="$3" relation_path="$4" ann_k="$5" top_k="$6" score_mode="$7"
+  cat <<SQL
+SELECT COALESCE(
+  string_agg(
+    format('%s:%s:%s:%s:%s', source_rel::text, entity_id, relation_id, target_id, payload),
+    '|' ORDER BY distance, entity_id, relation_id, target_id, source_rel::text
+  ),
+  ''
+)
+FROM sorted_heap_graph_route(
+  '${route_name}',
+  '${query}'::svec,
+  relation_path := ${relation_path},
+  route_key := '${route_key}',
+  ann_k := ${ann_k},
+  top_k := ${top_k},
+  score_mode := '${score_mode}',
+  limit_rows := 0
+);
+SQL
+}
+
+route_plan_sql() {
+  local route_name="$1"
+  local key_param="$2"  # 'route_key := ...' or 'route_value := ...'
+  cat <<SQL
+SELECT route_kind || ':' || resolution_path || ':' || COALESCE(used_profile_name, '') || ':' || used_default::text || ':' || COALESCE(array_to_string(candidate_shards::text[], ','), '')
+FROM sorted_heap_graph_route_plan('${route_name}', ${key_param});
+SQL
+}
+
 config_sql() {
   local rel="$1"
   cat <<SQL
@@ -392,6 +447,25 @@ check "routed_default_signature_nonempty" "t" "$([ -n "$lifecycle_routed_sig" ] 
 lifecycle_exact_routed_sig=$(PSQL "$DB" -c "$(routed_exact_default_signature_sql lifecycle_exact both '[0,1,0,0]' 'ARRAY[1,2]' 2 2 path)")
 check "routed_exact_default_signature" "$lifecycle_routed_sig" "$lifecycle_exact_routed_sig"
 
+# Unified router: sorted_heap_graph_route (range path, uses default profile)
+unified_range_sig=$(PSQL "$DB" -c "$(unified_route_range_signature_sql lifecycle_route 10 '[0,1,0,0]' 'ARRAY[1,2]' 2 2 path)")
+check "unified_route_range_nonempty" "t" "$([ -n "$unified_range_sig" ] && echo t || echo f)"
+check "unified_route_range_matches_routed_default" "$lifecycle_routed_sig" "$unified_range_sig"
+
+# Unified router: sorted_heap_graph_route (exact-key path, uses default profile)
+unified_exact_sig=$(PSQL "$DB" -c "$(unified_route_exact_signature_sql lifecycle_exact both '[0,1,0,0]' 'ARRAY[1,2]' 2 2 path)")
+check "unified_route_exact_nonempty" "t" "$([ -n "$unified_exact_sig" ] && echo t || echo f)"
+check "unified_route_exact_matches_routed_default" "$lifecycle_exact_routed_sig" "$unified_exact_sig"
+
+# Route plan: verify resolution paths
+range_plan=$(PSQL "$DB" -c "$(route_plan_sql lifecycle_route "route_value := 10")")
+check "route_plan_range_nonempty" "t" "$([ -n "$range_plan" ] && echo t || echo f)"
+check "route_plan_range_default" "t" "$(echo "$range_plan" | grep -c 'default' | awk '{print ($1>0)?"t":"f"}')"
+
+exact_plan=$(PSQL "$DB" -c "$(route_plan_sql lifecycle_exact "route_key := 'both'")")
+check "route_plan_exact_nonempty" "t" "$([ -n "$exact_plan" ] && echo t || echo f)"
+check "route_plan_exact_default" "t" "$(echo "$exact_plan" | grep -c 'default' | awk '{print ($1>0)?"t":"f"}')"
+
 "$PG_BINDIR/pg_dump" -h "$TMP_DIR" -p "$PORT" -Fc "$DB" -f "$TMP_DIR/graph_rag.fc" 2>/dev/null
 "$PG_BINDIR/dropdb" -h "$TMP_DIR" -p "$PORT" "$DB"
 "$PG_BINDIR/createdb" -h "$TMP_DIR" -p "$PORT" "$DB"
@@ -456,6 +530,20 @@ check "routed_default_signature_after_restore" "$lifecycle_routed_sig" "$restore
 
 restored_lifecycle_exact_routed_sig=$(PSQL "$DB" -c "$(routed_exact_default_signature_sql lifecycle_exact both '[0,1,0,0]' 'ARRAY[1,2]' 2 2 path)")
 check "routed_exact_default_signature_after_restore" "$lifecycle_exact_routed_sig" "$restored_lifecycle_exact_routed_sig"
+
+# Unified router after restore
+restored_unified_range_sig=$(PSQL "$DB" -c "$(unified_route_range_signature_sql lifecycle_route 10 '[0,1,0,0]' 'ARRAY[1,2]' 2 2 path)")
+check "unified_route_range_after_restore" "$unified_range_sig" "$restored_unified_range_sig"
+
+restored_unified_exact_sig=$(PSQL "$DB" -c "$(unified_route_exact_signature_sql lifecycle_exact both '[0,1,0,0]' 'ARRAY[1,2]' 2 2 path)")
+check "unified_route_exact_after_restore" "$unified_exact_sig" "$restored_unified_exact_sig"
+
+# Route plan after restore
+restored_range_plan=$(PSQL "$DB" -c "$(route_plan_sql lifecycle_route "route_value := 10")")
+check "route_plan_range_after_restore" "$range_plan" "$restored_range_plan"
+
+restored_exact_plan=$(PSQL "$DB" -c "$(route_plan_sql lifecycle_exact "route_key := 'both'")")
+check "route_plan_exact_after_restore" "$exact_plan" "$restored_exact_plan"
 
 PSQL "$DB" -c "SELECT sorted_heap_compact('facts_alias'::regclass)" >/dev/null
 post_restore_compact_sig=$(PSQL "$DB" -c "$(signature_sql facts_alias '[0,0,1,0]' 'ARRAY[1,2]' 2 2 path)")
