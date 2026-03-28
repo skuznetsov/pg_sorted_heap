@@ -306,29 +306,60 @@ def build_sharded_indexes(
             cur.execute("RESET sorted_hnsw.build_sq8")
 
 
-def route_tables(query: md.DeepQuery, num_pairs: int, shards: int, route_mode: str, fanout: int = 0) -> list[str]:
+def _bounded_shards(correct: int, fanout: int, shards: int, include_correct: bool) -> list[int]:
+    """Pick `fanout` shards centered on `correct`, optionally excluding it."""
+    k = min(fanout, shards) if fanout > 0 else 1
+    selected: set[int] = set()
+    if include_correct:
+        selected.add(correct)
+    # fill with adjacent shards, preferring right then left
+    left = correct - 1
+    right = correct + 1
+    # if correct excluded, also add the correct position's right neighbor first
+    if not include_correct and right < shards:
+        selected.add(right)
+        right += 1
+    while len(selected) < k:
+        if right < shards:
+            selected.add(right)
+            right += 1
+        if len(selected) < k and left >= 0:
+            selected.add(left)
+            left -= 1
+        if left < 0 and right >= shards:
+            break
+    return sorted(selected)
+
+
+def route_tables(
+    query: md.DeepQuery,
+    num_pairs: int,
+    shards: int,
+    route_mode: str,
+    fanout: int = 0,
+    recall_pct: int = 100,
+    query_idx: int = 0,
+    recall_seed: int = 42,
+) -> list[str]:
     if route_mode == "all":
         return [shard_table_name(shard_id) for shard_id in range(shards)]
     if route_mode == "exact":
         shard_id = shard_for_person(query.person_id, num_pairs, shards)
         return [shard_table_name(shard_id)]
+    correct = shard_for_person(query.person_id, num_pairs, shards)
     if route_mode == "bounded":
-        correct = shard_for_person(query.person_id, num_pairs, shards)
-        k = min(fanout, shards) if fanout > 0 else 1
-        selected = set()
-        selected.add(correct)
-        left = correct - 1
-        right = correct + 1
-        while len(selected) < k:
-            if right < shards:
-                selected.add(right)
-                right += 1
-            if len(selected) < k and left >= 0:
-                selected.add(left)
-                left -= 1
-            if left < 0 and right >= shards:
-                break
-        return [shard_table_name(s) for s in sorted(selected)]
+        ids = _bounded_shards(correct, fanout, shards, include_correct=True)
+        return [shard_table_name(s) for s in ids]
+    if route_mode == "bounded_recall":
+        # Deterministic per-query miss using a well-distributed hash.
+        import hashlib as _hl
+        h = int.from_bytes(
+            _hl.sha256(f"{recall_seed}:{query_idx}".encode()).digest()[:8],
+            "little",
+        )
+        hit = (h % 100) < recall_pct
+        ids = _bounded_shards(correct, fanout, shards, include_correct=hit)
+        return [shard_table_name(s) for s in ids]
     raise ValueError(f"unsupported route_mode: {route_mode}")
 
 
@@ -432,6 +463,8 @@ def measure_segmented_case(
     route_mode: str,
     merge_mode: str,
     fanout: int = 0,
+    recall_pct: int = 100,
+    recall_seed: int = 42,
 ) -> tuple[float, float, float, float, float]:
     latencies: list[float] = []
     returned_rows: list[int] = []
@@ -439,8 +472,9 @@ def measure_segmented_case(
     hitk = 0
 
     for _ in range(runs):
-        for query in queries:
-            tables = route_tables(query, num_pairs, shards, route_mode, fanout)
+        for qi, query in enumerate(queries):
+            tables = route_tables(query, num_pairs, shards, route_mode, fanout,
+                                  recall_pct=recall_pct, query_idx=qi, recall_seed=recall_seed)
             t0 = time.perf_counter()
             rows = merged_shard_rows(
                 cur,
@@ -533,12 +567,18 @@ def main() -> None:
     ap.add_argument("--maintenance-work-mem-mb", type=int, default=0)
     ap.add_argument("--post-load-op", choices=("compact", "merge", "none"), default="compact")
     ap.add_argument("--shards", type=int, default=4)
-    ap.add_argument("--route", choices=("all", "exact", "both", "bounded"), default="both")
+    ap.add_argument("--route", choices=("all", "exact", "both", "bounded", "bounded_recall"), default="both")
     ap.add_argument(
         "--fanout",
         type=int,
         default=0,
-        help="Number of shards to hit in bounded route mode (required for --route bounded)",
+        help="Number of shards to hit in bounded route mode (required for --route bounded/bounded_recall)",
+    )
+    ap.add_argument(
+        "--recall-pct",
+        type=int,
+        default=100,
+        help="Percent of queries where correct shard is included (for --route bounded_recall)",
     )
     ap.add_argument(
         "--merge-mode",
@@ -559,9 +599,11 @@ def main() -> None:
 
     if args.shards < 1:
         raise ValueError("--shards must be >= 1")
-    if args.route == "bounded" and args.fanout < 1:
-        raise ValueError("--route bounded requires --fanout >= 1")
-    if args.merge_mode in {"routed", "routed_exact"} and args.route in {"all", "bounded"}:
+    if args.route in {"bounded", "bounded_recall"} and args.fanout < 1:
+        raise ValueError(f"--route {args.route} requires --fanout >= 1")
+    if args.route == "bounded_recall" and not (0 <= args.recall_pct <= 100):
+        raise ValueError("--recall-pct must be 0..100")
+    if args.merge_mode in {"routed", "routed_exact"} and args.route in {"all", "bounded", "bounded_recall"}:
         raise ValueError(
             f"--merge-mode {args.merge_mode} supports only exact-routing benchmark modes"
         )
@@ -777,8 +819,14 @@ def main() -> None:
             for route_mode in routes:
                 if args.merge_mode in {"routed", "routed_exact"} and route_mode != "exact":
                     continue
-                fanout = args.fanout if route_mode == "bounded" else 0
-                label = f"{route_mode}" if route_mode != "bounded" else f"bounded({fanout}/{shards})"
+                fanout = args.fanout if route_mode in {"bounded", "bounded_recall"} else 0
+                recall_pct = args.recall_pct if route_mode == "bounded_recall" else 100
+                if route_mode == "bounded":
+                    label = f"bounded({fanout}/{shards})"
+                elif route_mode == "bounded_recall":
+                    label = f"bounded_recall({fanout}/{shards},r={recall_pct}%)"
+                else:
+                    label = route_mode
                 for depth in range(1, max_depth + 1):
                     print(
                         f"running|table=segmented|route={label}|depth={depth}|shards={shards}",
@@ -796,6 +844,8 @@ def main() -> None:
                         route_mode,
                         args.merge_mode,
                         fanout,
+                        recall_pct,
+                        args.seed,
                     )
                     print_result(label, args.merge_mode, shards, depth, p50, avg, rows, hit1, hitk)
         finally:

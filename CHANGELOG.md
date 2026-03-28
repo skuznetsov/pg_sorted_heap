@@ -58,6 +58,10 @@
   - bounded(2/8) is 4.0x faster than monolithic at depth 5
   - bounded(4/8) is 2.0x faster
   - gradient is smooth and linear with shards hit
+- Added routing-miss tolerance mode (`--route bounded_recall --recall-pct N`).
+  Quality tracks router recall linearly; no sharp cliff. A router with
+  90% recall keeps 87.5% hit@1 while remaining 2-3x faster than
+  monolithic. Routing quality determines answer quality, not latency.
 
 ### sorted_hnsw shared cache fix
 

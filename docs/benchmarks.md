@@ -952,6 +952,52 @@ Conclusion: bounded fanout remains materially useful on this measured
 shards captures ~50% of the exact-routing speedup. The performance
 gradient is smooth on this benchmark, not a cliff.
 
+### Routing-miss tolerance on `1M x 64D`
+
+This measures what happens when the router sometimes picks the wrong
+shards — the correct shard is not always included in the candidate set.
+Uses `--route bounded_recall --fanout 2 --recall-pct N` where N% of
+queries get the correct shard and the rest get 2 adjacent wrong shards.
+Miss schedule is deterministic per-query via SHA-256 hash (seed=42).
+
+Local, `200K` pairs x `5` hops, `64D`, `8` shards, `32` queries, `3` runs,
+`ann_k=256`, `top_k=32`, `ef_search=128`, `m=16`, `ef_construction=64`,
+`build_sq8=on`, `hop_weight=0.05`:
+
+```
+python3 scripts/bench_graph_rag_multidepth_segmented.py \
+  --num-pairs 200000 --max-depth 5 --query-count 32 --runs 3 \
+  --dim 64 --ann-k 256 --top-k 32 --ef-search 128 \
+  --ef-construction 64 --m 16 --build-sq8 on \
+  --shards 8 --route bounded_recall --fanout 2 \
+  --recall-pct {100,90,75,50,25,0} --hop-weight 0.05
+```
+
+Depth-5 routing-miss tolerance (fanout=2, 8 shards):
+
+| Router recall | Queries hitting correct shard | p50 (d5) | hit@1 (d5) | hit@k (d5) |
+|:---:|:---:|:---:|:---:|:---:|
+| 100% | 32/32 | 54.5 ms | 96.9% | 100.0% |
+| 90% | 29/32 | 64.7 ms | 87.5% | 90.6% |
+| 75% | 23/32 | 57.0 ms | 68.8% | 71.9% |
+| 50% | 18/32 | 45.4 ms | 53.1% | 56.2% |
+| 25% | 10/32 | 79.1 ms | 31.2% | 31.2% |
+| 0% | 0/32 | 44.8 ms | 0.0% | 0.0% |
+| (ref: monolithic) | — | 120.7 ms | 81.2% | 100.0% |
+
+Observations:
+- Quality tracks router recall nearly linearly. There is no sharp cliff.
+- A router with 90% recall keeps 87.5% hit@1 — close to the monolithic
+  baseline's 81.2%, while remaining 2-3x faster.
+- A router with 75% recall gives 68.8% hit@1 — below monolithic quality,
+  so the latency win comes at a quality cost.
+- Latency stays roughly constant across recall levels because the fanout
+  (2 shards) is fixed. The router-miss doesn't cost extra I/O — it just
+  returns wrong answers.
+- This means: **routing quality determines answer quality, not latency**.
+  The segmented latency win is structural (fewer rows per shard), but the
+  quality win depends entirely on the router including the correct shard.
+
 ### Current AWS GraphRAG benchmark (`person -> parent -> city`, stable fact contract)
 
 Repo-owned harness:
