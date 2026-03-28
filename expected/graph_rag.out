@@ -2145,6 +2145,208 @@ COPY (
   ) diff
 ) TO STDOUT;
 0
+-- ================================================================
+-- Unified router: sorted_heap_graph_route + route_plan
+-- (must run before profile/default unregister)
+-- ================================================================
+-- Test exact-key routing via unified wrapper (step 7: base dispatcher)
+COPY (
+  SELECT count(*) AS unified_exact_base_diff_rows
+  FROM (
+    SELECT entity_id, relation_id, target_id, payload, distance
+    FROM sorted_heap_graph_route(
+      'chain_meta_exact', '[1,0,0,0]'::svec, ARRAY[2],
+      route_key := 'left', ann_k := 16, top_k := 2
+    )
+    EXCEPT ALL
+    SELECT entity_id, relation_id, target_id, payload, distance
+    FROM sorted_heap_graph_rag_routed_exact(
+      'chain_meta_exact', 'left', '[1,0,0,0]'::svec, ARRAY[2],
+      ann_k := 16, top_k := 2
+    )
+  ) diff
+) TO STDOUT;
+0
+-- Test exact-key routing with default profile (step 6)
+COPY (
+  SELECT count(*) AS unified_exact_default_diff_rows
+  FROM (
+    SELECT entity_id, relation_id, target_id, payload, distance
+    FROM sorted_heap_graph_route(
+      'chain_exact', '[1,0,0,0]'::svec, ARRAY[2],
+      route_key := 'left', ann_k := 16, top_k := 2
+    )
+    EXCEPT ALL
+    SELECT entity_id, relation_id, target_id, payload, distance
+    FROM sorted_heap_graph_rag_routed_exact_default(
+      'chain_exact', 'left', '[1,0,0,0]'::svec, ARRAY[2],
+      ann_k := 16, top_k := 2
+    )
+  ) diff
+) TO STDOUT;
+0
+-- Test exact-key routing with explicit profile (step 3)
+COPY (
+  SELECT count(*) AS unified_exact_profile_diff_rows
+  FROM (
+    SELECT entity_id, relation_id, target_id, payload, distance
+    FROM sorted_heap_graph_route(
+      'chain_exact', '[1,0,0,0]'::svec, ARRAY[2],
+      route_key := 'left', profile_name := 'sealed_right',
+      ann_k := 16, top_k := 2
+    )
+    EXCEPT ALL
+    SELECT entity_id, relation_id, target_id, payload, distance
+    FROM sorted_heap_graph_rag_routed_exact_profile(
+      'chain_exact', 'left', 'sealed_right', '[1,0,0,0]'::svec, ARRAY[2],
+      ann_k := 16, top_k := 2
+    )
+  ) diff
+) TO STDOUT;
+0
+-- Test range routing via unified wrapper (step 7: base dispatcher)
+COPY (
+  SELECT count(*) AS unified_range_base_diff_rows
+  FROM (
+    SELECT entity_id, relation_id, target_id, payload, distance
+    FROM sorted_heap_graph_route(
+      'chain_grouped', '[1,0,0,0]'::svec, ARRAY[2],
+      route_value := 1, ann_k := 16, top_k := 2
+    )
+    EXCEPT ALL
+    SELECT entity_id, relation_id, target_id, payload, distance
+    FROM sorted_heap_graph_rag_routed(
+      'chain_grouped', 1, '[1,0,0,0]'::svec, ARRAY[2],
+      ann_k := 16, top_k := 2
+    )
+  ) diff
+) TO STDOUT;
+0
+-- Test range routing with default profile (step 6)
+COPY (
+  SELECT count(*) AS unified_range_default_diff_rows
+  FROM (
+    SELECT entity_id, relation_id, target_id, payload, distance
+    FROM sorted_heap_graph_route(
+      'chain_grouped', '[1,0,0,0]'::svec, ARRAY[2],
+      route_value := 1, ann_k := 16, top_k := 2
+    )
+    EXCEPT ALL
+    SELECT entity_id, relation_id, target_id, payload, distance
+    FROM sorted_heap_graph_rag_routed_default(
+      'chain_grouped', 1, '[1,0,0,0]'::svec, ARRAY[2],
+      ann_k := 16, top_k := 2
+    )
+  ) diff
+) TO STDOUT;
+0
+-- Test route_plan: exact-key base resolution
+COPY (
+  SELECT route_kind, resolution_path, used_default,
+         candidate_shards IS NOT NULL AS has_shards
+  FROM sorted_heap_graph_route_plan(
+    'chain_meta_exact', route_key := 'left')
+) TO STDOUT;
+exact	base	f	t
+-- Test route_plan: exact-key with default profile
+COPY (
+  SELECT route_kind, resolution_path, used_profile_name, used_default,
+         candidate_shards IS NOT NULL AS has_shards
+  FROM sorted_heap_graph_route_plan(
+    'chain_exact', route_key := 'left')
+) TO STDOUT;
+exact	default	inline_sealed_right	t	f
+-- Test route_plan: range with default profile
+COPY (
+  SELECT route_kind, resolution_path, used_profile_name, used_default,
+         candidate_shards IS NOT NULL AS has_shards
+  FROM sorted_heap_graph_route_plan(
+    'chain_grouped', route_value := 1)
+) TO STDOUT;
+range	default	inline_sealed_right	t	t
+-- Test route_plan: explicit profile
+COPY (
+  SELECT route_kind, resolution_path, used_profile_name, used_default
+  FROM sorted_heap_graph_route_plan(
+    'chain_exact', route_key := 'left', profile_name := 'sealed_right')
+) TO STDOUT;
+exact	profile	sealed_right	f
+-- Test validation: both route_key and route_value
+DO $$
+BEGIN
+  PERFORM * FROM sorted_heap_graph_route(
+    'chain_exact', '[1,0,0,0]'::svec, ARRAY[2],
+    route_key := 'left', route_value := 1);
+  RAISE EXCEPTION 'expected error not raised';
+EXCEPTION WHEN raise_exception THEN
+  IF sqlerrm LIKE '%route_key or route_value, not both%' THEN
+    RAISE NOTICE 'unified_route_both_keys_rejected: ok';
+  ELSE
+    RAISE;
+  END IF;
+END $$;
+-- Test validation: profile + segment_groups
+DO $$
+BEGIN
+  PERFORM * FROM sorted_heap_graph_route(
+    'chain_exact', '[1,0,0,0]'::svec, ARRAY[2],
+    route_key := 'left', profile_name := 'sealed_right',
+    segment_groups := ARRAY['hot']);
+  RAISE EXCEPTION 'expected error not raised';
+EXCEPTION WHEN raise_exception THEN
+  IF sqlerrm LIKE '%profile_name cannot be combined%' THEN
+    RAISE NOTICE 'unified_route_profile_override_rejected: ok';
+  ELSE
+    RAISE;
+  END IF;
+END $$;
+-- Test validation: policy + segment_groups
+DO $$
+BEGIN
+  PERFORM * FROM sorted_heap_graph_route(
+    'chain_exact', '[1,0,0,0]'::svec, ARRAY[2],
+    route_key := 'left', policy_name := 'prefer_sealed',
+    segment_groups := ARRAY['hot']);
+  RAISE EXCEPTION 'expected error not raised';
+EXCEPTION WHEN raise_exception THEN
+  IF sqlerrm LIKE '%policy_name cannot be combined with segment_groups%' THEN
+    RAISE NOTICE 'unified_route_policy_groups_rejected: ok';
+  ELSE
+    RAISE;
+  END IF;
+END $$;
+-- Test route_plan validation: profile + segment_groups
+DO $$
+BEGIN
+  PERFORM * FROM sorted_heap_graph_route_plan(
+    'chain_exact',
+    route_key := 'left',
+    profile_name := 'sealed_right',
+    segment_groups := ARRAY['hot']);
+  RAISE EXCEPTION 'expected error not raised';
+EXCEPTION WHEN raise_exception THEN
+  IF sqlerrm LIKE '%profile_name cannot be combined%' THEN
+    RAISE NOTICE 'unified_route_plan_profile_override_rejected: ok';
+  ELSE
+    RAISE;
+  END IF;
+END $$;
+-- Test route_plan validation: policy + segment_groups
+DO $$
+BEGIN
+  PERFORM * FROM sorted_heap_graph_route_plan(
+    'chain_exact',
+    route_key := 'left',
+    policy_name := 'prefer_sealed',
+    segment_groups := ARRAY['hot']);
+  RAISE EXCEPTION 'expected error not raised';
+EXCEPTION WHEN raise_exception THEN
+  IF sqlerrm LIKE '%policy_name cannot be combined with segment_groups%' THEN
+    RAISE NOTICE 'unified_route_plan_policy_groups_rejected: ok';
+  ELSE
+    RAISE;
+  END IF;
+END $$;
 COPY (
   SELECT sorted_heap_graph_route_default_unregister('chain_exact')
 ) TO STDOUT;

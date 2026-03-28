@@ -66,6 +66,17 @@
   bounded(2/8) matches monolithic hit@1 (75%) while staying 4x faster.
   Finer crossover resolution remains limited by the small 4-query point.
 
+### Unified routed GraphRAG wrapper
+
+- Added `sorted_heap_graph_route(...)` as a thin operator-facing dispatcher
+  over the existing exact/range + profile/policy/default routed GraphRAG
+  wrappers.
+- Added `sorted_heap_graph_route_plan(...)` to explain which routing path,
+  effective registry contract, and candidate shards the unified dispatcher
+  would use.
+- Explicit call-site routing overrides now take precedence over route
+  defaults; profile and policy paths remain mutually exclusive.
+
 ### sorted_hnsw shared cache fix
 
 - Fixed a multi-index shared-cache corruption bug where

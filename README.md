@@ -256,6 +256,8 @@ The older helper/wrapper family is still available for lower-level control:
 - `sorted_heap_graph_route_profile_resolve(...)`
 - `sorted_heap_graph_route_profile_catalog(...)`
 - `sorted_heap_graph_route_profile_unregister(...)`
+- `sorted_heap_graph_route(...)`
+- `sorted_heap_graph_route_plan(...)`
 - `sorted_heap_graph_route_catalog(...)`
 - `sorted_heap_graph_route_default_register(...)`
 - `sorted_heap_graph_route_default_config(...)`
@@ -342,6 +344,19 @@ current registry model easier to inspect.
 of that: it shows range-shard count, exact-binding count, policy/profile
 counts, and the effective default profile contract for that route, including
 default `segment_labels`.
+
+The newest operator-facing layer above those beta routed helpers is:
+
+- `sorted_heap_graph_route(...)`
+- `sorted_heap_graph_route_plan(...)`
+
+`sorted_heap_graph_route(...)` is a thin unified dispatcher over the existing
+range/exact + profile/policy/default routed paths. It does not introduce a new
+scoring contract; it only chooses the existing routed entry point according to
+the supplied route key/value and optional registry-backed routing contract.
+`sorted_heap_graph_route_plan(...)` exposes the same resolution order without
+running GraphRAG, so operators can see the chosen routing mode, effective
+profile/policy/default, and candidate shard list before executing a query.
 
 For tuning and debugging, GraphRAG now also exposes backend-local last-call
 stats:

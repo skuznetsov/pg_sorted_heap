@@ -1061,6 +1061,74 @@ FROM sorted_heap_graph_rag_routed_default(
 );
 ```
 
+### `sorted_heap_graph_route(route_name, query, relation_path, route_key, route_value, profile_name, policy_name, ann_k, top_k, score_mode, limit_rows, fanout_limit, segment_groups, relation_family, segment_labels)`
+
+Unified routed GraphRAG entry point over the existing beta exact/range
+wrappers.
+
+Resolution order:
+
+1. exactly one of `route_key` or `route_value`
+2. at most one of `profile_name` or `policy_name`
+3. explicit `profile_name`
+4. explicit `policy_name`
+5. explicit call-site routing overrides
+   - `fanout_limit`
+   - `segment_groups`
+   - `relation_family`
+   - `segment_labels`
+6. route default profile, if one exists
+7. base exact/range routed wrapper
+
+Important constraints:
+
+- `profile_name` cannot be combined with call-site routing overrides
+- `policy_name` cannot be combined with `segment_groups`
+- defaults never override explicit call-site routing knobs
+- this wrapper reuses the existing routed GraphRAG paths; it does not define
+  a new GraphRAG scoring model
+
+```sql
+SELECT source_rel, entity_id, relation_id, target_id, payload, distance
+FROM sorted_heap_graph_route(
+    'tenant_facts',
+    '[0.1,0.2,0.3,...]'::svec,
+    relation_path := ARRAY[1, 2],
+    route_key := 'kb_alpha',
+    ann_k := 64,
+    top_k := 10,
+    score_mode := 'path'
+);
+```
+
+### `sorted_heap_graph_route_plan(route_name, route_key, route_value, profile_name, policy_name, fanout_limit, segment_groups, relation_family, segment_labels)`
+
+Explain helper for `sorted_heap_graph_route(...)`.
+
+Returns:
+
+- `route_kind`
+- `resolution_path`
+- `used_profile_name`
+- `used_policy_name`
+- `used_default`
+- `effective_fanout_limit`
+- `effective_segment_groups`
+- `effective_relation_family`
+- `effective_segment_labels`
+- `candidate_shards`
+
+This function uses the same routing precedence as `sorted_heap_graph_route(...)`
+but does not execute GraphRAG.
+
+```sql
+SELECT *
+FROM sorted_heap_graph_route_plan(
+    'tenant_facts',
+    route_key := 'kb_alpha'
+);
+```
+
 ### `sorted_heap_graph_exact_register(route_name, route_key, rel, priority, segment_group, relation_family)`
 
 Registers an exact-key shard mapping in the beta exact-routing registry.

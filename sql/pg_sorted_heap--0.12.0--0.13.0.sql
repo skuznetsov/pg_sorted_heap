@@ -1790,3 +1790,278 @@ $$ LANGUAGE plpgsql STABLE;
 
 COMMENT ON FUNCTION @extschema@.sorted_heap_graph_rag_routed_exact_default(text, text, @extschema@.svec, int4[], int4, int4, text, int4)
 IS 'Beta exact-key routed GraphRAG wrapper. Resolves the default route profile for a route and delegates to sorted_heap_graph_rag_routed_exact_profile(...).';
+
+-- Unified router wrapper
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_route(
+  route_name text,
+  query @extschema@.svec,
+  relation_path int4[],
+  route_key text DEFAULT NULL,
+  route_value int8 DEFAULT NULL,
+  profile_name text DEFAULT NULL,
+  policy_name text DEFAULT NULL,
+  ann_k int4 DEFAULT 64,
+  top_k int4 DEFAULT 10,
+  score_mode text DEFAULT 'path',
+  limit_rows int4 DEFAULT 0,
+  fanout_limit int4 DEFAULT 0,
+  segment_groups text[] DEFAULT NULL,
+  relation_family text DEFAULT NULL,
+  segment_labels text[] DEFAULT NULL
+) RETURNS TABLE (
+  source_rel regclass,
+  entity_id int4,
+  relation_id int2,
+  target_id int4,
+  payload text,
+  distance float8
+)
+AS $$
+DECLARE
+  use_exact boolean;
+  has_overrides boolean;
+  default_profile text;
+BEGIN
+  IF route_key IS NOT NULL AND route_value IS NOT NULL THEN
+    RAISE EXCEPTION 'sorted_heap_graph_route: provide route_key or route_value, not both';
+  END IF;
+  IF route_key IS NULL AND route_value IS NULL THEN
+    RAISE EXCEPTION 'sorted_heap_graph_route: must provide route_key or route_value';
+  END IF;
+  use_exact := route_key IS NOT NULL;
+
+  IF profile_name IS NOT NULL AND policy_name IS NOT NULL THEN
+    RAISE EXCEPTION 'sorted_heap_graph_route: provide profile_name or policy_name, not both';
+  END IF;
+
+  IF profile_name IS NOT NULL THEN
+    IF segment_groups IS NOT NULL OR relation_family IS NOT NULL
+       OR segment_labels IS NOT NULL OR fanout_limit != 0
+    THEN
+      RAISE EXCEPTION 'sorted_heap_graph_route: profile_name cannot be combined with segment_groups, relation_family, segment_labels, or fanout_limit';
+    END IF;
+    IF use_exact THEN
+      RETURN QUERY SELECT g.* FROM @extschema@.sorted_heap_graph_rag_routed_exact_profile(
+        route_name, route_key, profile_name, query, relation_path,
+        ann_k, top_k, score_mode, limit_rows) AS g;
+    ELSE
+      RETURN QUERY SELECT g.* FROM @extschema@.sorted_heap_graph_rag_routed_profile(
+        route_name, route_value, profile_name, query, relation_path,
+        ann_k, top_k, score_mode, limit_rows) AS g;
+    END IF;
+    RETURN;
+  END IF;
+
+  IF policy_name IS NOT NULL THEN
+    IF segment_groups IS NOT NULL THEN
+      RAISE EXCEPTION 'sorted_heap_graph_route: policy_name cannot be combined with segment_groups';
+    END IF;
+    IF use_exact THEN
+      RETURN QUERY SELECT g.* FROM @extschema@.sorted_heap_graph_rag_routed_exact_policy(
+        route_name, route_key, policy_name, query, relation_path,
+        ann_k, top_k, score_mode, limit_rows,
+        fanout_limit, relation_family, segment_labels) AS g;
+    ELSE
+      RETURN QUERY SELECT g.* FROM @extschema@.sorted_heap_graph_rag_routed_policy(
+        route_name, route_value, policy_name, query, relation_path,
+        ann_k, top_k, score_mode, limit_rows,
+        fanout_limit, relation_family, segment_labels) AS g;
+    END IF;
+    RETURN;
+  END IF;
+
+  has_overrides := segment_groups IS NOT NULL
+    OR relation_family IS NOT NULL
+    OR segment_labels IS NOT NULL
+    OR fanout_limit != 0;
+
+  IF has_overrides THEN
+    IF use_exact THEN
+      RETURN QUERY SELECT g.* FROM @extschema@.sorted_heap_graph_rag_routed_exact(
+        route_name, route_key, query, relation_path,
+        ann_k, top_k, score_mode, limit_rows,
+        fanout_limit, segment_groups, relation_family, segment_labels) AS g;
+    ELSE
+      RETURN QUERY SELECT g.* FROM @extschema@.sorted_heap_graph_rag_routed(
+        route_name, route_value, query, relation_path,
+        ann_k, top_k, score_mode, limit_rows,
+        fanout_limit, segment_groups, relation_family, segment_labels) AS g;
+    END IF;
+    RETURN;
+  END IF;
+
+  SELECT d.profile_name INTO default_profile
+  FROM @extschema@.sorted_heap_graph_route_default_registry d
+  WHERE d.route_name = sorted_heap_graph_route.route_name;
+
+  IF default_profile IS NOT NULL THEN
+    IF use_exact THEN
+      RETURN QUERY SELECT g.* FROM @extschema@.sorted_heap_graph_rag_routed_exact_profile(
+        route_name, route_key, default_profile, query, relation_path,
+        ann_k, top_k, score_mode, limit_rows) AS g;
+    ELSE
+      RETURN QUERY SELECT g.* FROM @extschema@.sorted_heap_graph_rag_routed_profile(
+        route_name, route_value, default_profile, query, relation_path,
+        ann_k, top_k, score_mode, limit_rows) AS g;
+    END IF;
+    RETURN;
+  END IF;
+
+  IF use_exact THEN
+    RETURN QUERY SELECT g.* FROM @extschema@.sorted_heap_graph_rag_routed_exact(
+      route_name, route_key, query, relation_path,
+      ann_k, top_k, score_mode, limit_rows) AS g;
+  ELSE
+    RETURN QUERY SELECT g.* FROM @extschema@.sorted_heap_graph_rag_routed(
+      route_name, route_value, query, relation_path,
+      ann_k, top_k, score_mode, limit_rows) AS g;
+  END IF;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION @extschema@.sorted_heap_graph_route(text, @extschema@.svec, int4[], text, int8, text, text, int4, int4, text, int4, int4, text[], text, text[])
+IS 'Unified routed GraphRAG entry point. Dispatches to the appropriate routed path based on provided parameters. Resolution order: (1) route_key XOR route_value, (2) profile_name XOR policy_name, (3) profile path, (4) policy path, (5) explicit overrides, (6) default profile, (7) base dispatcher.';
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_route_plan(
+  route_name text,
+  route_key text DEFAULT NULL,
+  route_value int8 DEFAULT NULL,
+  profile_name text DEFAULT NULL,
+  policy_name text DEFAULT NULL,
+  fanout_limit int4 DEFAULT 0,
+  segment_groups text[] DEFAULT NULL,
+  relation_family text DEFAULT NULL,
+  segment_labels text[] DEFAULT NULL
+) RETURNS TABLE (
+  route_kind text,
+  resolution_path text,
+  used_profile_name text,
+  used_policy_name text,
+  used_default boolean,
+  effective_fanout_limit int4,
+  effective_segment_groups text[],
+  effective_relation_family text,
+  effective_segment_labels text[],
+  candidate_shards regclass[]
+)
+AS $$
+DECLARE
+  use_exact boolean;
+  has_overrides boolean;
+  default_profile text;
+  rels regclass[];
+  r_path text;
+  r_profile text;
+  r_policy text;
+  r_default boolean := false;
+  r_fanout int4 := fanout_limit;
+  r_groups text[];
+  r_family text;
+  r_labels text[];
+  p_policy text;
+  p_groups text[];
+  p_family text;
+  p_fanout int4;
+  p_labels text[];
+BEGIN
+  IF route_key IS NOT NULL AND route_value IS NOT NULL THEN
+    RAISE EXCEPTION 'sorted_heap_graph_route_plan: provide route_key or route_value, not both';
+  END IF;
+  IF route_key IS NULL AND route_value IS NULL THEN
+    RAISE EXCEPTION 'sorted_heap_graph_route_plan: must provide route_key or route_value';
+  END IF;
+  use_exact := route_key IS NOT NULL;
+
+  IF profile_name IS NOT NULL AND policy_name IS NOT NULL THEN
+    RAISE EXCEPTION 'sorted_heap_graph_route_plan: provide profile_name or policy_name, not both';
+  END IF;
+
+  IF profile_name IS NOT NULL THEN
+    IF segment_groups IS NOT NULL OR relation_family IS NOT NULL
+       OR segment_labels IS NOT NULL OR fanout_limit != 0
+    THEN
+      RAISE EXCEPTION 'sorted_heap_graph_route_plan: profile_name cannot be combined with segment_groups, relation_family, segment_labels, or fanout_limit';
+    END IF;
+  END IF;
+
+  IF policy_name IS NOT NULL AND segment_groups IS NOT NULL THEN
+    RAISE EXCEPTION 'sorted_heap_graph_route_plan: policy_name cannot be combined with segment_groups';
+  END IF;
+
+  IF profile_name IS NOT NULL THEN
+    r_path := 'profile';
+    r_profile := profile_name;
+    SELECT p.policy_name, p.segment_groups, p.relation_family, p.fanout_limit, p.segment_labels
+    INTO p_policy, p_groups, p_family, p_fanout, p_labels
+    FROM @extschema@.sorted_heap_graph_route_profile_resolve(route_name, profile_name) AS p;
+    r_policy := p_policy;
+    r_fanout := p_fanout;
+    r_groups := p_groups;
+    r_family := p_family;
+    r_labels := p_labels;
+  ELSIF policy_name IS NOT NULL THEN
+    r_path := 'policy';
+    r_policy := policy_name;
+    r_groups := @extschema@.sorted_heap_graph_route_policy_groups(route_name, policy_name);
+    r_family := relation_family;
+    r_labels := segment_labels;
+  ELSIF segment_groups IS NOT NULL OR relation_family IS NOT NULL
+        OR segment_labels IS NOT NULL OR fanout_limit != 0
+  THEN
+    r_path := 'explicit';
+    r_groups := segment_groups;
+    r_family := relation_family;
+    r_labels := segment_labels;
+  ELSE
+    SELECT d.profile_name INTO default_profile
+    FROM @extschema@.sorted_heap_graph_route_default_registry d
+    WHERE d.route_name = sorted_heap_graph_route_plan.route_name;
+
+    IF default_profile IS NOT NULL THEN
+      r_path := 'default';
+      r_default := true;
+      r_profile := default_profile;
+      SELECT p.policy_name, p.segment_groups, p.relation_family, p.fanout_limit, p.segment_labels
+      INTO p_policy, p_groups, p_family, p_fanout, p_labels
+      FROM @extschema@.sorted_heap_graph_route_profile_resolve(route_name, default_profile) AS p;
+      r_policy := p_policy;
+      r_fanout := p_fanout;
+      r_groups := p_groups;
+      r_family := p_family;
+      r_labels := p_labels;
+    ELSE
+      r_path := 'base';
+    END IF;
+  END IF;
+
+  IF use_exact THEN
+    SELECT array_agg(rel ORDER BY priority DESC, rel)
+    INTO rels
+    FROM @extschema@.sorted_heap_graph_exact_resolve(
+      route_name, route_key, COALESCE(r_fanout, 0),
+      r_groups, r_family, r_labels);
+  ELSE
+    SELECT array_agg(rel ORDER BY route_min, route_max, rel)
+    INTO rels
+    FROM @extschema@.sorted_heap_graph_segment_resolve(
+      route_name, route_value, COALESCE(r_fanout, 0),
+      r_groups, r_family, r_labels);
+  END IF;
+
+  RETURN QUERY SELECT
+    CASE WHEN use_exact THEN 'exact'::text ELSE 'range'::text END,
+    r_path,
+    r_profile,
+    r_policy,
+    r_default,
+    COALESCE(r_fanout, 0),
+    r_groups,
+    r_family,
+    r_labels,
+    rels;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION @extschema@.sorted_heap_graph_route_plan(text, text, int8, text, text, int4, text[], text, text[])
+IS 'Explain which routing path sorted_heap_graph_route would take for the given parameters. Returns the resolution path, resolved profile/policy/default, effective filter knobs, and the candidate shard list. Uses the same resolution order as sorted_heap_graph_route.';
