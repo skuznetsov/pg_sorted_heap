@@ -1475,3 +1475,134 @@ FROM sorted_heap_graph_rag(
     score_mode := 'path'
 );
 ```
+
+---
+
+## Routed GraphRAG: operator recipe
+
+This section describes the recommended app-facing flow for multi-shard
+GraphRAG with routing. Use `sorted_heap_graph_route(...)` for queries and
+`sorted_heap_graph_route_plan(...)` for inspection. The lower-level
+`_routed`, `_routed_exact`, `_routed_policy`, `_routed_profile`, and
+`_routed_default` wrappers remain lower-level beta building blocks.
+
+### What to call in an app
+
+| Task | Function |
+|------|----------|
+| **Query** (app code) | `sorted_heap_graph_route(...)` |
+| **Inspect routing** (operator/debug) | `sorted_heap_graph_route_plan(...)` |
+| Setup: register shard metadata | `sorted_heap_graph_register(...)` per shard |
+| Setup: register exact routes | `sorted_heap_graph_exact_register(...)` |
+| Setup: register range routes | `sorted_heap_graph_segment_register(...)` |
+| Setup: optional profile/default | `sorted_heap_graph_route_profile_register(...)` + `sorted_heap_graph_route_default_register(...)` |
+
+### Exact-key routing (tenant / knowledge-base)
+
+**Setup (once per deployment):**
+
+```sql
+-- 1. Create shard tables with HNSW indexes
+CREATE TABLE facts_shard_a (...) USING sorted_heap;
+CREATE TABLE facts_shard_b (...) USING sorted_heap;
+-- load data, compact, create sorted_hnsw indexes, ANALYZE
+
+-- 2. Register graph schema on each shard
+SELECT sorted_heap_graph_register('facts_shard_a'::regclass,
+  entity_column := 'entity_id', relation_column := 'relation_id',
+  target_column := 'target_id', embedding_column := 'embedding',
+  payload_column := 'payload');
+SELECT sorted_heap_graph_register('facts_shard_b'::regclass, ...);
+
+-- 3. Map tenant keys to shards
+SELECT sorted_heap_graph_exact_register('tenants', 'acme',
+  'facts_shard_a'::regclass, 100);
+SELECT sorted_heap_graph_exact_register('tenants', 'globex',
+  'facts_shard_b'::regclass, 100);
+```
+
+**Query (app code):**
+
+```sql
+SELECT entity_id, relation_id, target_id, payload, distance
+FROM sorted_heap_graph_route(
+  'tenants',                        -- route name
+  query_embedding,                  -- svec
+  ARRAY[1, 2],                      -- relation path (2-hop)
+  route_key := 'acme',              -- tenant key
+  ann_k := 64,
+  top_k := 10,
+  score_mode := 'path'
+);
+```
+
+**Inspect (operator):**
+
+```sql
+SELECT * FROM sorted_heap_graph_route_plan(
+  'tenants', route_key := 'acme');
+-- route_kind | resolution_path | candidate_shards
+-- exact      | base            | {facts_shard_a}
+```
+
+### Range routing (time-window / ID-range)
+
+**Setup:**
+
+```sql
+-- Map ID ranges to shards
+SELECT sorted_heap_graph_segment_register('id_range',
+  'facts_shard_a'::regclass, 1, 100000);
+SELECT sorted_heap_graph_segment_register('id_range',
+  'facts_shard_b'::regclass, 100001, 200000);
+```
+
+**Query:**
+
+```sql
+SELECT entity_id, relation_id, target_id, payload, distance
+FROM sorted_heap_graph_route(
+  'id_range',
+  query_embedding,
+  ARRAY[1, 2],
+  route_value := 42000,             -- routes to shard_a
+  ann_k := 64,
+  top_k := 10
+);
+```
+
+### Adding a default profile
+
+Profiles bundle routing knobs so app code doesn't need to pass them:
+
+```sql
+-- Register a profile that filters by segment group and relation family
+SELECT sorted_heap_graph_route_profile_register(
+  'tenants', 'production',
+  NULL,                             -- no policy
+  ARRAY['active'],                  -- segment_groups filter
+  'core',                           -- relation_family
+  0,                                -- fanout_limit
+  ARRAY['verified']                 -- segment_labels
+);
+
+-- Set as the default for this route
+SELECT sorted_heap_graph_route_default_register('tenants', 'production');
+```
+
+Now `sorted_heap_graph_route('tenants', ..., route_key := 'acme')` will
+automatically use the 'production' profile (step 6 in the resolution
+order) unless the caller explicitly provides a different profile, policy,
+or routing overrides.
+
+### Lower-level building blocks (not recommended for app code)
+
+The following functions are internal dispatch targets used by
+`sorted_heap_graph_route(...)`. They remain available for advanced use
+cases but are not the recommended app entry point:
+
+- `sorted_heap_graph_rag_routed(...)` / `sorted_heap_graph_rag_routed_exact(...)`
+- `sorted_heap_graph_rag_routed_policy(...)` / `sorted_heap_graph_rag_routed_exact_policy(...)`
+- `sorted_heap_graph_rag_routed_profile(...)` / `sorted_heap_graph_rag_routed_exact_profile(...)`
+- `sorted_heap_graph_rag_routed_default(...)` / `sorted_heap_graph_rag_routed_exact_default(...)`
+- `sorted_heap_graph_rag_segmented(...)`
