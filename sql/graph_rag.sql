@@ -2333,6 +2333,29 @@ EXCEPTION WHEN raise_exception THEN
   END IF;
 END $$;
 
+-- Edge case: zero-shard resolution (nonexistent key)
+COPY (
+  SELECT count(*) AS unified_route_zero_shard_rows
+  FROM sorted_heap_graph_route(
+    'chain_exact', '[1,0,0,0]'::svec, ARRAY[2],
+    route_key := 'nonexistent_key', ann_k := 16, top_k := 2
+  )
+) TO STDOUT;
+
+-- Edge case: route_plan on nonexistent key returns NULL shards
+COPY (
+  SELECT COALESCE(candidate_shards::text, 'NULL') AS zero_shard_plan
+  FROM sorted_heap_graph_route_plan(
+    'chain_exact', route_key := 'nonexistent_key')
+) TO STDOUT;
+
+-- Edge case: route_plan on nonexistent range value
+COPY (
+  SELECT COALESCE(candidate_shards::text, 'NULL') AS zero_range_plan
+  FROM sorted_heap_graph_route_plan(
+    'chain_grouped', route_value := 999999)
+) TO STDOUT;
+
 COPY (
   SELECT sorted_heap_graph_route_default_unregister('chain_exact')
 ) TO STDOUT;

@@ -17,23 +17,36 @@ Stable in this release:
 
 - `sorted_heap` table AM
 - `sorted_hnsw` Index AM for `svec` and `hsvec`
-- fact-shaped GraphRAG:
+- Fact-shaped GraphRAG (single-table):
   - `sorted_heap_graph_rag(...)`
   - `sorted_heap_graph_register(...)`
   - `sorted_heap_graph_config(...)`
   - `sorted_heap_graph_unregister(...)`
   - `sorted_heap_graph_rag_stats()`
   - `sorted_heap_graph_rag_reset_stats()`
+- Routed GraphRAG (multi-shard, the recommended app-facing flow):
+  - `sorted_heap_graph_route(...)` — unified routed query dispatcher
+  - `sorted_heap_graph_route_plan(...)` — routing introspection/explain
+  - Setup helpers for the canonical flow:
+    - `sorted_heap_graph_exact_register(...)` / `_unregister(...)`
+    - `sorted_heap_graph_segment_register(...)` / `_unregister(...)`
+    - `sorted_heap_graph_route_profile_register(...)` / `_unregister(...)`
+    - `sorted_heap_graph_route_default_register(...)` / `_unregister(...)`
+    - `sorted_heap_graph_route_policy_register(...)` / `_unregister(...)`
+    - `sorted_heap_graph_segment_meta_register(...)` / `_unregister(...)`
 
 Still beta:
 
-- Routed GraphRAG (recommended app entry points for multi-shard workloads):
-  - `sorted_heap_graph_route(...)` — unified routed query dispatcher
-  - `sorted_heap_graph_route_plan(...)` — routing introspection/explain
-- Routing setup helpers (exact-key, range, policy, profile, default registries)
-- Lower-level GraphRAG helper/wrapper building blocks
-- Code-corpus snippet/symbol/lexical retrieval contracts used by the benchmark
-  harnesses
+- Lower-level routed GraphRAG building blocks:
+  - `_routed(...)`, `_routed_exact(...)`, `_routed_policy(...)`,
+    `_routed_profile(...)`, `_routed_default(...)` and their exact-key variants
+  - `sorted_heap_graph_rag_segmented(...)` (direct shard-array merge)
+  - Deep catalog/introspection helpers (`_segment_catalog`, `_exact_catalog`,
+    `_route_profile_catalog`, `_route_catalog`)
+  - Config/resolve helpers (`_segment_config`, `_exact_config`,
+    `_route_profile_config`, `_route_default_config`, etc.)
+- Lower-level GraphRAG expand/rerank helpers and scan wrappers
+- Code-corpus snippet/symbol/lexical retrieval contracts
 
 Legacy/manual:
 
@@ -96,7 +109,7 @@ The fact-shaped GraphRAG path now has dedicated coverage for:
 - `sorted_hnsw` chunked cache integration test covering local-only,
   shared-cache publish/attach, and multi-index overwrite scenarios
 
-### Unified routed GraphRAG dispatcher (beta)
+### Unified routed GraphRAG dispatcher
 
 For multi-shard workloads (tenant isolation, knowledge-base routing), the
 new unified dispatcher replaces the previous zoo of per-routing-mode
@@ -256,11 +269,21 @@ These checks exercise the already-stable core extension surface around:
 
 The clean `0.13` split is:
 
-- **stable**: sorted storage, planner-integrated vector search, and the narrow
-  fact-shaped GraphRAG API
-- **beta**: lower-level GraphRAG helper composition
+- **stable**: sorted storage, planner-integrated vector search, the narrow
+  fact-shaped GraphRAG API, and the unified routed GraphRAG app flow
+  (`sorted_heap_graph_route` + `sorted_heap_graph_route_plan` + setup helpers)
+- **beta**: lower-level routed building blocks, expand/rerank helpers, scan
+  wrappers, deep catalog/introspection functions
 - **reference logic**: code-corpus retrieval contracts from the benchmark
   harnesses
 
-That keeps the stable promise aligned with what is repeatedly verified in the
-repo today.
+The stable routed flow is safe to release because:
+
+1. It dispatches to the existing beta building blocks without introducing new
+   scoring or retrieval semantics
+2. It has explicit validation for ambiguous/conflicting parameters
+3. Zero-shard resolution returns empty results (no crash, no silent error)
+4. The canonical setup → inspect → query flow is lifecycle-covered through
+   extension upgrade and dump/restore (60 lifecycle checks)
+5. The underlying shared-cache correctness bug is fixed and regression-guarded
+   (31 chunked-cache checks including multi-index overwrite)

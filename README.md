@@ -28,24 +28,30 @@ plus planner-integrated HNSW search.
     `ARRAY[1]`, `ARRAY[1, 2]`, or `ARRAY[1, 2, 3, 4, 5]`
   - `score_mode := 'endpoint' | 'path'`
 
+### Stable (routed GraphRAG)
+
+- `sorted_heap_graph_route(...)` — unified routed query dispatcher
+- `sorted_heap_graph_route_plan(...)` — routing introspection/explain
+- Canonical-flow setup helpers:
+  - `sorted_heap_graph_exact_register(...)` / `_unregister(...)`
+  - `sorted_heap_graph_segment_register(...)` / `_unregister(...)`
+  - `sorted_heap_graph_route_profile_register(...)` / `_unregister(...)`
+  - `sorted_heap_graph_route_default_register(...)` / `_unregister(...)`
+  - `sorted_heap_graph_route_policy_register(...)` / `_unregister(...)`
+  - `sorted_heap_graph_segment_meta_register(...)` / `_unregister(...)`
+- Edge-case contract:
+  - zero-shard resolution returns empty results
+  - ambiguous/conflicting routed inputs are rejected
+
 ### Beta
 
-- Routed GraphRAG (recommended entry points for multi-shard workloads):
-  - `sorted_heap_graph_route(...)` — unified routed query dispatcher
-  - `sorted_heap_graph_route_plan(...)` — routing introspection/explain
-- Routing setup helpers:
-  - `sorted_heap_graph_exact_register(...)` / `_config(...)` / `_resolve(...)` / `_unregister(...)`
-  - `sorted_heap_graph_segment_register(...)` / `_config(...)` / `_resolve(...)` / `_unregister(...)`
-  - `sorted_heap_graph_route_profile_register(...)` / `_config(...)` / `_resolve(...)` / `_unregister(...)`
-  - `sorted_heap_graph_route_default_register(...)` / `_config(...)` / `_resolve(...)` / `_unregister(...)`
-  - `sorted_heap_graph_route_policy_register(...)` / `_config(...)` / `_groups(...)` / `_unregister(...)`
-  - `sorted_heap_graph_segment_meta_register(...)` / `_config(...)` / `_unregister(...)`
-  - Catalog helpers: `_segment_catalog(...)`, `_exact_catalog(...)`, `_route_profile_catalog(...)`, `_route_catalog(...)`
-- Lower-level GraphRAG building blocks (expand/rerank helpers, scan
-  wrappers, per-routing-mode dispatchers). These remain available for
-  advanced use cases but are not the recommended app entry points.
+- Lower-level routed building blocks (`_routed`, `_routed_exact`,
+  `_routed_policy`, `_routed_profile`, `_routed_default` and variants,
+  `_segmented`, config/resolve helpers, policy group helpers, and catalog
+  helpers)
+- Lower-level GraphRAG expand/rerank helpers and scan wrappers
 - Code-corpus and snippet-oriented GraphRAG contracts that currently live
-  in benchmark/reference logic.
+  in benchmark/reference logic
 
 ### Legacy/manual
 
