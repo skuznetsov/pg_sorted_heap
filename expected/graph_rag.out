@@ -2502,6 +2502,110 @@ COPY (
   FROM sorted_heap_graph_config('facts_alias'::regclass)
 ) TO STDOUT;
 entity_id	relation_id	target_id	embedding	payload	f
+-- ================================================================
+-- hsvec embedding support in GraphRAG
+-- ================================================================
+CREATE TABLE facts_hsvec (
+  entity_id   int4 NOT NULL,
+  relation_id int2 NOT NULL,
+  target_id   int4 NOT NULL,
+  embedding   hsvec(4) NOT NULL,
+  payload     text NOT NULL,
+  PRIMARY KEY (entity_id, target_id)
+) USING sorted_heap;
+INSERT INTO facts_hsvec VALUES
+  (1, 1, 2, '[1,0,0,0]'::hsvec, 'h-a'),
+  (1, 2, 3, '[0.9,0.1,0,0]'::hsvec, 'h-b'),
+  (2, 1, 4, '[0.8,0.2,0,0]'::hsvec, 'h-c'),
+  (3, 2, 5, '[0.7,0.3,0,0]'::hsvec, 'h-d'),
+  (4, 1, 6, '[0.6,0.4,0,0]'::hsvec, 'h-e'),
+  (5, 1, 7, '[0,0,1,0]'::hsvec, 'h-f');
+SELECT sorted_heap_compact('facts_hsvec'::regclass);
+ sorted_heap_compact
+---------------------
+
+(1 row)
+
+CREATE INDEX facts_hsvec_idx ON facts_hsvec
+  USING sorted_hnsw (embedding hsvec_cosine_ops);
+SELECT sorted_heap_graph_register(
+  'facts_hsvec'::regclass,
+  entity_column := 'entity_id',
+  relation_column := 'relation_id',
+  target_column := 'target_id',
+  embedding_column := 'embedding',
+  payload_column := 'payload'
+);
+ sorted_heap_graph_register
+----------------------------
+
+(1 row)
+
+-- 1-hop GraphRAG on hsvec table (query is svec, implicit cast)
+COPY (
+  SELECT count(*) AS hsvec_1hop_rows
+  FROM sorted_heap_graph_rag(
+    'facts_hsvec'::regclass,
+    '[1,0,0,0]'::svec,
+    relation_path := ARRAY[1],
+    ann_k := 4,
+    top_k := 3,
+    score_mode := 'endpoint',
+    limit_rows := 0
+  )
+) TO STDOUT;
+1
+-- 2-hop GraphRAG on hsvec table
+COPY (
+  SELECT count(*) AS hsvec_2hop_rows
+  FROM sorted_heap_graph_rag(
+    'facts_hsvec'::regclass,
+    '[1,0,0,0]'::svec,
+    relation_path := ARRAY[1, 1],
+    ann_k := 4,
+    top_k := 3,
+    score_mode := 'path',
+    limit_rows := 0
+  )
+) TO STDOUT;
+1
+-- Verify hsvec results match svec results on same data
+CREATE TABLE facts_svec_mirror (
+  entity_id   int4 NOT NULL,
+  relation_id int2 NOT NULL,
+  target_id   int4 NOT NULL,
+  embedding   svec(4) NOT NULL,
+  payload     text NOT NULL,
+  PRIMARY KEY (entity_id, target_id)
+) USING sorted_heap;
+INSERT INTO facts_svec_mirror
+  SELECT entity_id, relation_id, target_id, embedding::svec, payload
+  FROM facts_hsvec;
+SELECT sorted_heap_compact('facts_svec_mirror'::regclass);
+ sorted_heap_compact
+---------------------
+
+(1 row)
+
+CREATE INDEX facts_svec_mirror_idx ON facts_svec_mirror
+  USING sorted_hnsw (embedding svec_cosine_ops);
+COPY (
+  SELECT count(*) AS hsvec_vs_svec_diff
+  FROM (
+    SELECT entity_id, relation_id, target_id, payload
+    FROM sorted_heap_graph_rag(
+      'facts_hsvec'::regclass, '[1,0,0,0]'::svec,
+      relation_path := ARRAY[1], ann_k := 4, top_k := 3)
+    EXCEPT ALL
+    SELECT entity_id, relation_id, target_id, payload
+    FROM sorted_heap_graph_rag(
+      'facts_svec_mirror'::regclass, '[1,0,0,0]'::svec,
+      relation_path := ARRAY[1], ann_k := 4, top_k := 3)
+  ) diff
+) TO STDOUT;
+0
+DROP TABLE facts_svec_mirror;
+DROP TABLE facts_hsvec;
 DROP TABLE facts_alias;
 DROP TABLE facts_sh;
 DROP EXTENSION pg_sorted_heap;

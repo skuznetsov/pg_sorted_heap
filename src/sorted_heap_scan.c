@@ -49,6 +49,7 @@
 
 #include "sorted_heap.h"
 #include "svec.h"
+#include "hsvec.h"
 
 /* Marker strategy for runtime IN-list array (Param) in runtime_meta */
 #define SH_RUNTIME_IN_ARRAY  (-1)
@@ -162,6 +163,10 @@ static bool zone_overlaps_in_values(SortedHeapZoneMapEntry *e,
 static bool sorted_heap_value_in_set(int64 value, int64 *values, int nvalues);
 static const char *sorted_heap_get_ext_schema(void);
 static bool sorted_heap_graph_type_is_svec(Oid typid);
+static bool sorted_heap_graph_type_is_hsvec(Oid typid);
+static float8 sorted_heap_graph_distance_to_embedding(Svec *query,
+														Datum embedding_datum,
+														bool is_hsvec);
 
 typedef struct GraphRagTopKEntry
 {
@@ -3134,6 +3139,9 @@ sorted_heap_graph_collect_target_scores(Relation rel,
 	GraphRagTargetScore *scores = NULL;
 	int					score_cap = 0;
 	int					n_scores = 0;
+	bool				embedding_is_hsvec =
+		sorted_heap_graph_type_is_hsvec(
+			TupleDescAttr(RelationGetDescr(rel), embedding_att - 1)->atttypid);
 	instr_time			t_expand_start;
 	instr_time			t_expand_end;
 
@@ -3208,7 +3216,6 @@ sorted_heap_graph_collect_target_scores(Relation rel,
 			int16		relation_id;
 			int32		target_id;
 			bool		zone_checked = false;
-			Svec	   *candidate;
 			float8		dist;
 
 			if (blk != last_blk && info->zm_loaded &&
@@ -3251,10 +3258,12 @@ sorted_heap_graph_collect_target_scores(Relation rel,
 			if (isnull)
 				continue;
 
-			candidate = DatumGetSvecP(slot_getattr(slot, embedding_att, &isnull));
+			dist = sorted_heap_graph_distance_to_embedding(
+				query,
+				slot_getattr(slot, embedding_att, &isnull),
+				embedding_is_hsvec);
 			if (isnull)
 				continue;
-			dist = svec_cosine_distance_internal(query, candidate);
 
 			if (n_scores >= score_cap)
 			{
@@ -3335,6 +3344,9 @@ sorted_heap_graph_collect_scored_targets(Relation rel,
 	int score_cap = 0;
 	int n_scores = 0;
 	int64 *seed_values = NULL;
+	bool embedding_is_hsvec =
+		sorted_heap_graph_type_is_hsvec(
+			TupleDescAttr(RelationGetDescr(rel), embedding_att - 1)->atttypid);
 	instr_time t_expand_start;
 	instr_time t_expand_end;
 
@@ -3415,7 +3427,6 @@ sorted_heap_graph_collect_scored_targets(Relation rel,
 			int32 target_id;
 			bool zone_checked = false;
 			float8 prefix_dist;
-			Svec *candidate;
 			float8 dist;
 
 			if (blk != last_blk && info->zm_loaded &&
@@ -3461,10 +3472,12 @@ sorted_heap_graph_collect_scored_targets(Relation rel,
 			if (isnull)
 				continue;
 
-			candidate = DatumGetSvecP(slot_getattr(slot, embedding_att, &isnull));
+			dist = prefix_dist + sorted_heap_graph_distance_to_embedding(
+				query,
+				slot_getattr(slot, embedding_att, &isnull),
+				embedding_is_hsvec);
 			if (isnull)
 				continue;
-			dist = prefix_dist + svec_cosine_distance_internal(query, candidate);
 
 			if (n_scores >= score_cap)
 			{
@@ -3544,6 +3557,9 @@ sorted_heap_graph_emit_rerank(ReturnSetInfo *rsinfo,
 	int32				n_scanned = 0;
 	GraphRagTopKEntry  *heap = NULL;
 	int					heap_size = 0;
+	bool				embedding_is_hsvec =
+		sorted_heap_graph_type_is_hsvec(
+			TupleDescAttr(RelationGetDescr(rel), embedding_att - 1)->atttypid);
 	instr_time			t_expand_start;
 	instr_time			t_expand_end;
 	instr_time			t_emit_start;
@@ -3619,7 +3635,6 @@ sorted_heap_graph_emit_rerank(ReturnSetInfo *rsinfo,
 			int16		relation_id;
 			int32		target_id;
 			bool		zone_checked = false;
-			Svec	   *candidate;
 			float8		dist;
 			Datum		payload_datum;
 			bool		payload_isnull;
@@ -3664,10 +3679,12 @@ sorted_heap_graph_emit_rerank(ReturnSetInfo *rsinfo,
 			if (isnull)
 				continue;
 
-			candidate = DatumGetSvecP(slot_getattr(slot, embedding_att, &isnull));
+			dist = sorted_heap_graph_distance_to_embedding(
+				query,
+				slot_getattr(slot, embedding_att, &isnull),
+				embedding_is_hsvec);
 			if (isnull)
 				continue;
-			dist = svec_cosine_distance_internal(query, candidate);
 
 			payload_datum = slot_getattr(slot, payload_att, &payload_isnull);
 			graph_rag_topk_insert(heap, &heap_size, top_k,
@@ -3756,6 +3773,9 @@ sorted_heap_graph_emit_twohop_path_rerank(ReturnSetInfo *rsinfo,
 	GraphRagTopKEntry  *heap = NULL;
 	int					heap_size = 0;
 	int64			   *hop1_values = NULL;
+	bool				embedding_is_hsvec =
+		sorted_heap_graph_type_is_hsvec(
+			TupleDescAttr(RelationGetDescr(rel), embedding_att - 1)->atttypid);
 	instr_time			t_expand_start;
 	instr_time			t_expand_end;
 	instr_time			t_emit_start;
@@ -3835,7 +3855,6 @@ sorted_heap_graph_emit_twohop_path_rerank(ReturnSetInfo *rsinfo,
 			int16		relation_id;
 			int32		target_id;
 			bool		zone_checked = false;
-			Svec	   *candidate;
 			float8		hop1_dist;
 			float8		dist;
 			Datum		payload_datum;
@@ -3884,10 +3903,12 @@ sorted_heap_graph_emit_twohop_path_rerank(ReturnSetInfo *rsinfo,
 			if (isnull)
 				continue;
 
-			candidate = DatumGetSvecP(slot_getattr(slot, embedding_att, &isnull));
+			dist = hop1_dist + sorted_heap_graph_distance_to_embedding(
+				query,
+				slot_getattr(slot, embedding_att, &isnull),
+				embedding_is_hsvec);
 			if (isnull)
 				continue;
-			dist = hop1_dist + svec_cosine_distance_internal(query, candidate);
 
 			payload_datum = slot_getattr(slot, payload_att, &payload_isnull);
 			graph_rag_topk_insert(heap, &heap_size, top_k,
@@ -3962,17 +3983,81 @@ sorted_heap_graph_type_is_svec(Oid typid)
 {
 	HeapTuple		tup;
 	Form_pg_type	typeform;
-	bool			is_svec = false;
+	const char	   *name;
+	bool			ok = false;
 
 	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
 	if (!HeapTupleIsValid(tup))
 		return false;
 
 	typeform = (Form_pg_type) GETSTRUCT(tup);
-	is_svec = (strcmp(NameStr(typeform->typname), "svec") == 0);
+	name = NameStr(typeform->typname);
+	ok = (strcmp(name, "svec") == 0 || strcmp(name, "hsvec") == 0);
 	ReleaseSysCache(tup);
 
-	return is_svec;
+	return ok;
+}
+
+static bool
+sorted_heap_graph_type_is_hsvec(Oid typid)
+{
+	HeapTuple		tup;
+	Form_pg_type	typeform;
+	bool			is_hsvec = false;
+
+	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+	if (!HeapTupleIsValid(tup))
+		return false;
+	typeform = (Form_pg_type) GETSTRUCT(tup);
+	is_hsvec = (strcmp(NameStr(typeform->typname), "hsvec") == 0);
+	ReleaseSysCache(tup);
+	return is_hsvec;
+}
+
+static float8
+sorted_heap_graph_distance_to_embedding(Svec *query,
+										Datum embedding_datum,
+										bool is_hsvec)
+{
+	if (!is_hsvec)
+		return svec_cosine_distance_internal(query, DatumGetSvecP(embedding_datum));
+	else
+	{
+		Hsvec	   *h = (Hsvec *) PG_DETOAST_DATUM(embedding_datum);
+		int			dim = query->dim;
+		double		dot = 0.0;
+		double		norm_a = 0.0;
+		double		norm_b = 0.0;
+		double		similarity;
+		int			i;
+
+		if (h->dim != dim)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("vector dimensions must match: %d vs %d",
+							dim, h->dim)));
+
+		for (i = 0; i < dim; i++)
+		{
+			double ai = (double) query->x[i];
+			double bi = (double) HalfToFloat4(h->x[i]);
+
+			dot += ai * bi;
+			norm_a += ai * ai;
+			norm_b += bi * bi;
+		}
+
+		if (norm_a == 0.0 || norm_b == 0.0)
+			return get_float8_nan();
+
+		similarity = dot / (sqrt(norm_a) * sqrt(norm_b));
+		if (similarity > 1.0)
+			similarity = 1.0;
+		else if (similarity < -1.0)
+			similarity = -1.0;
+
+		return 1.0 - similarity;
+	}
 }
 
 static void
@@ -4137,7 +4222,7 @@ sorted_heap_graph_resolve_attrs(Relation rel, const char *caller,
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("%s: relation \"%s\" must map the graph embedding column to svec",
+				 errmsg("%s: relation \"%s\" must map the graph embedding column to svec or hsvec",
 						caller, relname)));
 	}
 
