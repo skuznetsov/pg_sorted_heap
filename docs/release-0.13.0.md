@@ -208,13 +208,13 @@ bundle, including the narrower GraphRAG bundle.
 
 ## Release-candidate verification
 
-Fresh `0.13.0` release-candidate checks run on `2026-03-28`:
+Fresh `0.13.0` release-candidate checks ran on `2026-04-01`:
 
 ```bash
-make test-graphrag-release
+make test-release
 ```
 
-Observed signals:
+Observed GraphRAG-related signals from that full release bundle:
 
 - `make installcheck ...` -> `All 3 tests passed`
 - `make test-graphrag-lifecycle` -> `status=ok pass=60 fail=0 total=60`
@@ -236,7 +236,7 @@ This bundle covers the narrow stable GraphRAG surface directly:
 
 ## Extension-wide release-candidate checks
 
-Fresh extension-wide release checks run on `2026-03-26`:
+Fresh extension-wide release checks ran on `2026-04-01`:
 
 ```bash
 make test-release
