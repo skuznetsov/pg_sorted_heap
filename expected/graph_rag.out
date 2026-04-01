@@ -2503,6 +2503,102 @@ COPY (
 ) TO STDOUT;
 entity_id	relation_id	target_id	embedding	payload	f
 -- ================================================================
+-- Tiny code-graph-shaped fixture for stable GraphRAG
+-- ================================================================
+CREATE TABLE facts_code (
+  entity_id   int4 NOT NULL,
+  relation_id int2 NOT NULL,
+  target_id   int4 NOT NULL,
+  embedding   svec(4) NOT NULL,
+  payload     text NOT NULL,
+  PRIMARY KEY (entity_id, relation_id, target_id)
+) USING sorted_heap;
+INSERT INTO facts_code VALUES
+  (900, 10, 900, '[1,0,0,0]'::svec, 'summary src/app.cr'),
+  (900,  5, 100, '[1,0,0,0]'::svec, 'src/app.cr contains Greeter'),
+  (100, 10, 100, '[0,1,0,0]'::svec, 'summary Greeter'),
+  (100,  5, 110, '[0,1,0,0]'::svec, 'Greeter contains Greeter#render'),
+  (100,  1, 200, '[0,1,0,0]'::svec, 'Greeter calls Renderer#render'),
+  (300, 10, 300, '[0,0,1,0]'::svec, 'summary CLI'),
+  (300,  2, 100, '[0,0,1,0]'::svec, 'CLI includes Greeter');
+COPY (
+  SELECT 'ok'
+  FROM (SELECT sorted_heap_compact('facts_code'::regclass)) s
+) TO STDOUT;
+ok
+COPY (
+  SELECT 'ok'
+  FROM (
+    SELECT sorted_heap_graph_register(
+      'facts_code'::regclass,
+      entity_column := 'entity_id',
+      relation_column := 'relation_id',
+      target_column := 'target_id',
+      embedding_column := 'embedding',
+      payload_column := 'payload'
+    )
+  ) s
+) TO STDOUT;
+ok
+COPY (
+  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+  FROM sorted_heap_graph_rag(
+    'facts_code'::regclass,
+    '[0,1,0,0]'::svec,
+    relation_path := ARRAY[1],
+    ann_k := 4,
+    top_k := 2,
+    score_mode := 'endpoint',
+    limit_rows := 0
+  )
+  ORDER BY distance, entity_id, relation_id, target_id
+) TO STDOUT;
+100	1	200	Greeter calls Renderer#render	0.000000
+COPY (
+  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+  FROM sorted_heap_graph_rag(
+    'facts_code'::regclass,
+    '[1,0,0,0]'::svec,
+    relation_path := ARRAY[5],
+    ann_k := 4,
+    top_k := 2,
+    score_mode := 'endpoint',
+    limit_rows := 0
+  )
+  ORDER BY distance, entity_id, relation_id, target_id
+) TO STDOUT;
+900	5	100	src/app.cr contains Greeter	0.000000
+100	5	110	Greeter contains Greeter#render	1.000000
+COPY (
+  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+  FROM sorted_heap_graph_rag(
+    'facts_code'::regclass,
+    '[1,0,0,0]'::svec,
+    relation_path := ARRAY[5,1],
+    ann_k := 4,
+    top_k := 2,
+    score_mode := 'path',
+    limit_rows := 0
+  )
+  ORDER BY distance, entity_id, relation_id, target_id
+) TO STDOUT;
+100	1	200	Greeter calls Renderer#render	1.000000
+COPY (
+  SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
+  FROM sorted_heap_graph_rag(
+    'facts_code'::regclass,
+    '[0,0,1,0]'::svec,
+    relation_path := ARRAY[2],
+    ann_k := 4,
+    top_k := 2,
+    score_mode := 'endpoint',
+    limit_rows := 0
+  )
+  ORDER BY distance, entity_id, relation_id, target_id
+) TO STDOUT;
+300	2	100	CLI includes Greeter	0.000000
+DROP TABLE facts_code;
+-- ================================================================
 -- hsvec embedding support in GraphRAG
 -- ================================================================
 CREATE TABLE facts_hsvec (
@@ -2520,27 +2616,27 @@ INSERT INTO facts_hsvec VALUES
   (3, 2, 5, '[0.7,0.3,0,0]'::hsvec, 'h-d'),
   (4, 1, 6, '[0.6,0.4,0,0]'::hsvec, 'h-e'),
   (5, 1, 7, '[0,0,1,0]'::hsvec, 'h-f');
-SELECT sorted_heap_compact('facts_hsvec'::regclass);
- sorted_heap_compact
----------------------
-
-(1 row)
-
+COPY (
+  SELECT 'ok'
+  FROM (SELECT sorted_heap_compact('facts_hsvec'::regclass)) s
+) TO STDOUT;
+ok
 CREATE INDEX facts_hsvec_idx ON facts_hsvec
   USING sorted_hnsw (embedding hsvec_cosine_ops);
-SELECT sorted_heap_graph_register(
-  'facts_hsvec'::regclass,
-  entity_column := 'entity_id',
-  relation_column := 'relation_id',
-  target_column := 'target_id',
-  embedding_column := 'embedding',
-  payload_column := 'payload'
-);
- sorted_heap_graph_register
-----------------------------
-
-(1 row)
-
+COPY (
+  SELECT 'ok'
+  FROM (
+    SELECT sorted_heap_graph_register(
+      'facts_hsvec'::regclass,
+      entity_column := 'entity_id',
+      relation_column := 'relation_id',
+      target_column := 'target_id',
+      embedding_column := 'embedding',
+      payload_column := 'payload'
+    )
+  ) s
+) TO STDOUT;
+ok
 -- 1-hop GraphRAG on hsvec table (query is svec, implicit cast)
 COPY (
   SELECT count(*) AS hsvec_1hop_rows
@@ -2581,12 +2677,11 @@ CREATE TABLE facts_svec_mirror (
 INSERT INTO facts_svec_mirror
   SELECT entity_id, relation_id, target_id, embedding::svec, payload
   FROM facts_hsvec;
-SELECT sorted_heap_compact('facts_svec_mirror'::regclass);
- sorted_heap_compact
----------------------
-
-(1 row)
-
+COPY (
+  SELECT 'ok'
+  FROM (SELECT sorted_heap_compact('facts_svec_mirror'::regclass)) s
+) TO STDOUT;
+ok
 CREATE INDEX facts_svec_mirror_idx ON facts_svec_mirror
   USING sorted_hnsw (embedding svec_cosine_ops);
 COPY (
