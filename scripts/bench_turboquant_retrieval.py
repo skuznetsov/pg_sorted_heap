@@ -43,10 +43,15 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import ctypes
 import io
 import json
 import math
+import os
+import platform
 import statistics
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from functools import lru_cache
@@ -71,6 +76,51 @@ DATASETS = {
         "metric": "cosine",
     },
 }
+
+
+def packed_adc_helper_path() -> Path:
+    suffix = ".dylib" if sys.platform == "darwin" else ".so"
+    return Path(__file__).resolve().parent.parent / "build" / f"turboquant_packed_adc{suffix}"
+
+
+def build_packed_adc_helper(dst: Path) -> None:
+    src = Path(__file__).resolve().parent / "turboquant_packed_adc.c"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    cc = os.environ.get("CC", "cc")
+    cmd = [cc, "-O3", "-std=c99"]
+    if platform.system() == "Darwin":
+        cmd.extend(["-dynamiclib", "-o", str(dst), str(src)])
+    else:
+        cmd.extend(["-shared", "-fPIC", "-o", str(dst), str(src)])
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+@lru_cache(maxsize=1)
+def load_packed_adc_helper() -> ctypes.CDLL | None:
+    if os.environ.get("TURBOQUANT_DISABLE_C_HELPER") == "1":
+        return None
+    dst = packed_adc_helper_path()
+    src = Path(__file__).resolve().parent / "turboquant_packed_adc.c"
+    try:
+        if not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime:
+            build_packed_adc_helper(dst)
+        lib = ctypes.CDLL(str(dst))
+    except Exception:
+        return None
+    lib.turboquant_packed_adc_scores_f32.argtypes = [
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.turboquant_packed_adc_scores_f32.restype = None
+    return lib
+
+
+def packed_adc_backend_name() -> str:
+    return "c-helper" if load_packed_adc_helper() is not None else "python-fallback"
 
 
 def median_ms(values: list[float]) -> float:
@@ -450,14 +500,20 @@ def nibble_pair_lut(lo_values: np.ndarray, hi_values: np.ndarray | None = None) 
     return table.astype(np.float32, copy=False)
 
 
-def packed_lookup_scores(packed_codes: np.ndarray, byte_tables: list[np.ndarray]) -> np.ndarray:
+def packed_lookup_scores_python(
+    packed_codes: np.ndarray,
+    byte_tables: np.ndarray,
+    norms: np.ndarray | None = None,
+) -> np.ndarray:
     scores = np.zeros(packed_codes.shape[0], dtype=np.float32)
     chunk_size = 64
-    for start in range(0, len(byte_tables), chunk_size):
+    for start in range(0, byte_tables.shape[0], chunk_size):
         stop = min(start + chunk_size, len(byte_tables))
-        table_block = np.stack(byte_tables[start:stop], axis=0)
+        table_block = byte_tables[start:stop]
         code_block = packed_codes[:, start:stop].T.astype(np.intp, copy=False)
         scores += np.take_along_axis(table_block, code_block, axis=1).sum(axis=0, dtype=np.float32)
+    if norms is not None:
+        scores *= norms
     return scores
 
 
@@ -476,15 +532,47 @@ def deterministic_dither(dim: int, seed: int, step: float) -> np.ndarray:
     return ((unit - 0.5) * step).astype(np.float32)
 
 
-def score_luts_to_byte_tables(score_luts: np.ndarray) -> list[np.ndarray]:
+def score_luts_to_byte_tables(score_luts: np.ndarray) -> np.ndarray:
     if score_luts.ndim != 2:
         raise ValueError("score_luts_to_byte_tables expects a 2-D array")
-    tables: list[np.ndarray] = []
+    tables = np.empty(((score_luts.shape[0] + 1) // 2, 256), dtype=np.float32)
+    table_idx = 0
     for start in range(0, score_luts.shape[0], 2):
         lo_values = score_luts[start]
         hi_values = score_luts[start + 1] if start + 1 < score_luts.shape[0] else None
-        tables.append(nibble_pair_lut(lo_values, hi_values))
+        tables[table_idx] = nibble_pair_lut(lo_values, hi_values)
+        table_idx += 1
     return tables
+
+
+def packed_lookup_scores(
+    packed_codes: np.ndarray,
+    byte_tables: np.ndarray,
+    norms: np.ndarray | None = None,
+) -> np.ndarray:
+    if byte_tables.ndim != 2 or byte_tables.shape[1] != 256:
+        raise ValueError("packed_lookup_scores expects byte_tables shaped [n_bytes, 256]")
+    lib = load_packed_adc_helper()
+    if lib is None:
+        return packed_lookup_scores_python(packed_codes, byte_tables, norms)
+    packed_codes = np.ascontiguousarray(packed_codes, dtype=np.uint8)
+    byte_tables = np.ascontiguousarray(byte_tables, dtype=np.float32)
+    norms_arr = None if norms is None else np.ascontiguousarray(norms, dtype=np.float32)
+    scores = np.empty(packed_codes.shape[0], dtype=np.float32)
+    norm_ptr = (
+        ctypes.cast(0, ctypes.POINTER(ctypes.c_float))
+        if norms_arr is None
+        else norms_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    )
+    lib.turboquant_packed_adc_scores_f32(
+        packed_codes.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        byte_tables.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        norm_ptr,
+        ctypes.c_size_t(packed_codes.shape[0]),
+        ctypes.c_size_t(packed_codes.shape[1]),
+        scores.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+    )
+    return scores
 
 
 def expand_group_scales(group_scales: np.ndarray, dim: int, group_size: int) -> np.ndarray:
@@ -786,6 +874,7 @@ class TurboQuantBlockHadamardPackedMethod(RetrievalMethod):
     def fit(self, base: np.ndarray) -> None:
         if self.bits != 4:
             raise ValueError("turboquant_blockhadamard_packed4 currently requires --turbo-bits=4")
+        load_packed_adc_helper()
         self.dim = base.shape[1]
         rng = np.random.default_rng(self.seed)
         self.perm = rng.permutation(self.dim).astype(np.int32)
@@ -805,9 +894,7 @@ class TurboQuantBlockHadamardPackedMethod(RetrievalMethod):
         q_rot = structured_block_hadamard(query[np.newaxis, :], self.perm, self.signs, self.blocks)[0]
         coeffs = (q_rot / math.sqrt(self.dim)).astype(np.float32, copy=False)
         score_luts = coeffs[:, None] * self.centers[None, :]
-        scores = packed_lookup_scores(self.packed_codes, score_luts_to_byte_tables(score_luts))
-        if self.norms is not None:
-            scores *= self.norms
+        scores = packed_lookup_scores(self.packed_codes, score_luts_to_byte_tables(score_luts), self.norms)
         return topk_indices(scores, k)
 
     def bytes_per_vec(self) -> float:
@@ -1126,6 +1213,7 @@ class TurboQuantBlockwiseDimDitherPackedMethod(RetrievalMethod):
     def fit(self, base: np.ndarray) -> None:
         if self.bits != 4:
             raise ValueError(f"{self.name} currently requires --turbo-bits=4")
+        load_packed_adc_helper()
         self.dim = base.shape[1]
         rng = np.random.default_rng(self.seed)
         self.perm = rng.permutation(self.dim).astype(np.int32)
@@ -1158,9 +1246,7 @@ class TurboQuantBlockwiseDimDitherPackedMethod(RetrievalMethod):
         # The deterministic dim-only dither contributes a query-constant bias, so
         # packed search can omit it without changing ranking.
         score_luts = coeffs[:, None] * self._decoded_levels[None, :]
-        scores = packed_lookup_scores(self.packed_codes, score_luts_to_byte_tables(score_luts))
-        if self.norms is not None:
-            scores *= self.norms
+        scores = packed_lookup_scores(self.packed_codes, score_luts_to_byte_tables(score_luts), self.norms)
         return topk_indices(scores, k)
 
     def bytes_per_vec(self) -> float:
@@ -1753,6 +1839,10 @@ def main() -> int:
             f"nonfinite_rows_detected={input_nonfinite_rows} "
             f"nonfinite_rows_dropped={dropped_nonfinite_rows}"
         )
+    if any("packed4" in row.method for row in rows):
+        helper_path = packed_adc_helper_path()
+        helper_note = str(helper_path) if helper_path.exists() else "unavailable"
+        print(f"packed_adc_backend={packed_adc_backend_name()} helper={helper_note}")
     print_results("Results", rows)
     print("\nCaveat: turboquant_mse here implements only the first-stage MSE path.")
     print("It does not yet include the residual 1-bit QJL inner-product correction stage.")

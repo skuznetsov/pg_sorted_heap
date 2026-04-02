@@ -568,6 +568,14 @@ bench-nomic-ann:
 	  --ivf-nprobes $(VECTOR_IVF_NPROBES) \
 	  --warmup $(VECTOR_BENCH_WARMUP)
 
+build-turboquant-packed-helper:
+	@mkdir -p ./build && \
+	if [ "$$(uname -s)" = "Darwin" ]; then \
+		$${CC:-cc} -O3 -std=c99 -dynamiclib -o ./build/turboquant_packed_adc.dylib ./scripts/turboquant_packed_adc.c; \
+	else \
+		$${CC:-cc} -O3 -std=c99 -shared -fPIC -o ./build/turboquant_packed_adc.so ./scripts/turboquant_packed_adc.c; \
+	fi
+
 bench-turboquant:
 	@PYTHON_BIN="$$(./scripts/find_vector_python.sh)" && \
 	"$$PYTHON_BIN" ./scripts/bench_turboquant_retrieval.py \
@@ -766,6 +774,7 @@ help:
 	@echo "  make build-graph-bench-nomic VECTOR_BENCH_DSN='<dsn>' VECTOR_GRAPH_TABLE=<graph_table> VECTOR_ENTRY_TABLE=<entry_table>"
 	@echo "  make build-hnsw-bench-nomic VECTOR_BENCH_DSN='<dsn>' HNSW_SOURCE_TABLE=<graph_table> HNSW_PREFIX=<prefix>"
 	@echo "  make bench-nomic-ann VECTOR_BENCH_DSN='<dsn>' VECTOR_GRAPH_TABLE=<graph_table> VECTOR_ENTRY_TABLE=<entry_table>"
+	@echo "  make build-turboquant-packed-helper"
 	@echo "  make bench-turboquant TURBOQUANT_DATASET=<glove-100|nytimes-256> TURBOQUANT_SAMPLE_SIZE=<n> TURBOQUANT_QUERY_COUNT=<n> TURBOQUANT_K=<k> TURBOQUANT_PQ_M=<0|m> TURBOQUANT_PQ_BITS=<bits> TURBOQUANT_PQ_MAX_TRAIN=<n> TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_ARGS='<extra args>'"
 	@echo "  make bench-turboquant-sql TURBOQUANT_PG_DSN='<dsn>' TURBOQUANT_BASE_SQL='<sql>' TURBOQUANT_QUERY_SQL='<sql>' TURBOQUANT_METRIC=<cosine|ip> TURBOQUANT_K=<k> TURBOQUANT_PQ_M=<0|m> TURBOQUANT_PQ_BITS=<bits> TURBOQUANT_PQ_MAX_TRAIN=<n> TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_ARGS='<extra args>'"
 	@echo "  make bench-turboquant-sql-holdout TURBOQUANT_PG_DSN='<dsn>' TURBOQUANT_SHARED_SQL='<sql>' TURBOQUANT_METRIC=<cosine|ip> TURBOQUANT_QUERY_COUNT=<n> TURBOQUANT_FOLDS=<n> TURBOQUANT_K=<k> TURBOQUANT_PQ_M=<0|m> TURBOQUANT_PQ_BITS=<bits> TURBOQUANT_PQ_MAX_TRAIN=<n> TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_ARGS='<extra args>'"
