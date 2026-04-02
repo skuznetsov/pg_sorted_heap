@@ -139,6 +139,27 @@ def load_packed_adc_helper() -> ctypes.CDLL | None:
         ctypes.POINTER(ctypes.c_float),
     ]
     lib.turboquant_packed_adc_scores_t_mt_f32.restype = None
+    lib.turboquant_blockhadamard_packed4_scores_t_f32.argtypes = [
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.turboquant_blockhadamard_packed4_scores_t_f32.restype = None
+    lib.turboquant_blockhadamard_packed4_scores_t_mt_f32.argtypes = [
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.turboquant_blockhadamard_packed4_scores_t_mt_f32.restype = None
     return lib
 
 
@@ -670,6 +691,57 @@ def packed_lookup_scores_transposed(
     return scores
 
 
+def packed_lookup_scores_blockhadamard_packed4_transposed(
+    packed_codes_t: np.ndarray,
+    coeffs: np.ndarray,
+    centers: np.ndarray,
+    norms: np.ndarray | None = None,
+) -> np.ndarray:
+    lib = load_packed_adc_helper()
+    if lib is None:
+        score_luts = coeffs[:, None] * centers[None, :]
+        return packed_lookup_scores_transposed(
+            packed_codes_t,
+            score_luts_to_byte_tables(score_luts),
+            norms,
+        )
+    packed_codes_t = np.ascontiguousarray(packed_codes_t, dtype=np.uint8)
+    coeffs = np.ascontiguousarray(coeffs, dtype=np.float32)
+    centers = np.ascontiguousarray(centers, dtype=np.float32)
+    norms_arr = None if norms is None else np.ascontiguousarray(norms, dtype=np.float32)
+    scores = np.empty(packed_codes_t.shape[1], dtype=np.float32)
+    norm_ptr = (
+        ctypes.cast(0, ctypes.POINTER(ctypes.c_float))
+        if norms_arr is None
+        else norms_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    )
+    n_rows = packed_codes_t.shape[1]
+    dim = coeffs.shape[0]
+    thread_count = packed_adc_thread_count()
+    if thread_count > 1 and n_rows >= 16384 and packed_codes_t.shape[0] >= 256:
+        lib.turboquant_blockhadamard_packed4_scores_t_mt_f32(
+            packed_codes_t.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            coeffs.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            centers.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            norm_ptr,
+            ctypes.c_size_t(n_rows),
+            ctypes.c_size_t(dim),
+            ctypes.c_size_t(thread_count),
+            scores.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        )
+    else:
+        lib.turboquant_blockhadamard_packed4_scores_t_f32(
+            packed_codes_t.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            coeffs.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            centers.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            norm_ptr,
+            ctypes.c_size_t(n_rows),
+            ctypes.c_size_t(dim),
+            scores.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        )
+    return scores
+
+
 def expand_group_scales(group_scales: np.ndarray, dim: int, group_size: int) -> np.ndarray:
     return np.repeat(group_scales, group_size)[:dim].astype(np.float32, copy=False)
 
@@ -990,10 +1062,10 @@ class TurboQuantBlockHadamardPackedMethod(RetrievalMethod):
             raise RuntimeError("fit must run first")
         q_rot = structured_block_hadamard(query[np.newaxis, :], self.perm, self.signs, self.blocks)[0]
         coeffs = (q_rot / math.sqrt(self.dim)).astype(np.float32, copy=False)
-        score_luts = coeffs[:, None] * self.centers[None, :]
-        scores = packed_lookup_scores_transposed(
+        scores = packed_lookup_scores_blockhadamard_packed4_transposed(
             self.packed_codes_t,
-            score_luts_to_byte_tables(score_luts),
+            coeffs,
+            self.centers,
             self.norms,
         )
         return topk_indices(scores, k)

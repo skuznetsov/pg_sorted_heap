@@ -423,6 +423,44 @@ Current repo status:
     faster than its earlier `17-20 ms` helper-era plateau, so future kernel
     work should treat LUT build + scoring as one fused path rather than chase
     more helper-thread micro-optimizations in isolation
+  - the next narrowing branch tested two more ideas:
+    - direct fused nibble scoring in C for `blockhadamard_packed4`
+    - static pthread worker pool in the helper
+  - both were refuted as next steps:
+    - the fused nibble scorer preserved exact scores on adversarial random
+      checks (including odd `dim=31`) but did not beat the vectorized
+      Python-LUT + generic transposed scorer robustly on Gutenberg
+    - the static pool did not produce a stable win over the existing
+      create/join model
+  - the surviving synthesis was narrower:
+    - keep the dedicated `blockhadamard_packed4` helper entry points
+    - build the per-query byte tables inside C once per query
+    - then dispatch into the already-proven transposed packed scorer
+  - adversary equivalence check for this C-built-table path:
+    - random `dim=31`, `dim=32`, and `dim=2880` cases all matched the
+      old generic LUT path with `allclose=True` and `max_abs=0.0`
+  - vetted Gutenberg after this dedicated fused-build path:
+    - packed-only repeat A:
+      - `turboquant_blockhadamard_packed4`: `98.0% hit@1`,
+        `91.20% recall@10`, `29275.6 ms` encode, `11.419 ms` p50
+    - packed-only repeat B:
+      - `turboquant_blockhadamard_packed4`: `98.0% hit@1`,
+        `91.20% recall@10`, `28315.3 ms` encode, `11.216 ms` p50
+    - mixed-method vetted run:
+      - `turboquant_blockhadamard`: `98.0% hit@1`, `91.20% recall@10`,
+        `42190.4 ms` encode, `14.500 ms` p50
+      - `turboquant_blockhadamard_packed4`: `98.0% hit@1`,
+        `91.20% recall@10`, `30015.4 ms` encode, `10.625 ms` p50
+  Narrow conclusion:
+  - dedicated in-C byte-table build plus the existing transposed scorer is
+    the current strongest packed `blockhadamard` path
+  - it now moves the packed lane from the earlier `12.9-13.1 ms` plateau
+    down into the `10.6-11.4 ms` band on vetted Gutenberg, while preserving
+    identical quality
+  - this is the first repeatable point where the packed lane beats plain
+    `blockhadamard` on the vetted Gutenberg target, so the next kernel work
+    should start from this dedicated fused-build path, not from the refuted
+    direct-nibble or thread-pool branches
 
 ### Publication threshold
 
