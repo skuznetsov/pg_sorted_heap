@@ -1336,6 +1336,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--pq-m", type=int, default=0, help="PQ subvector count (0=auto)")
     ap.add_argument("--pq-bits", type=int, default=8)
     ap.add_argument("--pq-max-train", type=int, default=20000)
+    ap.add_argument(
+        "--methods",
+        help=(
+            "Comma-separated approximate method allowlist. "
+            "When set, selects exact methods explicitly and overrides skip/turbo-research defaults. "
+            "float32_exact is always included."
+        ),
+    )
     ap.add_argument("--skip-fp16", action="store_true")
     ap.add_argument("--skip-sq8", action="store_true")
     ap.add_argument("--skip-pq", action="store_true")
@@ -1346,6 +1354,86 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Include additional no-codebook research comparators (compander, dither, twopass, D4).",
     )
     return ap
+
+
+def parse_method_allowlist(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    names = [part.strip() for part in value.split(",") if part.strip()]
+    if not names:
+        raise SystemExit("--methods must name at least one method")
+    return names
+
+
+def method_factories(base: np.ndarray, args: argparse.Namespace) -> list[tuple[str, Callable[[], RetrievalMethod]]]:
+    return [
+        ("fp16", lambda: Fp16Method()),
+        ("sq8_linear", lambda: Sq8LinearMethod()),
+        ("pq_kmeans", lambda: PQKMeansMethod(auto_pq_m(base.shape[1], args.pq_m), args.pq_bits, args.pq_max_train, args.seed)),
+        ("turboquant_mse", lambda: TurboQuantMSEMethod(args.turbo_bits, args.seed)),
+        ("turboquant_blockhadamard", lambda: TurboQuantBlockHadamardMethod(args.turbo_bits, args.seed)),
+        ("turboquant_blockhadamard_whitened", lambda: TurboQuantBlockHadamardWhitenedMethod(args.turbo_bits, args.seed)),
+        ("turboquant_blockhadamard_block32", lambda: TurboQuantBlockHadamardBlockwiseMethod(args.turbo_bits, args.seed)),
+        ("turboquant_blockhadamard_twopass", lambda: TurboQuantBlockHadamardTwoPassMethod(args.turbo_bits, args.seed)),
+        ("turboquant_twopass_block32", lambda: TurboQuantTwoPassBlockwiseMethod(args.turbo_bits, args.seed)),
+        ("turboquant_block32_compand", lambda: TurboQuantBlockwiseCompandedMethod(args.turbo_bits, args.seed)),
+        ("turboquant_block32_dither", lambda: TurboQuantBlockwiseDitheredMethod(args.turbo_bits, args.seed)),
+        ("turboquant_block32_d4", lambda: TurboQuantBlockwiseD4Method(args.turbo_bits, args.seed)),
+        ("turboquant_twopass_block32_dither", lambda: TurboQuantTwoPassBlockwiseDitheredMethod(args.turbo_bits, args.seed)),
+        ("turboquant_prod", lambda: TurboQuantProdMethod(args.turbo_bits, args.seed)),
+    ]
+
+
+def default_method_names(args: argparse.Namespace) -> list[str]:
+    names: list[str] = []
+    if not args.skip_fp16:
+        names.append("fp16")
+    if not args.skip_sq8:
+        names.append("sq8_linear")
+    if not args.skip_pq:
+        names.append("pq_kmeans")
+    if not args.skip_turbo:
+        names.extend(
+            [
+                "turboquant_mse",
+                "turboquant_blockhadamard",
+                "turboquant_blockhadamard_whitened",
+                "turboquant_blockhadamard_block32",
+            ]
+        )
+        if args.turbo_research:
+            names.extend(
+                [
+                    "turboquant_blockhadamard_twopass",
+                    "turboquant_twopass_block32",
+                    "turboquant_block32_compand",
+                    "turboquant_block32_dither",
+                    "turboquant_block32_d4",
+                    "turboquant_twopass_block32_dither",
+                ]
+            )
+        if args.turbo_bits >= 2:
+            names.append("turboquant_prod")
+    return names
+
+
+def build_methods(base: np.ndarray, args: argparse.Namespace) -> list[RetrievalMethod]:
+    factories = method_factories(base, args)
+    factory_map = {name: factory for name, factory in factories}
+    requested = parse_method_allowlist(args.methods)
+    selected_names = requested if requested is not None else default_method_names(args)
+    missing = [name for name in selected_names if name not in factory_map]
+    if missing:
+        available = ", ".join(name for name, _ in factories)
+        raise SystemExit(
+            f"unknown --methods entries: {', '.join(missing)}; available methods: {available}"
+        )
+    methods: list[RetrievalMethod] = []
+    for name in selected_names:
+        if name == "turboquant_prod" and args.turbo_bits < 2:
+            raise SystemExit("turboquant_prod requires --turbo-bits >= 2")
+        methods.append(factory_map[name]())
+    return methods
 
 
 def evaluate_rows(base: np.ndarray, queries: np.ndarray, metric: str, args: argparse.Namespace) -> list[EvalResult]:
@@ -1376,28 +1464,7 @@ def evaluate_rows(base: np.ndarray, queries: np.ndarray, metric: str, args: argp
         )
     ]
 
-    methods: list[RetrievalMethod] = []
-    if not args.skip_fp16:
-        methods.append(Fp16Method())
-    if not args.skip_sq8:
-        methods.append(Sq8LinearMethod())
-    if not args.skip_pq:
-        methods.append(PQKMeansMethod(auto_pq_m(base.shape[1], args.pq_m), args.pq_bits, args.pq_max_train, args.seed))
-    if not args.skip_turbo:
-        methods.append(TurboQuantMSEMethod(args.turbo_bits, args.seed))
-        methods.append(TurboQuantBlockHadamardMethod(args.turbo_bits, args.seed))
-        methods.append(TurboQuantBlockHadamardWhitenedMethod(args.turbo_bits, args.seed))
-        methods.append(TurboQuantBlockHadamardBlockwiseMethod(args.turbo_bits, args.seed))
-        if args.turbo_research:
-            methods.append(TurboQuantBlockHadamardTwoPassMethod(args.turbo_bits, args.seed))
-            methods.append(TurboQuantTwoPassBlockwiseMethod(args.turbo_bits, args.seed))
-            methods.append(TurboQuantBlockwiseCompandedMethod(args.turbo_bits, args.seed))
-            methods.append(TurboQuantBlockwiseDitheredMethod(args.turbo_bits, args.seed))
-            methods.append(TurboQuantBlockwiseD4Method(args.turbo_bits, args.seed))
-            methods.append(TurboQuantTwoPassBlockwiseDitheredMethod(args.turbo_bits, args.seed))
-        if args.turbo_bits >= 2:
-            methods.append(TurboQuantProdMethod(args.turbo_bits, args.seed))
-
+    methods = build_methods(base, args)
     for method in methods:
         rows.append(evaluate_method(method, base, queries, gt_ids, args.k))
     return rows

@@ -70,6 +70,9 @@ Current repo status:
 - repo-owned SQL entry point: `make bench-turboquant-sql`
 - repo-owned repeated-holdout SQL entry point:
   `make bench-turboquant-sql-holdout`
+- the evaluator now also supports `--methods method_a,method_b,...`
+  so Gutenberg and future workload-specific runs can select exact lanes
+  without ad hoc imports or the full research bundle
 - structured result capture is supported via `TURBOQUANT_ARGS='--json-out /path/out.json'`
   so later larger real-data runs can be compared without scraping text output
 - current scope is intentionally narrow:
@@ -264,6 +267,76 @@ Current repo status:
   - `twopass_block32` currently carries a materially worse search-time
     constant factor at higher dimension, so it is not the next general lane to
     optimize or promote
+- repo-owned Gutenberg entry points now exist:
+  - `make bench-turboquant-gutenberg-vetted`
+  - `make bench-turboquant-gutenberg-full`
+  - both use the current evaluator directly and support `TURBOQUANT_METHODS`
+    / `TURBOQUANT_GUTENBERG_METHODS`
+  - if `TURBOQUANT_PG_DSN` is unset, they try the local cube fallback via
+    `default/pgvector-superuser` and `127.0.0.1:30432/cogniformerus`
+- verified on 2026-04-02 against the local Gutenberg cube in
+  `cogniformerus.public.gutenberg_gptoss_sh`
+  (`103260 x 2880D`, cosine, `k=10`)
+  - vetted subset (`50` queries via `bench_hnsw_gt`) reproduced by the
+    repo-owned target:
+    - `turboquant_mse`: `96.0% hit@1`, `90.60% recall@10`,
+      `30948.9 ms` encode, `22.575 ms` p50
+    - `turboquant_blockhadamard`: `98.0% hit@1`, `91.20% recall@10`,
+      `27813.1 ms` encode, `16.633 ms` p50
+    - `turboquant_blockhadamard_twopass`: `98.0% hit@1`,
+      `90.40% recall@10`, `44191.6 ms` encode, `17.550 ms` p50
+    - `turboquant_block32_dither`: `100.0% hit@1`, `91.80% recall@10`,
+      `23090.4 ms` encode, `27.515 ms` p50 in an isolate rerun
+  - full stored query set (`200` queries) on the same cube via the narrow
+    method-selected evaluator path:
+    - `turboquant_mse`: `99.0% hit@1`, `89.55% recall@10`,
+      `28851.6 ms` encode, `20.830 ms` p50
+    - `turboquant_blockhadamard`: `99.5% hit@1`, `90.60% recall@10`,
+      `30030.8 ms` encode, `15.382 ms` p50
+    - `turboquant_blockhadamard_twopass`: `99.5% hit@1`,
+      `89.00% recall@10`, `43870.0 ms` encode, `14.284 ms` p50
+    - `turboquant_block32_dither`: `100.0% hit@1`, `90.95% recall@10`,
+      `21276.0 ms` encode, `14.061 ms` p50 in the original direct evaluator run
+  Narrow conclusion:
+  - Gutenberg does **not** confirm `twopass` as the next default lane
+  - plain `blockhadamard` already beats dense `mse` on this workload:
+    better recall, better or comparable query latency, negligible metadata
+  - `block32_dither` is the strongest current Gutenberg **quality** lane:
+    best `hit@1`, best `recall@10`, and cheaper encode than the competing
+    structured methods
+  - `block32_dither` latency on the local cube shows more run-to-run variance
+    than its recall/encode signal, so the current claim is stronger on quality
+    than on p50 latency
+
+### Publication threshold
+
+The currently defensible publication thesis is narrow:
+
+- a no-codebook, data-oblivious structured transform family
+  (`blockhadamard`, `block32_dither`) can beat dense-rotation MSE-style
+  TurboQuant proxies on both a real Cogniformerus code-graph set and a larger
+  real Gutenberg retrieval workload while preserving tiny metadata
+
+What is **not** yet defensible:
+
+- claiming superiority over Google's TurboQuant implementation itself
+- claiming `twopass` is the best general lane
+- claiming the result generalizes beyond the current real workloads plus the
+  small ANN-Benchmarks cross-checks
+
+Before this becomes publishable instead of just interesting, the repo still
+needs:
+
+1. a packed/kernelized path for the surviving lanes, not just Python eval
+2. a stronger multi-dataset operating curve across `2-6` bits
+3. at least one very-high-dimension run (`>= 65536D`, ideally `262144D`)
+   with recall and throughput, not only synthetic metadata scaling
+4. a clean comparison against the official TurboQuant implementation if one
+   becomes available
+5. a clear statement of what the new contribution is:
+   - structured no-codebook transforms for very-high-dimensional retrieval, or
+   - blockwise subtractive dither as the strongest real operating point
+   under near-zero-metadata constraints
 
 Inputs:
 
