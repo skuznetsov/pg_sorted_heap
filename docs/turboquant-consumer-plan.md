@@ -96,6 +96,23 @@ Current repo status:
   (`49` base / `10` query each fold):
   - `pq_kmeans`: `hit@1=100%`, `recall@5=100%`
   - `turboquant_mse`: `hit@1=90%`, `recall@5=91.2%`
+- verified on 2026-04-02 against a larger real Cogniformerus-derived
+  code-graph summary set produced by the existing
+  `bin/bench_code_graph_perf.cr --keep-table` flow on
+  `src/cogniformerus`:
+  - `1122` summary vectors total
+  - `33` non-finite summary embeddings detected and dropped explicitly
+  - repeated holdout (`5` folds, `200` queries/fold, `k=10`) on the
+    remaining `1089` vectors gave:
+    - `pq_kmeans`: `hit@1=47.0%`, `recall@10=67.33%`, `16 B/vec`
+    - `turboquant_mse`: `hit@1=88.8%`, `recall@10=91.17%`, `388 B/vec`
+    - `sq8_linear`: `hit@1=99.1%`, `recall@10=99.21%`, `768 B/vec`
+  Narrow conclusion:
+  - the current MSE-only TurboQuant lane clearly beats the simple PQ
+    baseline on this larger real consumer-derived set
+  - it does not beat `sq8_linear` on quality
+  - upstream non-finite embeddings are a real consumer-quality caveat,
+    not just a benchmark artifact
 
 Inputs:
 

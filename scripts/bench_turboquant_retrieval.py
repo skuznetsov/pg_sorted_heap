@@ -290,6 +290,16 @@ def average_eval_results(rows: list[EvalResult]) -> EvalResult:
     )
 
 
+def nonfinite_row_count(vectors: np.ndarray) -> int:
+    return int((~np.isfinite(vectors).all(axis=1)).sum())
+
+
+def drop_nonfinite_rows(vectors: np.ndarray) -> tuple[np.ndarray, int]:
+    mask = np.isfinite(vectors).all(axis=1)
+    dropped = int((~mask).sum())
+    return vectors[mask].astype(np.float32, copy=False), dropped
+
+
 def split_shared_vectors(vectors: np.ndarray, query_count: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
     total = vectors.shape[0]
     if query_count <= 0:
@@ -542,6 +552,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--shared-sql", help="SQL returning one vector column for repeated holdout evaluation")
     ap.add_argument("--metric", choices=("cosine", "ip"), default="cosine")
     ap.add_argument("--json-out", type=Path, help="Write structured JSON summary to this path")
+    ap.add_argument("--drop-nonfinite", action="store_true", help="Drop rows containing NaN/Inf instead of failing")
     ap.add_argument("--cache-dir", type=Path, default=Path("/tmp/ann_real_cache"))
     ap.add_argument("--sample-size", type=int, default=4000)
     ap.add_argument("--query-count", type=int, default=50)
@@ -621,6 +632,8 @@ def main() -> int:
 
     folds = 1
     shared: np.ndarray | None = None
+    input_nonfinite_rows = 0
+    dropped_nonfinite_rows = 0
     if args.dataset:
         base, queries, metric = load_ann_dataset(
             args.dataset,
@@ -641,6 +654,13 @@ def main() -> int:
             if args.folds <= 0:
                 raise SystemExit("--folds must be positive")
             shared = load_pg_query_vectors(args.pg_dsn, args.shared_sql)
+            input_nonfinite_rows = nonfinite_row_count(shared)
+            if input_nonfinite_rows:
+                if not args.drop_nonfinite:
+                    raise SystemExit(
+                        f"shared vector set contains {input_nonfinite_rows} non-finite rows; rerun with --drop-nonfinite to filter them"
+                    )
+                shared, dropped_nonfinite_rows = drop_nonfinite_rows(shared)
             base, queries = split_shared_vectors(shared, args.query_count, args.seed)
             folds = args.folds
         else:
@@ -648,6 +668,15 @@ def main() -> int:
                 raise SystemExit("--base-sql and --query-sql are required with --pg-dsn")
             base = load_pg_query_vectors(args.pg_dsn, args.base_sql)
             queries = load_pg_query_vectors(args.pg_dsn, args.query_sql)
+            input_nonfinite_rows = nonfinite_row_count(base) + nonfinite_row_count(queries)
+            if input_nonfinite_rows:
+                if not args.drop_nonfinite:
+                    raise SystemExit(
+                        f"base/query vectors contain {input_nonfinite_rows} non-finite rows; rerun with --drop-nonfinite to filter them"
+                    )
+                base, dropped_base = drop_nonfinite_rows(base)
+                queries, dropped_queries = drop_nonfinite_rows(queries)
+                dropped_nonfinite_rows = dropped_base + dropped_queries
         metric = args.metric
 
     if args.shared_sql:
@@ -673,6 +702,11 @@ def main() -> int:
     )
     if folds > 1:
         print(f"holdout_folds={folds} query_count={query_count} seed={args.seed}")
+    if input_nonfinite_rows:
+        print(
+            f"nonfinite_rows_detected={input_nonfinite_rows} "
+            f"nonfinite_rows_dropped={dropped_nonfinite_rows}"
+        )
     print_results("Results", rows)
     print("\nCaveat: turboquant_mse here implements only the first-stage MSE path.")
     print("It does not yet include the residual 1-bit QJL inner-product correction stage.")
@@ -686,6 +720,8 @@ def main() -> int:
             "k": args.k,
             "seed": args.seed,
             "folds": folds,
+            "input_nonfinite_rows": input_nonfinite_rows,
+            "dropped_nonfinite_rows": dropped_nonfinite_rows,
             "results": [eval_result_to_dict(row) for row in rows],
             "caveat": "turboquant_mse implements only the first-stage MSE path; residual 1-bit QJL correction is not included",
         }
