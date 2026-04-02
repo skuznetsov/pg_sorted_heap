@@ -63,6 +63,21 @@ Suggested location:
 - `poc/turboquant_eval.py` or
 - `scripts/bench_turboquant_retrieval.py`
 
+Current repo status:
+
+- implemented as `scripts/bench_turboquant_retrieval.py`
+- repo-owned entry point: `make bench-turboquant`
+- current scope is intentionally narrow:
+  - float32 exact reference
+  - float16 baseline
+  - SQ8 linear baseline
+  - k-means PQ baseline
+  - `turboquant_mse` experimental path
+- current `turboquant_mse` is only the first-stage MSE path:
+  random orthogonal rotation + scalar quantization on rotated coordinates
+- the residual `1-bit` QJL inner-product correction stage is **not** implemented
+  in this first branch
+
 Inputs:
 
 - ANN-Benchmarks/real vector dataset already used in repo harnesses
@@ -237,4 +252,3 @@ The enlarged unpublished `0.13` should be treated as:
 not as:
 
 > more routed/segmented infrastructure
-
