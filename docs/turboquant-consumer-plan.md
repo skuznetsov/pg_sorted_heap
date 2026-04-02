@@ -70,6 +70,8 @@ Current repo status:
 - repo-owned SQL entry point: `make bench-turboquant-sql`
 - repo-owned repeated-holdout SQL entry point:
   `make bench-turboquant-sql-holdout`
+- structured result capture is supported via `TURBOQUANT_ARGS='--json-out /path/out.json'`
+  so later larger real-data runs can be compared without scraping text output
 - current scope is intentionally narrow:
   - float32 exact reference
   - float16 baseline

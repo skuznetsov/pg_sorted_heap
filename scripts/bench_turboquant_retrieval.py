@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import math
 import statistics
 import time
@@ -540,6 +541,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--query-sql", help="SQL returning one vector column for query vectors")
     ap.add_argument("--shared-sql", help="SQL returning one vector column for repeated holdout evaluation")
     ap.add_argument("--metric", choices=("cosine", "ip"), default="cosine")
+    ap.add_argument("--json-out", type=Path, help="Write structured JSON summary to this path")
     ap.add_argument("--cache-dir", type=Path, default=Path("/tmp/ann_real_cache"))
     ap.add_argument("--sample-size", type=int, default=4000)
     ap.add_argument("--query-count", type=int, default=50)
@@ -600,6 +602,20 @@ def evaluate_rows(base: np.ndarray, queries: np.ndarray, metric: str, args: argp
     return rows
 
 
+def eval_result_to_dict(row: EvalResult) -> dict[str, float | str]:
+    return {
+        "method": row.method,
+        "bits_per_dim": row.bits_per_dim,
+        "bytes_per_vec": row.bytes_per_vec,
+        "metadata_kb": row.metadata_kb,
+        "encode_ms": row.encode_ms,
+        "search_p50_ms": row.search_p50_ms,
+        "search_avg_ms": row.search_avg_ms,
+        "hit1": row.hit1,
+        "recall_at_k": row.recall_at_k,
+    }
+
+
 def main() -> int:
     args = build_arg_parser().parse_args()
 
@@ -648,15 +664,33 @@ def main() -> int:
         rows = evaluate_rows(base, queries, metric, args)
         source_name = args.dataset or (str(args.vectors) if args.vectors else None) or "postgresql"
 
+    base_count = int(base.shape[0])
+    query_count = int(queries.shape[0])
+    dim = int(base.shape[1])
     print(
         f"turboquant offline retrieval eval | source={source_name} metric={metric} "
-        f"base={base.shape[0]} queries={queries.shape[0]} dim={base.shape[1]} k={args.k}"
+        f"base={base_count} queries={query_count} dim={dim} k={args.k}"
     )
     if folds > 1:
-        print(f"holdout_folds={folds} query_count={queries.shape[0]} seed={args.seed}")
+        print(f"holdout_folds={folds} query_count={query_count} seed={args.seed}")
     print_results("Results", rows)
     print("\nCaveat: turboquant_mse here implements only the first-stage MSE path.")
     print("It does not yet include the residual 1-bit QJL inner-product correction stage.")
+    if args.json_out:
+        payload = {
+            "source": source_name,
+            "metric": metric,
+            "base_count": base_count,
+            "query_count": query_count,
+            "dim": dim,
+            "k": args.k,
+            "seed": args.seed,
+            "folds": folds,
+            "results": [eval_result_to_dict(row) for row in rows],
+            "caveat": "turboquant_mse implements only the first-stage MSE path; residual 1-bit QJL correction is not included",
+        }
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return 0
 
 
