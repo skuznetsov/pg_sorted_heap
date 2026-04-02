@@ -91,7 +91,7 @@ def build_packed_adc_helper(dst: Path) -> None:
     if platform.system() == "Darwin":
         cmd.extend(["-dynamiclib", "-o", str(dst), str(src)])
     else:
-        cmd.extend(["-shared", "-fPIC", "-o", str(dst), str(src)])
+        cmd.extend(["-shared", "-fPIC", "-pthread", "-o", str(dst), str(src)])
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -125,11 +125,31 @@ def load_packed_adc_helper() -> ctypes.CDLL | None:
         ctypes.POINTER(ctypes.c_float),
     ]
     lib.turboquant_packed_adc_scores_t_f32.restype = None
+    lib.turboquant_packed_adc_scores_t_mt_f32.argtypes = [
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.turboquant_packed_adc_scores_t_mt_f32.restype = None
     return lib
 
 
 def packed_adc_backend_name() -> str:
     return "c-helper" if load_packed_adc_helper() is not None else "python-fallback"
+
+
+def packed_adc_thread_count() -> int:
+    raw = os.environ.get("TURBOQUANT_ADC_THREADS")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            return 1
+    return max(1, min(6, os.cpu_count() or 1))
 
 
 def median_ms(values: list[float]) -> float:
@@ -622,14 +642,28 @@ def packed_lookup_scores_transposed(
         if norms_arr is None
         else norms_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
     )
-    lib.turboquant_packed_adc_scores_t_f32(
-        packed_codes_t.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-        byte_tables.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        norm_ptr,
-        ctypes.c_size_t(packed_codes_t.shape[1]),
-        ctypes.c_size_t(packed_codes_t.shape[0]),
-        scores.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-    )
+    n_rows = packed_codes_t.shape[1]
+    n_bytes = packed_codes_t.shape[0]
+    thread_count = packed_adc_thread_count()
+    if thread_count > 1 and n_rows >= 16384 and n_bytes >= 256:
+        lib.turboquant_packed_adc_scores_t_mt_f32(
+            packed_codes_t.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            byte_tables.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            norm_ptr,
+            ctypes.c_size_t(n_rows),
+            ctypes.c_size_t(n_bytes),
+            ctypes.c_size_t(thread_count),
+            scores.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        )
+    else:
+        lib.turboquant_packed_adc_scores_t_f32(
+            packed_codes_t.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            byte_tables.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            norm_ptr,
+            ctypes.c_size_t(n_rows),
+            ctypes.c_size_t(n_bytes),
+            scores.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        )
     return scores
 
 
@@ -1906,7 +1940,10 @@ def main() -> int:
     if any("packed4" in row.method for row in rows):
         helper_path = packed_adc_helper_path()
         helper_note = str(helper_path) if helper_path.exists() else "unavailable"
-        print(f"packed_adc_backend={packed_adc_backend_name()} helper={helper_note}")
+        print(
+            f"packed_adc_backend={packed_adc_backend_name()} "
+            f"threads={packed_adc_thread_count()} helper={helper_note}"
+        )
     print_results("Results", rows)
     print("\nCaveat: turboquant_mse here implements only the first-stage MSE path.")
     print("It does not yet include the residual 1-bit QJL inner-product correction stage.")

@@ -102,6 +102,9 @@ Current repo status:
     falls back to Python otherwise
   - the current strongest helper path is byte-major/transposed for the plain
     `blockhadamard_packed4` lane
+  - the current evaluator defaults to a coarse multi-threaded packed scorer for
+    large searches (`threads=min(6, cpu_count)` unless
+    `TURBOQUANT_ADC_THREADS` overrides it)
 - `turboquant_block32_dimdither_packed4` now exists as a kernel-friendly
   dimension-only dither analogue for the `block32` family; it avoids
   per-value random dither state so it can be fused later if it earns its keep
@@ -338,6 +341,18 @@ Current repo status:
         `28624.9 ms` encode, `14.287 ms` p50
       - `turboquant_blockhadamard_packed4`: `98.0% hit@1`, `91.20% recall@10`,
         `27996.0 ms` encode, `55.060 ms` p50
+    - then byte-major/transposed + coarse multi-threaded helper
+      (`packed_adc_backend=c-helper`, `threads=6`):
+      - repeat A:
+        - `turboquant_blockhadamard`: `98.0% hit@1`, `91.20% recall@10`,
+          `28027.0 ms` encode, `13.936 ms` p50
+        - `turboquant_blockhadamard_packed4`: `98.0% hit@1`, `91.20% recall@10`,
+          `27522.8 ms` encode, `19.735 ms` p50
+      - repeat B:
+        - `turboquant_blockhadamard`: `98.0% hit@1`, `91.20% recall@10`,
+          `27418.8 ms` encode, `14.018 ms` p50
+        - `turboquant_blockhadamard_packed4`: `98.0% hit@1`, `91.20% recall@10`,
+          `27479.9 ms` encode, `19.293 ms` p50
   - `turboquant_block32_dither`: `100.0% hit@1`, `91.80% recall@10`,
     `22886.3 ms` encode, `23.821 ms` p50
   - `turboquant_block32_dimdither_packed4`: `96.0% hit@1`, `90.00% recall@10`,
@@ -351,9 +366,12 @@ Current repo status:
     (`824.263 ms -> 96.090 ms`) without changing quality
   - moving again to the byte-major/transposed helper cut it by another
     `1.7x` (`96.090 ms -> 55.060 ms`) with the same ranking
-  - even after that it remains about `3.9x` slower than plain
-    `blockhadamard`, so the next serious speedup should target the inner loop
-    itself with tighter SIMD/kernel work rather than more high-level shaping
+  - adding coarse multi-threaded row sharding cut it by another
+    `2.8-2.9x` on repeated vetted Gutenberg runs
+    (`55.060 ms -> 19.3-19.7 ms`) with the same ranking
+  - that leaves packed `blockhadamard` only about `1.4x` slower than plain
+    `blockhadamard` on this workload, which is the first point where an engine
+    path looks genuinely plausible instead of merely interesting
   - the dimension-only dither analogue does **not** survive Gutenberg:
     it loses both `hit@1` and `recall@10` relative to plain `block32_dither`
   - therefore the next kernelization candidate should stay centered on plain
