@@ -100,19 +100,20 @@ Current repo status:
   code-graph summary set produced by the existing
   `bin/bench_code_graph_perf.cr --keep-table` flow on
   `src/cogniformerus`:
-  - `1122` summary vectors total
-  - `33` non-finite summary embeddings detected and dropped explicitly
-  - repeated holdout (`5` folds, `200` queries/fold, `k=10`) on the
-    remaining `1089` vectors gave:
-    - `pq_kmeans`: `hit@1=47.0%`, `recall@10=67.33%`, `16 B/vec`
-    - `turboquant_mse`: `hit@1=88.8%`, `recall@10=91.17%`, `388 B/vec`
-    - `sq8_linear`: `hit@1=99.1%`, `recall@10=99.21%`, `768 B/vec`
+  - `1124` summary vectors total
+  - `0` non-finite summary embeddings after the upstream
+    `NativeMetalProvider` batch-recovery fix in Cogniformerus
+  - repeated holdout (`5` folds, `200` queries/fold, `k=10`) on that
+    clean set gave:
+    - `pq_kmeans`: `hit@1=45.3%`, `recall@10=66.55%`, `16 B/vec`
+    - `turboquant_mse`: `hit@1=86.5%`, `recall@10=91.33%`, `388 B/vec`
+    - `sq8_linear`: `hit@1=98.6%`, `recall@10=99.28%`, `768 B/vec`
   Narrow conclusion:
-  - the current MSE-only TurboQuant lane clearly beats the simple PQ
+  - the current MSE-only TurboQuant lane still clearly beats the simple PQ
     baseline on this larger real consumer-derived set
-  - it does not beat `sq8_linear` on quality
-  - upstream non-finite embeddings are a real consumer-quality caveat,
-    not just a benchmark artifact
+  - it still does not beat `sq8_linear` on quality
+  - the previous non-finite-row caveat is no longer the blocker; the
+    remaining caveat is algorithmic, not data-integrity-related
 
 Inputs:
 
