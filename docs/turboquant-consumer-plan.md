@@ -78,6 +78,9 @@ Current repo status:
   - SQ8 linear baseline
   - k-means PQ baseline
   - `turboquant_mse` experimental path
+- `turboquant_prod` comparator now exists in the evaluator as a bounded
+  second-stage QJL residual experiment; it is still evaluator-only and not an
+  engine integration candidate
 - current `turboquant_mse` is only the first-stage MSE path:
   random orthogonal rotation + scalar quantization on rotated coordinates
 - the residual `1-bit` QJL inner-product correction stage is **not** implemented
@@ -114,6 +117,22 @@ Current repo status:
   - it still does not beat `sq8_linear` on quality
   - the previous non-finite-row caveat is no longer the blocker; the
     remaining caveat is algorithmic, not data-integrity-related
+- verified on the same clean code-graph summary set with a bounded
+  `turboquant_prod` bit sweep (`exact + mse + prod` only):
+  - `2` bits:
+    - `turboquant_mse`: `hit@1=74.1%`, `recall@10=81.03%`
+    - `turboquant_prod`: `hit@1=62.5%`, `recall@10=71.04%`
+  - `3` bits:
+    - `turboquant_mse`: `hit@1=80.6%`, `recall@10=86.34%`
+    - `turboquant_prod`: `hit@1=72.7%`, `recall@10=78.25%`
+  - `4` bits:
+    - `turboquant_mse`: `hit@1=86.5%`, `recall@10=91.33%`
+    - `turboquant_prod`: `hit@1=79.8%`, `recall@10=86.13%`
+  Narrow conclusion:
+  - this dense-Gaussian residual-QJL variant underperforms the simpler
+    first-stage MSE path on the real code-graph workload across `2-4` bits
+  - it should stay as a negative-reference method in the evaluator, not as
+    the next engine-integration hypothesis
 
 Inputs:
 

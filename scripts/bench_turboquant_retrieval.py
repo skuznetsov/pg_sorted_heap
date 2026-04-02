@@ -10,6 +10,7 @@ It compares a few reversible retrieval-side baselines on the same vectors:
   - sq8_linear baseline
   - pq_kmeans baseline
   - turboquant_mse experimental path
+  - turboquant_prod experimental path
 
 TurboQuant v1 in this harness covers only the MSE-oriented first stage:
 random orthogonal rotation + coordinate-wise scalar quantization on rotated
@@ -489,6 +490,78 @@ class TurboQuantMSEMethod(RetrievalMethod):
         return total
 
 
+class TurboQuantProdMethod(RetrievalMethod):
+    def __init__(self, bits: int, seed: int) -> None:
+        super().__init__("turboquant_prod")
+        if bits < 2:
+            raise ValueError("turboquant_prod requires turbo_bits >= 2")
+        self.bits = bits
+        self.seed = seed
+        self.mse_bits = bits - 1
+        self.rotation: np.ndarray | None = None
+        self.qjl_proj: np.ndarray | None = None
+        self.codes: np.ndarray | None = None
+        self.norms: np.ndarray | None = None
+        self.decoded_rot: np.ndarray | None = None
+        self.centers: np.ndarray | None = None
+        self.bounds: np.ndarray | None = None
+        self.residual_signs: np.ndarray | None = None
+        self.residual_norms: np.ndarray | None = None
+        self.dim = 0
+
+    def fit(self, base: np.ndarray) -> None:
+        self.dim = base.shape[1]
+        self.rotation = random_orthogonal(self.dim, self.seed)
+        self.qjl_proj = np.random.default_rng(self.seed + 1).standard_normal(
+            (self.dim, self.dim), dtype=np.float32
+        )
+        self.centers, self.bounds = gaussian_lloyd_max(self.mse_bits)
+        norms = np.linalg.norm(base, axis=1).astype(np.float32)
+        unit = base / np.maximum(norms[:, None], 1e-12)
+        rotated_unit = unit @ self.rotation
+        scaled_rotated = rotated_unit * math.sqrt(self.dim)
+        codes = np.digitize(scaled_rotated, self.bounds[1:-1], right=False).astype(np.uint8)
+        decoded_rot = self.centers[codes] / math.sqrt(self.dim)
+        residual = rotated_unit - decoded_rot
+        residual_norms = np.linalg.norm(residual, axis=1).astype(np.float32)
+        normalized_residual = residual / np.maximum(residual_norms[:, None], 1e-12)
+        residual_signs = np.sign(normalized_residual @ self.qjl_proj.T).astype(np.int8)
+        residual_signs[residual_signs == 0] = 1
+
+        self.codes = codes
+        self.norms = norms
+        self.decoded_rot = decoded_rot.astype(np.float32, copy=False)
+        self.residual_signs = residual_signs
+        self.residual_norms = residual_norms
+
+    def search(self, query: np.ndarray, k: int) -> np.ndarray:
+        q_rot = query @ self.rotation
+        mse_scores = self.decoded_rot @ q_rot
+        qjl_query = np.sqrt(np.pi / 2.0) / float(self.dim) * (self.qjl_proj @ q_rot)
+        qjl_scores = self.residual_signs.astype(np.float32) @ qjl_query
+        scores = (mse_scores + self.residual_norms * qjl_scores) * self.norms
+        return topk_indices(scores, k)
+
+    def bytes_per_vec(self) -> float:
+        if self.codes is None:
+            raise RuntimeError("fit must run first")
+        mse_bytes = self.codes.shape[1] * self.mse_bits / 8.0
+        qjl_bytes = self.codes.shape[1] / 8.0
+        return float(mse_bytes + qjl_bytes + 4.0 + 4.0)
+
+    def metadata_bytes(self) -> int:
+        total = 0
+        if self.rotation is not None:
+            total += int(self.rotation.nbytes)
+        if self.qjl_proj is not None:
+            total += int(self.qjl_proj.nbytes)
+        if self.centers is not None:
+            total += int(self.centers.nbytes)
+        if self.bounds is not None:
+            total += int(self.bounds.nbytes)
+        return total
+
+
 def evaluate_method(
     method: RetrievalMethod,
     base: np.ndarray,
@@ -607,6 +680,8 @@ def evaluate_rows(base: np.ndarray, queries: np.ndarray, metric: str, args: argp
         methods.append(PQKMeansMethod(auto_pq_m(base.shape[1], args.pq_m), args.pq_bits, args.pq_max_train, args.seed))
     if not args.skip_turbo:
         methods.append(TurboQuantMSEMethod(args.turbo_bits, args.seed))
+        if args.turbo_bits >= 2:
+            methods.append(TurboQuantProdMethod(args.turbo_bits, args.seed))
 
     for method in methods:
         rows.append(evaluate_method(method, base, queries, gt_ids, args.k))
@@ -710,6 +785,11 @@ def main() -> int:
     print_results("Results", rows)
     print("\nCaveat: turboquant_mse here implements only the first-stage MSE path.")
     print("It does not yet include the residual 1-bit QJL inner-product correction stage.")
+    if args.turbo_bits >= 2:
+        print(
+            "turboquant_prod uses a second-stage QJL residual correction "
+            "with a dense Gaussian projection in this evaluator."
+        )
     if args.json_out:
         payload = {
             "source": source_name,
@@ -723,7 +803,10 @@ def main() -> int:
             "input_nonfinite_rows": input_nonfinite_rows,
             "dropped_nonfinite_rows": dropped_nonfinite_rows,
             "results": [eval_result_to_dict(row) for row in rows],
-            "caveat": "turboquant_mse implements only the first-stage MSE path; residual 1-bit QJL correction is not included",
+            "caveat": (
+                "turboquant_mse implements only the first-stage MSE path; "
+                "turboquant_prod adds a dense-Gaussian QJL residual correction stage"
+            ),
         }
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
