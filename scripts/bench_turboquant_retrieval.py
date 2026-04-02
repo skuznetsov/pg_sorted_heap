@@ -428,6 +428,69 @@ def two_pass_block_hadamard(
     )
 
 
+def pack_nibbles(codes: np.ndarray) -> np.ndarray:
+    if codes.ndim != 2:
+        raise ValueError("pack_nibbles expects a 2-D array")
+    if codes.dtype != np.uint8:
+        codes = codes.astype(np.uint8, copy=False)
+    n_rows, dim = codes.shape
+    packed = np.zeros((n_rows, (dim + 1) // 2), dtype=np.uint8)
+    packed[:, : codes[:, 0::2].shape[1]] |= codes[:, 0::2] & 0x0F
+    packed[:, : codes[:, 1::2].shape[1]] |= (codes[:, 1::2] & 0x0F) << 4
+    return packed
+
+
+def nibble_pair_lut(lo_values: np.ndarray, hi_values: np.ndarray | None = None) -> np.ndarray:
+    byte_codes = np.arange(256, dtype=np.uint8)
+    lo = byte_codes & 0x0F
+    table = lo_values[lo].astype(np.float32, copy=False)
+    if hi_values is not None:
+        hi = byte_codes >> 4
+        table = table + hi_values[hi]
+    return table.astype(np.float32, copy=False)
+
+
+def packed_lookup_scores(packed_codes: np.ndarray, byte_tables: list[np.ndarray]) -> np.ndarray:
+    scores = np.zeros(packed_codes.shape[0], dtype=np.float32)
+    chunk_size = 64
+    for start in range(0, len(byte_tables), chunk_size):
+        stop = min(start + chunk_size, len(byte_tables))
+        table_block = np.stack(byte_tables[start:stop], axis=0)
+        code_block = packed_codes[:, start:stop].T.astype(np.intp, copy=False)
+        scores += np.take_along_axis(table_block, code_block, axis=1).sum(axis=0, dtype=np.float32)
+    return scores
+
+
+def splitmix64(values: np.ndarray) -> np.ndarray:
+    mask = np.uint64(0xFFFFFFFFFFFFFFFF)
+    z = (values + np.uint64(0x9E3779B97F4A7C15)) & mask
+    z = ((z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)) & mask
+    z = ((z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)) & mask
+    return z ^ (z >> np.uint64(31))
+
+
+def deterministic_dither(dim: int, seed: int, step: float) -> np.ndarray:
+    idx = np.arange(dim, dtype=np.uint64) + np.uint64(seed)
+    mixed = splitmix64(idx)
+    unit = ((mixed >> np.uint64(11)).astype(np.float64) / float(1 << 53)).astype(np.float32)
+    return ((unit - 0.5) * step).astype(np.float32)
+
+
+def score_luts_to_byte_tables(score_luts: np.ndarray) -> list[np.ndarray]:
+    if score_luts.ndim != 2:
+        raise ValueError("score_luts_to_byte_tables expects a 2-D array")
+    tables: list[np.ndarray] = []
+    for start in range(0, score_luts.shape[0], 2):
+        lo_values = score_luts[start]
+        hi_values = score_luts[start + 1] if start + 1 < score_luts.shape[0] else None
+        tables.append(nibble_pair_lut(lo_values, hi_values))
+    return tables
+
+
+def expand_group_scales(group_scales: np.ndarray, dim: int, group_size: int) -> np.ndarray:
+    return np.repeat(group_scales, group_size)[:dim].astype(np.float32, copy=False)
+
+
 @dataclass
 class EvalResult:
     method: str
@@ -707,6 +770,59 @@ class TurboQuantBlockHadamardMethod(RetrievalMethod):
         return 16
 
 
+class TurboQuantBlockHadamardPackedMethod(RetrievalMethod):
+    def __init__(self, bits: int, seed: int) -> None:
+        super().__init__("turboquant_blockhadamard_packed4")
+        self.bits = bits
+        self.seed = seed
+        self.perm: np.ndarray | None = None
+        self.signs: np.ndarray | None = None
+        self.blocks: list[int] = []
+        self.packed_codes: np.ndarray | None = None
+        self.norms: np.ndarray | None = None
+        self.centers: np.ndarray | None = None
+        self.dim = 0
+
+    def fit(self, base: np.ndarray) -> None:
+        if self.bits != 4:
+            raise ValueError("turboquant_blockhadamard_packed4 currently requires --turbo-bits=4")
+        self.dim = base.shape[1]
+        rng = np.random.default_rng(self.seed)
+        self.perm = rng.permutation(self.dim).astype(np.int32)
+        self.signs = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=self.dim, replace=True)
+        self.blocks = power_of_two_blocks(self.dim)
+        self.centers, bounds = gaussian_lloyd_max(self.bits)
+        norms = np.linalg.norm(base, axis=1).astype(np.float32)
+        unit = base / np.maximum(norms[:, None], 1e-12)
+        rotated = structured_block_hadamard(unit, self.perm, self.signs, self.blocks) * math.sqrt(self.dim)
+        codes = np.digitize(rotated, bounds[1:-1], right=False).astype(np.uint8)
+        self.packed_codes = pack_nibbles(codes)
+        self.norms = maybe_store_norms(norms)
+
+    def search(self, query: np.ndarray, k: int) -> np.ndarray:
+        if self.packed_codes is None or self.centers is None:
+            raise RuntimeError("fit must run first")
+        q_rot = structured_block_hadamard(query[np.newaxis, :], self.perm, self.signs, self.blocks)[0]
+        coeffs = (q_rot / math.sqrt(self.dim)).astype(np.float32, copy=False)
+        score_luts = coeffs[:, None] * self.centers[None, :]
+        scores = packed_lookup_scores(self.packed_codes, score_luts_to_byte_tables(score_luts))
+        if self.norms is not None:
+            scores *= self.norms
+        return topk_indices(scores, k)
+
+    def bytes_per_vec(self) -> float:
+        if self.packed_codes is None:
+            raise RuntimeError("fit must run first")
+        norm_bytes = 4.0 if self.norms is not None else 0.0
+        return float(self.packed_codes.shape[1] + norm_bytes)
+
+    def metadata_bytes(self) -> int:
+        total = 16
+        if self.centers is not None:
+            total += int(self.centers.nbytes)
+        return total
+
+
 class TurboQuantBlockHadamardWhitenedMethod(RetrievalMethod):
     def __init__(self, bits: int, seed: int) -> None:
         super().__init__("turboquant_blockhadamard_whitened")
@@ -983,6 +1099,75 @@ class TurboQuantBlockwiseDitheredMethod(RetrievalMethod):
             raise RuntimeError("fit must run first")
         norm_bytes = 4.0 if self.norms is not None else 0.0
         return float(self.codes.shape[1] * self.bits / 8.0 + norm_bytes)
+
+    def metadata_bytes(self) -> int:
+        total = 24
+        if self.group_scales is not None:
+            total += int(self.group_scales.nbytes)
+        return total
+
+
+class TurboQuantBlockwiseDimDitherPackedMethod(RetrievalMethod):
+    def __init__(self, bits: int, seed: int, group_size: int = 32, clip: float = 3.0) -> None:
+        super().__init__(f"turboquant_block{group_size}_dimdither_packed4")
+        self.bits = bits
+        self.seed = seed
+        self.group_size = group_size
+        self.clip = clip
+        self.perm: np.ndarray | None = None
+        self.signs: np.ndarray | None = None
+        self.blocks: list[int] = []
+        self.packed_codes: np.ndarray | None = None
+        self.norms: np.ndarray | None = None
+        self.group_scales: np.ndarray | None = None
+        self._decoded_levels: np.ndarray | None = None
+        self.dim = 0
+
+    def fit(self, base: np.ndarray) -> None:
+        if self.bits != 4:
+            raise ValueError(f"{self.name} currently requires --turbo-bits=4")
+        self.dim = base.shape[1]
+        rng = np.random.default_rng(self.seed)
+        self.perm = rng.permutation(self.dim).astype(np.int32)
+        self.signs = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=self.dim, replace=True)
+        self.blocks = power_of_two_blocks(self.dim)
+        norms = np.linalg.norm(base, axis=1).astype(np.float32)
+        unit = base / np.maximum(norms[:, None], 1e-12)
+        rotated = structured_block_hadamard(unit, self.perm, self.signs, self.blocks) * math.sqrt(self.dim)
+        group_scales, expanded_scales = grouped_rms_scales(rotated, self.group_size)
+        equalized = rotated / expanded_scales
+        max_abs, levels = symmetric_int_levels(self.bits)
+        step = (2.0 * self.clip) / float(levels - 1)
+        dither = deterministic_dither(self.dim, self.seed + 17, step)
+        scaled = np.clip((equalized + dither[np.newaxis, :]) / step, -max_abs, max_abs)
+        signed_codes = np.rint(scaled).astype(np.int16)
+        stored_codes = (signed_codes + max_abs).astype(np.uint8)
+        decoded_levels = np.zeros(16, dtype=np.float32)
+        decoded_levels[:levels] = (np.arange(levels, dtype=np.float32) - float(max_abs)) * step
+        self.packed_codes = pack_nibbles(stored_codes)
+        self.norms = maybe_store_norms(norms)
+        self.group_scales = group_scales
+        self._decoded_levels = decoded_levels
+
+    def search(self, query: np.ndarray, k: int) -> np.ndarray:
+        if self.packed_codes is None or self.group_scales is None or self._decoded_levels is None:
+            raise RuntimeError("fit must run first")
+        q_rot = structured_block_hadamard(query[np.newaxis, :], self.perm, self.signs, self.blocks)[0]
+        expanded_scales = expand_group_scales(self.group_scales, self.dim, self.group_size)
+        coeffs = (expanded_scales * q_rot / math.sqrt(self.dim)).astype(np.float32, copy=False)
+        # The deterministic dim-only dither contributes a query-constant bias, so
+        # packed search can omit it without changing ranking.
+        score_luts = coeffs[:, None] * self._decoded_levels[None, :]
+        scores = packed_lookup_scores(self.packed_codes, score_luts_to_byte_tables(score_luts))
+        if self.norms is not None:
+            scores *= self.norms
+        return topk_indices(scores, k)
+
+    def bytes_per_vec(self) -> float:
+        if self.packed_codes is None:
+            raise RuntimeError("fit must run first")
+        norm_bytes = 4.0 if self.norms is not None else 0.0
+        return float(self.packed_codes.shape[1] + norm_bytes)
 
     def metadata_bytes(self) -> int:
         total = 24
@@ -1372,12 +1557,14 @@ def method_factories(base: np.ndarray, args: argparse.Namespace) -> list[tuple[s
         ("pq_kmeans", lambda: PQKMeansMethod(auto_pq_m(base.shape[1], args.pq_m), args.pq_bits, args.pq_max_train, args.seed)),
         ("turboquant_mse", lambda: TurboQuantMSEMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard", lambda: TurboQuantBlockHadamardMethod(args.turbo_bits, args.seed)),
+        ("turboquant_blockhadamard_packed4", lambda: TurboQuantBlockHadamardPackedMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_whitened", lambda: TurboQuantBlockHadamardWhitenedMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_block32", lambda: TurboQuantBlockHadamardBlockwiseMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_twopass", lambda: TurboQuantBlockHadamardTwoPassMethod(args.turbo_bits, args.seed)),
         ("turboquant_twopass_block32", lambda: TurboQuantTwoPassBlockwiseMethod(args.turbo_bits, args.seed)),
         ("turboquant_block32_compand", lambda: TurboQuantBlockwiseCompandedMethod(args.turbo_bits, args.seed)),
         ("turboquant_block32_dither", lambda: TurboQuantBlockwiseDitheredMethod(args.turbo_bits, args.seed)),
+        ("turboquant_block32_dimdither_packed4", lambda: TurboQuantBlockwiseDimDitherPackedMethod(args.turbo_bits, args.seed)),
         ("turboquant_block32_d4", lambda: TurboQuantBlockwiseD4Method(args.turbo_bits, args.seed)),
         ("turboquant_twopass_block32_dither", lambda: TurboQuantTwoPassBlockwiseDitheredMethod(args.turbo_bits, args.seed)),
         ("turboquant_prod", lambda: TurboQuantProdMethod(args.turbo_bits, args.seed)),
@@ -1432,6 +1619,8 @@ def build_methods(base: np.ndarray, args: argparse.Namespace) -> list[RetrievalM
     for name in selected_names:
         if name == "turboquant_prod" and args.turbo_bits < 2:
             raise SystemExit("turboquant_prod requires --turbo-bits >= 2")
+        if name in {"turboquant_blockhadamard_packed4", "turboquant_block32_dimdither_packed4"} and args.turbo_bits != 4:
+            raise SystemExit(f"{name} currently requires --turbo-bits=4")
         methods.append(factory_map[name]())
     return methods
 
@@ -1578,6 +1767,10 @@ def main() -> int:
     print(
         "turboquant_blockhadamard_block32 adds coarse blockwise RMS scaling "
         "on top of the structured block-Hadamard transform."
+    )
+    print(
+        "Packed4 research lanes reuse the same scalar quantizers but switch search to byte-packed "
+        "ADC-style lookup tables; they are kernel-shape prototypes, not optimized kernels."
     )
     if args.turbo_research:
         print(

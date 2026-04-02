@@ -91,6 +91,13 @@ Current repo status:
   equalization experiment on top of the structured block-Hadamard transform
 - `turboquant_blockhadamard_block32` now exists as a coarse blockwise-RMS
   equalization experiment on top of the structured block-Hadamard transform
+- `turboquant_blockhadamard_packed4` now exists as a kernel-shape packed-ADC
+  mirror of plain `blockhadamard`; it is explicit-only and intended to answer
+  whether packed nibble lookup can preserve ranking before any low-level kernel
+  work exists
+- `turboquant_block32_dimdither_packed4` now exists as a kernel-friendly
+  dimension-only dither analogue for the `block32` family; it avoids
+  per-value random dither state so it can be fused later if it earns its keep
 - current `turboquant_mse` is only the first-stage MSE path:
   random orthogonal rotation + scalar quantization on rotated coordinates
 - the residual `1-bit` QJL inner-product correction stage is **not** implemented
@@ -307,6 +314,27 @@ Current repo status:
   - `block32_dither` latency on the local cube shows more run-to-run variance
     than its recall/encode signal, so the current claim is stronger on quality
     than on p50 latency
+- verified on 2026-04-02 against the same vetted Gutenberg subset with
+  packed kernel-shape prototypes (`50` queries, `103260 x 2880D`, cosine,
+  `k=10`):
+  - `turboquant_blockhadamard`: `98.0% hit@1`, `91.20% recall@10`,
+    `28745.9 ms` encode, `26.233 ms` p50
+  - `turboquant_blockhadamard_packed4`: `98.0% hit@1`, `91.20% recall@10`,
+    `28474.8 ms` encode, `824.263 ms` p50
+  - `turboquant_block32_dither`: `100.0% hit@1`, `91.80% recall@10`,
+    `22886.3 ms` encode, `23.821 ms` p50
+  - `turboquant_block32_dimdither_packed4`: `96.0% hit@1`, `90.00% recall@10`,
+    `24406.1 ms` encode, `921.517 ms` p50
+  Narrow conclusion:
+  - `blockhadamard_packed4` exactly preserves the plain `blockhadamard`
+    ranking on Gutenberg, so the packed nibble-ADC path is algorithmically
+    faithful
+  - in Python it is about `31x` slower on query p50, so this is evidence for a
+    future fused kernel path, not a Python-level latency win
+  - the dimension-only dither analogue does **not** survive Gutenberg:
+    it loses both `hit@1` and `recall@10` relative to plain `block32_dither`
+  - therefore the next kernelization candidate should stay centered on plain
+    `blockhadamard` first, not on the dim-only dither surrogate
 
 ### Publication threshold
 
@@ -327,7 +355,10 @@ What is **not** yet defensible:
 Before this becomes publishable instead of just interesting, the repo still
 needs:
 
-1. a packed/kernelized path for the surviving lanes, not just Python eval
+1. a packed/kernelized path for the surviving lanes, not just Python eval;
+   the new packed `blockhadamard` result is good evidence that quality can
+   survive the format change, but it also shows Python ADC is far too slow to
+   claim any latency benefit before low-level kernel work
 2. a stronger multi-dataset operating curve across `2-6` bits
 3. at least one very-high-dimension run (`>= 65536D`, ideally `262144D`)
    with recall and throughput, not only synthetic metadata scaling
