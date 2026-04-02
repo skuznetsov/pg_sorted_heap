@@ -10,6 +10,7 @@ It compares a few reversible retrieval-side baselines on the same vectors:
   - sq8_linear baseline
   - pq_kmeans baseline
   - turboquant_mse experimental path
+  - turboquant_blockhadamard experimental path
   - turboquant_prod experimental path
 
 TurboQuant v1 in this harness covers only the MSE-oriented first stage:
@@ -261,6 +262,52 @@ def random_orthogonal(dim: int, seed: int) -> np.ndarray:
     return q.astype(np.float32, copy=False)
 
 
+def power_of_two_blocks(dim: int) -> list[int]:
+    blocks: list[int] = []
+    remaining = dim
+    while remaining > 0:
+        block = 1 << (remaining.bit_length() - 1)
+        blocks.append(block)
+        remaining -= block
+    return blocks
+
+
+def fwht_rows(block: np.ndarray) -> np.ndarray:
+    out = block.astype(np.float32, copy=True)
+    width = out.shape[1]
+    if width <= 1:
+        return out
+    h = 1
+    while h < width:
+        reshaped = out.reshape(out.shape[0], -1, 2 * h)
+        left = reshaped[:, :, :h].copy()
+        right = reshaped[:, :, h : 2 * h].copy()
+        reshaped[:, :, :h] = left + right
+        reshaped[:, :, h : 2 * h] = left - right
+        out = reshaped.reshape(out.shape[0], width)
+        h *= 2
+    out /= math.sqrt(width)
+    return out
+
+
+def structured_block_hadamard(
+    x: np.ndarray,
+    perm: np.ndarray,
+    signs: np.ndarray,
+    blocks: list[int],
+) -> np.ndarray:
+    if x.ndim != 2:
+        raise ValueError("structured_block_hadamard expects a 2-D array")
+    mixed = x[:, perm] * signs[np.newaxis, :]
+    out = np.empty_like(mixed, dtype=np.float32)
+    offset = 0
+    for block in blocks:
+        chunk = mixed[:, offset : offset + block]
+        out[:, offset : offset + block] = fwht_rows(chunk)
+        offset += block
+    return out
+
+
 @dataclass
 class EvalResult:
     method: str
@@ -490,6 +537,52 @@ class TurboQuantMSEMethod(RetrievalMethod):
         return total
 
 
+class TurboQuantBlockHadamardMethod(RetrievalMethod):
+    def __init__(self, bits: int, seed: int) -> None:
+        super().__init__("turboquant_blockhadamard")
+        self.bits = bits
+        self.seed = seed
+        self.perm: np.ndarray | None = None
+        self.signs: np.ndarray | None = None
+        self.blocks: list[int] = []
+        self.codes: np.ndarray | None = None
+        self.norms: np.ndarray | None = None
+        self.decoded_rot: np.ndarray | None = None
+        self.centers: np.ndarray | None = None
+        self.bounds: np.ndarray | None = None
+        self.dim = 0
+
+    def fit(self, base: np.ndarray) -> None:
+        self.dim = base.shape[1]
+        rng = np.random.default_rng(self.seed)
+        self.perm = rng.permutation(self.dim).astype(np.int32)
+        self.signs = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=self.dim, replace=True)
+        self.blocks = power_of_two_blocks(self.dim)
+        self.centers, self.bounds = gaussian_lloyd_max(self.bits)
+        norms = np.linalg.norm(base, axis=1).astype(np.float32)
+        unit = base / np.maximum(norms[:, None], 1e-12)
+        rotated = structured_block_hadamard(unit, self.perm, self.signs, self.blocks) * math.sqrt(self.dim)
+        codes = np.digitize(rotated, self.bounds[1:-1], right=False).astype(np.uint8)
+        self.codes = codes
+        self.norms = norms
+        self.decoded_rot = self.centers[codes] / math.sqrt(self.dim)
+
+    def search(self, query: np.ndarray, k: int) -> np.ndarray:
+        q_rot = structured_block_hadamard(query[np.newaxis, :], self.perm, self.signs, self.blocks)[0]
+        scores = self.decoded_rot @ q_rot
+        scores *= self.norms
+        return topk_indices(scores, k)
+
+    def bytes_per_vec(self) -> float:
+        if self.codes is None:
+            raise RuntimeError("fit must run first")
+        return float(self.codes.shape[1] * self.bits / 8.0 + 4.0)
+
+    def metadata_bytes(self) -> int:
+        # Seed-derived structured transform: only tiny config needs storing.
+        return 16
+
+
 class TurboQuantProdMethod(RetrievalMethod):
     def __init__(self, bits: int, seed: int) -> None:
         super().__init__("turboquant_prod")
@@ -680,6 +773,7 @@ def evaluate_rows(base: np.ndarray, queries: np.ndarray, metric: str, args: argp
         methods.append(PQKMeansMethod(auto_pq_m(base.shape[1], args.pq_m), args.pq_bits, args.pq_max_train, args.seed))
     if not args.skip_turbo:
         methods.append(TurboQuantMSEMethod(args.turbo_bits, args.seed))
+        methods.append(TurboQuantBlockHadamardMethod(args.turbo_bits, args.seed))
         if args.turbo_bits >= 2:
             methods.append(TurboQuantProdMethod(args.turbo_bits, args.seed))
 
@@ -785,6 +879,10 @@ def main() -> int:
     print_results("Results", rows)
     print("\nCaveat: turboquant_mse here implements only the first-stage MSE path.")
     print("It does not yet include the residual 1-bit QJL inner-product correction stage.")
+    print(
+        "turboquant_blockhadamard uses a seed-derived sign+permutation+block-Hadamard "
+        "transform to cut rotation metadata."
+    )
     if args.turbo_bits >= 2:
         print(
             "turboquant_prod uses a second-stage QJL residual correction "

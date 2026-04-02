@@ -81,6 +81,9 @@ Current repo status:
 - `turboquant_prod` comparator now exists in the evaluator as a bounded
   second-stage QJL residual experiment; it is still evaluator-only and not an
   engine integration candidate
+- `turboquant_blockhadamard` comparator now exists as a seed-derived
+  sign+permutation+block-Hadamard rotation experiment intended to cut the
+  dense rotation metadata cost of `turboquant_mse`
 - current `turboquant_mse` is only the first-stage MSE path:
   random orthogonal rotation + scalar quantization on rotated coordinates
 - the residual `1-bit` QJL inner-product correction stage is **not** implemented
@@ -133,6 +136,19 @@ Current repo status:
     first-stage MSE path on the real code-graph workload across `2-4` bits
   - it should stay as a negative-reference method in the evaluator, not as
     the next engine-integration hypothesis
+- verified on the same clean code-graph summary set with a bounded
+  `exact + turboquant_mse + turboquant_blockhadamard` run at `4` bits:
+  - `turboquant_mse`: `hit@1=86.5%`, `recall@10=91.04%`,
+    `388 B/vec`, `2304.1 KB` metadata, `702.3 ms` encode
+  - `turboquant_blockhadamard`: `hit@1=86.1%`, `recall@10=91.13%`,
+    `388 B/vec`, effectively `0 KB` metadata, `47.2 ms` encode
+  Narrow conclusion:
+  - on this real consumer-derived set, structured block-Hadamard rotation
+    holds the same practical compression ratio as dense `turboquant_mse`
+  - quality is nearly identical on the current holdout, with slightly lower
+    `hit@1` but slightly higher `recall@10`
+  - this is now the strongest next TurboQuant lane, because it removes the
+    evaluator's biggest practical weakness without widening the engine surface
 
 Inputs:
 
