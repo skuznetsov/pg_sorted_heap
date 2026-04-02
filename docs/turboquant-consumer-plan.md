@@ -67,6 +67,7 @@ Current repo status:
 
 - implemented as `scripts/bench_turboquant_retrieval.py`
 - repo-owned entry point: `make bench-turboquant`
+- repo-owned SQL entry point: `make bench-turboquant-sql`
 - current scope is intentionally narrow:
   - float32 exact reference
   - float16 baseline
@@ -79,6 +80,11 @@ Current repo status:
   in this first branch
 - SQL-backed inputs are supported, so the evaluator can run on a real
   Cogniformerus-derived embedding set without touching the stable AM path
+- verified on 2026-04-02 against one tiny local `halfvec` memory slice
+  (`49` base / `10` query, `384D`):
+  - `pq_kmeans`: `hit@1=100%`, `recall@5=100%`, `16 B/vec`
+  - `turboquant_mse`: `hit@1=100%`, `recall@5=88%`, `196 B/vec`
+  This is only a tiny real-data smoke signal, not a broad quality claim.
 
 Inputs:
 
