@@ -180,8 +180,42 @@ Current repo status:
     evaluated TurboQuant lanes, while preserving tiny metadata and cheap
     encode cost relative to dense `mse`
   - `block32` does not dominate every lower-bit point, so the next likely
-    improvement is empirical scalar codebooks on top of the structured
-    transform, not more diagonal whitening or residual-QJL work
+    improvement should stay in the no-codebook family rather than return to
+    diagonal whitening or residual-QJL work
+- verified on the same clean code-graph summary set with bounded
+  no-codebook research lanes (`twopass`, `compand`, `dither`, `D4`, and a
+  `twopass+dither` synthesis) at `2-4` bits:
+  - `2` bits:
+    - `turboquant_blockhadamard_twopass`: `hit@1=76.5%`, `recall@10=81.29%`
+    - `turboquant_block32_dither`: `hit@1=48.4%`, `recall@10=60.70%`
+    - `turboquant_block32_compand`: `hit@1=34.2%`, `recall@10=46.25%`
+    - `turboquant_block32_d4`: `hit@1=29.7%`, `recall@10=42.06%`
+  - `3` bits:
+    - `turboquant_blockhadamard_twopass`: `hit@1=81.5%`, `recall@10=86.50%`
+    - `turboquant_block32_dither`: `hit@1=75.9%`, `recall@10=82.55%`
+    - `turboquant_block32_compand`: `hit@1=73.1%`, `recall@10=78.35%`
+    - `turboquant_block32_d4`: `hit@1=75.9%`, `recall@10=81.53%`
+  - `4` bits:
+    - `turboquant_blockhadamard_twopass`: `hit@1=88.9%`, `recall@10=91.33%`,
+      `0 KB` metadata, `61.3 ms` encode
+    - `turboquant_block32_dither`: `hit@1=86.3%`, `recall@10=91.64%`,
+      `0.1 KB` metadata, `23.5 ms` encode
+    - `turboquant_twopass_block32_dither`: `hit@1=88.5%`, `recall@10=91.60%`,
+      `0.1 KB` metadata, `39.9 ms` encode
+    - `turboquant_block32_compand`: `hit@1=83.2%`, `recall@10=89.17%`
+    - `turboquant_block32_d4`: `hit@1=86.2%`, `recall@10=90.51%`,
+      but `1324-1379 ms` encode in the current Python implementation
+  Narrow conclusion:
+  - the strongest general no-codebook lane is now `twopass structured mixing`;
+    it wins at `2` and `3` bits and gives the best `hit@1` at `4` bits
+  - the strongest high-rate no-codebook lane is `block32_dither`; at `4` bits
+    it gives the best observed `recall@10` while keeping tiny metadata and the
+    cheapest encode among the competitive lanes
+  - the `twopass+dither` synthesis is a good `4`-bit compromise, but it does
+    not clearly dominate `twopass` on `hit@1` or `block32_dither` on
+    `recall@10`
+  - the current compander and D4 lanes are refuted on this real workload in
+    their present form; they are not the next branch to invest in
 
 Inputs:
 

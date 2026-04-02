@@ -333,6 +333,101 @@ def grouped_rms_scales(rotated: np.ndarray, group_size: int) -> tuple[np.ndarray
     return group_scales, expanded
 
 
+def power_compand(x: np.ndarray, beta: float) -> np.ndarray:
+    return np.sign(x) * np.power(np.abs(x), beta, dtype=np.float32)
+
+
+def power_decompand(x: np.ndarray, beta: float) -> np.ndarray:
+    inv_beta = 1.0 / beta
+    return np.sign(x) * np.power(np.abs(x), inv_beta, dtype=np.float32)
+
+
+def symmetric_int_levels(bits: int) -> tuple[int, int]:
+    max_abs = max(1, (1 << (bits - 1)) - 1)
+    levels = 2 * max_abs + 1
+    return max_abs, levels
+
+
+def uniform_quantize(x: np.ndarray, bits: int, clip: float) -> tuple[np.ndarray, np.ndarray, float]:
+    max_abs, levels = symmetric_int_levels(bits)
+    step = (2.0 * clip) / float(levels - 1)
+    scaled = np.clip(x / step, -max_abs, max_abs)
+    codes = np.rint(scaled).astype(np.int16)
+    decoded = codes.astype(np.float32) * step
+    return codes, decoded, step
+
+
+def dithered_uniform_quantize(
+    x: np.ndarray, bits: int, clip: float, seed: int
+) -> tuple[np.ndarray, np.ndarray, float]:
+    max_abs, levels = symmetric_int_levels(bits)
+    step = (2.0 * clip) / float(levels - 1)
+    rng = np.random.default_rng(seed)
+    dither = rng.uniform(-0.5 * step, 0.5 * step, size=x.shape).astype(np.float32)
+    scaled = np.clip((x + dither) / step, -max_abs, max_abs)
+    codes = np.rint(scaled).astype(np.int16)
+    decoded = codes.astype(np.float32) * step - dither
+    return codes, decoded, step
+
+
+def nearest_d4_rows(x: np.ndarray, max_abs: int) -> np.ndarray:
+    rounded = np.clip(np.rint(x), -max_abs, max_abs).astype(np.int16)
+    parity = (rounded.sum(axis=1) & 1).astype(bool)
+    if not np.any(parity):
+        return rounded
+
+    odd_idx = np.flatnonzero(parity)
+    for row_idx in odd_idx:
+        row = rounded[row_idx].copy()
+        target = x[row_idx]
+        best_coord = 0
+        best_delta = 0
+        best_penalty = float("inf")
+        for coord in range(row.shape[0]):
+            current = int(row[coord])
+            preferred = 1 if target[coord] >= current else -1
+            for delta in (preferred, -preferred):
+                candidate = current + delta
+                if candidate < -max_abs or candidate > max_abs:
+                    continue
+                penalty = abs(target[coord] - candidate)
+                if penalty < best_penalty:
+                    best_penalty = penalty
+                    best_coord = coord
+                    best_delta = delta
+        row[best_coord] = np.int16(int(row[best_coord]) + best_delta)
+        rounded[row_idx] = row
+    return rounded
+
+
+def d4_quantize_rows(x: np.ndarray, bits: int, clip: float) -> tuple[np.ndarray, np.ndarray, float]:
+    max_abs, levels = symmetric_int_levels(bits)
+    step = (2.0 * clip) / float(levels - 1)
+    q = np.clip(x / step, -max_abs, max_abs)
+    if q.shape[1] % 4 != 0:
+        raise ValueError("D4 quantization requires dimensions divisible by 4")
+    flat = q.reshape(-1, 4)
+    lattice = nearest_d4_rows(flat, max_abs=max_abs)
+    decoded = lattice.astype(np.float32).reshape(x.shape) * step
+    return lattice.reshape(x.shape), decoded, step
+
+
+def two_pass_block_hadamard(
+    x: np.ndarray,
+    perm1: np.ndarray,
+    signs1: np.ndarray,
+    perm2: np.ndarray,
+    signs2: np.ndarray,
+    blocks: list[int],
+) -> np.ndarray:
+    return structured_block_hadamard(
+        structured_block_hadamard(x, perm1, signs1, blocks),
+        perm2,
+        signs2,
+        blocks,
+    )
+
+
 @dataclass
 class EvalResult:
     method: str
@@ -722,6 +817,305 @@ class TurboQuantBlockHadamardBlockwiseMethod(RetrievalMethod):
         return total
 
 
+class TurboQuantBlockHadamardTwoPassMethod(RetrievalMethod):
+    def __init__(self, bits: int, seed: int) -> None:
+        super().__init__("turboquant_blockhadamard_twopass")
+        self.bits = bits
+        self.seed = seed
+        self.perm1: np.ndarray | None = None
+        self.signs1: np.ndarray | None = None
+        self.perm2: np.ndarray | None = None
+        self.signs2: np.ndarray | None = None
+        self.blocks: list[int] = []
+        self.codes: np.ndarray | None = None
+        self.norms: np.ndarray | None = None
+        self.decoded_rot: np.ndarray | None = None
+        self.centers: np.ndarray | None = None
+        self.bounds: np.ndarray | None = None
+        self.dim = 0
+
+    def fit(self, base: np.ndarray) -> None:
+        self.dim = base.shape[1]
+        rng1 = np.random.default_rng(self.seed)
+        rng2 = np.random.default_rng(self.seed + 1)
+        self.perm1 = rng1.permutation(self.dim).astype(np.int32)
+        self.signs1 = rng1.choice(np.array([-1.0, 1.0], dtype=np.float32), size=self.dim, replace=True)
+        self.perm2 = rng2.permutation(self.dim).astype(np.int32)
+        self.signs2 = rng2.choice(np.array([-1.0, 1.0], dtype=np.float32), size=self.dim, replace=True)
+        self.blocks = power_of_two_blocks(self.dim)
+        self.centers, self.bounds = gaussian_lloyd_max(self.bits)
+        norms = np.linalg.norm(base, axis=1).astype(np.float32)
+        unit = base / np.maximum(norms[:, None], 1e-12)
+        rotated = two_pass_block_hadamard(
+            unit,
+            self.perm1,
+            self.signs1,
+            self.perm2,
+            self.signs2,
+            self.blocks,
+        ) * math.sqrt(self.dim)
+        codes = np.digitize(rotated, self.bounds[1:-1], right=False).astype(np.uint8)
+        self.codes = codes
+        self.norms = maybe_store_norms(norms)
+        self.decoded_rot = self.centers[codes] / math.sqrt(self.dim)
+
+    def search(self, query: np.ndarray, k: int) -> np.ndarray:
+        q_rot = two_pass_block_hadamard(
+            query[np.newaxis, :],
+            self.perm1,
+            self.signs1,
+            self.perm2,
+            self.signs2,
+            self.blocks,
+        )[0]
+        scores = self.decoded_rot @ q_rot
+        if self.norms is not None:
+            scores *= self.norms
+        return topk_indices(scores, k)
+
+    def bytes_per_vec(self) -> float:
+        if self.codes is None:
+            raise RuntimeError("fit must run first")
+        norm_bytes = 4.0 if self.norms is not None else 0.0
+        return float(self.codes.shape[1] * self.bits / 8.0 + norm_bytes)
+
+    def metadata_bytes(self) -> int:
+        return 32
+
+
+class TurboQuantBlockwiseCompandedMethod(RetrievalMethod):
+    def __init__(self, bits: int, seed: int, group_size: int = 32, beta: float = 0.75, clip: float = 3.0) -> None:
+        super().__init__(f"turboquant_block{group_size}_compand")
+        self.bits = bits
+        self.seed = seed
+        self.group_size = group_size
+        self.beta = beta
+        self.clip = clip
+        self.perm: np.ndarray | None = None
+        self.signs: np.ndarray | None = None
+        self.blocks: list[int] = []
+        self.codes: np.ndarray | None = None
+        self.norms: np.ndarray | None = None
+        self.decoded_rot: np.ndarray | None = None
+        self.group_scales: np.ndarray | None = None
+        self.dim = 0
+
+    def fit(self, base: np.ndarray) -> None:
+        self.dim = base.shape[1]
+        rng = np.random.default_rng(self.seed)
+        self.perm = rng.permutation(self.dim).astype(np.int32)
+        self.signs = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=self.dim, replace=True)
+        self.blocks = power_of_two_blocks(self.dim)
+        norms = np.linalg.norm(base, axis=1).astype(np.float32)
+        unit = base / np.maximum(norms[:, None], 1e-12)
+        rotated = structured_block_hadamard(unit, self.perm, self.signs, self.blocks) * math.sqrt(self.dim)
+        group_scales, expanded_scales = grouped_rms_scales(rotated, self.group_size)
+        equalized = rotated / expanded_scales
+        companded = power_compand(equalized, self.beta)
+        codes, decoded_companded, _ = uniform_quantize(companded, self.bits, self.clip)
+        self.codes = codes
+        self.norms = maybe_store_norms(norms)
+        self.group_scales = group_scales
+        self.decoded_rot = (power_decompand(decoded_companded, self.beta) * expanded_scales) / math.sqrt(self.dim)
+
+    def search(self, query: np.ndarray, k: int) -> np.ndarray:
+        q_rot = structured_block_hadamard(query[np.newaxis, :], self.perm, self.signs, self.blocks)[0]
+        scores = self.decoded_rot @ q_rot
+        if self.norms is not None:
+            scores *= self.norms
+        return topk_indices(scores, k)
+
+    def bytes_per_vec(self) -> float:
+        if self.codes is None:
+            raise RuntimeError("fit must run first")
+        norm_bytes = 4.0 if self.norms is not None else 0.0
+        return float(self.codes.shape[1] * self.bits / 8.0 + norm_bytes)
+
+    def metadata_bytes(self) -> int:
+        total = 24
+        if self.group_scales is not None:
+            total += int(self.group_scales.nbytes)
+        return total
+
+
+class TurboQuantBlockwiseDitheredMethod(RetrievalMethod):
+    def __init__(self, bits: int, seed: int, group_size: int = 32, clip: float = 3.0) -> None:
+        super().__init__(f"turboquant_block{group_size}_dither")
+        self.bits = bits
+        self.seed = seed
+        self.group_size = group_size
+        self.clip = clip
+        self.perm: np.ndarray | None = None
+        self.signs: np.ndarray | None = None
+        self.blocks: list[int] = []
+        self.codes: np.ndarray | None = None
+        self.norms: np.ndarray | None = None
+        self.decoded_rot: np.ndarray | None = None
+        self.group_scales: np.ndarray | None = None
+        self.dim = 0
+
+    def fit(self, base: np.ndarray) -> None:
+        self.dim = base.shape[1]
+        rng = np.random.default_rng(self.seed)
+        self.perm = rng.permutation(self.dim).astype(np.int32)
+        self.signs = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=self.dim, replace=True)
+        self.blocks = power_of_two_blocks(self.dim)
+        norms = np.linalg.norm(base, axis=1).astype(np.float32)
+        unit = base / np.maximum(norms[:, None], 1e-12)
+        rotated = structured_block_hadamard(unit, self.perm, self.signs, self.blocks) * math.sqrt(self.dim)
+        group_scales, expanded_scales = grouped_rms_scales(rotated, self.group_size)
+        equalized = rotated / expanded_scales
+        codes, decoded_equalized, _ = dithered_uniform_quantize(equalized, self.bits, self.clip, self.seed + 17)
+        self.codes = codes
+        self.norms = maybe_store_norms(norms)
+        self.group_scales = group_scales
+        self.decoded_rot = (decoded_equalized * expanded_scales) / math.sqrt(self.dim)
+
+    def search(self, query: np.ndarray, k: int) -> np.ndarray:
+        q_rot = structured_block_hadamard(query[np.newaxis, :], self.perm, self.signs, self.blocks)[0]
+        scores = self.decoded_rot @ q_rot
+        if self.norms is not None:
+            scores *= self.norms
+        return topk_indices(scores, k)
+
+    def bytes_per_vec(self) -> float:
+        if self.codes is None:
+            raise RuntimeError("fit must run first")
+        norm_bytes = 4.0 if self.norms is not None else 0.0
+        return float(self.codes.shape[1] * self.bits / 8.0 + norm_bytes)
+
+    def metadata_bytes(self) -> int:
+        total = 24
+        if self.group_scales is not None:
+            total += int(self.group_scales.nbytes)
+        return total
+
+
+class TurboQuantBlockwiseD4Method(RetrievalMethod):
+    def __init__(self, bits: int, seed: int, group_size: int = 32, clip: float = 3.0) -> None:
+        super().__init__(f"turboquant_block{group_size}_d4")
+        self.bits = bits
+        self.seed = seed
+        self.group_size = group_size
+        self.clip = clip
+        self.perm: np.ndarray | None = None
+        self.signs: np.ndarray | None = None
+        self.blocks: list[int] = []
+        self.codes: np.ndarray | None = None
+        self.norms: np.ndarray | None = None
+        self.decoded_rot: np.ndarray | None = None
+        self.group_scales: np.ndarray | None = None
+        self.dim = 0
+
+    def fit(self, base: np.ndarray) -> None:
+        self.dim = base.shape[1]
+        rng = np.random.default_rng(self.seed)
+        self.perm = rng.permutation(self.dim).astype(np.int32)
+        self.signs = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=self.dim, replace=True)
+        self.blocks = power_of_two_blocks(self.dim)
+        norms = np.linalg.norm(base, axis=1).astype(np.float32)
+        unit = base / np.maximum(norms[:, None], 1e-12)
+        rotated = structured_block_hadamard(unit, self.perm, self.signs, self.blocks) * math.sqrt(self.dim)
+        group_scales, expanded_scales = grouped_rms_scales(rotated, self.group_size)
+        equalized = rotated / expanded_scales
+        codes, decoded_equalized, _ = d4_quantize_rows(equalized, self.bits, self.clip)
+        self.codes = codes
+        self.norms = maybe_store_norms(norms)
+        self.group_scales = group_scales
+        self.decoded_rot = (decoded_equalized * expanded_scales) / math.sqrt(self.dim)
+
+    def search(self, query: np.ndarray, k: int) -> np.ndarray:
+        q_rot = structured_block_hadamard(query[np.newaxis, :], self.perm, self.signs, self.blocks)[0]
+        scores = self.decoded_rot @ q_rot
+        if self.norms is not None:
+            scores *= self.norms
+        return topk_indices(scores, k)
+
+    def bytes_per_vec(self) -> float:
+        if self.codes is None:
+            raise RuntimeError("fit must run first")
+        norm_bytes = 4.0 if self.norms is not None else 0.0
+        return float(self.codes.shape[1] * self.bits / 8.0 + norm_bytes)
+
+    def metadata_bytes(self) -> int:
+        total = 24
+        if self.group_scales is not None:
+            total += int(self.group_scales.nbytes)
+        return total
+
+
+class TurboQuantTwoPassBlockwiseDitheredMethod(RetrievalMethod):
+    def __init__(self, bits: int, seed: int, group_size: int = 32, clip: float = 3.0) -> None:
+        super().__init__(f"turboquant_twopass_block{group_size}_dither")
+        self.bits = bits
+        self.seed = seed
+        self.group_size = group_size
+        self.clip = clip
+        self.perm1: np.ndarray | None = None
+        self.signs1: np.ndarray | None = None
+        self.perm2: np.ndarray | None = None
+        self.signs2: np.ndarray | None = None
+        self.blocks: list[int] = []
+        self.codes: np.ndarray | None = None
+        self.norms: np.ndarray | None = None
+        self.decoded_rot: np.ndarray | None = None
+        self.group_scales: np.ndarray | None = None
+        self.dim = 0
+
+    def fit(self, base: np.ndarray) -> None:
+        self.dim = base.shape[1]
+        rng1 = np.random.default_rng(self.seed)
+        rng2 = np.random.default_rng(self.seed + 1)
+        self.perm1 = rng1.permutation(self.dim).astype(np.int32)
+        self.signs1 = rng1.choice(np.array([-1.0, 1.0], dtype=np.float32), size=self.dim, replace=True)
+        self.perm2 = rng2.permutation(self.dim).astype(np.int32)
+        self.signs2 = rng2.choice(np.array([-1.0, 1.0], dtype=np.float32), size=self.dim, replace=True)
+        self.blocks = power_of_two_blocks(self.dim)
+        norms = np.linalg.norm(base, axis=1).astype(np.float32)
+        unit = base / np.maximum(norms[:, None], 1e-12)
+        rotated = two_pass_block_hadamard(
+            unit,
+            self.perm1,
+            self.signs1,
+            self.perm2,
+            self.signs2,
+            self.blocks,
+        ) * math.sqrt(self.dim)
+        group_scales, expanded_scales = grouped_rms_scales(rotated, self.group_size)
+        equalized = rotated / expanded_scales
+        codes, decoded_equalized, _ = dithered_uniform_quantize(equalized, self.bits, self.clip, self.seed + 29)
+        self.codes = codes
+        self.norms = maybe_store_norms(norms)
+        self.group_scales = group_scales
+        self.decoded_rot = (decoded_equalized * expanded_scales) / math.sqrt(self.dim)
+
+    def search(self, query: np.ndarray, k: int) -> np.ndarray:
+        q_rot = two_pass_block_hadamard(
+            query[np.newaxis, :],
+            self.perm1,
+            self.signs1,
+            self.perm2,
+            self.signs2,
+            self.blocks,
+        )[0]
+        scores = self.decoded_rot @ q_rot
+        if self.norms is not None:
+            scores *= self.norms
+        return topk_indices(scores, k)
+
+    def bytes_per_vec(self) -> float:
+        if self.codes is None:
+            raise RuntimeError("fit must run first")
+        norm_bytes = 4.0 if self.norms is not None else 0.0
+        return float(self.codes.shape[1] * self.bits / 8.0 + norm_bytes)
+
+    def metadata_bytes(self) -> int:
+        total = 40
+        if self.group_scales is not None:
+            total += int(self.group_scales.nbytes)
+        return total
+
+
 class TurboQuantProdMethod(RetrievalMethod):
     def __init__(self, bits: int, seed: int) -> None:
         super().__init__("turboquant_prod")
@@ -872,6 +1266,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--skip-sq8", action="store_true")
     ap.add_argument("--skip-pq", action="store_true")
     ap.add_argument("--skip-turbo", action="store_true")
+    ap.add_argument(
+        "--turbo-research",
+        action="store_true",
+        help="Include additional no-codebook research comparators (compander, dither, twopass, D4).",
+    )
     return ap
 
 
@@ -915,6 +1314,12 @@ def evaluate_rows(base: np.ndarray, queries: np.ndarray, metric: str, args: argp
         methods.append(TurboQuantBlockHadamardMethod(args.turbo_bits, args.seed))
         methods.append(TurboQuantBlockHadamardWhitenedMethod(args.turbo_bits, args.seed))
         methods.append(TurboQuantBlockHadamardBlockwiseMethod(args.turbo_bits, args.seed))
+        if args.turbo_research:
+            methods.append(TurboQuantBlockHadamardTwoPassMethod(args.turbo_bits, args.seed))
+            methods.append(TurboQuantBlockwiseCompandedMethod(args.turbo_bits, args.seed))
+            methods.append(TurboQuantBlockwiseDitheredMethod(args.turbo_bits, args.seed))
+            methods.append(TurboQuantBlockwiseD4Method(args.turbo_bits, args.seed))
+            methods.append(TurboQuantTwoPassBlockwiseDitheredMethod(args.turbo_bits, args.seed))
         if args.turbo_bits >= 2:
             methods.append(TurboQuantProdMethod(args.turbo_bits, args.seed))
 
@@ -1032,6 +1437,12 @@ def main() -> int:
         "turboquant_blockhadamard_block32 adds coarse blockwise RMS scaling "
         "on top of the structured block-Hadamard transform."
     )
+    if args.turbo_research:
+        print(
+            "turboquant research lanes add no-codebook experiments: twopass structured mixing, "
+            "blockwise companding, blockwise subtractive dither, blockwise D4 lattice rounding, "
+            "and a twopass+dither combination."
+        )
     if args.turbo_bits >= 2:
         print(
             "turboquant_prod uses a second-stage QJL residual correction "
