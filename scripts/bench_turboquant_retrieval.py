@@ -160,6 +160,14 @@ def load_packed_adc_helper() -> ctypes.CDLL | None:
         ctypes.POINTER(ctypes.c_float),
     ]
     lib.turboquant_blockhadamard_packed4_scores_t_mt_f32.restype = None
+    lib.turboquant_blockhadamard_packed4_profile_reset.argtypes = []
+    lib.turboquant_blockhadamard_packed4_profile_reset.restype = None
+    lib.turboquant_blockhadamard_packed4_profile_get.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    lib.turboquant_blockhadamard_packed4_profile_get.restype = None
     return lib
 
 
@@ -774,8 +782,34 @@ def packed_lookup_scores_blockhadamard_packed4_transposed(
             ctypes.c_size_t(n_rows),
             ctypes.c_size_t(dim),
             scores.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        )
+    )
     return scores
+
+
+def reset_blockhadamard_packed4_profile() -> None:
+    lib = load_packed_adc_helper()
+    if lib is None:
+        return
+    lib.turboquant_blockhadamard_packed4_profile_reset()
+
+
+def get_blockhadamard_packed4_profile() -> dict[str, float | int] | None:
+    lib = load_packed_adc_helper()
+    if lib is None:
+        return None
+    build_ms = ctypes.c_double()
+    score_ms = ctypes.c_double()
+    calls = ctypes.c_uint64()
+    lib.turboquant_blockhadamard_packed4_profile_get(
+        ctypes.byref(build_ms),
+        ctypes.byref(score_ms),
+        ctypes.byref(calls),
+    )
+    return {
+        "c_build_ms_total": float(build_ms.value),
+        "c_score_ms_total": float(score_ms.value),
+        "c_calls": int(calls.value),
+    }
 
 
 def expand_group_scales(group_scales: np.ndarray, dim: int, group_size: int) -> np.ndarray:
@@ -793,6 +827,7 @@ class EvalResult:
     search_avg_ms: float
     hit1: float
     recall_at_k: float
+    stage_profile: dict[str, float | int] | None = None
 
 
 def average_eval_results(rows: list[EvalResult]) -> EvalResult:
@@ -809,6 +844,7 @@ def average_eval_results(rows: list[EvalResult]) -> EvalResult:
         search_avg_ms=avg_ms([row.search_avg_ms for row in rows]),
         hit1=avg_ms([row.hit1 for row in rows]),
         recall_at_k=avg_ms([row.recall_at_k for row in rows]),
+        stage_profile=first.stage_profile,
     )
 
 
@@ -855,6 +891,12 @@ class RetrievalMethod:
 
     def bits_per_dim(self, dim: int) -> float:
         return self.bytes_per_vec() * 8.0 / float(dim)
+
+    def reset_profile(self) -> None:
+        return None
+
+    def profile_summary(self) -> dict[str, float | int] | None:
+        return None
 
 
 class Fp16Method(RetrievalMethod):
@@ -1074,6 +1116,8 @@ class TurboQuantBlockHadamardPackedMethod(RetrievalMethod):
         self.norms: np.ndarray | None = None
         self.centers: np.ndarray | None = None
         self.dim = 0
+        self.transform_ms_total = 0.0
+        self.transform_calls = 0
 
     def fit(self, base: np.ndarray) -> None:
         if self.bits != 4:
@@ -1092,11 +1136,16 @@ class TurboQuantBlockHadamardPackedMethod(RetrievalMethod):
         self.packed_codes = pack_nibbles(codes)
         self.packed_codes_t = transpose_packed_codes(self.packed_codes)
         self.norms = maybe_store_norms(norms)
+        self.transform_ms_total = 0.0
+        self.transform_calls = 0
 
     def search(self, query: np.ndarray, k: int) -> np.ndarray:
         if self.packed_codes_t is None or self.centers is None:
             raise RuntimeError("fit must run first")
+        t0 = time.perf_counter()
         q_rot = structured_block_hadamard_vec(query, self.perm, self.signs, self.blocks)
+        self.transform_ms_total += (time.perf_counter() - t0) * 1000.0
+        self.transform_calls += 1
         coeffs = (q_rot / math.sqrt(self.dim)).astype(np.float32, copy=False)
         scores = packed_lookup_scores_blockhadamard_packed4_transposed(
             self.packed_codes_t,
@@ -1117,6 +1166,26 @@ class TurboQuantBlockHadamardPackedMethod(RetrievalMethod):
         if self.centers is not None:
             total += int(self.centers.nbytes)
         return total
+
+    def reset_profile(self) -> None:
+        self.transform_ms_total = 0.0
+        self.transform_calls = 0
+        reset_blockhadamard_packed4_profile()
+
+    def profile_summary(self) -> dict[str, float | int] | None:
+        helper_profile = get_blockhadamard_packed4_profile()
+        if helper_profile is None:
+            return None
+        calls = max(1, int(helper_profile["c_calls"]))
+        return {
+            "query_transform_ms_total": self.transform_ms_total,
+            "query_transform_ms_per_query": self.transform_ms_total / max(1, self.transform_calls),
+            "c_build_ms_total": float(helper_profile["c_build_ms_total"]),
+            "c_build_ms_per_query": float(helper_profile["c_build_ms_total"]) / calls,
+            "c_score_ms_total": float(helper_profile["c_score_ms_total"]),
+            "c_score_ms_per_query": float(helper_profile["c_score_ms_total"]) / calls,
+            "c_calls": int(helper_profile["c_calls"]),
+        }
 
 
 class TurboQuantBlockHadamardWhitenedMethod(RetrievalMethod):
@@ -1748,6 +1817,7 @@ def evaluate_method(
     queries: np.ndarray,
     gt_ids: list[np.ndarray],
     k: int,
+    profile_packed_stages: bool = False,
 ) -> EvalResult:
     t0 = time.perf_counter()
     method.fit(base)
@@ -1756,6 +1826,8 @@ def evaluate_method(
     latencies: list[float] = []
     hit1_parts: list[float] = []
     recall_parts: list[float] = []
+    if profile_packed_stages:
+        method.reset_profile()
     for q, gt in zip(queries, gt_ids, strict=True):
         q0 = time.perf_counter()
         found = method.search(q, k)
@@ -1774,6 +1846,7 @@ def evaluate_method(
         search_avg_ms=avg_ms(latencies),
         hit1=avg_ms(hit1_parts),
         recall_at_k=avg_ms(recall_parts),
+        stage_profile=method.profile_summary() if profile_packed_stages else None,
     )
 
 
@@ -1790,6 +1863,18 @@ def print_results(title: str, rows: list[EvalResult]) -> None:
             f"{row.metadata_kb:>10.1f} {row.encode_ms:>11.1f} {row.search_p50_ms:>9.3f} "
             f"{row.search_avg_ms:>9.3f} {row.hit1:>8.2f} {row.recall_at_k:>10.2f}"
         )
+    profiled = [row for row in rows if row.stage_profile]
+    if profiled:
+        print("\nStage profile")
+        print("=============")
+        for row in profiled:
+            profile = row.stage_profile or {}
+            print(
+                f"{row.method}: transform={profile.get('query_transform_ms_per_query', 0.0):.3f} ms/query "
+                f"c_build={profile.get('c_build_ms_per_query', 0.0):.3f} ms/query "
+                f"c_score={profile.get('c_score_ms_per_query', 0.0):.3f} ms/query "
+                f"calls={int(profile.get('c_calls', 0))}"
+            )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1813,6 +1898,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--turbo-bits", type=int, default=4)
+    ap.add_argument("--profile-packed-stages", action="store_true", help="Print packed blockhadamard stage timings")
     ap.add_argument("--pq-m", type=int, default=0, help="PQ subvector count (0=auto)")
     ap.add_argument("--pq-bits", type=int, default=8)
     ap.add_argument("--pq-max-train", type=int, default=20000)
@@ -1950,7 +2036,7 @@ def evaluate_rows(base: np.ndarray, queries: np.ndarray, metric: str, args: argp
 
     methods = build_methods(base, args)
     for method in methods:
-        rows.append(evaluate_method(method, base, queries, gt_ids, args.k))
+        rows.append(evaluate_method(method, base, queries, gt_ids, args.k, args.profile_packed_stages))
     return rows
 
 

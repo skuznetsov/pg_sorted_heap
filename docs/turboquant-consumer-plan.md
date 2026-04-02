@@ -494,6 +494,35 @@ Current repo status:
     comparison run
   - the remaining hot path is now concentrated even more clearly in the
     packed scorer itself, not in Python query-prep scaffolding
+  - to avoid guessing on the next kernel step, the evaluator now also has a
+    repo-owned `--profile-packed-stages` mode for
+    `turboquant_blockhadamard_packed4`
+    - it reports:
+      - Python query transform time
+      - C byte-table build time
+      - C packed scoring time
+  - vetted Gutenberg stage-profile repeats:
+    - repeat A:
+      - `turboquant_blockhadamard_packed4`: `11.717 ms` p50,
+        `11.527 ms` avg
+      - stage split:
+        - `transform=0.155 ms/query`
+        - `c_build=0.224 ms/query`
+        - `c_score=9.788 ms/query`
+    - repeat B:
+      - `turboquant_blockhadamard_packed4`: `8.105 ms` p50,
+        `8.589 ms` avg
+      - stage split:
+        - `transform=0.132 ms/query`
+        - `c_build=0.227 ms/query`
+        - `c_score=6.966 ms/query`
+  Narrow conclusion:
+  - the stage ordering is stable even when absolute latency moves:
+    `c_score` dominates, `c_build` is distant second, and query transform is
+    small
+  - the next kernelization branch should therefore target the packed scoring
+    loop first, not the byte-table builder and not further Python transform
+    cleanup
 
 ### Publication threshold
 

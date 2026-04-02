@@ -1,6 +1,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <time.h>
 #if !defined(_WIN32)
 #include <pthread.h>
 #endif
@@ -16,6 +17,38 @@
 #else
 #define TQ_EXPORT
 #endif
+
+static double g_tq_blockhadamard_packed4_build_ms = 0.0;
+static double g_tq_blockhadamard_packed4_score_ms = 0.0;
+static uint64_t g_tq_blockhadamard_packed4_calls = 0;
+
+static double tq_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+}
+
+TQ_EXPORT void turboquant_blockhadamard_packed4_profile_reset(void) {
+    g_tq_blockhadamard_packed4_build_ms = 0.0;
+    g_tq_blockhadamard_packed4_score_ms = 0.0;
+    g_tq_blockhadamard_packed4_calls = 0;
+}
+
+TQ_EXPORT void turboquant_blockhadamard_packed4_profile_get(
+    double *build_ms,
+    double *score_ms,
+    uint64_t *calls
+) {
+    if (build_ms != NULL) {
+        *build_ms = g_tq_blockhadamard_packed4_build_ms;
+    }
+    if (score_ms != NULL) {
+        *score_ms = g_tq_blockhadamard_packed4_score_ms;
+    }
+    if (calls != NULL) {
+        *calls = g_tq_blockhadamard_packed4_calls;
+    }
+}
 
 TQ_EXPORT void turboquant_packed_adc_scores_f32(
     const uint8_t *TQ_RESTRICT packed_codes,
@@ -177,7 +210,9 @@ TQ_EXPORT void turboquant_blockhadamard_packed4_scores_t_f32(
     const size_t n_bytes = (dim + 1u) / 2u;
     float *byte_tables = (float *)malloc(n_bytes * 256u * sizeof(float));
     if (byte_tables != NULL) {
+        const double build_t0 = tq_now_ms();
         tq_blockhadamard_packed4_build_byte_tables(coeffs, centers, dim, byte_tables);
+        const double score_t0 = tq_now_ms();
         turboquant_packed_adc_scores_t_f32(
             packed_codes_t,
             byte_tables,
@@ -186,9 +221,13 @@ TQ_EXPORT void turboquant_blockhadamard_packed4_scores_t_f32(
             n_bytes,
             out_scores
         );
+        g_tq_blockhadamard_packed4_build_ms += score_t0 - build_t0;
+        g_tq_blockhadamard_packed4_score_ms += tq_now_ms() - score_t0;
+        g_tq_blockhadamard_packed4_calls += 1;
         free(byte_tables);
         return;
     }
+    const double score_t0 = tq_now_ms();
     tq_blockhadamard_packed4_score_range(
         packed_codes_t,
         coeffs,
@@ -200,6 +239,8 @@ TQ_EXPORT void turboquant_blockhadamard_packed4_scores_t_f32(
         n_rows,
         out_scores
     );
+    g_tq_blockhadamard_packed4_score_ms += tq_now_ms() - score_t0;
+    g_tq_blockhadamard_packed4_calls += 1;
 }
 
 #if !defined(_WIN32)
@@ -352,7 +393,9 @@ TQ_EXPORT void turboquant_blockhadamard_packed4_scores_t_mt_f32(
     const size_t n_bytes = (dim + 1u) / 2u;
     float *byte_tables = (float *)malloc(n_bytes * 256u * sizeof(float));
     if (byte_tables != NULL) {
+        const double build_t0 = tq_now_ms();
         tq_blockhadamard_packed4_build_byte_tables(coeffs, centers, dim, byte_tables);
+        const double score_t0 = tq_now_ms();
         turboquant_packed_adc_scores_t_mt_f32(
             packed_codes_t,
             byte_tables,
@@ -362,6 +405,9 @@ TQ_EXPORT void turboquant_blockhadamard_packed4_scores_t_mt_f32(
             n_threads,
             out_scores
         );
+        g_tq_blockhadamard_packed4_build_ms += score_t0 - build_t0;
+        g_tq_blockhadamard_packed4_score_ms += tq_now_ms() - score_t0;
+        g_tq_blockhadamard_packed4_calls += 1;
         free(byte_tables);
         return;
     }
