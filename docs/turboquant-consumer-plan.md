@@ -387,6 +387,42 @@ Current repo status:
     it loses both `hit@1` and `recall@10` relative to plain `block32_dither`
   - therefore the next kernelization candidate should stay centered on plain
     `blockhadamard` first, not on the dim-only dither surrogate
+  - later local experiments on the same helper produced a useful negative
+    pattern: more C-side micro-tuning of the packed scorer itself did not
+    give robust wins
+    - refuted branches:
+      - tiled threaded worker
+      - pointer-increment address arithmetic / local-offset rewrite
+      - static pthread pool
+  - the next real speedup instead came from the Python side: replacing the
+    per-query `score_luts_to_byte_tables()` Python loop with vectorized nibble
+    table materialization
+    - direct `2880 x 16` microbench:
+      - old builder: `2.233 ms` p50, `2.251 ms` avg
+      - vectorized builder: `1.052 ms` p50, `1.054 ms` avg
+      - outputs remained `allclose`
+    - packed-only vetted Gutenberg repeats after that change:
+      - repeat A:
+        - `turboquant_blockhadamard_packed4`: `98.0% hit@1`,
+          `91.20% recall@10`, `28321.1 ms` encode, `12.864 ms` p50
+      - repeat B:
+        - `turboquant_blockhadamard_packed4`: `98.0% hit@1`,
+          `91.20% recall@10`, `28173.8 ms` encode, `13.058 ms` p50
+    - one mixed-method vetted run on the same code also showed:
+      - `turboquant_blockhadamard`: `98.0% hit@1`, `91.20% recall@10`,
+        `33314.6 ms` encode, `20.542 ms` p50
+      - `turboquant_blockhadamard_packed4`: `98.0% hit@1`,
+        `91.20% recall@10`, `33386.9 ms` encode, `12.251 ms` p50
+  Narrow conclusion:
+  - the remaining packed-path tax was not just in the C helper; per-query LUT
+    materialization was a first-class bottleneck
+  - after vectorizing that stage, the packed `blockhadamard` lane is now
+    consistently around `12.9-13.1 ms` p50 on packed-only vetted Gutenberg
+    runs while preserving identical quality
+  - this is the first repeatable point where the packed lane is materially
+    faster than its earlier `17-20 ms` helper-era plateau, so future kernel
+    work should treat LUT build + scoring as one fused path rather than chase
+    more helper-thread micro-optimizations in isolation
 
 ### Publication threshold
 

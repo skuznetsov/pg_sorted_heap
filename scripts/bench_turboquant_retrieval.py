@@ -77,6 +77,10 @@ DATASETS = {
     },
 }
 
+BYTE_CODES = np.arange(256, dtype=np.uint8)
+BYTE_LO_NIBBLES = (BYTE_CODES & 0x0F).astype(np.intp, copy=False)
+BYTE_HI_NIBBLES = (BYTE_CODES >> 4).astype(np.intp, copy=False)
+
 
 def packed_adc_helper_path() -> Path:
     suffix = ".dylib" if sys.platform == "darwin" else ".so"
@@ -526,12 +530,9 @@ def transpose_packed_codes(packed_codes: np.ndarray) -> np.ndarray:
 
 
 def nibble_pair_lut(lo_values: np.ndarray, hi_values: np.ndarray | None = None) -> np.ndarray:
-    byte_codes = np.arange(256, dtype=np.uint8)
-    lo = byte_codes & 0x0F
-    table = lo_values[lo].astype(np.float32, copy=False)
+    table = lo_values[BYTE_LO_NIBBLES].astype(np.float32, copy=False)
     if hi_values is not None:
-        hi = byte_codes >> 4
-        table = table + hi_values[hi]
+        table = table + hi_values[BYTE_HI_NIBBLES]
     return table.astype(np.float32, copy=False)
 
 
@@ -570,13 +571,15 @@ def deterministic_dither(dim: int, seed: int, step: float) -> np.ndarray:
 def score_luts_to_byte_tables(score_luts: np.ndarray) -> np.ndarray:
     if score_luts.ndim != 2:
         raise ValueError("score_luts_to_byte_tables expects a 2-D array")
-    tables = np.empty(((score_luts.shape[0] + 1) // 2, 256), dtype=np.float32)
-    table_idx = 0
-    for start in range(0, score_luts.shape[0], 2):
-        lo_values = score_luts[start]
-        hi_values = score_luts[start + 1] if start + 1 < score_luts.shape[0] else None
-        tables[table_idx] = nibble_pair_lut(lo_values, hi_values)
-        table_idx += 1
+    lo_tables = np.ascontiguousarray(score_luts[0::2][:, BYTE_LO_NIBBLES], dtype=np.float32)
+    if score_luts.shape[0] % 2 == 0:
+        hi_tables = np.ascontiguousarray(score_luts[1::2][:, BYTE_HI_NIBBLES], dtype=np.float32)
+        tables = lo_tables + hi_tables
+    else:
+        tables = lo_tables
+        if score_luts.shape[0] > 1:
+            hi_tables = np.ascontiguousarray(score_luts[1::2][:, BYTE_HI_NIBBLES], dtype=np.float32)
+            tables[:-1] += hi_tables
     return tables
 
 
