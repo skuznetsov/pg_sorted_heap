@@ -77,6 +77,8 @@ Current repo status:
   random orthogonal rotation + scalar quantization on rotated coordinates
 - the residual `1-bit` QJL inner-product correction stage is **not** implemented
   in this first branch
+- SQL-backed inputs are supported, so the evaluator can run on a real
+  Cogniformerus-derived embedding set without touching the stable AM path
 
 Inputs:
 

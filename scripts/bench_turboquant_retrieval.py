@@ -359,11 +359,12 @@ class PQKMeansMethod(RetrievalMethod):
         for part in range(self.m):
             start = part * self.dsub
             stop = start + self.dsub
+            n_clusters = min(self.ksub, train.shape[0])
             km = MiniBatchKMeans(
-                n_clusters=self.ksub,
+                n_clusters=n_clusters,
                 random_state=self.seed + part,
                 n_init=1,
-                batch_size=min(8192, max(1024, self.ksub * 8)),
+                batch_size=min(8192, max(1024, n_clusters * 8)),
                 max_iter=100,
                 reassignment_ratio=0.0,
             )
@@ -418,9 +419,7 @@ class TurboQuantMSEMethod(RetrievalMethod):
         self.decoded_rot = self.centers[codes] / math.sqrt(self.dim)
 
     def search(self, query: np.ndarray, k: int) -> np.ndarray:
-        q_norm = max(float(np.linalg.norm(query)), 1e-12)
-        q_unit = query / q_norm
-        q_rot = q_unit @ self.rotation
+        q_rot = query @ self.rotation
         scores = self.decoded_rot @ q_rot
         scores *= self.norms
         return topk_indices(scores, k)
@@ -579,7 +578,7 @@ def main() -> int:
     for method in methods:
         rows.append(evaluate_method(method, base, queries, gt_ids, args.k))
 
-    source_name = args.dataset or str(args.vectors) or "postgresql"
+    source_name = args.dataset or (str(args.vectors) if args.vectors else None) or "postgresql"
     print(
         f"turboquant offline retrieval eval | source={source_name} metric={metric} "
         f"base={base.shape[0]} queries={queries.shape[0]} dim={base.shape[1]} k={args.k}"
