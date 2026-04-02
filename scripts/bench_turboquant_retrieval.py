@@ -116,6 +116,15 @@ def load_packed_adc_helper() -> ctypes.CDLL | None:
         ctypes.POINTER(ctypes.c_float),
     ]
     lib.turboquant_packed_adc_scores_f32.restype = None
+    lib.turboquant_packed_adc_scores_t_f32.argtypes = [
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.turboquant_packed_adc_scores_t_f32.restype = None
     return lib
 
 
@@ -490,6 +499,12 @@ def pack_nibbles(codes: np.ndarray) -> np.ndarray:
     return packed
 
 
+def transpose_packed_codes(packed_codes: np.ndarray) -> np.ndarray:
+    if packed_codes.ndim != 2:
+        raise ValueError("transpose_packed_codes expects a 2-D array")
+    return np.ascontiguousarray(packed_codes.T)
+
+
 def nibble_pair_lut(lo_values: np.ndarray, hi_values: np.ndarray | None = None) -> np.ndarray:
     byte_codes = np.arange(256, dtype=np.uint8)
     lo = byte_codes & 0x0F
@@ -570,6 +585,49 @@ def packed_lookup_scores(
         norm_ptr,
         ctypes.c_size_t(packed_codes.shape[0]),
         ctypes.c_size_t(packed_codes.shape[1]),
+        scores.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+    )
+    return scores
+
+
+def packed_lookup_scores_transposed_python(
+    packed_codes_t: np.ndarray,
+    byte_tables: np.ndarray,
+    norms: np.ndarray | None = None,
+) -> np.ndarray:
+    scores = np.zeros(packed_codes_t.shape[1], dtype=np.float32)
+    for byte_idx in range(packed_codes_t.shape[0]):
+        scores += byte_tables[byte_idx][packed_codes_t[byte_idx]]
+    if norms is not None:
+        scores *= norms
+    return scores
+
+
+def packed_lookup_scores_transposed(
+    packed_codes_t: np.ndarray,
+    byte_tables: np.ndarray,
+    norms: np.ndarray | None = None,
+) -> np.ndarray:
+    if byte_tables.ndim != 2 or byte_tables.shape[1] != 256:
+        raise ValueError("packed_lookup_scores_transposed expects byte_tables shaped [n_bytes, 256]")
+    lib = load_packed_adc_helper()
+    if lib is None:
+        return packed_lookup_scores_transposed_python(packed_codes_t, byte_tables, norms)
+    packed_codes_t = np.ascontiguousarray(packed_codes_t, dtype=np.uint8)
+    byte_tables = np.ascontiguousarray(byte_tables, dtype=np.float32)
+    norms_arr = None if norms is None else np.ascontiguousarray(norms, dtype=np.float32)
+    scores = np.empty(packed_codes_t.shape[1], dtype=np.float32)
+    norm_ptr = (
+        ctypes.cast(0, ctypes.POINTER(ctypes.c_float))
+        if norms_arr is None
+        else norms_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    )
+    lib.turboquant_packed_adc_scores_t_f32(
+        packed_codes_t.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        byte_tables.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        norm_ptr,
+        ctypes.c_size_t(packed_codes_t.shape[1]),
+        ctypes.c_size_t(packed_codes_t.shape[0]),
         scores.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
     )
     return scores
@@ -867,6 +925,7 @@ class TurboQuantBlockHadamardPackedMethod(RetrievalMethod):
         self.signs: np.ndarray | None = None
         self.blocks: list[int] = []
         self.packed_codes: np.ndarray | None = None
+        self.packed_codes_t: np.ndarray | None = None
         self.norms: np.ndarray | None = None
         self.centers: np.ndarray | None = None
         self.dim = 0
@@ -886,15 +945,20 @@ class TurboQuantBlockHadamardPackedMethod(RetrievalMethod):
         rotated = structured_block_hadamard(unit, self.perm, self.signs, self.blocks) * math.sqrt(self.dim)
         codes = np.digitize(rotated, bounds[1:-1], right=False).astype(np.uint8)
         self.packed_codes = pack_nibbles(codes)
+        self.packed_codes_t = transpose_packed_codes(self.packed_codes)
         self.norms = maybe_store_norms(norms)
 
     def search(self, query: np.ndarray, k: int) -> np.ndarray:
-        if self.packed_codes is None or self.centers is None:
+        if self.packed_codes_t is None or self.centers is None:
             raise RuntimeError("fit must run first")
         q_rot = structured_block_hadamard(query[np.newaxis, :], self.perm, self.signs, self.blocks)[0]
         coeffs = (q_rot / math.sqrt(self.dim)).astype(np.float32, copy=False)
         score_luts = coeffs[:, None] * self.centers[None, :]
-        scores = packed_lookup_scores(self.packed_codes, score_luts_to_byte_tables(score_luts), self.norms)
+        scores = packed_lookup_scores_transposed(
+            self.packed_codes_t,
+            score_luts_to_byte_tables(score_luts),
+            self.norms,
+        )
         return topk_indices(scores, k)
 
     def bytes_per_vec(self) -> float:

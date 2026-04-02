@@ -100,6 +100,8 @@ Current repo status:
   - explicit build entry point: `make build-turboquant-packed-helper`
   - the evaluator also auto-builds/loads it via `ctypes` when available and
     falls back to Python otherwise
+  - the current strongest helper path is byte-major/transposed for the plain
+    `blockhadamard_packed4` lane
 - `turboquant_block32_dimdither_packed4` now exists as a kernel-friendly
   dimension-only dither analogue for the `block32` family; it avoids
   per-value random dither state so it can be fused later if it earns its keep
@@ -326,10 +328,16 @@ Current repo status:
     - `turboquant_blockhadamard_packed4`: `98.0% hit@1`, `91.20% recall@10`,
       `28474.8 ms` encode, `824.263 ms` p50
   - after the tiny C helper path (`packed_adc_backend=c-helper`):
-    - `turboquant_blockhadamard`: `98.0% hit@1`, `91.20% recall@10`,
-      `27532.1 ms` encode, `17.208 ms` p50
-    - `turboquant_blockhadamard_packed4`: `98.0% hit@1`, `91.20% recall@10`,
-      `27655.5 ms` encode, `96.090 ms` p50
+    - first row-major C helper:
+      - `turboquant_blockhadamard`: `98.0% hit@1`, `91.20% recall@10`,
+        `27532.1 ms` encode, `17.208 ms` p50
+      - `turboquant_blockhadamard_packed4`: `98.0% hit@1`, `91.20% recall@10`,
+        `27655.5 ms` encode, `96.090 ms` p50
+    - then byte-major/transposed C helper:
+      - `turboquant_blockhadamard`: `98.0% hit@1`, `91.20% recall@10`,
+        `28624.9 ms` encode, `14.287 ms` p50
+      - `turboquant_blockhadamard_packed4`: `98.0% hit@1`, `91.20% recall@10`,
+        `27996.0 ms` encode, `55.060 ms` p50
   - `turboquant_block32_dither`: `100.0% hit@1`, `91.80% recall@10`,
     `22886.3 ms` encode, `23.821 ms` p50
   - `turboquant_block32_dimdither_packed4`: `96.0% hit@1`, `90.00% recall@10`,
@@ -338,11 +346,14 @@ Current repo status:
   - `blockhadamard_packed4` exactly preserves the plain `blockhadamard`
     ranking on Gutenberg, so the packed nibble-ADC path is algorithmically
     faithful
-  - the tiny C helper already cuts packed `blockhadamard` p50 by about `8.6x`
-    on vetted Gutenberg (`824.263 ms -> 96.090 ms`) without changing quality
-  - even after that win it remains about `5.8x` slower than plain
-    `blockhadamard`, so the next serious speedup still needs a tighter fused
-    low-level kernel path rather than more Python shaping
+  - moving from Python ADC to the first row-major C helper cut packed
+    `blockhadamard` p50 by about `8.6x`
+    (`824.263 ms -> 96.090 ms`) without changing quality
+  - moving again to the byte-major/transposed helper cut it by another
+    `1.7x` (`96.090 ms -> 55.060 ms`) with the same ranking
+  - even after that it remains about `3.9x` slower than plain
+    `blockhadamard`, so the next serious speedup should target the inner loop
+    itself with tighter SIMD/kernel work rather than more high-level shaping
   - the dimension-only dither analogue does **not** survive Gutenberg:
     it loses both `hit@1` and `recall@10` relative to plain `block32_dither`
   - therefore the next kernelization candidate should stay centered on plain
