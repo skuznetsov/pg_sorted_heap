@@ -1116,6 +1116,80 @@ class TurboQuantTwoPassBlockwiseDitheredMethod(RetrievalMethod):
         return total
 
 
+class TurboQuantTwoPassBlockwiseMethod(RetrievalMethod):
+    def __init__(self, bits: int, seed: int, group_size: int = 32) -> None:
+        super().__init__(f"turboquant_twopass_block{group_size}")
+        self.bits = bits
+        self.seed = seed
+        self.group_size = group_size
+        self.perm1: np.ndarray | None = None
+        self.signs1: np.ndarray | None = None
+        self.perm2: np.ndarray | None = None
+        self.signs2: np.ndarray | None = None
+        self.blocks: list[int] = []
+        self.codes: np.ndarray | None = None
+        self.norms: np.ndarray | None = None
+        self.decoded_rot: np.ndarray | None = None
+        self.centers: np.ndarray | None = None
+        self.bounds: np.ndarray | None = None
+        self.group_scales: np.ndarray | None = None
+        self.dim = 0
+
+    def fit(self, base: np.ndarray) -> None:
+        self.dim = base.shape[1]
+        rng1 = np.random.default_rng(self.seed)
+        rng2 = np.random.default_rng(self.seed + 1)
+        self.perm1 = rng1.permutation(self.dim).astype(np.int32)
+        self.signs1 = rng1.choice(np.array([-1.0, 1.0], dtype=np.float32), size=self.dim, replace=True)
+        self.perm2 = rng2.permutation(self.dim).astype(np.int32)
+        self.signs2 = rng2.choice(np.array([-1.0, 1.0], dtype=np.float32), size=self.dim, replace=True)
+        self.blocks = power_of_two_blocks(self.dim)
+        self.centers, self.bounds = gaussian_lloyd_max(self.bits)
+        norms = np.linalg.norm(base, axis=1).astype(np.float32)
+        unit = base / np.maximum(norms[:, None], 1e-12)
+        rotated = two_pass_block_hadamard(
+            unit,
+            self.perm1,
+            self.signs1,
+            self.perm2,
+            self.signs2,
+            self.blocks,
+        ) * math.sqrt(self.dim)
+        group_scales, expanded_scales = grouped_rms_scales(rotated, self.group_size)
+        equalized = rotated / expanded_scales
+        codes = np.digitize(equalized, self.bounds[1:-1], right=False).astype(np.uint8)
+        self.codes = codes
+        self.norms = maybe_store_norms(norms)
+        self.group_scales = group_scales
+        self.decoded_rot = (self.centers[codes] * expanded_scales) / math.sqrt(self.dim)
+
+    def search(self, query: np.ndarray, k: int) -> np.ndarray:
+        q_rot = two_pass_block_hadamard(
+            query[np.newaxis, :],
+            self.perm1,
+            self.signs1,
+            self.perm2,
+            self.signs2,
+            self.blocks,
+        )[0]
+        scores = self.decoded_rot @ q_rot
+        if self.norms is not None:
+            scores *= self.norms
+        return topk_indices(scores, k)
+
+    def bytes_per_vec(self) -> float:
+        if self.codes is None:
+            raise RuntimeError("fit must run first")
+        norm_bytes = 4.0 if self.norms is not None else 0.0
+        return float(self.codes.shape[1] * self.bits / 8.0 + norm_bytes)
+
+    def metadata_bytes(self) -> int:
+        total = 32
+        if self.group_scales is not None:
+            total += int(self.group_scales.nbytes)
+        return total
+
+
 class TurboQuantProdMethod(RetrievalMethod):
     def __init__(self, bits: int, seed: int) -> None:
         super().__init__("turboquant_prod")
@@ -1316,6 +1390,7 @@ def evaluate_rows(base: np.ndarray, queries: np.ndarray, metric: str, args: argp
         methods.append(TurboQuantBlockHadamardBlockwiseMethod(args.turbo_bits, args.seed))
         if args.turbo_research:
             methods.append(TurboQuantBlockHadamardTwoPassMethod(args.turbo_bits, args.seed))
+            methods.append(TurboQuantTwoPassBlockwiseMethod(args.turbo_bits, args.seed))
             methods.append(TurboQuantBlockwiseCompandedMethod(args.turbo_bits, args.seed))
             methods.append(TurboQuantBlockwiseDitheredMethod(args.turbo_bits, args.seed))
             methods.append(TurboQuantBlockwiseD4Method(args.turbo_bits, args.seed))
@@ -1440,8 +1515,8 @@ def main() -> int:
     if args.turbo_research:
         print(
             "turboquant research lanes add no-codebook experiments: twopass structured mixing, "
-            "blockwise companding, blockwise subtractive dither, blockwise D4 lattice rounding, "
-            "and a twopass+dither combination."
+            "twopass+block scaling, blockwise companding, blockwise subtractive dither, "
+            "blockwise D4 lattice rounding, and a twopass+dither combination."
         )
     if args.turbo_bits >= 2:
         print(

@@ -216,6 +216,54 @@ Current repo status:
     `recall@10`
   - the current compander and D4 lanes are refuted on this real workload in
     their present form; they are not the next branch to invest in
+- one subsequent fresh rebuild of `code_graph_turboquant_eval` failed again
+  in the upstream Cogniformerus embedding path with a non-finite batch during
+  `code_reindex_graph`; instead of blocking the algorithm loop on that flake,
+  the next comparison pass used the valid `308`-row summary subset that had
+  already been materialized before the failure
+- verified on that partial live summary set (`308` rows, `5` folds,
+  `50` queries/fold, `4` bits):
+  - `turboquant_twopass_block32`: `hit@1=87.6%`, `recall@10=94.08%`
+  - `turboquant_block16_dither_c2.5`: `hit@1=91.2%`, `recall@10=94.36%`
+  - `turboquant_block64_dither_c3.0`: `hit@1=88.4%`, `recall@10=94.40%`
+  - `turboquant_twopass_block32_dither_c3.0`: `hit@1=91.6%`,
+    `recall@10=94.04%`
+  Narrow conclusion:
+  - there are tuned no-codebook settings that outperform the fixed
+    `group_size=32`, `clip=3.0` choices on this live slice
+  - `twopass_block32` is a real candidate, not just a theoretical combo
+  - but this slice is too narrow to justify promoting these tuned settings to
+    new defaults without a broader cross-check
+- cross-checked the strongest partial-live candidates on ANN-Benchmarks
+  `glove-100` and `nytimes-256` at `4` bits:
+  - `turboquant_twopass_block32` did not dominate:
+    - `glove-100`: `82.0% hit@1`, `86.2% recall@10`
+    - `nytimes-256`: `89.0% hit@1`, `89.9% recall@10`
+  - tuned dither settings also failed to generalize cleanly:
+    - `block16_dither_c2.5` was competitive on the live slice, but on
+      `nytimes-256` it fell to `87.6% recall@10`
+    - `block64_dither_c3.0` reached `94.40% recall@10` on the live slice,
+      but only `84.6%` on `glove-100` and `86.5%` on `nytimes-256`
+  Narrow conclusion:
+  - the tuned live-slice winners look workload-specific
+  - the strongest robust general lane is still plain `twopass`
+  - tuned dither and `twopass_block32` should remain research comparators, not
+    new evaluator defaults
+- synthetic scaling checks on the strongest structured lanes now extend to
+  `65536D`:
+  - `turboquant_blockhadamard_block32`: `fit_ms=390.5`, `search_ms=8.43`,
+    `meta_kb=8.02`
+  - `turboquant_blockhadamard_twopass`: `fit_ms=572.0`, `search_ms=8.74`,
+    `meta_kb=0.03`
+  - `turboquant_twopass_block32`: `fit_ms=595.9`, `search_ms=30.40`,
+    `meta_kb=8.03`
+  Narrow conclusion:
+  - the surviving structured lanes keep metadata linear in dimension; at
+    `65536D`, `block32`-style shared scales are still only about `8 KB`,
+    implying about `32 KB` at `262144D`
+  - `twopass_block32` currently carries a materially worse search-time
+    constant factor at higher dimension, so it is not the next general lane to
+    optimize or promote
 
 Inputs:
 
