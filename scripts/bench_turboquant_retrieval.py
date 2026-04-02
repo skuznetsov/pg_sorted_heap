@@ -19,6 +19,7 @@ Supported inputs:
   - ANN-Benchmarks HDF5 datasets (downloaded on demand)
   - generic .npy / .npz files
   - PostgreSQL SQL queries that return one vector column castable to text
+  - PostgreSQL shared-SQL holdout evaluation for tiny real datasets
 
 Examples:
   "$(./scripts/find_vector_python.sh)" ./scripts/bench_turboquant_retrieval.py \
@@ -28,6 +29,11 @@ Examples:
     --pg-dsn 'postgres://sergey@127.0.0.1/postgres' \
     --base-sql "SELECT embedding::text FROM my_table ORDER BY id LIMIT 2000" \
     --query-sql "SELECT embedding::text FROM my_queries ORDER BY qid LIMIT 50"
+
+  "$(./scripts/find_vector_python.sh)" ./scripts/bench_turboquant_retrieval.py \
+    --pg-dsn 'postgres://sergey@127.0.0.1/postgres' \
+    --shared-sql "SELECT embedding::text FROM my_table ORDER BY id LIMIT 200" \
+    --query-count 20 --folds 5
 """
 
 from __future__ import annotations
@@ -266,6 +272,38 @@ class EvalResult:
     recall_at_k: float
 
 
+def average_eval_results(rows: list[EvalResult]) -> EvalResult:
+    if not rows:
+        raise ValueError("rows must not be empty")
+    first = rows[0]
+    return EvalResult(
+        method=first.method,
+        bits_per_dim=avg_ms([row.bits_per_dim for row in rows]),
+        bytes_per_vec=avg_ms([row.bytes_per_vec for row in rows]),
+        metadata_kb=avg_ms([row.metadata_kb for row in rows]),
+        encode_ms=avg_ms([row.encode_ms for row in rows]),
+        search_p50_ms=avg_ms([row.search_p50_ms for row in rows]),
+        search_avg_ms=avg_ms([row.search_avg_ms for row in rows]),
+        hit1=avg_ms([row.hit1 for row in rows]),
+        recall_at_k=avg_ms([row.recall_at_k for row in rows]),
+    )
+
+
+def split_shared_vectors(vectors: np.ndarray, query_count: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    total = vectors.shape[0]
+    if query_count <= 0:
+        raise ValueError("query_count must be positive for shared holdout mode")
+    if query_count >= total:
+        raise ValueError(f"query_count={query_count} must be smaller than shared set size {total}")
+    rng = np.random.default_rng(seed)
+    query_idx = np.sort(rng.choice(total, size=query_count, replace=False))
+    query_mask = np.zeros(total, dtype=bool)
+    query_mask[query_idx] = True
+    base = vectors[~query_mask]
+    queries = vectors[query_mask]
+    return base.astype(np.float32, copy=False), queries.astype(np.float32, copy=False)
+
+
 class RetrievalMethod:
     def __init__(self, name: str) -> None:
         self.name = name
@@ -500,10 +538,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--queries", type=Path, help="Query vectors (.npy) for --vectors input")
     ap.add_argument("--base-sql", help="SQL returning one vector column for base vectors")
     ap.add_argument("--query-sql", help="SQL returning one vector column for query vectors")
+    ap.add_argument("--shared-sql", help="SQL returning one vector column for repeated holdout evaluation")
     ap.add_argument("--metric", choices=("cosine", "ip"), default="cosine")
     ap.add_argument("--cache-dir", type=Path, default=Path("/tmp/ann_real_cache"))
     ap.add_argument("--sample-size", type=int, default=4000)
     ap.add_argument("--query-count", type=int, default=50)
+    ap.add_argument("--folds", type=int, default=1, help="Repeated holdout folds for --shared-sql mode")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--turbo-bits", type=int, default=4)
@@ -517,33 +557,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def main() -> int:
-    args = build_arg_parser().parse_args()
-
-    if args.dataset:
-        base, queries, metric = load_ann_dataset(
-            args.dataset,
-            args.sample_size,
-            args.query_count,
-            args.seed,
-            args.cache_dir,
-        )
-    elif args.vectors:
-        if args.queries is None:
-            raise SystemExit("--queries is required with --vectors")
-        base, queries = load_numpy_dataset(args.vectors, args.queries)
-        metric = args.metric
-    else:
-        if not args.base_sql or not args.query_sql:
-            raise SystemExit("--base-sql and --query-sql are required with --pg-dsn")
-        base = load_pg_query_vectors(args.pg_dsn, args.base_sql)
-        queries = load_pg_query_vectors(args.pg_dsn, args.query_sql)
-        metric = args.metric
-
+def evaluate_rows(base: np.ndarray, queries: np.ndarray, metric: str, args: argparse.Namespace) -> list[EvalResult]:
     if base.ndim != 2 or queries.ndim != 2:
         raise SystemExit("base and query vectors must be 2-D arrays")
     if base.shape[1] != queries.shape[1]:
         raise SystemExit(f"dimension mismatch: base={base.shape[1]} query={queries.shape[1]}")
+    if base.shape[0] < args.k:
+        raise SystemExit(f"base size {base.shape[0]} must be >= k={args.k}")
 
     if metric == "cosine":
         base = normalize_rows(base)
@@ -577,12 +597,63 @@ def main() -> int:
 
     for method in methods:
         rows.append(evaluate_method(method, base, queries, gt_ids, args.k))
+    return rows
 
-    source_name = args.dataset or (str(args.vectors) if args.vectors else None) or "postgresql"
+
+def main() -> int:
+    args = build_arg_parser().parse_args()
+
+    folds = 1
+    shared: np.ndarray | None = None
+    if args.dataset:
+        base, queries, metric = load_ann_dataset(
+            args.dataset,
+            args.sample_size,
+            args.query_count,
+            args.seed,
+            args.cache_dir,
+        )
+    elif args.vectors:
+        if args.queries is None:
+            raise SystemExit("--queries is required with --vectors")
+        base, queries = load_numpy_dataset(args.vectors, args.queries)
+        metric = args.metric
+    else:
+        if args.shared_sql:
+            if args.base_sql or args.query_sql:
+                raise SystemExit("--shared-sql cannot be combined with --base-sql/--query-sql")
+            if args.folds <= 0:
+                raise SystemExit("--folds must be positive")
+            shared = load_pg_query_vectors(args.pg_dsn, args.shared_sql)
+            base, queries = split_shared_vectors(shared, args.query_count, args.seed)
+            folds = args.folds
+        else:
+            if not args.base_sql or not args.query_sql:
+                raise SystemExit("--base-sql and --query-sql are required with --pg-dsn")
+            base = load_pg_query_vectors(args.pg_dsn, args.base_sql)
+            queries = load_pg_query_vectors(args.pg_dsn, args.query_sql)
+        metric = args.metric
+
+    if args.shared_sql:
+        per_fold_rows: list[list[EvalResult]] = []
+        for fold_idx in range(args.folds):
+            fold_base, fold_queries = split_shared_vectors(shared, args.query_count, args.seed + fold_idx)
+            per_fold_rows.append(evaluate_rows(fold_base, fold_queries, metric, args))
+        rows = [
+            average_eval_results([fold_rows[row_idx] for fold_rows in per_fold_rows])
+            for row_idx in range(len(per_fold_rows[0]))
+        ]
+        source_name = "postgresql(shared_sql)"
+    else:
+        rows = evaluate_rows(base, queries, metric, args)
+        source_name = args.dataset or (str(args.vectors) if args.vectors else None) or "postgresql"
+
     print(
         f"turboquant offline retrieval eval | source={source_name} metric={metric} "
         f"base={base.shape[0]} queries={queries.shape[0]} dim={base.shape[1]} k={args.k}"
     )
+    if folds > 1:
+        print(f"holdout_folds={folds} query_count={queries.shape[0]} seed={args.seed}")
     print_results("Results", rows)
     print("\nCaveat: turboquant_mse here implements only the first-stage MSE path.")
     print("It does not yet include the residual 1-bit QJL inner-product correction stage.")

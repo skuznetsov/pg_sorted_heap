@@ -68,6 +68,8 @@ Current repo status:
 - implemented as `scripts/bench_turboquant_retrieval.py`
 - repo-owned entry point: `make bench-turboquant`
 - repo-owned SQL entry point: `make bench-turboquant-sql`
+- repo-owned repeated-holdout SQL entry point:
+  `make bench-turboquant-sql-holdout`
 - current scope is intentionally narrow:
   - float32 exact reference
   - float16 baseline
@@ -85,6 +87,13 @@ Current repo status:
   - `pq_kmeans`: `hit@1=100%`, `recall@5=100%`, `16 B/vec`
   - `turboquant_mse`: `hit@1=100%`, `recall@5=88%`, `196 B/vec`
   This is only a tiny real-data smoke signal, not a broad quality claim.
+- because the live local consumer-derived slice is tiny, the harness now also
+  supports repeated holdout folds from one shared SQL vector set so the real
+  signal can be averaged over multiple random splits instead of one ad hoc cut
+- verified on the same local `59`-row slice with `5` holdout folds
+  (`49` base / `10` query each fold):
+  - `pq_kmeans`: `hit@1=100%`, `recall@5=100%`
+  - `turboquant_mse`: `hit@1=90%`, `recall@5=91.2%`
 
 Inputs:
 
