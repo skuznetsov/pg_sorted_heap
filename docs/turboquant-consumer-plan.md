@@ -84,6 +84,10 @@ Current repo status:
 - `turboquant_blockhadamard` comparator now exists as a seed-derived
   sign+permutation+block-Hadamard rotation experiment intended to cut the
   dense rotation metadata cost of `turboquant_mse`
+- `turboquant_blockhadamard_whitened` now exists as a diagonal-variance
+  equalization experiment on top of the structured block-Hadamard transform
+- `turboquant_blockhadamard_block32` now exists as a coarse blockwise-RMS
+  equalization experiment on top of the structured block-Hadamard transform
 - current `turboquant_mse` is only the first-stage MSE path:
   random orthogonal rotation + scalar quantization on rotated coordinates
 - the residual `1-bit` QJL inner-product correction stage is **not** implemented
@@ -149,6 +153,35 @@ Current repo status:
     `hit@1` but slightly higher `recall@10`
   - this is now the strongest next TurboQuant lane, because it removes the
     evaluator's biggest practical weakness without widening the engine surface
+- verified on the same clean code-graph summary set with a bounded
+  `exact + mse + blockhadamard + whitened + block32 + prod` bit sweep:
+  - `2` bits:
+    - `turboquant_blockhadamard`: `hit@1=71.9%`, `recall@10=80.00%`
+    - `turboquant_blockhadamard_whitened`: `hit@1=72.6%`, `recall@10=79.45%`
+    - `turboquant_blockhadamard_block32`: `hit@1=71.7%`, `recall@10=79.86%`
+  - `3` bits:
+    - `turboquant_blockhadamard`: `hit@1=81.8%`, `recall@10=86.14%`
+    - `turboquant_blockhadamard_whitened`: `hit@1=78.7%`, `recall@10=84.55%`
+    - `turboquant_blockhadamard_block32`: `hit@1=80.8%`, `recall@10=86.13%`
+  - `4` bits, confirmatory rerun on the compact-metadata implementation:
+    - `turboquant_blockhadamard`: `hit@1=86.2%`, `recall@10=91.06%`,
+      `384 B/vec`, effectively `0 KB` metadata, `48.1 ms` encode
+    - `turboquant_blockhadamard_whitened`: `hit@1=85.9%`, `recall@10=90.13%`,
+      `384 B/vec`, `3.0 KB` metadata, `44.3 ms` encode
+    - `turboquant_blockhadamard_block32`: `hit@1=86.3%`, `recall@10=91.57%`,
+      `384 B/vec`, `0.1 KB` metadata, `55.1 ms` encode
+  Narrow conclusion:
+  - diagonal whitening is not the right next lane for this workload; it
+    underperforms plain `blockhadamard` on real `recall@10` across `2-4` bits
+  - coarse blockwise equalization is materially better behaved than
+    diagonal whitening
+  - `block32` is the current strongest experimental TurboQuant point at
+    `4` bits on the real code-graph set: best `recall@10` among the
+    evaluated TurboQuant lanes, while preserving tiny metadata and cheap
+    encode cost relative to dense `mse`
+  - `block32` does not dominate every lower-bit point, so the next likely
+    improvement is empirical scalar codebooks on top of the structured
+    transform, not more diagonal whitening or residual-QJL work
 
 Inputs:
 
