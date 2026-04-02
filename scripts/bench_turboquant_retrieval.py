@@ -396,6 +396,24 @@ def fwht_rows(block: np.ndarray) -> np.ndarray:
     return out
 
 
+def fwht_vec(block: np.ndarray) -> np.ndarray:
+    out = block.astype(np.float32, copy=True)
+    width = out.shape[0]
+    if width <= 1:
+        return out
+    h = 1
+    while h < width:
+        reshaped = out.reshape(-1, 2 * h)
+        left = reshaped[:, :h].copy()
+        right = reshaped[:, h : 2 * h].copy()
+        reshaped[:, :h] = left + right
+        reshaped[:, h : 2 * h] = left - right
+        out = reshaped.reshape(width)
+        h *= 2
+    out /= math.sqrt(width)
+    return out
+
+
 def structured_block_hadamard(
     x: np.ndarray,
     perm: np.ndarray,
@@ -410,6 +428,24 @@ def structured_block_hadamard(
     for block in blocks:
         chunk = mixed[:, offset : offset + block]
         out[:, offset : offset + block] = fwht_rows(chunk)
+        offset += block
+    return out
+
+
+def structured_block_hadamard_vec(
+    x: np.ndarray,
+    perm: np.ndarray,
+    signs: np.ndarray,
+    blocks: list[int],
+) -> np.ndarray:
+    if x.ndim != 1:
+        raise ValueError("structured_block_hadamard_vec expects a 1-D array")
+    mixed = x[perm] * signs
+    out = np.empty_like(mixed, dtype=np.float32)
+    offset = 0
+    for block in blocks:
+        chunk = mixed[offset : offset + block]
+        out[offset : offset + block] = fwht_vec(chunk)
         offset += block
     return out
 
@@ -1008,7 +1044,7 @@ class TurboQuantBlockHadamardMethod(RetrievalMethod):
         self.decoded_rot = self.centers[codes] / math.sqrt(self.dim)
 
     def search(self, query: np.ndarray, k: int) -> np.ndarray:
-        q_rot = structured_block_hadamard(query[np.newaxis, :], self.perm, self.signs, self.blocks)[0]
+        q_rot = structured_block_hadamard_vec(query, self.perm, self.signs, self.blocks)
         scores = self.decoded_rot @ q_rot
         if self.norms is not None:
             scores *= self.norms
@@ -1060,7 +1096,7 @@ class TurboQuantBlockHadamardPackedMethod(RetrievalMethod):
     def search(self, query: np.ndarray, k: int) -> np.ndarray:
         if self.packed_codes_t is None or self.centers is None:
             raise RuntimeError("fit must run first")
-        q_rot = structured_block_hadamard(query[np.newaxis, :], self.perm, self.signs, self.blocks)[0]
+        q_rot = structured_block_hadamard_vec(query, self.perm, self.signs, self.blocks)
         coeffs = (q_rot / math.sqrt(self.dim)).astype(np.float32, copy=False)
         scores = packed_lookup_scores_blockhadamard_packed4_transposed(
             self.packed_codes_t,

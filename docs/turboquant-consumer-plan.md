@@ -461,6 +461,39 @@ Current repo status:
     `blockhadamard` on the vetted Gutenberg target, so the next kernel work
     should start from this dedicated fused-build path, not from the refuted
     direct-nibble or thread-pool branches
+  - a further narrow cleanup then removed the remaining batch-style temporary
+    on the query transform side:
+    - added `fwht_vec(...)` and `structured_block_hadamard_vec(...)`
+    - switched single-query `blockhadamard` and `blockhadamard_packed4`
+      search paths from
+      `structured_block_hadamard(query[np.newaxis, ...])[0]`
+      to the 1-D fast path
+  - adversary equivalence check for the 1-D transform path:
+    - random `dim=31`, `dim=32`, and `dim=2880` queries matched the old
+      2-D batch path with `allclose=True` and `max_abs=0.0`
+    - direct transform microbench on `2880D`:
+      - old 2-D path: `0.132 ms` p50
+      - new 1-D path: `0.119 ms` p50
+  - vetted Gutenberg after the 1-D transform cleanup:
+    - packed-only repeat A:
+      - `turboquant_blockhadamard_packed4`: `98.0% hit@1`,
+        `91.20% recall@10`, `27602.2 ms` encode, `11.113 ms` p50
+    - packed-only repeat B:
+      - `turboquant_blockhadamard_packed4`: `98.0% hit@1`,
+        `91.20% recall@10`, `30029.0 ms` encode, `10.022 ms` p50
+    - mixed-method vetted run:
+      - `turboquant_blockhadamard`: `98.0% hit@1`, `91.20% recall@10`,
+        `27754.3 ms` encode, `17.477 ms` p50
+      - `turboquant_blockhadamard_packed4`: `98.0% hit@1`,
+        `91.20% recall@10`, `28228.5 ms` encode, `9.583 ms` p50
+  Narrow conclusion:
+  - this is a smaller win than the fused C-built-table branch, but it is
+    still a clean improvement with exact semantics
+  - the packed `blockhadamard` lane now lives around the `10-11 ms` band on
+    packed-only vetted Gutenberg runs and reached `9.583 ms` in the mixed
+    comparison run
+  - the remaining hot path is now concentrated even more clearly in the
+    packed scorer itself, not in Python query-prep scaffolding
 
 ### Publication threshold
 
