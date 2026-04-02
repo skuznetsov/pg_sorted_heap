@@ -103,7 +103,7 @@ Current repo status:
   - the current strongest helper path is byte-major/transposed for the plain
     `blockhadamard_packed4` lane
   - the current evaluator defaults to a coarse multi-threaded packed scorer for
-    large searches (`threads=min(6, cpu_count)` unless
+    large searches (`threads=min(8, cpu_count)` unless
     `TURBOQUANT_ADC_THREADS` overrides it)
 - `turboquant_block32_dimdither_packed4` now exists as a kernel-friendly
   dimension-only dither analogue for the `block32` family; it avoids
@@ -372,6 +372,17 @@ Current repo status:
   - that leaves packed `blockhadamard` only about `1.4x` slower than plain
     `blockhadamard` on this workload, which is the first point where an engine
     path looks genuinely plausible instead of merely interesting
+  - explicit thread sweep on the same vetted Gutenberg target gave:
+    - `threads=1`: `52.335 ms` p50
+    - `threads=2`: `35.796 ms` p50
+    - `threads=4`: `25.743 ms` p50
+    - `threads=6`: `19.046 ms` p50
+    - `threads=8`: `17.403 ms` p50
+    - `threads=12`: `18.818 ms` p50 with worse `avg_ms`
+  - narrow conclusion from that sweep:
+    - `8` is the best current default on this Apple M-series local box
+    - `12` does not help further on the real target, so the next step should
+      return to inner-loop work, not add more threads
   - the dimension-only dither analogue does **not** survive Gutenberg:
     it loses both `hit@1` and `recall@10` relative to plain `block32_dither`
   - therefore the next kernelization candidate should stay centered on plain

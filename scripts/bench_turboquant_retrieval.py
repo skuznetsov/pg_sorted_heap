@@ -149,7 +149,7 @@ def packed_adc_thread_count() -> int:
             return max(1, int(raw))
         except ValueError:
             return 1
-    return max(1, min(6, os.cpu_count() or 1))
+    return max(1, min(8, os.cpu_count() or 1))
 
 
 def median_ms(values: list[float]) -> float:
