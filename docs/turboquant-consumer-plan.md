@@ -783,8 +783,24 @@ Current repo status:
   - on 5K vectors IVF does not help speed (exhaustive already fast)
   - IVF value is at scale (50K+); recall saturates at nprobe=12 (90.0%)
   - CLI supports `--ivf-clusters`, `--ivf-nprobe`, `--ivf-cache-dir`
-  - status: VALIDATED on glove-100 + Gutenberg 5K subset; full 103K
-    sweep now feasible via caching but not yet run
+  - full 103K Gutenberg nprobe sweep (ivf32, 2880D, cosine, k=10):
+
+    | method / nprobe        | hit@1 | recall@10 | p50 ms |
+    |------------------------|-------|-----------|--------|
+    | block16_packed4_topk   |  80%  |    89.4%  |   8.0  |
+    | blockhadamard_p4_topk  |  86%  |    87.8%  |   7.9  |
+    | ivf32 nprobe=2         |  76%  |    80.2%  |   4.2  |
+    | ivf32 nprobe=4         |  82%  |    86.2%  |   7.8  |
+    | ivf32 nprobe=8         |  82%  |    87.6%  |  13.7  |
+    | ivf32 nprobe=16        |  82%  |    87.8%  |  25.4  |
+
+  - verdict: **IVF does not help at 103K scale** — exhaustive packed topk
+    (8ms) matches or beats IVF at all nprobe settings that achieve
+    comparable recall. IVF per-cluster overhead exceeds scan savings.
+  - IVF value requires 500K+ vectors where exhaustive scan dominates.
+  - centroid caching works (15ms warm vs 36s cold on full 103K).
+  - status: VALIDATED as correct, but NOT RECOMMENDED for the current
+    Gutenberg-scale workload. Exhaustive packed topk is the right choice.
 
 ### Publication threshold
 
