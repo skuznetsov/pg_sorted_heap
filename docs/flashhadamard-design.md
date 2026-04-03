@@ -306,20 +306,62 @@ Live KV hook parked as later optimization: only revisit if re-eval
 latency becomes the dominant bottleneck after the selective memory path
 is productionized.
 
-**Experiment 3: Selective memory end-to-end prototype**
+**Experiment 3: Selective memory e2e prototype — single-text PASS, robustness FAIL**
 
-Goal: long-session prototype with hot tail + sketch-retrieved old blocks.
+Single-text result (Gemma 3 4B, 844 tokens, k=5):
+- Full context: ppl=9.76
+- Recency only: ppl=25.36
+- Sketch-routed (PG-backed): ppl=10.23, 74% memory, 97% recovery
+- Retrieve overhead: 17.5ms (16ms embed + 1.5ms PG)
+- Script: `cogniformerus/bin/selective_memory_exp3.cr`
 
-Setup:
-- Long text (2K+ tokens, multiple documents/sessions)
-- Hot tail: last N tokens always in context
-- Cold blocks: older text stored in pg_sorted_heap with FlashHadamard sketch
-- On each generation step: retrieve top-k cold blocks, prepend to tail
-- Measure: perplexity, generation quality, total latency (retrieve + re-eval)
+Robustness pass (3 Gutenberg texts, 1024 tokens each, k=3 and k=5):
+- **Random block selection consistently outperforms sketch routing**
+- War and Peace k=3: random 95% recovery vs sketch 78%
+- Les Mis k=5: random 92% vs sketch 42%
+- Bleak House k=3: random 85% vs sketch 56%
+- Script: `cogniformerus/bin/selective_memory_robustness.cr`
 
-Gate:
-- PASS: quality near full-context, latency acceptable for interactive use
-- FAIL: re-eval latency too high OR quality poor on longer sessions
+Root cause: embedding similarity to the tail selects REDUNDANT context
+(semantically close to what model already sees in hot tail), not
+COMPLEMENTARY context. For perplexity, diverse prefix coverage matters
+more than semantic similarity to the current window.
+
+**Consequence: tail-similarity routing is REFUTED as a general method.**
+
+Baseline for any future memory routing is now `random blocks`, not
+`recency-only`. A routing signal that cannot beat random is not useful.
+
+**Current status of selective memory track: PARKED**
+
+What is validated:
+- pg_sorted_heap can serve blocks fast enough (Exp 0)
+- Exact token spill/restore is quality-neutral (Exp 2A)
+- FlashHadamard quantizer/retrieval (independent of routing)
+
+What is refuted:
+- "Retrieve blocks most similar to tail" as routing signal
+
+What is untested:
+- Coverage/diversity-based routing (MMR, DPP)
+- Recency + diversity hybrid
+- Attention-weight-based routing (needs KV access)
+
+Live KV hook: parked. No investment until a routing signal beats
+random robustly across texts.
+
+**Two independent tracks going forward:**
+
+Track A — FlashHadamard quantizer/retrieval (ACTIVE):
+- block16_packed4_topk and blockhadamard_packed4_topk validated
+- IVF centroid caching + Gutenberg nprobe frontier needed
+- Publishable as no-codebook packed ANN quantizer
+
+Track B — Selective memory routing (RESEARCH-ONLY):
+- Only offline experiments
+- Must beat random as baseline
+- Coverage/diversity objectives
+- No live hook until routing validated
 
 **Original Experiment 2 (replaced):**
 - Same long session, but with KV offload active
