@@ -248,14 +248,50 @@ Result (Gemma 3 4B, War and Peace excerpt, block_size=64, k=2): **PASS**
   perform identically. The gap between "text embedding of block" and
   "mean key vector of KV block" remains untested.
 
-**Experiment 2: End-to-end quality (only after 1B PASS)**
-- Same long session, but with actual KV offload active
-- Compare generation quality between:
-  a. Full KV cache (baseline)
-  b. Hot tail only (no recall)
-  c. Hot tail + FlashHadamard routed recall
+**Experiment 2A: Exact token spill/restore — PASS**
 
-**Experiment 1 (original, replaced by 1A+1B above):**
+Proves token-level spill/restore is quality-neutral:
+- Full context (618 tokens): ppl=12.47
+- Exact restore (618 tokens): ppl=12.47, delta=0.0
+- Partial block included (boundary fix from initial 0.98 delta)
+- Script: `cogni-ml/bin/kv_offload_exp2a.cr`
+
+Note: this is token re-evaluation, not KV tensor serialization.
+
+**Experiment 2B: Selective context routing proxy — PASS**
+
+Tests whether sketch-selected text blocks yield good context:
+- Full context (618 tokens): ppl=12.47
+- Recency only (128 tokens): ppl=31.51
+- Sketch-selected (234 tokens, 2 blocks): ppl=11.93
+- 62% memory reduction with equal or better perplexity
+- Script: `cogni-ml/bin/kv_offload_exp2b.cr`
+
+Important caveats:
+- This is **context selection**, not live KV-cache spill/restore.
+  The script re-evaluates from tokens, not from serialized KV tensors.
+- The routing sketch is embedding-based (nomic-embed), not KV-tensor-based.
+- "Better than full context" is one excerpt, one k=2 — likely from
+  filtering noise in irrelevant middle context, not a general guarantee.
+- This supports the thesis for **retrieval-augmented selective memory**
+  but does NOT yet prove a live KV offload/restore architecture.
+
+**What is proven so far (summary):**
+- pg_sorted_heap can serve blocks fast enough (Exp 0)
+- Embedding-based sketch finds relevant blocks (Exp 1A)
+- Sketch-selected context improves LLM perplexity over recency-only (Exp 1B, 2B)
+- Token-level spill/restore is quality-neutral (Exp 2A)
+
+**What is NOT yet proven:**
+- Live KV tensor serialization/restore through llama.cpp
+- KV-tensor-based sketches (vs embedding-based)
+- Performance on longer contexts (> 1K tokens)
+- Generalization beyond one text excerpt
+- That the architecture works under real interactive generation
+
+**Next: Experiment 3 — either live KV hook or reframe as selective memory**
+
+**Experiment 1 (original, replaced by 1A+1B+2A+2B above):**
 - Run Cogniformerus on a long session (8K+ tokens)
 - Extract per-layer KV cache at each step
 - Compute block-level mean-key sketches
@@ -263,7 +299,17 @@ Result (Gemma 3 4B, War and Peace excerpt, block_size=64, k=2): **PASS**
 - Compare against actual attention weight distribution
 - Metric: does top-5 by sketch overlap with top-5 by attention weight?
 
-**Experiment 2: End-to-end quality**
+**Experiment 3: Live integration (decision point)**
+Choice:
+  a. Live KV serialization/restore hook in cogni-ml llama.cpp bindings
+     (requires llama_kv_cache access, KV tensor export, SQ8 compression)
+  b. Reframe as "retrieval-augmented selective memory" without KV-level
+     integration — route at the token/text level, re-evaluate selected
+     context blocks (higher latency but no llama.cpp internals needed)
+
+Gate: decide which path before investing engineering effort.
+
+**Original Experiment 2 (replaced):**
 - Same long session, but with KV offload active
 - Compare generation quality (perplexity, coherence) between:
   a. Full KV cache (baseline)
