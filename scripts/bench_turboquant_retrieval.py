@@ -1373,6 +1373,52 @@ class TurboQuantBlock32PackedMethod(TurboQuantBlockHadamardPackedMethod):
         return total
 
 
+class TurboQuantBlock32PackedTopKMethod(TurboQuantBlock32PackedMethod):
+    """Packed blockwise with fused helper-side top-k."""
+
+    def __init__(self, bits: int, seed: int, group_size: int = 32) -> None:
+        super().__init__(bits, seed, group_size)
+        self.name = f"turboquant_block{group_size}_packed4_topk"
+
+    def search(self, query: np.ndarray, k: int) -> np.ndarray:
+        if self.packed_codes_t is None or self.centers is None or self._expanded_scales is None:
+            raise RuntimeError("fit must run first")
+        t0 = time.perf_counter()
+        q_rot = structured_block_hadamard_vec(query, self.perm, self.signs, self.blocks)
+        self.transform_ms_total += (time.perf_counter() - t0) * 1000.0
+        self.transform_calls += 1
+        coeffs = (q_rot * self._expanded_scales / math.sqrt(self.dim)).astype(np.float32, copy=False)
+        return packed_topk_blockhadamard_packed4_transposed(
+            self.packed_codes_t,
+            coeffs,
+            self.centers,
+            self.norms,
+            k,
+        )
+
+    def reset_profile(self) -> None:
+        self.transform_ms_total = 0.0
+        self.transform_calls = 0
+        reset_blockhadamard_packed4_profile()
+
+    def profile_summary(self) -> dict[str, float | int] | None:
+        helper_profile = get_blockhadamard_packed4_topk_profile()
+        if helper_profile is None:
+            return None
+        calls = max(1, int(helper_profile["c_calls"]))
+        return {
+            "query_transform_ms_total": self.transform_ms_total,
+            "query_transform_ms_per_query": self.transform_ms_total / max(1, self.transform_calls),
+            "c_build_ms_total": float(helper_profile["c_build_ms_total"]),
+            "c_build_ms_per_query": float(helper_profile["c_build_ms_total"]) / calls,
+            "c_score_ms_total": float(helper_profile["c_score_ms_total"]),
+            "c_score_ms_per_query": float(helper_profile["c_score_ms_total"]) / calls,
+            "c_merge_ms_total": float(helper_profile["c_merge_ms_total"]),
+            "c_merge_ms_per_query": float(helper_profile["c_merge_ms_total"]) / calls,
+            "c_calls": int(helper_profile["c_calls"]),
+        }
+
+
 class TurboQuantBlock32DitherPackedMethod(TurboQuantBlock32PackedMethod):
     """Packed block32 with dithered encoding.
 
@@ -2332,7 +2378,9 @@ def method_factories(base: np.ndarray, args: argparse.Namespace) -> list[tuple[s
         ("turboquant_blockhadamard_packed4", lambda: TurboQuantBlockHadamardPackedMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_packed4_topk", lambda: TurboQuantBlockHadamardPackedTopKMethod(args.turbo_bits, args.seed)),
         ("turboquant_block16_packed4", lambda: TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16)),
+        ("turboquant_block16_packed4_topk", lambda: TurboQuantBlock32PackedTopKMethod(args.turbo_bits, args.seed, group_size=16)),
         ("turboquant_block32_packed4", lambda: TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed)),
+        ("turboquant_block32_packed4_topk", lambda: TurboQuantBlock32PackedTopKMethod(args.turbo_bits, args.seed)),
         ("turboquant_block32_dither_packed4", lambda: TurboQuantBlock32DitherPackedMethod(args.turbo_bits, args.seed)),
         ("turboquant_ivf32_block32_packed4", lambda: TurboQuantIVFBlock32PackedMethod(args.turbo_bits, args.seed, n_clusters=args.ivf_clusters or 32, n_probe=args.ivf_nprobe or 8)),
         ("turboquant_ivf64_block32_packed4", lambda: TurboQuantIVFBlock32PackedMethod(args.turbo_bits, args.seed, n_clusters=args.ivf_clusters or 64, n_probe=args.ivf_nprobe or 12)),
@@ -2404,7 +2452,7 @@ def build_methods(base: np.ndarray, args: argparse.Namespace) -> list[RetrievalM
     for name in selected_names:
         if name == "turboquant_prod" and args.turbo_bits < 2:
             raise SystemExit("turboquant_prod requires --turbo-bits >= 2")
-        if name in {"turboquant_blockhadamard_packed4", "turboquant_blockhadamard_packed4_topk", "turboquant_block16_packed4", "turboquant_block32_packed4", "turboquant_block32_dither_packed4", "turboquant_block32_dimdither_packed4"} and args.turbo_bits != 4:
+        if name in {"turboquant_blockhadamard_packed4", "turboquant_blockhadamard_packed4_topk", "turboquant_block16_packed4", "turboquant_block16_packed4_topk", "turboquant_block32_packed4", "turboquant_block32_packed4_topk", "turboquant_block32_dither_packed4", "turboquant_block32_dimdither_packed4"} and args.turbo_bits != 4:
             raise SystemExit(f"{name} currently requires --turbo-bits=4")
         methods.append(factory_map[name]())
     return methods

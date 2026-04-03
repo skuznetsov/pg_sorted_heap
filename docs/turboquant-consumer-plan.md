@@ -682,9 +682,19 @@ Current repo status:
   | block32_packed4             | 100.0% |    89.40% |   7.6  | over-equalized, demoted      |
   | block32_dither (non-packed) | 100.0% |    91.80% |  17.2  | best overall quality (dense) |
 
-  Default packed lane for Cogniformerus consumer objective: **block16_packed4**
-  (100% hit@1, 91.0% recall@10 — only 0.2% below blockhadamard on recall,
-  +2% on hit@1, fastest packed lane at 7.1ms)
+  | block16_packed4_topk        | 100/98%|    91.00% |   5.7  | **fastest packed lane**      |
+  | block32_packed4_topk        | 100.0% |    89.40% |   --   | (available, not primary)     |
+
+  Default packed lane for Cogniformerus consumer objective: **block16_packed4_topk**
+  (91.0% recall@10, 5.7ms p50 — fastest packed lane; hit@1 is 100% at
+  seed=123 and 98% at seed=42 due to tie-break reordering, not set diff)
+
+- block16_packed4_topk contract screen (2026-04-03, vetted Gutenberg):
+  - parity-against block16_packed4 at seed=42: `order_diff=1`, `set_diff=0`
+  - parity-against block16_packed4 at seed=123: `order_diff=1`, `set_diff=0`
+  - passes same-metrics contract: identical recall@10, set_diff=0
+  - hit@1 variation (100% vs 98% across seeds) is from tie-break reordering
+    of the true #1 result within the top-k set, not from scoring divergence
 
 - block32 recall regression ablation (2026-04-03, vetted Gutenberg):
   - group_size sweep: 16/32/64/128 + plain blockhadamard (no scaling)
