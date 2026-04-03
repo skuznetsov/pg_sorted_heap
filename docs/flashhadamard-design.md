@@ -241,6 +241,12 @@ Result (Gemma 3 4B, War and Peace excerpt, block_size=64, k=2): **PASS**
 - Sketch + tail (256 tokens): ppl=12.48
 - Recovery: 99.9% of context gap closed using 41% of tokens
 - Script: `cogni-ml/bin/kv_routing_exp1b.cr`
+- Adversary note: 1B uses block-text embedding similarity as routing
+  signal, not actual serialized KV-block sketches. This is a strong
+  routing proxy (proven by the perplexity recovery), but still not
+  final proof that sketches computed from KV tensors directly would
+  perform identically. The gap between "text embedding of block" and
+  "mean key vector of KV block" remains untested.
 
 **Experiment 2: End-to-end quality (only after 1B PASS)**
 - Same long session, but with actual KV offload active
