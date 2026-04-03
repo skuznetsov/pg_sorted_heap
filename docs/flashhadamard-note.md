@@ -120,8 +120,12 @@ second-stage rerank on a small shortlist fixes most of them.
 | 16 | 100% | 97.0% | 12.1 | 21.8 | 4320 |
 | 20 | 100% | 97.6% | 12.3 | 23.8 | 4320 |
 
-Sweet spot: **M=12 with SQ8 rerank** — 100% hit@1, 96.2% recall@10,
-11.5ms p50, 4320 bytes/vec (3× compression vs float32).
+Sweet spot: **M=12 with SQ8 rerank** — 94% hit@1, 92.8% recall@10,
+8.9ms p50 (with fused TopK inner), 4320 bytes/vec (3× compression).
+
+Shortlist size has minimal latency impact (8.5-9.5ms for M=8-20) because
+the packed scorer cost is fixed at ~6.6ms regardless of M. Reducing M
+saves rerank time (<0.5ms) but not scorer time.
 
 **Latency breakdown (SQ8 rerank M=12 on full 103K):**
 
