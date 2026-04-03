@@ -178,11 +178,29 @@ In `ML::LLM::Context` (cogni-ml `src/ml/llm/llama.cr`):
 
 ### Experiment plan
 
-**Experiment 0: pg_sorted_heap round-trip latency**
-- Write 1000 blocks of 256 x 64 x 2 bytes (32KB each) to sorted_heap
-- Read-back by primary key: measure p50
-- Read-back by sketch similarity: measure p50
-- Gate: p50 < 5ms for primary key, < 10ms for sketch search
+**Experiment 0: pg_sorted_heap round-trip latency — PASS**
+
+Measured on local containerized PG (pg_sorted_heap 0.11.0, port 30432):
+
+| config | heap | read-id p50 | read+decode p50 | sketch top-5 p50 | verdict |
+|--------|------|-------------|-----------------|-------------------|---------|
+| 1K blocks, 32KB | plain | 0.70ms | 0.78ms | 1.89ms | PASS |
+| 1K blocks, 32KB | sorted_heap | 0.71ms | 0.79ms | 1.95ms | PASS |
+| 1K blocks, 128KB | plain | 1.60ms | 1.91ms | 5.63ms | PASS |
+| 1K blocks, 128KB | sorted_heap | 1.58ms | 1.88ms | 5.67ms | PASS |
+| 10K blocks, 32KB | plain | 0.71ms | 0.79ms | (skipped) | - |
+| 10K blocks, 32KB | sorted_heap | 0.69ms | 0.78ms | (skipped) | - |
+
+Key findings:
+- exact read-by-id + decode comfortably under 2ms at 32KB, under 2ms at 128KB
+- no degradation from 1K to 10K blocks on exact reads
+- sorted_heap performs identically to plain heap (no overhead)
+- sketch search adds ~1ms at 32KB, ~4ms at 128KB (HNSW on 64-dim vectors)
+- all gates pass for 32KB blocks; 128KB sketch search is marginal (5.6ms vs 8ms gate)
+
+Conclusion: pg_sorted_heap is a viable warm-tier backing store for KV blocks.
+32KB blocks (256 tokens) are the recommended payload size.
+Script: `scripts/bench_kv_offload_exp0.py`
 
 **Experiment 1: Block sketch relevance**
 - Run Cogniformerus on a long session (8K+ tokens)
