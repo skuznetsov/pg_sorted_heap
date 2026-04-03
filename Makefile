@@ -649,6 +649,20 @@ endef
 
 bench-turboquant-gutenberg: bench-turboquant-gutenberg-vetted
 
+bench-turboquant-gutenberg-screen:
+	@$(resolve_turboquant_local_cube_dsn) && \
+	"$$PYTHON_BIN" ./scripts/bench_turboquant_packed_screen.py \
+	  --pg-dsn "$$PG_DSN" \
+	  --base-sql "SELECT embedding::text FROM public.gutenberg_gptoss_sh ORDER BY id" \
+	  --query-sql "SELECT q.qvec::text FROM public.bench_gptoss_queries q JOIN public.bench_hnsw_gt gt USING (qid) ORDER BY q.qid" \
+	  --metric cosine \
+	  --k $(TURBOQUANT_K) \
+	  --turbo-bits $(TURBOQUANT_TURBO_BITS) \
+	  --seed $(TURBOQUANT_SEED) \
+	  --methods '$(TURBOQUANT_GUTENBERG_METHODS)' \
+	  --parity-against turboquant_blockhadamard_packed4 \
+	  $(TURBOQUANT_ARGS)
+
 bench-turboquant-gutenberg-vetted:
 	@$(resolve_turboquant_local_cube_dsn) && \
 	"$$PYTHON_BIN" ./scripts/bench_turboquant_retrieval.py \
@@ -779,6 +793,7 @@ help:
 	@echo "  make bench-turboquant-sql TURBOQUANT_PG_DSN='<dsn>' TURBOQUANT_BASE_SQL='<sql>' TURBOQUANT_QUERY_SQL='<sql>' TURBOQUANT_METRIC=<cosine|ip> TURBOQUANT_K=<k> TURBOQUANT_PQ_M=<0|m> TURBOQUANT_PQ_BITS=<bits> TURBOQUANT_PQ_MAX_TRAIN=<n> TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_ARGS='<extra args>'"
 	@echo "  make bench-turboquant-sql-holdout TURBOQUANT_PG_DSN='<dsn>' TURBOQUANT_SHARED_SQL='<sql>' TURBOQUANT_METRIC=<cosine|ip> TURBOQUANT_QUERY_COUNT=<n> TURBOQUANT_FOLDS=<n> TURBOQUANT_K=<k> TURBOQUANT_PQ_M=<0|m> TURBOQUANT_PQ_BITS=<bits> TURBOQUANT_PQ_MAX_TRAIN=<n> TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_ARGS='<extra args>'"
 	@echo "  make bench-turboquant-gutenberg-vetted TURBOQUANT_PG_DSN='<dsn|optional local cube auto-discovery>' TURBOQUANT_GUTENBERG_METHODS='<csv methods>' TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_K=<k> TURBOQUANT_ARGS='<extra args>'"
+	@echo "  make bench-turboquant-gutenberg-screen TURBOQUANT_PG_DSN='<dsn|optional local cube auto-discovery>' TURBOQUANT_GUTENBERG_METHODS='<csv packed methods>' TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_K=<k> TURBOQUANT_ARGS='<extra args>'"
 	@echo "  make bench-turboquant-gutenberg-full TURBOQUANT_PG_DSN='<dsn|optional local cube auto-discovery>' TURBOQUANT_GUTENBERG_METHODS='<csv methods>' TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_K=<k> TURBOQUANT_ARGS='<extra args>'"
 	@echo "  make bench BENCH_PORT=<port> BENCH_SCALES=<comma-separated>"
 	@echo "  make policy-lint-strict"

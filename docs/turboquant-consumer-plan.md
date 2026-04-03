@@ -95,10 +95,11 @@ Current repo status:
   mirror of plain `blockhadamard`; it is explicit-only and intended to answer
   whether packed nibble lookup can preserve ranking before any low-level kernel
   work exists
-- `turboquant_blockhadamard_packed4_topk` now exists as an exact helper-side
+- `turboquant_blockhadamard_packed4_topk` now exists as a helper-side
   top-k variant of the packed `blockhadamard` lane; it is explicit-only and
   intended to answer whether eliminating full score materialization plus
-  Python-side `argpartition` buys a real end-to-end win on large workloads
+  Python-side `argpartition` buys a real end-to-end win on large workloads,
+  with exactness tested separately instead of assumed
 - a tiny repo-owned C helper now exists for packed ADC scoring:
   - source: `scripts/turboquant_packed_adc.c`
   - explicit build entry point: `make build-turboquant-packed-helper`
@@ -290,6 +291,7 @@ Current repo status:
     optimize or promote
 - repo-owned Gutenberg entry points now exist:
   - `make bench-turboquant-gutenberg-vetted`
+  - `make bench-turboquant-gutenberg-screen`
   - `make bench-turboquant-gutenberg-full`
   - both use the current evaluator directly and support `TURBOQUANT_METHODS`
     / `TURBOQUANT_GUTENBERG_METHODS`
@@ -574,16 +576,16 @@ Current repo status:
   - the next kernelization branch should still target the packed scoring
     loop first, but now it should build on the proven `2`-byte fusion path
     rather than the earlier single-byte generic loop
-  - the next surviving branch after that moved exact top-k selection into the
+  - the next surviving branch after that moved helper-side top-k selection into the
     packed helper for `turboquant_blockhadamard_packed4_topk`, so the helper
-    now builds byte tables once, scores each row chunk, keeps per-thread exact
+    now builds byte tables once, scores each row chunk, keeps per-thread
     top-k candidates, and avoids materializing the full score vector before
     Python ranking
     - adversary check versus the current exact packed scorer:
       - `dim=31`: top-k ids identical
       - `dim=32`: top-k ids identical
       - `dim=2880`: top-k ids identical
-    - vetted Gutenberg repeats with exact ranking preserved:
+    - vetted Gutenberg repeats with the same top-level quality metrics:
       - repeat A:
         - `turboquant_blockhadamard_packed4`: `98.0% hit@1`,
           `91.20% recall@10`, `9.726 ms` p50, `9.776 ms` avg
@@ -596,9 +598,11 @@ Current repo status:
           `91.20% recall@10`, `7.059 ms` p50, `7.535 ms` avg
   Narrow conclusion:
   - the current strongest packed lane is no longer just exact packed scoring;
-    it is exact packed scoring with helper-side top-k
+    it is packed scoring with helper-side top-k, but real-workload parity
+    must be treated as an adversary check rather than assumed exact
   - on the real Gutenberg target this removes roughly `1-2.6 ms/query`
-    from the end-to-end path while preserving identical ranking and quality
+    from the end-to-end path while preserving the same `hit@1` and
+    `recall@10` on the vetted Gutenberg benchmark
   - the remaining next kernelization question is now narrower:
     further reduce the helper-side scoring cost, not Python-side selection
   - a follow-up top-k-specific profiler now exists and narrows that further:
@@ -607,6 +611,18 @@ Current repo status:
     (`~0.001 ms/query`), while the helper-side `c_score` bucket still
     dominated; a non-profiled rerun on the same tree still kept the top-k
     lane ahead (`6.925 ms` p50 vs `8.294 ms` for plain `packed4`)
+  - a repo-owned packed screening harness now exists:
+    - `make bench-turboquant-gutenberg-screen`
+    - it fits only the packed lanes on the real vetted Gutenberg shape and
+      reports direct search latency plus exact-order and same-set mismatch
+      counts against the plain packed lane
+    - this harness is now the preferred adversary screen before accepting any
+      packed-helper micro-optimization, because full evaluator runs are too
+      expensive for every tiny helper branch
+    - current screen on the real vetted Gutenberg set showed:
+      - `packed4_topk`: `5.393 ms` p50 vs `9.747 ms` for plain `packed4`
+      - `order_diff=2`
+      - `set_diff=1`
   Narrow conclusion:
   - the next exact helper branch should not spend time on final candidate
     merge or Python ranking
