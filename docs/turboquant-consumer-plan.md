@@ -601,6 +601,17 @@ Current repo status:
     from the end-to-end path while preserving identical ranking and quality
   - the remaining next kernelization question is now narrower:
     further reduce the helper-side scoring cost, not Python-side selection
+  - a follow-up top-k-specific profiler now exists and narrows that further:
+    on a profiled vetted Gutenberg comparison, `c_merge` for
+    `turboquant_blockhadamard_packed4_topk` was effectively zero
+    (`~0.001 ms/query`), while the helper-side `c_score` bucket still
+    dominated; a non-profiled rerun on the same tree still kept the top-k
+    lane ahead (`6.925 ms` p50 vs `8.294 ms` for plain `packed4`)
+  Narrow conclusion:
+  - the next exact helper branch should not spend time on final candidate
+    merge or Python ranking
+  - if the packed top-k lane is to improve further, the win has to come from
+    the worker-side scan itself or its memory layout
 
 ### Publication threshold
 

@@ -22,6 +22,10 @@
 static double g_tq_blockhadamard_packed4_build_ms = 0.0;
 static double g_tq_blockhadamard_packed4_score_ms = 0.0;
 static uint64_t g_tq_blockhadamard_packed4_calls = 0;
+static double g_tq_blockhadamard_packed4_topk_build_ms = 0.0;
+static double g_tq_blockhadamard_packed4_topk_score_ms = 0.0;
+static double g_tq_blockhadamard_packed4_topk_merge_ms = 0.0;
+static uint64_t g_tq_blockhadamard_packed4_topk_calls = 0;
 
 static double tq_now_ms(void) {
     struct timespec ts;
@@ -33,6 +37,10 @@ TQ_EXPORT void turboquant_blockhadamard_packed4_profile_reset(void) {
     g_tq_blockhadamard_packed4_build_ms = 0.0;
     g_tq_blockhadamard_packed4_score_ms = 0.0;
     g_tq_blockhadamard_packed4_calls = 0;
+    g_tq_blockhadamard_packed4_topk_build_ms = 0.0;
+    g_tq_blockhadamard_packed4_topk_score_ms = 0.0;
+    g_tq_blockhadamard_packed4_topk_merge_ms = 0.0;
+    g_tq_blockhadamard_packed4_topk_calls = 0;
 }
 
 TQ_EXPORT void turboquant_blockhadamard_packed4_profile_get(
@@ -48,6 +56,26 @@ TQ_EXPORT void turboquant_blockhadamard_packed4_profile_get(
     }
     if (calls != NULL) {
         *calls = g_tq_blockhadamard_packed4_calls;
+    }
+}
+
+TQ_EXPORT void turboquant_blockhadamard_packed4_topk_profile_get(
+    double *build_ms,
+    double *score_ms,
+    double *merge_ms,
+    uint64_t *calls
+) {
+    if (build_ms != NULL) {
+        *build_ms = g_tq_blockhadamard_packed4_topk_build_ms;
+    }
+    if (score_ms != NULL) {
+        *score_ms = g_tq_blockhadamard_packed4_topk_score_ms;
+    }
+    if (merge_ms != NULL) {
+        *merge_ms = g_tq_blockhadamard_packed4_topk_merge_ms;
+    }
+    if (calls != NULL) {
+        *calls = g_tq_blockhadamard_packed4_topk_calls;
     }
 }
 
@@ -624,11 +652,13 @@ TQ_EXPORT void turboquant_blockhadamard_packed4_topk_t_mt_f32(
     (void)out_scores;
 #else
     const size_t n_bytes = (dim + 1u) / 2u;
+    const double build_t0 = tq_now_ms();
     float *byte_tables = (float *)malloc(n_bytes * 256u * sizeof(float));
     if (byte_tables == NULL) {
         return;
     }
     tq_blockhadamard_packed4_build_byte_tables(coeffs, centers, dim, byte_tables);
+    const double score_t0 = tq_now_ms();
     if (n_threads <= 1 || n_rows < 16384 || n_bytes < 256) {
         n_threads = 1;
     }
@@ -677,6 +707,7 @@ TQ_EXPORT void turboquant_blockhadamard_packed4_topk_t_mt_f32(
         pthread_join(threads[idx], NULL);
     }
 
+    const double merge_t0 = tq_now_ms();
     size_t filled = 0;
     size_t min_pos = 0;
     float min_score = -INFINITY;
@@ -711,6 +742,10 @@ TQ_EXPORT void turboquant_blockhadamard_packed4_topk_t_mt_f32(
             }
         }
     }
+    g_tq_blockhadamard_packed4_topk_build_ms += score_t0 - build_t0;
+    g_tq_blockhadamard_packed4_topk_score_ms += merge_t0 - score_t0;
+    g_tq_blockhadamard_packed4_topk_merge_ms += tq_now_ms() - merge_t0;
+    g_tq_blockhadamard_packed4_topk_calls += 1;
     free(byte_tables);
     free(all_ids);
     free(all_scores);

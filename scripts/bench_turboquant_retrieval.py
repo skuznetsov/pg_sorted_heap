@@ -181,6 +181,13 @@ def load_packed_adc_helper() -> ctypes.CDLL | None:
         ctypes.POINTER(ctypes.c_uint64),
     ]
     lib.turboquant_blockhadamard_packed4_profile_get.restype = None
+    lib.turboquant_blockhadamard_packed4_topk_profile_get.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    lib.turboquant_blockhadamard_packed4_topk_profile_get.restype = None
     return lib
 
 
@@ -864,6 +871,28 @@ def get_blockhadamard_packed4_profile() -> dict[str, float | int] | None:
     }
 
 
+def get_blockhadamard_packed4_topk_profile() -> dict[str, float | int] | None:
+    lib = load_packed_adc_helper()
+    if lib is None:
+        return None
+    build_ms = ctypes.c_double()
+    score_ms = ctypes.c_double()
+    merge_ms = ctypes.c_double()
+    calls = ctypes.c_uint64()
+    lib.turboquant_blockhadamard_packed4_topk_profile_get(
+        ctypes.byref(build_ms),
+        ctypes.byref(score_ms),
+        ctypes.byref(merge_ms),
+        ctypes.byref(calls),
+    )
+    return {
+        "c_build_ms_total": float(build_ms.value),
+        "c_score_ms_total": float(score_ms.value),
+        "c_merge_ms_total": float(merge_ms.value),
+        "c_calls": int(calls.value),
+    }
+
+
 def expand_group_scales(group_scales: np.ndarray, dim: int, group_size: int) -> np.ndarray:
     return np.repeat(group_scales, group_size)[:dim].astype(np.float32, copy=False)
 
@@ -1260,6 +1289,23 @@ class TurboQuantBlockHadamardPackedTopKMethod(TurboQuantBlockHadamardPackedMetho
             self.norms,
             k,
         )
+
+    def profile_summary(self) -> dict[str, float | int] | None:
+        helper_profile = get_blockhadamard_packed4_topk_profile()
+        if helper_profile is None:
+            return None
+        calls = max(1, int(helper_profile["c_calls"]))
+        return {
+            "query_transform_ms_total": self.transform_ms_total,
+            "query_transform_ms_per_query": self.transform_ms_total / max(1, self.transform_calls),
+            "c_build_ms_total": float(helper_profile["c_build_ms_total"]),
+            "c_build_ms_per_query": float(helper_profile["c_build_ms_total"]) / calls,
+            "c_score_ms_total": float(helper_profile["c_score_ms_total"]),
+            "c_score_ms_per_query": float(helper_profile["c_score_ms_total"]) / calls,
+            "c_merge_ms_total": float(helper_profile["c_merge_ms_total"]),
+            "c_merge_ms_per_query": float(helper_profile["c_merge_ms_total"]) / calls,
+            "c_calls": int(helper_profile["c_calls"]),
+        }
 
 
 class TurboQuantBlockHadamardWhitenedMethod(RetrievalMethod):
@@ -1947,6 +1993,7 @@ def print_results(title: str, rows: list[EvalResult]) -> None:
                 f"{row.method}: transform={profile.get('query_transform_ms_per_query', 0.0):.3f} ms/query "
                 f"c_build={profile.get('c_build_ms_per_query', 0.0):.3f} ms/query "
                 f"c_score={profile.get('c_score_ms_per_query', 0.0):.3f} ms/query "
+                f"c_merge={profile.get('c_merge_ms_per_query', 0.0):.3f} ms/query "
                 f"calls={int(profile.get('c_calls', 0))}"
             )
 
