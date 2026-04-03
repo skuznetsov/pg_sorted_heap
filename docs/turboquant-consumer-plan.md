@@ -636,6 +636,17 @@ Current repo status:
       differences between C heap-insert order and Python `argpartition`
     - before investing in a tie-aware fix, the repo needs a contract:
       is exact order required, or is same-set / same-metrics sufficient?
+    - **chosen contract (2026-04-03): same-metrics equivalence**
+      - the consumer (Cogniformerus memory retrieval) cares about retrieving
+        the right set of relevant chunks, not their internal ordering
+      - `recall@k` and `hit@1` are the acceptance metrics
+      - `order_diff` within top-k is informational, not a gate
+      - `set_diff` on tie boundaries (where `tie_only == set_diff`) is
+        acceptable and does not require a fix
+      - a `set_diff` NOT on tie boundaries would indicate a scoring bug and
+        block acceptance
+      - consequence: the current `packed4_topk` lane passes this contract
+        on the vetted Gutenberg run; no tie-aware fix is needed
   Narrow conclusion:
   - the next exact helper branch should not spend time on final candidate
     merge or Python ranking
@@ -644,6 +655,22 @@ Current repo status:
   - the `set_diff=1` mismatch is strongly consistent with tie-only on
     this workload; a deterministic tie-break policy is a nice-to-have,
     not a correctness blocker
+
+- verified on 2026-04-03 against vetted Gutenberg that the dithered-encode
+  packed4 variant (`block32_dither_packed4`) does NOT recover dither quality
+  when scoring via standard packed ADC without the per-row dither correction:
+  - `block32_packed4` (no dither): `100.0% hit@1`, `89.40% recall@10`, `9.8 ms`
+  - `block32_dither_packed4` (dithered codes, no correction): `98.0% hit@1`,
+    `88.60% recall@10`, `10.1 ms`
+  - `block32_dither` (full dithered, non-packed): `100.0% hit@1`,
+    `91.80% recall@10`, `17.9 ms`
+  Narrow conclusion:
+  - dropping the per-row dither correction actively hurts quality because
+    dithered code assignment disagrees with the non-corrected LUT decode
+  - `block32_dither` is not packable in the current shared-LUT ADC form
+  - `block32_packed4` (no dither) remains the strongest packed quality lane
+  - future paths for packed dither: group-level dither with storable
+    correction, or seed-derived on-the-fly correction (high compute cost)
 
 ### Publication threshold
 

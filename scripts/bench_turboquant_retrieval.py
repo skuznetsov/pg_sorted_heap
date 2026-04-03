@@ -1373,6 +1373,61 @@ class TurboQuantBlock32PackedMethod(TurboQuantBlockHadamardPackedMethod):
         return total
 
 
+class TurboQuantBlock32DitherPackedMethod(TurboQuantBlock32PackedMethod):
+    """Packed block32 with dithered encoding.
+
+    Encode with subtractive dither (better codes) but score via standard
+    packed ADC on the codes, ignoring the per-row dither correction term.
+    This tests whether dither's primary benefit is in CODE quality rather
+    than the decode correction.
+    """
+
+    def __init__(self, bits: int, seed: int, group_size: int = 32, clip: float = 3.0) -> None:
+        super().__init__(bits, seed, group_size)
+        self.name = f"turboquant_block{group_size}_dither_packed4"
+        self.clip = clip
+
+    def fit(self, base: np.ndarray) -> None:
+        if self.bits != 4:
+            raise ValueError(f"{self.name} currently requires --turbo-bits=4")
+        load_packed_adc_helper()
+        self.dim = base.shape[1]
+        rng = np.random.default_rng(self.seed)
+        self.perm = rng.permutation(self.dim).astype(np.int32)
+        self.signs = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=self.dim, replace=True)
+        self.blocks = power_of_two_blocks(self.dim)
+        norms = np.linalg.norm(base, axis=1).astype(np.float32)
+        unit = base / np.maximum(norms[:, None], 1e-12)
+        rotated = structured_block_hadamard(unit, self.perm, self.signs, self.blocks) * math.sqrt(self.dim)
+        group_scales, expanded_scales = grouped_rms_scales(rotated, self.group_size)
+        equalized = rotated / expanded_scales
+        # Dithered uniform quantization for better code assignment
+        max_abs, n_levels = symmetric_int_levels(self.bits)
+        step = (2.0 * self.clip) / float(n_levels - 1)
+        dither_rng = np.random.default_rng(self.seed + 17)
+        dither = dither_rng.uniform(-0.5 * step, 0.5 * step, size=equalized.shape).astype(np.float32)
+        scaled = np.clip((equalized + dither) / step, -max_abs, max_abs)
+        codes_signed = np.rint(scaled).astype(np.int16)
+        # Unsigned codes 0..14 for nibble packing (15 levels from 4-bit symmetric)
+        codes_unsigned = np.clip(codes_signed + max_abs, 0, 2 * max_abs).astype(np.uint8)
+        self.packed_codes = pack_nibbles(codes_unsigned)
+        self.packed_codes_t = transpose_packed_codes(self.packed_codes)
+        self.norms = maybe_store_norms(norms)
+        self.group_scales = group_scales
+        self._expanded_scales = expand_group_scales(group_scales, self.dim, self.group_size)
+        # Centers for uniform quantization: code_unsigned=i → value=(i-max_abs)*step
+        # The C helper computes coeff[d] * centers[level], so centers must be
+        # the decoded values WITHOUT group_scale (scale is folded into coeffs).
+        self.centers = np.array([(i - max_abs) * step for i in range(2 * max_abs + 1)],
+                                dtype=np.float32)
+        # Pad to 16 entries if needed (4-bit = max 16 levels, we have 15)
+        if len(self.centers) < 16:
+            self.centers = np.pad(self.centers, (0, 16 - len(self.centers)),
+                                  constant_values=0.0)
+        self.transform_ms_total = 0.0
+        self.transform_calls = 0
+
+
 class TurboQuantBlockHadamardWhitenedMethod(RetrievalMethod):
     def __init__(self, bits: int, seed: int) -> None:
         super().__init__("turboquant_blockhadamard_whitened")
@@ -2127,6 +2182,7 @@ def method_factories(base: np.ndarray, args: argparse.Namespace) -> list[tuple[s
         ("turboquant_blockhadamard_packed4", lambda: TurboQuantBlockHadamardPackedMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_packed4_topk", lambda: TurboQuantBlockHadamardPackedTopKMethod(args.turbo_bits, args.seed)),
         ("turboquant_block32_packed4", lambda: TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed)),
+        ("turboquant_block32_dither_packed4", lambda: TurboQuantBlock32DitherPackedMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_whitened", lambda: TurboQuantBlockHadamardWhitenedMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_block32", lambda: TurboQuantBlockHadamardBlockwiseMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_twopass", lambda: TurboQuantBlockHadamardTwoPassMethod(args.turbo_bits, args.seed)),
@@ -2188,7 +2244,7 @@ def build_methods(base: np.ndarray, args: argparse.Namespace) -> list[RetrievalM
     for name in selected_names:
         if name == "turboquant_prod" and args.turbo_bits < 2:
             raise SystemExit("turboquant_prod requires --turbo-bits >= 2")
-        if name in {"turboquant_blockhadamard_packed4", "turboquant_blockhadamard_packed4_topk", "turboquant_block32_packed4", "turboquant_block32_dimdither_packed4"} and args.turbo_bits != 4:
+        if name in {"turboquant_blockhadamard_packed4", "turboquant_blockhadamard_packed4_topk", "turboquant_block32_packed4", "turboquant_block32_dither_packed4", "turboquant_block32_dimdither_packed4"} and args.turbo_bits != 4:
             raise SystemExit(f"{name} currently requires --turbo-bits=4")
         methods.append(factory_map[name]())
     return methods
