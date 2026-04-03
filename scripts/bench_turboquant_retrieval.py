@@ -1428,6 +1428,123 @@ class TurboQuantBlock32DitherPackedMethod(TurboQuantBlock32PackedMethod):
         self.transform_calls = 0
 
 
+class TurboQuantIVFBlock32PackedMethod(RetrievalMethod):
+    """IVF + packed block32 TQ: cluster in rotated space, probe top-C clusters.
+
+    For datasets > ~50K vectors. Uses k-means on Hadamard-rotated vectors
+    for partitioning, then packed block32 TQ within each cluster for scoring.
+    """
+
+    def __init__(self, bits: int, seed: int, n_clusters: int = 32, n_probe: int = 4,
+                 group_size: int = 32) -> None:
+        super().__init__(f"turboquant_ivf{n_clusters}_block{group_size}_packed4")
+        self.bits = bits
+        self.seed = seed
+        self.n_clusters = n_clusters
+        self.n_probe = n_probe
+        self.group_size = group_size
+        self.perm: np.ndarray | None = None
+        self.signs: np.ndarray | None = None
+        self.blocks: list[int] = []
+        self.centroids: np.ndarray | None = None
+        self.cluster_codes_t: list[np.ndarray] = []
+        self.cluster_norms: list[np.ndarray | None] = []
+        self.cluster_row_ids: list[np.ndarray] = []
+        self.centers: np.ndarray | None = None
+        self._expanded_scales: np.ndarray | None = None
+        self.dim = 0
+
+    def fit(self, base: np.ndarray) -> None:
+        if self.bits != 4:
+            raise ValueError(f"{self.name} requires --turbo-bits=4")
+        load_packed_adc_helper()
+        self.dim = base.shape[1]
+        rng = np.random.default_rng(self.seed)
+        self.perm = rng.permutation(self.dim).astype(np.int32)
+        self.signs = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=self.dim, replace=True)
+        self.blocks = power_of_two_blocks(self.dim)
+        self.centers, bounds = gaussian_lloyd_max(self.bits)
+        norms = np.linalg.norm(base, axis=1).astype(np.float32)
+        unit = base / np.maximum(norms[:, None], 1e-12)
+        rotated = structured_block_hadamard(unit, self.perm, self.signs, self.blocks) * math.sqrt(self.dim)
+        group_scales, expanded_scales = grouped_rms_scales(rotated, self.group_size)
+        self._expanded_scales = expand_group_scales(group_scales, self.dim, self.group_size)
+
+        # k-means on equalized rotated vectors
+        equalized = rotated / expanded_scales
+        n_clusters = min(self.n_clusters, base.shape[0])
+        km = MiniBatchKMeans(n_clusters=n_clusters, random_state=self.seed,
+                             n_init=3, batch_size=min(8192, max(1024, n_clusters * 8)),
+                             max_iter=100)
+        labels = km.fit_predict(equalized)
+        self.centroids = km.cluster_centers_.astype(np.float32)
+
+        # Per-cluster packed codes
+        self.cluster_codes_t = []
+        self.cluster_norms = []
+        self.cluster_row_ids = []
+        for c in range(n_clusters):
+            mask = labels == c
+            if not np.any(mask):
+                self.cluster_codes_t.append(np.empty((0, 0), dtype=np.uint8))
+                self.cluster_norms.append(None)
+                self.cluster_row_ids.append(np.empty(0, dtype=np.int32))
+                continue
+            cluster_eq = equalized[mask]
+            codes = np.digitize(cluster_eq, bounds[1:-1], right=False).astype(np.uint8)
+            packed = pack_nibbles(codes)
+            self.cluster_codes_t.append(transpose_packed_codes(packed))
+            cluster_norms = norms[mask]
+            self.cluster_norms.append(maybe_store_norms(cluster_norms))
+            self.cluster_row_ids.append(np.flatnonzero(mask).astype(np.int32))
+
+    def search(self, query: np.ndarray, k: int) -> np.ndarray:
+        if self.centroids is None or self._expanded_scales is None:
+            raise RuntimeError("fit must run first")
+        q_rot = structured_block_hadamard_vec(query, self.perm, self.signs, self.blocks)
+        coeffs = (q_rot * self._expanded_scales / math.sqrt(self.dim)).astype(np.float32, copy=False)
+        # Equalized query for centroid comparison (same space as k-means)
+        q_eq = (q_rot * math.sqrt(self.dim) / self._expanded_scales).astype(np.float32)
+
+        # Find top-n_probe clusters by L2 distance (matches k-means objective)
+        dists = np.sum((self.centroids - q_eq[np.newaxis, :]) ** 2, axis=1)
+        probe_clusters = np.argsort(dists)[:self.n_probe]
+
+        # Score within probed clusters
+        all_scores = []
+        all_ids = []
+        for c in probe_clusters:
+            codes_t = self.cluster_codes_t[c]
+            if codes_t.size == 0:
+                continue
+            scores = packed_lookup_scores_blockhadamard_packed4_transposed(
+                codes_t, coeffs, self.centers, self.cluster_norms[c])
+            row_ids = self.cluster_row_ids[c]
+            all_scores.append(scores)
+            all_ids.append(row_ids)
+
+        if not all_scores:
+            return np.array([], dtype=np.int32)
+        merged_scores = np.concatenate(all_scores)
+        merged_ids = np.concatenate(all_ids)
+        top_local = topk_indices(merged_scores, min(k, len(merged_scores)))
+        return merged_ids[top_local]
+
+    def bytes_per_vec(self) -> float:
+        norm_bytes = 4.0
+        return float(self.dim * self.bits / 8.0 + norm_bytes)
+
+    def metadata_bytes(self) -> int:
+        total = 64
+        if self.centroids is not None:
+            total += int(self.centroids.nbytes)
+        if self._expanded_scales is not None:
+            total += int(self._expanded_scales.nbytes)
+        if self.centers is not None:
+            total += int(self.centers.nbytes)
+        return total
+
+
 class TurboQuantBlockHadamardWhitenedMethod(RetrievalMethod):
     def __init__(self, bits: int, seed: int) -> None:
         super().__init__("turboquant_blockhadamard_whitened")
@@ -2183,6 +2300,9 @@ def method_factories(base: np.ndarray, args: argparse.Namespace) -> list[tuple[s
         ("turboquant_blockhadamard_packed4_topk", lambda: TurboQuantBlockHadamardPackedTopKMethod(args.turbo_bits, args.seed)),
         ("turboquant_block32_packed4", lambda: TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed)),
         ("turboquant_block32_dither_packed4", lambda: TurboQuantBlock32DitherPackedMethod(args.turbo_bits, args.seed)),
+        ("turboquant_ivf32_block32_packed4", lambda: TurboQuantIVFBlock32PackedMethod(args.turbo_bits, args.seed, n_clusters=32, n_probe=8)),
+        ("turboquant_ivf64_block32_packed4", lambda: TurboQuantIVFBlock32PackedMethod(args.turbo_bits, args.seed, n_clusters=64, n_probe=12)),
+        ("turboquant_ivf128_block32_packed4", lambda: TurboQuantIVFBlock32PackedMethod(args.turbo_bits, args.seed, n_clusters=128, n_probe=16)),
         ("turboquant_blockhadamard_whitened", lambda: TurboQuantBlockHadamardWhitenedMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_block32", lambda: TurboQuantBlockHadamardBlockwiseMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_twopass", lambda: TurboQuantBlockHadamardTwoPassMethod(args.turbo_bits, args.seed)),
