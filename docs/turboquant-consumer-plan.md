@@ -516,13 +516,60 @@ Current repo status:
         - `transform=0.132 ms/query`
         - `c_build=0.227 ms/query`
         - `c_score=6.966 ms/query`
+  - several cheap scalar scorer tweaks were then explicitly refuted on the
+    same shape before the next win was accepted:
+    - `4 -> 8` unroll in the generic transposed scorer preserved exactness,
+      but regressed vetted Gutenberg to `11.892 ms` p50 and
+      `c_score=10.614 ms/query`
+    - fused first-byte initialization was slower on a direct scorer microbench
+      (`103260 x 1440` bytes, `threads=8`):
+      - baseline: `9.486 ms` p50, `9.284 ms` avg
+      - fused-init: `9.926 ms` p50, `9.998 ms` avg
+    - local pointer hoisting was also slower on the same microbench:
+      - `10.232 ms` p50, `10.135 ms` avg
+    - forcing the direct threaded `lo/hi nibble` scorer instead of the current
+      `build 256-byte tables -> generic scorer` path was also worse on the
+      same screening shape:
+      - `10.174 ms` p50, `10.147 ms` avg
+  - the next surviving branch fused `2` byte tables per inner pass in the
+    generic transposed scorer, so each `out_scores` load/store is amortized
+    across two gathers instead of one
+    - direct scorer microbench on the same `103260 x 1440`-byte shape:
+      - baseline: `9.486 ms` p50, `9.284 ms` avg
+      - `2`-byte fusion: `5.430 ms` p50, `5.891 ms` avg
+      - checksum changed only by float summation order:
+        `-1481.380615 -> -1481.380493`
+    - adversary check versus the Python transposed scorer:
+      - `dim=31`: `max_abs=1.90734863e-06`, `top10_same=True`
+      - `dim=32`: `max_abs=1.90734863e-06`, `top10_same=True`
+      - `dim=2880`: `max_abs=0.000148773193`,
+        `max_rel=0.000534369086`, `top10_same=True`
+    - vetted Gutenberg stage-profile repeats after `2`-byte fusion:
+      - repeat A:
+        - `turboquant_blockhadamard_packed4`: `7.914 ms` p50,
+          `8.082 ms` avg
+        - stage split:
+          - `transform=0.157 ms/query`
+          - `c_build=0.233 ms/query`
+          - `c_score=6.351 ms/query`
+      - repeat B:
+        - `turboquant_blockhadamard_packed4`: `7.796 ms` p50,
+          `7.782 ms` avg
+        - stage split:
+          - `transform=0.151 ms/query`
+          - `c_build=0.233 ms/query`
+          - `c_score=6.031 ms/query`
   Narrow conclusion:
   - the stage ordering is stable even when absolute latency moves:
     `c_score` dominates, `c_build` is distant second, and query transform is
     small
-  - the next kernelization branch should therefore target the packed scoring
-    loop first, not the byte-table builder and not further Python transform
-    cleanup
+  - the surviving packed-scorer win so far is **traffic reduction**, not more
+    scalar cosmetics: amortizing score-slice RMW over two byte tables helped,
+    while unroll, init-fusion, pointer-hoist, and direct `lo/hi` fallback did
+    not
+  - the next kernelization branch should still target the packed scoring
+    loop first, but now it should build on the proven `2`-byte fusion path
+    rather than the earlier single-byte generic loop
 
 ### Publication threshold
 

@@ -96,17 +96,27 @@ TQ_EXPORT void turboquant_packed_adc_scores_t_f32(
         out_scores[row] = 0.0f;
     }
 
-    for (size_t byte_idx = 0; byte_idx < n_bytes; byte_idx++) {
-        const uint8_t *codes = packed_codes_t + byte_idx * n_rows;
-        const float *table = byte_tables + byte_idx * 256u;
+    size_t byte_idx = 0;
+    for (; byte_idx + 1 < n_bytes; byte_idx += 2) {
+        const uint8_t *codes0 = packed_codes_t + (byte_idx + 0) * n_rows;
+        const uint8_t *codes1 = packed_codes_t + (byte_idx + 1) * n_rows;
+        const float *table0 = byte_tables + (byte_idx + 0) * 256u;
+        const float *table1 = byte_tables + (byte_idx + 1) * 256u;
         size_t row = 0;
         for (; row + 3 < n_rows; row += 4) {
-            out_scores[row + 0] += table[codes[row + 0]];
-            out_scores[row + 1] += table[codes[row + 1]];
-            out_scores[row + 2] += table[codes[row + 2]];
-            out_scores[row + 3] += table[codes[row + 3]];
+            out_scores[row + 0] += table0[codes0[row + 0]] + table1[codes1[row + 0]];
+            out_scores[row + 1] += table0[codes0[row + 1]] + table1[codes1[row + 1]];
+            out_scores[row + 2] += table0[codes0[row + 2]] + table1[codes1[row + 2]];
+            out_scores[row + 3] += table0[codes0[row + 3]] + table1[codes1[row + 3]];
         }
         for (; row < n_rows; row++) {
+            out_scores[row] += table0[codes0[row]] + table1[codes1[row]];
+        }
+    }
+    if (byte_idx < n_bytes) {
+        const uint8_t *codes = packed_codes_t + byte_idx * n_rows;
+        const float *table = byte_tables + byte_idx * 256u;
+        for (size_t row = 0; row < n_rows; row++) {
             out_scores[row] += table[codes[row]];
         }
     }
@@ -273,18 +283,31 @@ static void *tq_packed_adc_worker(void *arg) {
         task->out_scores[row] = 0.0f;
     }
 
-    for (size_t byte_idx = 0; byte_idx < task->n_bytes; byte_idx++) {
-        const uint8_t *codes = task->packed_codes_t + byte_idx * task->n_rows + task->row_start;
-        const float *table = task->byte_tables + byte_idx * 256u;
+    size_t byte_idx = 0;
+    for (; byte_idx + 1 < task->n_bytes; byte_idx += 2) {
+        const uint8_t *codes0 =
+            task->packed_codes_t + (byte_idx + 0) * task->n_rows + task->row_start;
+        const uint8_t *codes1 =
+            task->packed_codes_t + (byte_idx + 1) * task->n_rows + task->row_start;
+        const float *table0 = task->byte_tables + (byte_idx + 0) * 256u;
+        const float *table1 = task->byte_tables + (byte_idx + 1) * 256u;
         size_t row = task->row_start;
         for (; row + 3 < task->row_end; row += 4) {
-            task->out_scores[row + 0] += table[codes[0]];
-            task->out_scores[row + 1] += table[codes[1]];
-            task->out_scores[row + 2] += table[codes[2]];
-            task->out_scores[row + 3] += table[codes[3]];
-            codes += 4;
+            task->out_scores[row + 0] += table0[codes0[0]] + table1[codes1[0]];
+            task->out_scores[row + 1] += table0[codes0[1]] + table1[codes1[1]];
+            task->out_scores[row + 2] += table0[codes0[2]] + table1[codes1[2]];
+            task->out_scores[row + 3] += table0[codes0[3]] + table1[codes1[3]];
+            codes0 += 4;
+            codes1 += 4;
         }
         for (; row < task->row_end; row++) {
+            task->out_scores[row] += table0[*codes0++] + table1[*codes1++];
+        }
+    }
+    if (byte_idx < task->n_bytes) {
+        const uint8_t *codes = task->packed_codes_t + byte_idx * task->n_rows + task->row_start;
+        const float *table = task->byte_tables + byte_idx * 256u;
+        for (size_t row = task->row_start; row < task->row_end; row++) {
             task->out_scores[row] += table[*codes++];
         }
     }
