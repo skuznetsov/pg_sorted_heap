@@ -623,11 +623,27 @@ Current repo status:
       - `packed4_topk`: `5.393 ms` p50 vs `9.747 ms` for plain `packed4`
       - `order_diff=2`
       - `set_diff=1`
+    - follow-up screen (2026-04-03) with `tie_only` column confirmed:
+      - `packed4`: `10.320 ms` p50
+      - `packed4_topk`: `8.322 ms` p50, `order_diff=2`, `set_diff=1`,
+        `tie_only=1`
+    - since `tie_only == set_diff`, all observed set-membership differences
+      on the current vetted Gutenberg run sit on the tie boundary
+      (`|score_diff| ≤ 1e-6` for every XOR-different candidate)
+    - this strongly supports (but does not universally prove) that the
+      `packed4_topk` lane is scoring-exact relative to `packed4` on this
+      workload, with mismatch arising only from tie-breaking policy
+      differences between C heap-insert order and Python `argpartition`
+    - before investing in a tie-aware fix, the repo needs a contract:
+      is exact order required, or is same-set / same-metrics sufficient?
   Narrow conclusion:
   - the next exact helper branch should not spend time on final candidate
     merge or Python ranking
   - if the packed top-k lane is to improve further, the win has to come from
     the worker-side scan itself or its memory layout
+  - the `set_diff=1` mismatch is strongly consistent with tie-only on
+    this workload; a deterministic tie-break policy is a nice-to-have,
+    not a correctness blocker
 
 ### Publication threshold
 

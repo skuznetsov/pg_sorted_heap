@@ -96,6 +96,7 @@ TURBOQUANT_SHARED_SQL ?=
 TURBOQUANT_FOLDS ?= 5
 TURBOQUANT_METHODS ?=
 TURBOQUANT_GUTENBERG_METHODS ?= turboquant_mse,turboquant_blockhadamard,turboquant_blockhadamard_twopass,turboquant_block32_dither
+TURBOQUANT_GUTENBERG_SCREEN_METHODS ?= turboquant_blockhadamard_packed4,turboquant_blockhadamard_packed4_topk
 TURBOQUANT_LOCAL_CUBE_PORT ?= 30432
 TURBOQUANT_LOCAL_CUBE_DB ?= cogniformerus
 TURBOQUANT_ARGS ?=
@@ -659,7 +660,7 @@ bench-turboquant-gutenberg-screen:
 	  --k $(TURBOQUANT_K) \
 	  --turbo-bits $(TURBOQUANT_TURBO_BITS) \
 	  --seed $(TURBOQUANT_SEED) \
-	  --methods '$(TURBOQUANT_GUTENBERG_METHODS)' \
+	  --methods '$(TURBOQUANT_GUTENBERG_SCREEN_METHODS)' \
 	  --parity-against turboquant_blockhadamard_packed4 \
 	  $(TURBOQUANT_ARGS)
 
