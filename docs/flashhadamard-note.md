@@ -138,9 +138,18 @@ per query. M2 Max theoretical bandwidth floor: ~0.75ms. The 6.6ms includes
 per-byte LUT lookups, thread sync, and cache effects. Rerank overhead is
 negligible (<0.5ms for M=12).
 
-Fusing rerank into C would save ~0.3ms Python overhead. The path to
-materially faster serving requires either a smaller scan (IVF at larger
-scale) or a faster memory access pattern in the packed scorer itself.
+Fusing rerank into C would save ~0.3ms Python overhead. This is the
+current floor for exhaustive CPU full-scan on this scorer layout, not
+a fundamental limit. Paths to materially faster serving:
+- Fewer candidates scanned (IVF at 500K+ scale, pre-filtering)
+- Fewer bytes per query (lower dim, coarser first stage)
+- Different execution substrate (GPU scorer via Metal)
+- Smaller shortlist M (if quality holds at M=8)
+
+Note: the 12 bits/dim serving footprint (4-bit packed + 8-bit SQ8 rerank
+payload) is no longer a pure 4-bit lane. This is a two-tier storage
+tradeoff: fast packed scan for shortlisting + higher-fidelity SQ8 for
+boundary disambiguation.
 
 ## Open Work
 
