@@ -4,7 +4,7 @@ title: FlashHadamard Design Note
 nav_order: 12
 ---
 
-# FlashHadamard: Structured Packed Retrieval Quantizer + KV Memory Architecture
+# FlashHadamard: Structured Packed Retrieval Quantizer + Selective Memory
 
 ## 1. What FlashHadamard Is
 
@@ -83,10 +83,11 @@ Key observation: most of a long session's KV cache has already been
 "read through" — the information it carried is absorbed into the hidden
 state of subsequent tokens. The full cache is rarely needed simultaneously.
 
-### Architecture: Selective KV Memory
+### Architecture: Selective Memory
 
-NOT "compressed KV cache" — **selective KV memory with pg_sorted_heap
-backing**.
+NOT "compressed KV cache" or "KV virtualization" — **retrieval-augmented
+selective memory with pg_sorted_heap backing**. Routes at text/token level,
+not KV tensor level.
 
 ```
 ┌─────────────────────────────────────────┐
@@ -289,25 +290,36 @@ Important caveats:
 - Generalization beyond one text excerpt
 - That the architecture works under real interactive generation
 
-**Next: Experiment 3 — either live KV hook or reframe as selective memory**
+**Decision (2026-04-03): selective memory, not live KV hook**
 
-**Experiment 1 (original, replaced by 1A+1B+2A+2B above):**
-- Run Cogniformerus on a long session (8K+ tokens)
-- Extract per-layer KV cache at each step
-- Compute block-level mean-key sketches
-- For each new token: rank old blocks by sketch similarity
-- Compare against actual attention weight distribution
-- Metric: does top-5 by sketch overlap with top-5 by attention weight?
+All evidence so far supports retrieval-augmented selective memory
+(text/token-level routing + re-eval) more strongly than KV-tensor-level
+virtualization. Live KV hook requires deep llama.cpp surgery with
+uncertain payoff; selective memory is already proven to work at the
+text level.
 
-**Experiment 3: Live integration (decision point)**
-Choice:
-  a. Live KV serialization/restore hook in cogni-ml llama.cpp bindings
-     (requires llama_kv_cache access, KV tensor export, SQ8 compression)
-  b. Reframe as "retrieval-augmented selective memory" without KV-level
-     integration — route at the token/text level, re-evaluate selected
-     context blocks (higher latency but no llama.cpp internals needed)
+Reframed thesis: **FlashHadamard selective memory** — a retrieval layer
+that selects relevant historical context blocks via cheap sketch routing
+and reinserts them as tokens for re-evaluation.
 
-Gate: decide which path before investing engineering effort.
+Live KV hook parked as later optimization: only revisit if re-eval
+latency becomes the dominant bottleneck after the selective memory path
+is productionized.
+
+**Experiment 3: Selective memory end-to-end prototype**
+
+Goal: long-session prototype with hot tail + sketch-retrieved old blocks.
+
+Setup:
+- Long text (2K+ tokens, multiple documents/sessions)
+- Hot tail: last N tokens always in context
+- Cold blocks: older text stored in pg_sorted_heap with FlashHadamard sketch
+- On each generation step: retrieve top-k cold blocks, prepend to tail
+- Measure: perplexity, generation quality, total latency (retrieve + re-eval)
+
+Gate:
+- PASS: quality near full-context, latency acceptable for interactive use
+- FAIL: re-eval latency too high OR quality poor on longer sessions
 
 **Original Experiment 2 (replaced):**
 - Same long session, but with KV offload active
