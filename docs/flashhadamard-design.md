@@ -180,23 +180,23 @@ In `ML::LLM::Context` (cogni-ml `src/ml/llm/llama.cr`):
 
 **Experiment 0: pg_sorted_heap round-trip latency — PASS**
 
-Measured on local containerized PG (pg_sorted_heap 0.11.0, port 30432):
+Measured on local containerized PG (pg_sorted_heap 0.13.dev, port 30432):
 
 | config | heap | read-id p50 | read+decode p50 | sketch top-5 p50 | verdict |
 |--------|------|-------------|-----------------|-------------------|---------|
-| 1K blocks, 32KB | plain | 0.70ms | 0.78ms | 1.89ms | PASS |
-| 1K blocks, 32KB | sorted_heap | 0.71ms | 0.79ms | 1.95ms | PASS |
-| 1K blocks, 128KB | plain | 1.60ms | 1.91ms | 5.63ms | PASS |
-| 1K blocks, 128KB | sorted_heap | 1.58ms | 1.88ms | 5.67ms | PASS |
-| 10K blocks, 32KB | plain | 0.71ms | 0.79ms | (skipped) | - |
-| 10K blocks, 32KB | sorted_heap | 0.69ms | 0.78ms | (skipped) | - |
+| 1K blocks, 32KB | plain | 0.72ms | 0.78ms | 1.88ms | PASS |
+| 1K blocks, 32KB | sorted_heap | 0.69ms | 0.78ms | 1.99ms | PASS |
+| 1K blocks, 128KB | plain | 1.60ms | 1.92ms | 5.49ms | PASS |
+| 1K blocks, 128KB | sorted_heap | 1.51ms | 1.85ms | 5.62ms | PASS |
+| 10K blocks, 32KB | plain | 0.70ms | 0.77ms | 2.21ms | PASS |
+| 10K blocks, 32KB | sorted_heap | 0.69ms | 0.81ms | 2.27ms | PASS |
 
 Key findings:
-- exact read-by-id + decode comfortably under 2ms at 32KB, under 2ms at 128KB
-- no degradation from 1K to 10K blocks on exact reads
+- exact read-by-id + decode comfortably under 1ms at 32KB, under 2ms at 128KB
+- no degradation from 1K to 10K blocks on exact reads (0.69-0.72ms stable)
 - sorted_heap performs identically to plain heap (no overhead)
-- sketch search adds ~1ms at 32KB, ~4ms at 128KB (HNSW on 64-dim vectors)
-- all gates pass for 32KB blocks; 128KB sketch search is marginal (5.6ms vs 8ms gate)
+- sketch search scales mildly with block count (1.9ms→2.3ms from 1K to 10K at 32KB)
+- all gates pass for 32KB blocks; 128KB sketch search is marginal (5.5ms vs 8ms gate)
 
 Conclusion: pg_sorted_heap is a viable warm-tier backing store for KV blocks.
 32KB blocks (256 tokens) are the recommended payload size.
