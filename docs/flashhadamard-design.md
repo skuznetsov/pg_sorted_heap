@@ -202,7 +202,54 @@ Conclusion: pg_sorted_heap is a viable warm-tier backing store for KV blocks.
 32KB blocks (256 tokens) are the recommended payload size.
 Script: `scripts/bench_kv_offload_exp0.py`
 
-**Experiment 1: Block sketch relevance**
+**Experiment 1A: Embedding-proxy routing quality — PASS**
+
+Tested on 4 Gutenberg novels (1K-2K chunks each, block_size=8, k=5):
+- FlashHadamard sketch: 65-70% mean overlap with ground truth top-5
+- Random baseline: 0-4%
+- Recency-only: 0-11%
+- Signal ~15x above random, consistently above recency
+
+Caveat: ground truth is exact embedding cosine similarity, NOT actual
+KV-cache attention weights. This is a necessary but not sufficient
+condition for routing quality. Script: `scripts/bench_kv_routing_exp1a.py`
+
+**Experiment 1B: LLM-closer routing quality (next)**
+Goal: validate routing with a ground truth signal closer to actual
+autoregressive model behavior.
+
+Approach: for a long text processed by an autoregressive LLM (Qwen 3.5 9B
+via cogni-ml llama.cpp bindings), measure whether removing/restoring old
+context blocks affects generation quality. Specifically:
+- process a long text (~2K tokens) through the LLM
+- at each evaluation point, compare perplexity on next-N tokens with:
+  a. full context (baseline)
+  b. truncated to last-M tokens only (recency-only)
+  c. last-M tokens + top-k blocks retrieved by FlashHadamard sketch
+- if (c) is materially closer to (a) than (b), the routing thesis holds
+  at the model level, not just embedding level
+
+Gate:
+- PASS: sketch-augmented perplexity materially closer to full context
+  than recency-only
+- SOFT: sketch helps but margin is small
+- FAIL: no meaningful perplexity improvement from sketch-routed blocks
+
+Result (Gemma 3 4B, War and Peace excerpt, block_size=64, k=2): **PASS**
+- Full context (618 tokens): ppl=12.47
+- Recency only (128 tokens): ppl=31.51
+- Sketch + tail (256 tokens): ppl=12.48
+- Recovery: 99.9% of context gap closed using 41% of tokens
+- Script: `cogni-ml/bin/kv_routing_exp1b.cr`
+
+**Experiment 2: End-to-end quality (only after 1B PASS)**
+- Same long session, but with actual KV offload active
+- Compare generation quality between:
+  a. Full KV cache (baseline)
+  b. Hot tail only (no recall)
+  c. Hot tail + FlashHadamard routed recall
+
+**Experiment 1 (original, replaced by 1A+1B above):**
 - Run Cogniformerus on a long session (8K+ tokens)
 - Extract per-layer KV cache at each step
 - Compute block-level mean-key sketches
