@@ -98,6 +98,35 @@ query latency and zero training cost. This is competitive with traditional
 PQ (which requires codebook fitting) and much cheaper in metadata than
 dense random rotation approaches.
 
+## Two-Stage Rerank
+
+The packed quantizer's errors concentrate at the top-k boundary. A cheap
+second-stage rerank on a small shortlist fixes most of them.
+
+**FP32 rerank (quality ceiling, not honest storage):**
+
+| M (shortlist) | hit@1 | recall@10 | p50 ms |
+|---------------|-------|-----------|--------|
+| no rerank | 80% | 89.4% | 6.8 |
+| M=20 | 100% | 99.6% | 11.3 |
+| M=50 | 100% | 100% | 23.5 |
+
+**SQ8 rerank (honest storage: 12 bits/dim total):**
+
+| M | hit@1 | recall@10 | p50 ms | p95 ms | bytes/vec |
+|---|-------|-----------|--------|--------|-----------|
+| 8 | 100% | 78.2% | 10.7 | 19.4 | 4320 |
+| 12 | 100% | 96.2% | 11.5 | 20.0 | 4320 |
+| 16 | 100% | 97.0% | 12.1 | 21.8 | 4320 |
+| 20 | 100% | 97.6% | 12.3 | 23.8 | 4320 |
+
+Sweet spot: **M=12 with SQ8 rerank** — 100% hit@1, 96.2% recall@10,
+11.5ms p50, 4320 bytes/vec (3× compression vs float32).
+
+Current latency is dominated by Python overhead. A fused C helper path
+(packed shortlist → SQ8 gather → rerank → top-k in one call) should
+bring this under 5ms.
+
 ## Open Work
 
 1. **Larger datasets.** IVF becomes relevant at 500K+ vectors. The centroid
