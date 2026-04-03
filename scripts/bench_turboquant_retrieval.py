@@ -2235,41 +2235,80 @@ class TurboQuantTwoPassBlockwiseMethod(RetrievalMethod):
 
 
 class FlashHadamardRerankMethod(RetrievalMethod):
-    """Two-stage: FlashHadamard packed shortlist → exact float32 rerank.
+    """Two-stage: FlashHadamard packed shortlist → rerank.
 
     Stage 1: run the inner packed method with shortlist_m candidates
-    Stage 2: rerank shortlist by exact float32 dot product against stored base
+    Stage 2: rerank shortlist against stored vectors
+
+    rerank_mode:
+      "fp32" — exact float32 rerank (full base in memory, not honest storage)
+      "sq8"  — SQ8 compressed rerank (1 byte/dim + per-dim min/max metadata)
     """
 
-    def __init__(self, inner: RetrievalMethod, shortlist_m: int = 50) -> None:
-        super().__init__(f"{inner.name}_rerank{shortlist_m}")
+    def __init__(self, inner: RetrievalMethod, shortlist_m: int = 50,
+                 rerank_mode: str = "sq8") -> None:
+        suffix = f"rerank{shortlist_m}" if rerank_mode == "fp32" else f"sq8rerank{shortlist_m}"
+        super().__init__(f"{inner.name}_{suffix}")
         self.inner = inner
         self.shortlist_m = shortlist_m
+        self.rerank_mode = rerank_mode
         self._base_normalized: np.ndarray | None = None
+        # SQ8 state
+        self._sq8_codes: np.ndarray | None = None
+        self._sq8_mins: np.ndarray | None = None
+        self._sq8_scales: np.ndarray | None = None
+        self._dim = 0
 
     def fit(self, base: np.ndarray) -> None:
         self.inner.fit(base)
-        # Store normalized base for exact rerank
+        self._dim = base.shape[1]
         norms = np.linalg.norm(base, axis=1, keepdims=True)
-        self._base_normalized = (base / np.maximum(norms, 1e-12)).astype(np.float32)
+        normalized = (base / np.maximum(norms, 1e-12)).astype(np.float32)
+
+        if self.rerank_mode == "fp32":
+            self._base_normalized = normalized
+        else:
+            # SQ8: per-dimension min/max quantization
+            col_min = normalized.min(axis=0).astype(np.float32)
+            col_max = normalized.max(axis=0).astype(np.float32)
+            col_range = col_max - col_min
+            col_range = np.maximum(col_range, 1e-8)
+            self._sq8_codes = np.clip(
+                np.rint((normalized - col_min) / col_range * 255.0),
+                0, 255
+            ).astype(np.uint8)
+            self._sq8_mins = col_min
+            self._sq8_scales = col_range / 255.0
 
     def search(self, query: np.ndarray, k: int) -> np.ndarray:
-        if self._base_normalized is None:
-            raise RuntimeError("fit must run first")
         # Stage 1: packed shortlist
         shortlist_ids = self.inner.search(query, self.shortlist_m)
-        # Stage 2: exact rerank
-        candidates = self._base_normalized[shortlist_ids]
         q_norm = query / max(np.linalg.norm(query), 1e-12)
-        exact_scores = candidates @ q_norm
-        reranked = np.argsort(exact_scores)[::-1][:k]
+
+        if self.rerank_mode == "fp32":
+            candidates = self._base_normalized[shortlist_ids]
+            scores = candidates @ q_norm
+        else:
+            # SQ8 decode + dot product
+            codes = self._sq8_codes[shortlist_ids]  # [M, dim] uint8
+            decoded = codes.astype(np.float32) * self._sq8_scales + self._sq8_mins
+            scores = decoded @ q_norm
+
+        reranked = np.argsort(scores)[::-1][:k]
         return shortlist_ids[reranked]
 
     def bytes_per_vec(self) -> float:
-        return self.inner.bytes_per_vec()
+        inner_bytes = self.inner.bytes_per_vec()
+        if self.rerank_mode == "fp32":
+            return inner_bytes  # NOTE: misleading, full fp32 base resident
+        else:
+            return inner_bytes + float(self._dim)  # packed codes + SQ8 codes
 
     def metadata_bytes(self) -> int:
-        return self.inner.metadata_bytes()
+        inner_meta = self.inner.metadata_bytes()
+        if self.rerank_mode == "sq8" and self._sq8_mins is not None:
+            inner_meta += int(self._sq8_mins.nbytes + self._sq8_scales.nbytes)
+        return inner_meta
 
 
 class TurboQuantProdMethod(RetrievalMethod):
@@ -2479,10 +2518,11 @@ def method_factories(base: np.ndarray, args: argparse.Namespace) -> list[tuple[s
         ("turboquant_blockhadamard_packed4_topk", lambda: TurboQuantBlockHadamardPackedTopKMethod(args.turbo_bits, args.seed)),
         ("turboquant_block16_packed4", lambda: TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16)),
         ("turboquant_block16_packed4_topk", lambda: TurboQuantBlock32PackedTopKMethod(args.turbo_bits, args.seed, group_size=16)),
-        ("turboquant_block16_packed4_rerank20", lambda: FlashHadamardRerankMethod(TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16), shortlist_m=20)),
-        ("turboquant_block16_packed4_rerank50", lambda: FlashHadamardRerankMethod(TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16), shortlist_m=50)),
-        ("turboquant_block16_packed4_rerank100", lambda: FlashHadamardRerankMethod(TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16), shortlist_m=100)),
-        ("turboquant_block16_packed4_rerank200", lambda: FlashHadamardRerankMethod(TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16), shortlist_m=200)),
+        ("turboquant_block16_packed4_sq8rerank20", lambda: FlashHadamardRerankMethod(TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16), shortlist_m=20, rerank_mode="sq8")),
+        ("turboquant_block16_packed4_sq8rerank50", lambda: FlashHadamardRerankMethod(TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16), shortlist_m=50, rerank_mode="sq8")),
+        ("turboquant_block16_packed4_sq8rerank100", lambda: FlashHadamardRerankMethod(TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16), shortlist_m=100, rerank_mode="sq8")),
+        ("turboquant_block16_packed4_rerank20", lambda: FlashHadamardRerankMethod(TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16), shortlist_m=20, rerank_mode="fp32")),
+        ("turboquant_block16_packed4_rerank50", lambda: FlashHadamardRerankMethod(TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16), shortlist_m=50, rerank_mode="fp32")),
         ("turboquant_block32_packed4", lambda: TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed)),
         ("turboquant_block32_packed4_topk", lambda: TurboQuantBlock32PackedTopKMethod(args.turbo_bits, args.seed)),
         ("turboquant_block32_dither_packed4", lambda: TurboQuantBlock32DitherPackedMethod(args.turbo_bits, args.seed)),
