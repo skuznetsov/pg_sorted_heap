@@ -676,13 +676,26 @@ Current repo status:
 
   | lane                        | hit@1  | recall@10 | p50 ms | role                         |
   |-----------------------------|--------|-----------|--------|------------------------------|
-  | blockhadamard_packed4       |  98.0% |    91.20% |   9.9  | best packed recall@10 lane   |
+  | blockhadamard_packed4       |  98.0% |    91.20% |   7.6  | best packed recall@10 lane   |
   | blockhadamard_packed4_topk  |  98.0% |    91.20% |   8.3  | (same quality, fused top-k)  |
-  | block32_packed4             | 100.0% |    89.40% |   9.8  | best packed hit@1 lane       |
+  | **block16_packed4**         | 100.0% |    91.00% |   7.1  | **best combined lane**       |
+  | block32_packed4             | 100.0% |    89.40% |   7.6  | over-equalized, demoted      |
   | block32_dither (non-packed) | 100.0% |    91.80% |  17.2  | best overall quality (dense) |
 
-  Default packed lane for Cogniformerus consumer objective: **blockhadamard_packed4**
-  (best recall@10 among packed lanes; hit@1 difference is 2% = 1 query out of 50)
+  Default packed lane for Cogniformerus consumer objective: **block16_packed4**
+  (100% hit@1, 91.0% recall@10 — only 0.2% below blockhadamard on recall,
+  +2% on hit@1, fastest packed lane at 7.1ms)
+
+- block32 recall regression ablation (2026-04-03, vetted Gutenberg):
+  - group_size sweep: 16/32/64/128 + plain blockhadamard (no scaling)
+  - finding: group_size=32 over-equalizes on 2880D Gutenberg, losing 1.8%
+    recall@10 vs plain blockhadamard while gaining 2% hit@1
+  - group_size=16 is the sweet spot: preserves tail discrimination while
+    still improving hit@1, yielding 100% hit@1 + 91.0% recall@10
+  - shrinkage ablation (blend group_scale toward global RMS): shrinkage
+    helps recall partially (90.4% at alpha=0.5-0.75) but does not match
+    block16 (91.0%), and introduces an extra tuning parameter
+  - block16_packed4 verified exact quality match vs non-packed block16
 
 - IVF+TQ research lane added (2026-04-03) as
   `TurboQuantIVFBlock32PackedMethod` in the evaluator: k-means on

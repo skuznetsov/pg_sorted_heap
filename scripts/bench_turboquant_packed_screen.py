@@ -45,6 +45,7 @@ def build_method(mod, name: str, bits: int, seed: int):
     mapping = {
         "turboquant_blockhadamard_packed4": lambda: mod.TurboQuantBlockHadamardPackedMethod(bits, seed),
         "turboquant_blockhadamard_packed4_topk": lambda: mod.TurboQuantBlockHadamardPackedTopKMethod(bits, seed),
+        "turboquant_block16_packed4": lambda: mod.TurboQuantBlock32PackedMethod(bits, seed, group_size=16),
         "turboquant_block32_packed4": lambda: mod.TurboQuantBlock32PackedMethod(bits, seed),
         "turboquant_block32_dither_packed4": lambda: mod.TurboQuantBlock32DitherPackedMethod(bits, seed),
     }

@@ -1655,6 +1655,37 @@ class TurboQuantBlockHadamardBlockwiseMethod(RetrievalMethod):
         return total
 
 
+class TurboQuantBlockHadamardBlockwiseShrunkMethod(TurboQuantBlockHadamardBlockwiseMethod):
+    """Blockwise with scale shrinkage toward global RMS."""
+
+    def __init__(self, bits: int, seed: int, group_size: int = 32, shrinkage: float = 0.5) -> None:
+        super().__init__(bits, seed, group_size)
+        self.shrinkage = shrinkage
+        self.name = f"turboquant_block{group_size}_shrink{shrinkage}"
+
+    def fit(self, base: np.ndarray) -> None:
+        self.dim = base.shape[1]
+        rng = np.random.default_rng(self.seed)
+        self.perm = rng.permutation(self.dim).astype(np.int32)
+        self.signs = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=self.dim, replace=True)
+        self.blocks = power_of_two_blocks(self.dim)
+        self.centers, self.bounds = gaussian_lloyd_max(self.bits)
+        norms = np.linalg.norm(base, axis=1).astype(np.float32)
+        unit = base / np.maximum(norms[:, None], 1e-12)
+        rotated = structured_block_hadamard(unit, self.perm, self.signs, self.blocks) * math.sqrt(self.dim)
+        group_scales, expanded_scales = grouped_rms_scales(rotated, self.group_size)
+        # Shrink toward global RMS
+        global_rms = float(np.sqrt(np.mean(rotated * rotated)))
+        shrunk_group = (1.0 - self.shrinkage) * group_scales + self.shrinkage * global_rms
+        shrunk_expanded = expand_group_scales(shrunk_group, self.dim, self.group_size)
+        equalized = rotated / shrunk_expanded
+        codes = np.digitize(equalized, self.bounds[1:-1], right=False).astype(np.uint8)
+        self.codes = codes
+        self.norms = maybe_store_norms(norms)
+        self.group_scales = shrunk_group
+        self.decoded_rot = (self.centers[codes] * shrunk_expanded) / math.sqrt(self.dim)
+
+
 class TurboQuantBlockHadamardTwoPassMethod(RetrievalMethod):
     def __init__(self, bits: int, seed: int) -> None:
         super().__init__("turboquant_blockhadamard_twopass")
@@ -2300,13 +2331,20 @@ def method_factories(base: np.ndarray, args: argparse.Namespace) -> list[tuple[s
         ("turboquant_blockhadamard", lambda: TurboQuantBlockHadamardMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_packed4", lambda: TurboQuantBlockHadamardPackedMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_packed4_topk", lambda: TurboQuantBlockHadamardPackedTopKMethod(args.turbo_bits, args.seed)),
+        ("turboquant_block16_packed4", lambda: TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16)),
         ("turboquant_block32_packed4", lambda: TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed)),
         ("turboquant_block32_dither_packed4", lambda: TurboQuantBlock32DitherPackedMethod(args.turbo_bits, args.seed)),
         ("turboquant_ivf32_block32_packed4", lambda: TurboQuantIVFBlock32PackedMethod(args.turbo_bits, args.seed, n_clusters=args.ivf_clusters or 32, n_probe=args.ivf_nprobe or 8)),
         ("turboquant_ivf64_block32_packed4", lambda: TurboQuantIVFBlock32PackedMethod(args.turbo_bits, args.seed, n_clusters=args.ivf_clusters or 64, n_probe=args.ivf_nprobe or 12)),
         ("turboquant_ivf128_block32_packed4", lambda: TurboQuantIVFBlock32PackedMethod(args.turbo_bits, args.seed, n_clusters=args.ivf_clusters or 128, n_probe=args.ivf_nprobe or 16)),
         ("turboquant_blockhadamard_whitened", lambda: TurboQuantBlockHadamardWhitenedMethod(args.turbo_bits, args.seed)),
+        ("turboquant_blockhadamard_block16", lambda: TurboQuantBlockHadamardBlockwiseMethod(args.turbo_bits, args.seed, group_size=16)),
         ("turboquant_blockhadamard_block32", lambda: TurboQuantBlockHadamardBlockwiseMethod(args.turbo_bits, args.seed)),
+        ("turboquant_blockhadamard_block64", lambda: TurboQuantBlockHadamardBlockwiseMethod(args.turbo_bits, args.seed, group_size=64)),
+        ("turboquant_blockhadamard_block128", lambda: TurboQuantBlockHadamardBlockwiseMethod(args.turbo_bits, args.seed, group_size=128)),
+        ("turboquant_block32_shrink0.25", lambda: TurboQuantBlockHadamardBlockwiseShrunkMethod(args.turbo_bits, args.seed, shrinkage=0.25)),
+        ("turboquant_block32_shrink0.5", lambda: TurboQuantBlockHadamardBlockwiseShrunkMethod(args.turbo_bits, args.seed, shrinkage=0.5)),
+        ("turboquant_block32_shrink0.75", lambda: TurboQuantBlockHadamardBlockwiseShrunkMethod(args.turbo_bits, args.seed, shrinkage=0.75)),
         ("turboquant_blockhadamard_twopass", lambda: TurboQuantBlockHadamardTwoPassMethod(args.turbo_bits, args.seed)),
         ("turboquant_twopass_block32", lambda: TurboQuantTwoPassBlockwiseMethod(args.turbo_bits, args.seed)),
         ("turboquant_block32_compand", lambda: TurboQuantBlockwiseCompandedMethod(args.turbo_bits, args.seed)),
@@ -2366,7 +2404,7 @@ def build_methods(base: np.ndarray, args: argparse.Namespace) -> list[RetrievalM
     for name in selected_names:
         if name == "turboquant_prod" and args.turbo_bits < 2:
             raise SystemExit("turboquant_prod requires --turbo-bits >= 2")
-        if name in {"turboquant_blockhadamard_packed4", "turboquant_blockhadamard_packed4_topk", "turboquant_block32_packed4", "turboquant_block32_dither_packed4", "turboquant_block32_dimdither_packed4"} and args.turbo_bits != 4:
+        if name in {"turboquant_blockhadamard_packed4", "turboquant_blockhadamard_packed4_topk", "turboquant_block16_packed4", "turboquant_block32_packed4", "turboquant_block32_dither_packed4", "turboquant_block32_dimdither_packed4"} and args.turbo_bits != 4:
             raise SystemExit(f"{name} currently requires --turbo-bits=4")
         methods.append(factory_map[name]())
     return methods
