@@ -160,6 +160,19 @@ def load_packed_adc_helper() -> ctypes.CDLL | None:
         ctypes.POINTER(ctypes.c_float),
     ]
     lib.turboquant_blockhadamard_packed4_scores_t_mt_f32.restype = None
+    lib.turboquant_blockhadamard_packed4_topk_t_mt_f32.argtypes = [
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.turboquant_blockhadamard_packed4_topk_t_mt_f32.restype = None
     lib.turboquant_blockhadamard_packed4_profile_reset.argtypes = []
     lib.turboquant_blockhadamard_packed4_profile_reset.restype = None
     lib.turboquant_blockhadamard_packed4_profile_get.argtypes = [
@@ -786,6 +799,45 @@ def packed_lookup_scores_blockhadamard_packed4_transposed(
     return scores
 
 
+def packed_topk_blockhadamard_packed4_transposed(
+    packed_codes_t: np.ndarray,
+    coeffs: np.ndarray,
+    centers: np.ndarray,
+    norms: np.ndarray | None,
+    k: int,
+) -> np.ndarray:
+    lib = load_packed_adc_helper()
+    if lib is None:
+        scores = packed_lookup_scores_blockhadamard_packed4_transposed(
+            packed_codes_t, coeffs, centers, norms
+        )
+        return topk_indices(scores, k)
+    packed_codes_t = np.ascontiguousarray(packed_codes_t, dtype=np.uint8)
+    coeffs = np.ascontiguousarray(coeffs, dtype=np.float32)
+    centers = np.ascontiguousarray(centers, dtype=np.float32)
+    norms_arr = None if norms is None else np.ascontiguousarray(norms, dtype=np.float32)
+    norm_ptr = (
+        ctypes.cast(0, ctypes.POINTER(ctypes.c_float))
+        if norms_arr is None
+        else norms_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    )
+    out_ids = np.empty(k, dtype=np.int32)
+    out_scores = np.empty(k, dtype=np.float32)
+    lib.turboquant_blockhadamard_packed4_topk_t_mt_f32(
+        packed_codes_t.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        coeffs.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        centers.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        norm_ptr,
+        ctypes.c_size_t(packed_codes_t.shape[1]),
+        ctypes.c_size_t(coeffs.shape[0]),
+        ctypes.c_size_t(packed_adc_thread_count()),
+        ctypes.c_size_t(k),
+        out_ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+        out_scores.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+    )
+    return out_ids[out_ids >= 0]
+
+
 def reset_blockhadamard_packed4_profile() -> None:
     lib = load_packed_adc_helper()
     if lib is None:
@@ -1186,6 +1238,28 @@ class TurboQuantBlockHadamardPackedMethod(RetrievalMethod):
             "c_score_ms_per_query": float(helper_profile["c_score_ms_total"]) / calls,
             "c_calls": int(helper_profile["c_calls"]),
         }
+
+
+class TurboQuantBlockHadamardPackedTopKMethod(TurboQuantBlockHadamardPackedMethod):
+    def __init__(self, bits: int, seed: int) -> None:
+        super().__init__(bits, seed)
+        self.name = "turboquant_blockhadamard_packed4_topk"
+
+    def search(self, query: np.ndarray, k: int) -> np.ndarray:
+        if self.packed_codes_t is None or self.centers is None:
+            raise RuntimeError("fit must run first")
+        t0 = time.perf_counter()
+        q_rot = structured_block_hadamard_vec(query, self.perm, self.signs, self.blocks)
+        self.transform_ms_total += (time.perf_counter() - t0) * 1000.0
+        self.transform_calls += 1
+        coeffs = (q_rot / math.sqrt(self.dim)).astype(np.float32, copy=False)
+        return packed_topk_blockhadamard_packed4_transposed(
+            self.packed_codes_t,
+            coeffs,
+            self.centers,
+            self.norms,
+            k,
+        )
 
 
 class TurboQuantBlockHadamardWhitenedMethod(RetrievalMethod):
@@ -1939,6 +2013,7 @@ def method_factories(base: np.ndarray, args: argparse.Namespace) -> list[tuple[s
         ("turboquant_mse", lambda: TurboQuantMSEMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard", lambda: TurboQuantBlockHadamardMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_packed4", lambda: TurboQuantBlockHadamardPackedMethod(args.turbo_bits, args.seed)),
+        ("turboquant_blockhadamard_packed4_topk", lambda: TurboQuantBlockHadamardPackedTopKMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_whitened", lambda: TurboQuantBlockHadamardWhitenedMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_block32", lambda: TurboQuantBlockHadamardBlockwiseMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_twopass", lambda: TurboQuantBlockHadamardTwoPassMethod(args.turbo_bits, args.seed)),
@@ -2000,7 +2075,7 @@ def build_methods(base: np.ndarray, args: argparse.Namespace) -> list[RetrievalM
     for name in selected_names:
         if name == "turboquant_prod" and args.turbo_bits < 2:
             raise SystemExit("turboquant_prod requires --turbo-bits >= 2")
-        if name in {"turboquant_blockhadamard_packed4", "turboquant_block32_dimdither_packed4"} and args.turbo_bits != 4:
+        if name in {"turboquant_blockhadamard_packed4", "turboquant_blockhadamard_packed4_topk", "turboquant_block32_dimdither_packed4"} and args.turbo_bits != 4:
             raise SystemExit(f"{name} currently requires --turbo-bits=4")
         methods.append(factory_map[name]())
     return methods

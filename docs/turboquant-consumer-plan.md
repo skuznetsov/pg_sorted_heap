@@ -95,6 +95,10 @@ Current repo status:
   mirror of plain `blockhadamard`; it is explicit-only and intended to answer
   whether packed nibble lookup can preserve ranking before any low-level kernel
   work exists
+- `turboquant_blockhadamard_packed4_topk` now exists as an exact helper-side
+  top-k variant of the packed `blockhadamard` lane; it is explicit-only and
+  intended to answer whether eliminating full score materialization plus
+  Python-side `argpartition` buys a real end-to-end win on large workloads
 - a tiny repo-owned C helper now exists for packed ADC scoring:
   - source: `scripts/turboquant_packed_adc.c`
   - explicit build entry point: `make build-turboquant-packed-helper`
@@ -570,6 +574,33 @@ Current repo status:
   - the next kernelization branch should still target the packed scoring
     loop first, but now it should build on the proven `2`-byte fusion path
     rather than the earlier single-byte generic loop
+  - the next surviving branch after that moved exact top-k selection into the
+    packed helper for `turboquant_blockhadamard_packed4_topk`, so the helper
+    now builds byte tables once, scores each row chunk, keeps per-thread exact
+    top-k candidates, and avoids materializing the full score vector before
+    Python ranking
+    - adversary check versus the current exact packed scorer:
+      - `dim=31`: top-k ids identical
+      - `dim=32`: top-k ids identical
+      - `dim=2880`: top-k ids identical
+    - vetted Gutenberg repeats with exact ranking preserved:
+      - repeat A:
+        - `turboquant_blockhadamard_packed4`: `98.0% hit@1`,
+          `91.20% recall@10`, `9.726 ms` p50, `9.776 ms` avg
+        - `turboquant_blockhadamard_packed4_topk`: `98.0% hit@1`,
+          `91.20% recall@10`, `8.518 ms` p50, `8.630 ms` avg
+      - repeat B:
+        - `turboquant_blockhadamard_packed4`: `98.0% hit@1`,
+          `91.20% recall@10`, `9.705 ms` p50, `10.192 ms` avg
+        - `turboquant_blockhadamard_packed4_topk`: `98.0% hit@1`,
+          `91.20% recall@10`, `7.059 ms` p50, `7.535 ms` avg
+  Narrow conclusion:
+  - the current strongest packed lane is no longer just exact packed scoring;
+    it is exact packed scoring with helper-side top-k
+  - on the real Gutenberg target this removes roughly `1-2.6 ms/query`
+    from the end-to-end path while preserving identical ranking and quality
+  - the remaining next kernelization question is now narrower:
+    further reduce the helper-side scoring cost, not Python-side selection
 
 ### Publication threshold
 
