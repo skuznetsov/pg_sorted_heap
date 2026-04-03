@@ -765,15 +765,26 @@ Current repo status:
     exhaustive `block32_packed4` baseline: `86% hit@1`, `85.6% recall@10`,
     `1.15 ms` p50
 
-  - status: PROVISIONAL — nprobe sweep done on glove-100 (low-dim), but:
-    - Gutenberg sweep blocked by k-means fit cost (507s per run)
-    - nprobe=32 (all clusters) recovers exhaustive recall exactly,
-      confirming correctness
-    - sweet spot on glove-100: nprobe=8-16 (2.4-1.3x speedup, 79-84% recall)
-    - higher-dim datasets should show tighter clusters and better
-      recall at same nprobe, but this is untested
-    - CLI now supports `--ivf-clusters` and `--ivf-nprobe` overrides
-    - not a candidate for engine integration until Gutenberg sweep completes
+  - Gutenberg nprobe sweep (5K subset, 2880D, ivf32, from centroid cache):
+
+    | nprobe | hit@1 | recall@10 | p50 ms |
+    |--------|-------|-----------|--------|
+    |      2 |  78%  |    81.6%  |  0.93  |
+    |      4 |  84%  |    88.0%  |  1.35  |
+    |      8 |  84%  |    89.6%  |  2.43  |
+    |     12 |  84%  |    90.0%  |  3.51  |
+    |     32 |  84%  |    90.0%  |  7.96  |
+
+    exhaustive `block16_packed4_topk`: `86% hit@1`, `90.4% recall@10`,
+    `2.15 ms` p50
+
+  - centroid caching: `--ivf-cache-dir` saves fitted state to .npz;
+    warm encode 15ms vs 50s cold (3000x faster)
+  - on 5K vectors IVF does not help speed (exhaustive already fast)
+  - IVF value is at scale (50K+); recall saturates at nprobe=12 (90.0%)
+  - CLI supports `--ivf-clusters`, `--ivf-nprobe`, `--ivf-cache-dir`
+  - status: VALIDATED on glove-100 + Gutenberg 5K subset; full 103K
+    sweep now feasible via caching but not yet run
 
 ### Publication threshold
 

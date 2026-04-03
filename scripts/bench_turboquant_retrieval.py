@@ -1479,16 +1479,18 @@ class TurboQuantIVFBlock32PackedMethod(RetrievalMethod):
 
     For datasets > ~50K vectors. Uses k-means on Hadamard-rotated vectors
     for partitioning, then packed block32 TQ within each cluster for scoring.
+    Supports disk caching of fitted state to avoid repeated k-means.
     """
 
     def __init__(self, bits: int, seed: int, n_clusters: int = 32, n_probe: int = 4,
-                 group_size: int = 32) -> None:
+                 group_size: int = 32, cache_dir: str | None = None) -> None:
         super().__init__(f"turboquant_ivf{n_clusters}_block{group_size}_packed4")
         self.bits = bits
         self.seed = seed
         self.n_clusters = n_clusters
         self.n_probe = n_probe
         self.group_size = group_size
+        self.cache_dir = cache_dir
         self.perm: np.ndarray | None = None
         self.signs: np.ndarray | None = None
         self.blocks: list[int] = []
@@ -1499,12 +1501,69 @@ class TurboQuantIVFBlock32PackedMethod(RetrievalMethod):
         self.centers: np.ndarray | None = None
         self._expanded_scales: np.ndarray | None = None
         self.dim = 0
+        self._cache_hit = False
+
+    def _cache_key(self, n_rows: int, dim: int) -> str:
+        return f"ivf_b{self.bits}_s{self.seed}_c{self.n_clusters}_g{self.group_size}_{n_rows}x{dim}"
+
+    def _try_load_cache(self, n_rows: int, dim: int) -> bool:
+        if self.cache_dir is None:
+            return False
+        cache_path = Path(self.cache_dir) / f"{self._cache_key(n_rows, dim)}.npz"
+        if not cache_path.exists():
+            return False
+        try:
+            data = np.load(cache_path, allow_pickle=True)
+            self.centroids = data["centroids"]
+            self._expanded_scales = data["expanded_scales"]
+            self.centers = data["centers"]
+            n_clusters = int(data["n_clusters_actual"])
+            self.cluster_codes_t = []
+            self.cluster_norms = []
+            self.cluster_row_ids = []
+            for c in range(n_clusters):
+                self.cluster_codes_t.append(data[f"codes_t_{c}"])
+                norms_key = f"norms_{c}"
+                self.cluster_norms.append(data[norms_key] if norms_key in data else None)
+                self.cluster_row_ids.append(data[f"row_ids_{c}"])
+            self._cache_hit = True
+            return True
+        except Exception:
+            return False
+
+    def _save_cache(self, n_rows: int, dim: int, n_clusters_actual: int) -> None:
+        if self.cache_dir is None:
+            return
+        cache_dir = Path(self.cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_dir / f"{self._cache_key(n_rows, dim)}.npz"
+        save_dict: dict[str, np.ndarray] = {
+            "centroids": self.centroids,
+            "expanded_scales": self._expanded_scales,
+            "centers": self.centers,
+            "n_clusters_actual": np.array(n_clusters_actual),
+        }
+        for c in range(n_clusters_actual):
+            save_dict[f"codes_t_{c}"] = self.cluster_codes_t[c]
+            if self.cluster_norms[c] is not None:
+                save_dict[f"norms_{c}"] = self.cluster_norms[c]
+            save_dict[f"row_ids_{c}"] = self.cluster_row_ids[c]
+        np.savez(cache_path, **save_dict)
 
     def fit(self, base: np.ndarray) -> None:
         if self.bits != 4:
             raise ValueError(f"{self.name} requires --turbo-bits=4")
         load_packed_adc_helper()
         self.dim = base.shape[1]
+
+        # Try cache first
+        if self._try_load_cache(base.shape[0], self.dim):
+            rng = np.random.default_rng(self.seed)
+            self.perm = rng.permutation(self.dim).astype(np.int32)
+            self.signs = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=self.dim, replace=True)
+            self.blocks = power_of_two_blocks(self.dim)
+            return
+
         rng = np.random.default_rng(self.seed)
         self.perm = rng.permutation(self.dim).astype(np.int32)
         self.signs = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=self.dim, replace=True)
@@ -1543,6 +1602,8 @@ class TurboQuantIVFBlock32PackedMethod(RetrievalMethod):
             cluster_norms = norms[mask]
             self.cluster_norms.append(maybe_store_norms(cluster_norms))
             self.cluster_row_ids.append(np.flatnonzero(mask).astype(np.int32))
+
+        self._save_cache(base.shape[0], self.dim, n_clusters)
 
     def search(self, query: np.ndarray, k: int) -> np.ndarray:
         if self.centroids is None or self._expanded_scales is None:
@@ -2335,6 +2396,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--turbo-bits", type=int, default=4)
     ap.add_argument("--ivf-clusters", type=int, default=0, help="Override n_clusters for IVF lanes (0=use factory default)")
     ap.add_argument("--ivf-nprobe", type=int, default=0, help="Override n_probe for IVF lanes (0=use factory default)")
+    ap.add_argument("--ivf-cache-dir", type=str, default=None, help="Directory for IVF centroid cache (skip k-means on warm runs)")
     ap.add_argument("--profile-packed-stages", action="store_true", help="Print packed blockhadamard stage timings")
     ap.add_argument("--pq-m", type=int, default=0, help="PQ subvector count (0=auto)")
     ap.add_argument("--pq-bits", type=int, default=8)
@@ -2382,9 +2444,9 @@ def method_factories(base: np.ndarray, args: argparse.Namespace) -> list[tuple[s
         ("turboquant_block32_packed4", lambda: TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed)),
         ("turboquant_block32_packed4_topk", lambda: TurboQuantBlock32PackedTopKMethod(args.turbo_bits, args.seed)),
         ("turboquant_block32_dither_packed4", lambda: TurboQuantBlock32DitherPackedMethod(args.turbo_bits, args.seed)),
-        ("turboquant_ivf32_block32_packed4", lambda: TurboQuantIVFBlock32PackedMethod(args.turbo_bits, args.seed, n_clusters=args.ivf_clusters or 32, n_probe=args.ivf_nprobe or 8)),
-        ("turboquant_ivf64_block32_packed4", lambda: TurboQuantIVFBlock32PackedMethod(args.turbo_bits, args.seed, n_clusters=args.ivf_clusters or 64, n_probe=args.ivf_nprobe or 12)),
-        ("turboquant_ivf128_block32_packed4", lambda: TurboQuantIVFBlock32PackedMethod(args.turbo_bits, args.seed, n_clusters=args.ivf_clusters or 128, n_probe=args.ivf_nprobe or 16)),
+        ("turboquant_ivf32_block32_packed4", lambda: TurboQuantIVFBlock32PackedMethod(args.turbo_bits, args.seed, n_clusters=args.ivf_clusters or 32, n_probe=args.ivf_nprobe or 8, cache_dir=args.ivf_cache_dir)),
+        ("turboquant_ivf64_block32_packed4", lambda: TurboQuantIVFBlock32PackedMethod(args.turbo_bits, args.seed, n_clusters=args.ivf_clusters or 64, n_probe=args.ivf_nprobe or 12, cache_dir=args.ivf_cache_dir)),
+        ("turboquant_ivf128_block32_packed4", lambda: TurboQuantIVFBlock32PackedMethod(args.turbo_bits, args.seed, n_clusters=args.ivf_clusters or 128, n_probe=args.ivf_nprobe or 16, cache_dir=args.ivf_cache_dir)),
         ("turboquant_blockhadamard_whitened", lambda: TurboQuantBlockHadamardWhitenedMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_block16", lambda: TurboQuantBlockHadamardBlockwiseMethod(args.turbo_bits, args.seed, group_size=16)),
         ("turboquant_blockhadamard_block32", lambda: TurboQuantBlockHadamardBlockwiseMethod(args.turbo_bits, args.seed)),
