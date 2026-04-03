@@ -672,6 +672,29 @@ Current repo status:
   - future paths for packed dither: group-level dither with storable
     correction, or seed-derived on-the-fly correction (high compute cost)
 
+- IVF+TQ research lane added (2026-04-03) as
+  `TurboQuantIVFBlock32PackedMethod` in the evaluator: k-means on
+  equalized rotated space, packed block32 TQ scoring within probed clusters
+  - glove-100 (50K base, 100D, cosine, k=10):
+    - `block32_packed4` (exhaustive): `86% hit@1`, `85.6% recall@10`,
+      `1.17 ms` p50
+    - `ivf32_block32_packed4` (nprobe=8): `80% hit@1`, `78.8% recall@10`,
+      `0.49 ms` p50 — 2.4x speedup, ~7% recall gap
+    - `ivf64_block32_packed4` (nprobe=12): `78% hit@1`, `79.4% recall@10`,
+      `0.48 ms` p50
+  - vetted Gutenberg (103260 x 2880D, cosine, k=10, nprobe=4 old config):
+    - `block32_packed4` (exhaustive): `100% hit@1`, `89.40% recall@10`,
+      `15.9 ms` p50
+    - `ivf32_block32_packed4`: `88% hit@1`, `81.40% recall@10`,
+      `10.1 ms` p50 — 1.57x speedup, ~8% recall gap
+    - encode cost: `507 s` (k-means fit on 103K x 2880D, one-time)
+  - status: PROVISIONAL — code exists, initial numbers collected, but:
+    - nprobe tuning not swept on Gutenberg (only nprobe=4 tested)
+    - encode cost high for iterative development
+    - recall gap (~8%) may narrow with higher nprobe
+    - not a candidate for engine integration until recall/speed tradeoff
+      is characterized across nprobe values on the real workload
+
 ### Publication threshold
 
 The currently defensible publication thesis is narrow:
