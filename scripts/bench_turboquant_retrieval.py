@@ -1308,6 +1308,70 @@ class TurboQuantBlockHadamardPackedTopKMethod(TurboQuantBlockHadamardPackedMetho
         }
 
 
+class TurboQuantBlock32PackedMethod(TurboQuantBlockHadamardPackedMethod):
+    """Packed blockhadamard with group-32 RMS scaling.
+
+    Same C helper as plain blockhadamard_packed4 — group scales are folded
+    into query coefficients at search time, so the packed codes and LUT
+    scoring path are identical.
+    """
+
+    def __init__(self, bits: int, seed: int, group_size: int = 32) -> None:
+        super().__init__(bits, seed)
+        self.name = f"turboquant_block{group_size}_packed4"
+        self.group_size = group_size
+        self.group_scales: np.ndarray | None = None
+
+    def fit(self, base: np.ndarray) -> None:
+        if self.bits != 4:
+            raise ValueError(f"{self.name} currently requires --turbo-bits=4")
+        load_packed_adc_helper()
+        self.dim = base.shape[1]
+        rng = np.random.default_rng(self.seed)
+        self.perm = rng.permutation(self.dim).astype(np.int32)
+        self.signs = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=self.dim, replace=True)
+        self.blocks = power_of_two_blocks(self.dim)
+        self.centers, bounds = gaussian_lloyd_max(self.bits)
+        norms = np.linalg.norm(base, axis=1).astype(np.float32)
+        unit = base / np.maximum(norms[:, None], 1e-12)
+        rotated = structured_block_hadamard(unit, self.perm, self.signs, self.blocks) * math.sqrt(self.dim)
+        group_scales, expanded_scales = grouped_rms_scales(rotated, self.group_size)
+        equalized = rotated / expanded_scales
+        codes = np.digitize(equalized, bounds[1:-1], right=False).astype(np.uint8)
+        self.packed_codes = pack_nibbles(codes)
+        self.packed_codes_t = transpose_packed_codes(self.packed_codes)
+        self.norms = maybe_store_norms(norms)
+        self.group_scales = group_scales
+        self.transform_ms_total = 0.0
+        self.transform_calls = 0
+
+    def search(self, query: np.ndarray, k: int) -> np.ndarray:
+        if self.packed_codes_t is None or self.centers is None or self.group_scales is None:
+            raise RuntimeError("fit must run first")
+        t0 = time.perf_counter()
+        q_rot = structured_block_hadamard_vec(query, self.perm, self.signs, self.blocks)
+        self.transform_ms_total += (time.perf_counter() - t0) * 1000.0
+        self.transform_calls += 1
+        # Fold group scales into query coefficients
+        expanded_scales = expand_group_scales(self.group_scales, self.dim, self.group_size)
+        coeffs = (q_rot * expanded_scales / math.sqrt(self.dim)).astype(np.float32, copy=False)
+        scores = packed_lookup_scores_blockhadamard_packed4_transposed(
+            self.packed_codes_t,
+            coeffs,
+            self.centers,
+            self.norms,
+        )
+        return topk_indices(scores, k)
+
+    def metadata_bytes(self) -> int:
+        total = 24
+        if self.centers is not None:
+            total += int(self.centers.nbytes)
+        if self.group_scales is not None:
+            total += int(self.group_scales.nbytes)
+        return total
+
+
 class TurboQuantBlockHadamardWhitenedMethod(RetrievalMethod):
     def __init__(self, bits: int, seed: int) -> None:
         super().__init__("turboquant_blockhadamard_whitened")
@@ -2061,6 +2125,7 @@ def method_factories(base: np.ndarray, args: argparse.Namespace) -> list[tuple[s
         ("turboquant_blockhadamard", lambda: TurboQuantBlockHadamardMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_packed4", lambda: TurboQuantBlockHadamardPackedMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_packed4_topk", lambda: TurboQuantBlockHadamardPackedTopKMethod(args.turbo_bits, args.seed)),
+        ("turboquant_block32_packed4", lambda: TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_whitened", lambda: TurboQuantBlockHadamardWhitenedMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_block32", lambda: TurboQuantBlockHadamardBlockwiseMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_twopass", lambda: TurboQuantBlockHadamardTwoPassMethod(args.turbo_bits, args.seed)),
@@ -2122,7 +2187,7 @@ def build_methods(base: np.ndarray, args: argparse.Namespace) -> list[RetrievalM
     for name in selected_names:
         if name == "turboquant_prod" and args.turbo_bits < 2:
             raise SystemExit("turboquant_prod requires --turbo-bits >= 2")
-        if name in {"turboquant_blockhadamard_packed4", "turboquant_blockhadamard_packed4_topk", "turboquant_block32_dimdither_packed4"} and args.turbo_bits != 4:
+        if name in {"turboquant_blockhadamard_packed4", "turboquant_blockhadamard_packed4_topk", "turboquant_block32_packed4", "turboquant_block32_dimdither_packed4"} and args.turbo_bits != 4:
             raise SystemExit(f"{name} currently requires --turbo-bits=4")
         methods.append(factory_map[name]())
     return methods

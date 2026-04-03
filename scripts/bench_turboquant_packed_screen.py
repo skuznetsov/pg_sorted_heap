@@ -45,10 +45,27 @@ def build_method(mod, name: str, bits: int, seed: int):
     mapping = {
         "turboquant_blockhadamard_packed4": lambda: mod.TurboQuantBlockHadamardPackedMethod(bits, seed),
         "turboquant_blockhadamard_packed4_topk": lambda: mod.TurboQuantBlockHadamardPackedTopKMethod(bits, seed),
+        "turboquant_block32_packed4": lambda: mod.TurboQuantBlock32PackedMethod(bits, seed),
     }
     if name not in mapping:
         raise SystemExit(f"unsupported screening method: {name}")
     return mapping[name]()
+
+
+def tie_only_set_diff(mod, method, query: np.ndarray, ref: np.ndarray, got: np.ndarray, tol: float = 1e-6) -> bool:
+    if not isinstance(method, mod.TurboQuantBlockHadamardPackedMethod):
+        return False
+    q_rot = mod.structured_block_hadamard_vec(query, method.perm, method.signs, method.blocks)
+    coeffs = (q_rot / np.sqrt(method.dim)).astype(np.float32, copy=False)
+    scores = mod.packed_lookup_scores_blockhadamard_packed4_transposed(
+        method.packed_codes_t,
+        coeffs,
+        method.centers,
+        method.norms,
+    )
+    boundary = min(float(scores[int(ref[-1])]), float(scores[int(got[-1])]))
+    xor = np.setxor1d(ref, got)
+    return all(abs(float(scores[int(idx)]) - boundary) <= tol for idx in xor.tolist())
 
 
 def p50_ms(samples: list[float]) -> float:
@@ -80,8 +97,10 @@ def main() -> int:
 
     results: dict[str, dict[str, float | int | bool]] = {}
     id_cache: dict[str, list[np.ndarray]] = {}
+    method_objs: dict[str, object] = {}
     for name in method_names:
         method = build_method(mod, name, args.turbo_bits, args.seed)
+        method_objs[name] = method
         t0 = time.perf_counter()
         method.fit(base)
         encode_ms = (time.perf_counter() - t0) * 1000.0
@@ -109,13 +128,17 @@ def main() -> int:
                 continue
             order_diff_queries = 0
             set_diff_queries = 0
-            for ref, got in zip(baseline, id_cache[name], strict=True):
+            tie_only_set_diff_queries = 0
+            for query_idx, (ref, got) in enumerate(zip(baseline, id_cache[name], strict=True)):
                 if not np.array_equal(ref, got):
                     order_diff_queries += 1
                     if np.setxor1d(ref, got).size != 0:
                         set_diff_queries += 1
+                        if tie_only_set_diff(mod, method_objs[args.parity_against], queries[query_idx], ref, got):
+                            tie_only_set_diff_queries += 1
             results[name]["order_diff_queries"] = order_diff_queries
             results[name]["set_diff_queries"] = set_diff_queries
+            results[name]["tie_only_set_diff_queries"] = tie_only_set_diff_queries
 
     print(
         f"packed turboquant screening | metric={args.metric} base={base.shape[0]} "
@@ -123,16 +146,18 @@ def main() -> int:
     )
     print("Results")
     print("=======")
-    print("method                              encode_ms    p50_ms    avg_ms  order_diff  set_diff")
+    print("method                              encode_ms    p50_ms    avg_ms  order_diff  set_diff  tie_only")
     for name in method_names:
         row = results[name]
         order_diff = row.get("order_diff_queries")
         set_diff = row.get("set_diff_queries")
+        tie_only = row.get("tie_only_set_diff_queries")
         order_text = "-" if order_diff is None else str(int(order_diff))
         set_text = "-" if set_diff is None else str(int(set_diff))
+        tie_text = "-" if tie_only is None else str(int(tie_only))
         print(
             f"{name:<34} {float(row['encode_ms']):>10.1f} {float(row['p50_ms']):>9.3f} "
-            f"{float(row['avg_ms']):>9.3f} {order_text:>11} {set_text:>9}"
+            f"{float(row['avg_ms']):>9.3f} {order_text:>11} {set_text:>9} {tie_text:>9}"
         )
     return 0
 
