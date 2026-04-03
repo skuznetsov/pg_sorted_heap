@@ -636,17 +636,24 @@ Current repo status:
       differences between C heap-insert order and Python `argpartition`
     - before investing in a tie-aware fix, the repo needs a contract:
       is exact order required, or is same-set / same-metrics sufficient?
-    - **chosen contract (2026-04-03): same-metrics equivalence**
-      - the consumer (Cogniformerus memory retrieval) cares about retrieving
-        the right set of relevant chunks, not their internal ordering
-      - `recall@k` and `hit@1` are the acceptance metrics
+    - **chosen helper parity contract (2026-04-03): same-set equivalence**
+      - the topk helper must produce the same RESULT SET as the non-topk
+        scoring path for the same algorithm and seed
+      - gate metric: `set_diff` — must be 0 or tie-only (`tie_only == set_diff`)
       - `order_diff` within top-k is informational, not a gate
-      - `set_diff` on tie boundaries (where `tie_only == set_diff`) is
-        acceptable and does not require a fix
+      - `recall@k` is a consequence of set equivalence (same set = same recall)
+      - `hit@1` is NOT a helper parity metric — it depends on ordering within
+        the result set, which legitimately differs between topk heap-insert
+        order and argpartition. hit@1 variation from reordering is expected.
       - a `set_diff` NOT on tie boundaries would indicate a scoring bug and
         block acceptance
-      - consequence: the current `packed4_topk` lane passes this contract
-        on the vetted Gutenberg run; no tie-aware fix is needed
+      - consequence: the current `packed4_topk` and `block16_packed4_topk`
+        lanes pass this contract (set_diff=0 on vetted Gutenberg)
+    - **separate concern: product operating point selection**
+      - which lane to recommend as default is a product decision based on
+        end-to-end metrics (recall@k, hit@1, latency) against ground truth
+      - this is distinct from helper parity — two lanes with different
+        algorithms (e.g. block16 vs blockhadamard) are expected to differ
   Narrow conclusion:
   - the next exact helper branch should not spend time on final candidate
     merge or Python ranking
@@ -685,16 +692,17 @@ Current repo status:
   | block16_packed4_topk        | 100/98%|    91.00% |   5.7  | **fastest packed lane**      |
   | block32_packed4_topk        | 100.0% |    89.40% |   --   | (available, not primary)     |
 
-  Default packed lane for Cogniformerus consumer objective: **block16_packed4_topk**
-  (91.0% recall@10, 5.7ms p50 — fastest packed lane; hit@1 is 100% at
-  seed=123 and 98% at seed=42 due to tie-break reordering, not set diff)
+  Recommended product operating points:
+  - **fastest**: `block16_packed4_topk` — 91.0% recall@10, 5.7ms p50
+  - **highest recall**: `blockhadamard_packed4_topk` — 91.2% recall@10, 6.2ms
 
-- block16_packed4_topk contract screen (2026-04-03, vetted Gutenberg):
+- block16_packed4_topk helper parity screen (2026-04-03, vetted Gutenberg):
   - parity-against block16_packed4 at seed=42: `order_diff=1`, `set_diff=0`
   - parity-against block16_packed4 at seed=123: `order_diff=1`, `set_diff=0`
-  - passes same-metrics contract: identical recall@10, set_diff=0
-  - hit@1 variation (100% vs 98% across seeds) is from tie-break reordering
-    of the true #1 result within the top-k set, not from scoring divergence
+  - passes helper parity contract: set_diff=0 at both seeds
+  - hit@1 varies (100% at seed=123, 98% at seed=42) due to tie-break
+    reordering of the true #1 within the same result set — this is expected
+    under the helper parity contract and does not indicate scoring divergence
 
 - block32 recall regression ablation (2026-04-03, vetted Gutenberg):
   - group_size sweep: 16/32/64/128 + plain blockhadamard (no scaling)
