@@ -794,7 +794,7 @@ help:
 	@echo "  make bench-turboquant-sql TURBOQUANT_PG_DSN='<dsn>' TURBOQUANT_BASE_SQL='<sql>' TURBOQUANT_QUERY_SQL='<sql>' TURBOQUANT_METRIC=<cosine|ip> TURBOQUANT_K=<k> TURBOQUANT_PQ_M=<0|m> TURBOQUANT_PQ_BITS=<bits> TURBOQUANT_PQ_MAX_TRAIN=<n> TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_ARGS='<extra args>'"
 	@echo "  make bench-turboquant-sql-holdout TURBOQUANT_PG_DSN='<dsn>' TURBOQUANT_SHARED_SQL='<sql>' TURBOQUANT_METRIC=<cosine|ip> TURBOQUANT_QUERY_COUNT=<n> TURBOQUANT_FOLDS=<n> TURBOQUANT_K=<k> TURBOQUANT_PQ_M=<0|m> TURBOQUANT_PQ_BITS=<bits> TURBOQUANT_PQ_MAX_TRAIN=<n> TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_ARGS='<extra args>'"
 	@echo "  make bench-turboquant-gutenberg-vetted TURBOQUANT_PG_DSN='<dsn|optional local cube auto-discovery>' TURBOQUANT_GUTENBERG_METHODS='<csv methods>' TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_K=<k> TURBOQUANT_ARGS='<extra args>'"
-	@echo "  make bench-turboquant-gutenberg-screen TURBOQUANT_PG_DSN='<dsn|optional local cube auto-discovery>' TURBOQUANT_GUTENBERG_METHODS='<csv packed methods>' TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_K=<k> TURBOQUANT_ARGS='<extra args>'"
+	@echo "  make bench-turboquant-gutenberg-screen TURBOQUANT_PG_DSN='<dsn|optional local cube auto-discovery>' TURBOQUANT_GUTENBERG_SCREEN_METHODS='<csv packed methods>' TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_K=<k> TURBOQUANT_ARGS='<extra args>'"
 	@echo "  make bench-turboquant-gutenberg-full TURBOQUANT_PG_DSN='<dsn|optional local cube auto-discovery>' TURBOQUANT_GUTENBERG_METHODS='<csv methods>' TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_K=<k> TURBOQUANT_ARGS='<extra args>'"
 	@echo "  make bench BENCH_PORT=<port> BENCH_SCALES=<comma-separated>"
 	@echo "  make policy-lint-strict"

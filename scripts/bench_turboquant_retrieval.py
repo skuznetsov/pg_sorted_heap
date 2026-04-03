@@ -1321,6 +1321,7 @@ class TurboQuantBlock32PackedMethod(TurboQuantBlockHadamardPackedMethod):
         self.name = f"turboquant_block{group_size}_packed4"
         self.group_size = group_size
         self.group_scales: np.ndarray | None = None
+        self._expanded_scales: np.ndarray | None = None
 
     def fit(self, base: np.ndarray) -> None:
         if self.bits != 4:
@@ -1342,19 +1343,19 @@ class TurboQuantBlock32PackedMethod(TurboQuantBlockHadamardPackedMethod):
         self.packed_codes_t = transpose_packed_codes(self.packed_codes)
         self.norms = maybe_store_norms(norms)
         self.group_scales = group_scales
+        self._expanded_scales = expand_group_scales(group_scales, self.dim, self.group_size)
         self.transform_ms_total = 0.0
         self.transform_calls = 0
 
     def search(self, query: np.ndarray, k: int) -> np.ndarray:
-        if self.packed_codes_t is None or self.centers is None or self.group_scales is None:
+        if self.packed_codes_t is None or self.centers is None or self._expanded_scales is None:
             raise RuntimeError("fit must run first")
         t0 = time.perf_counter()
         q_rot = structured_block_hadamard_vec(query, self.perm, self.signs, self.blocks)
         self.transform_ms_total += (time.perf_counter() - t0) * 1000.0
         self.transform_calls += 1
-        # Fold group scales into query coefficients
-        expanded_scales = expand_group_scales(self.group_scales, self.dim, self.group_size)
-        coeffs = (q_rot * expanded_scales / math.sqrt(self.dim)).astype(np.float32, copy=False)
+        # Fold pre-expanded group scales into query coefficients
+        coeffs = (q_rot * self._expanded_scales / math.sqrt(self.dim)).astype(np.float32, copy=False)
         scores = packed_lookup_scores_blockhadamard_packed4_transposed(
             self.packed_codes_t,
             coeffs,
