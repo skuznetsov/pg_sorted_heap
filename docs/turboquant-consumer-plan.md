@@ -668,9 +668,21 @@ Current repo status:
   - dropping the per-row dither correction actively hurts quality because
     dithered code assignment disagrees with the non-corrected LUT decode
   - `block32_dither` is not packable in the current shared-LUT ADC form
-  - `block32_packed4` (no dither) remains the strongest packed quality lane
   - future paths for packed dither: group-level dither with storable
-    correction, or seed-derived on-the-fly correction (high compute cost)
+    correction, or seed-derived on-the-fly correction (high compute cost);
+    parked until a representation change is warranted
+
+- **packed lane summary (vetted Gutenberg, 103260 x 2880D, 4 bits, k=10)**:
+
+  | lane                        | hit@1  | recall@10 | p50 ms | role                         |
+  |-----------------------------|--------|-----------|--------|------------------------------|
+  | blockhadamard_packed4       |  98.0% |    91.20% |   9.9  | best packed recall@10 lane   |
+  | blockhadamard_packed4_topk  |  98.0% |    91.20% |   8.3  | (same quality, fused top-k)  |
+  | block32_packed4             | 100.0% |    89.40% |   9.8  | best packed hit@1 lane       |
+  | block32_dither (non-packed) | 100.0% |    91.80% |  17.2  | best overall quality (dense) |
+
+  Default packed lane for Cogniformerus consumer objective: **blockhadamard_packed4**
+  (best recall@10 among packed lanes; hit@1 difference is 2% = 1 query out of 50)
 
 - IVF+TQ research lane added (2026-04-03) as
   `TurboQuantIVFBlock32PackedMethod` in the evaluator: k-means on
@@ -688,12 +700,28 @@ Current repo status:
     - `ivf32_block32_packed4`: `88% hit@1`, `81.40% recall@10`,
       `10.1 ms` p50 — 1.57x speedup, ~8% recall gap
     - encode cost: `507 s` (k-means fit on 103K x 2880D, one-time)
-  - status: PROVISIONAL — code exists, initial numbers collected, but:
-    - nprobe tuning not swept on Gutenberg (only nprobe=4 tested)
-    - encode cost high for iterative development
-    - recall gap (~8%) may narrow with higher nprobe
-    - not a candidate for engine integration until recall/speed tradeoff
-      is characterized across nprobe values on the real workload
+  - nprobe sweep on glove-100 (50K base, 100D, ivf32, k=10):
+
+    | nprobe | hit@1 | recall@10 | p50 ms | speedup |
+    |--------|-------|-----------|--------|---------|
+    |      2 |  66%  |    64.8%  |  0.16  |   7.2x  |
+    |      4 |  76%  |    71.8%  |  0.27  |   4.3x  |
+    |      8 |  80%  |    78.8%  |  0.49  |   2.4x  |
+    |     16 |  84%  |    83.8%  |  0.91  |   1.3x  |
+    |     32 |  86%  |    85.6%  |  1.67  |   0.7x  |
+
+    exhaustive `block32_packed4` baseline: `86% hit@1`, `85.6% recall@10`,
+    `1.15 ms` p50
+
+  - status: PROVISIONAL — nprobe sweep done on glove-100 (low-dim), but:
+    - Gutenberg sweep blocked by k-means fit cost (507s per run)
+    - nprobe=32 (all clusters) recovers exhaustive recall exactly,
+      confirming correctness
+    - sweet spot on glove-100: nprobe=8-16 (2.4-1.3x speedup, 79-84% recall)
+    - higher-dim datasets should show tighter clusters and better
+      recall at same nprobe, but this is untested
+    - CLI now supports `--ivf-clusters` and `--ivf-nprobe` overrides
+    - not a candidate for engine integration until Gutenberg sweep completes
 
 ### Publication threshold
 

@@ -2256,6 +2256,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--turbo-bits", type=int, default=4)
+    ap.add_argument("--ivf-clusters", type=int, default=0, help="Override n_clusters for IVF lanes (0=use factory default)")
+    ap.add_argument("--ivf-nprobe", type=int, default=0, help="Override n_probe for IVF lanes (0=use factory default)")
     ap.add_argument("--profile-packed-stages", action="store_true", help="Print packed blockhadamard stage timings")
     ap.add_argument("--pq-m", type=int, default=0, help="PQ subvector count (0=auto)")
     ap.add_argument("--pq-bits", type=int, default=8)
@@ -2300,9 +2302,9 @@ def method_factories(base: np.ndarray, args: argparse.Namespace) -> list[tuple[s
         ("turboquant_blockhadamard_packed4_topk", lambda: TurboQuantBlockHadamardPackedTopKMethod(args.turbo_bits, args.seed)),
         ("turboquant_block32_packed4", lambda: TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed)),
         ("turboquant_block32_dither_packed4", lambda: TurboQuantBlock32DitherPackedMethod(args.turbo_bits, args.seed)),
-        ("turboquant_ivf32_block32_packed4", lambda: TurboQuantIVFBlock32PackedMethod(args.turbo_bits, args.seed, n_clusters=32, n_probe=8)),
-        ("turboquant_ivf64_block32_packed4", lambda: TurboQuantIVFBlock32PackedMethod(args.turbo_bits, args.seed, n_clusters=64, n_probe=12)),
-        ("turboquant_ivf128_block32_packed4", lambda: TurboQuantIVFBlock32PackedMethod(args.turbo_bits, args.seed, n_clusters=128, n_probe=16)),
+        ("turboquant_ivf32_block32_packed4", lambda: TurboQuantIVFBlock32PackedMethod(args.turbo_bits, args.seed, n_clusters=args.ivf_clusters or 32, n_probe=args.ivf_nprobe or 8)),
+        ("turboquant_ivf64_block32_packed4", lambda: TurboQuantIVFBlock32PackedMethod(args.turbo_bits, args.seed, n_clusters=args.ivf_clusters or 64, n_probe=args.ivf_nprobe or 12)),
+        ("turboquant_ivf128_block32_packed4", lambda: TurboQuantIVFBlock32PackedMethod(args.turbo_bits, args.seed, n_clusters=args.ivf_clusters or 128, n_probe=args.ivf_nprobe or 16)),
         ("turboquant_blockhadamard_whitened", lambda: TurboQuantBlockHadamardWhitenedMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_block32", lambda: TurboQuantBlockHadamardBlockwiseMethod(args.turbo_bits, args.seed)),
         ("turboquant_blockhadamard_twopass", lambda: TurboQuantBlockHadamardTwoPassMethod(args.turbo_bits, args.seed)),
