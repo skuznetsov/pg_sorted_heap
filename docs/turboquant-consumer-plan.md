@@ -696,6 +696,27 @@ Current repo status:
   - **fastest**: `block16_packed4_topk` — 91.0% recall@10, 5.7ms p50
   - **highest recall**: `blockhadamard_packed4_topk` — 91.2% recall@10, 6.2ms
 
+- robustness pass (2026-04-03, vetted Gutenberg):
+  - multi-seed (42/123/7/999) on 50 queries:
+
+    | seed | bh_topk hit@1 | bh_topk r@10 | b16_topk hit@1 | b16_topk r@10 |
+    |------|---------------|--------------|----------------|---------------|
+    |   42 |         98.0% |       91.20% |          98.0% |        91.00% |
+    |  123 |         98.0% |       90.80% |          98.0% |        90.40% |
+    |    7 |         98.0% |       90.20% |          98.0% |        90.60% |
+    |  999 |        100.0% |       89.60% |          98.0% |        90.00% |
+    | mean |         98.5% |       90.45% |          98.0% |        90.50% |
+
+  - full 200 queries at seed=42:
+    - `blockhadamard_packed4_topk`: `99.5% hit@1`, `90.60% recall@10`, `6.2 ms`
+    - `block16_packed4_topk`: `99.5% hit@1`, `90.75% recall@10`, `8.1 ms`
+  - conclusion: both lanes are stable across seeds; the 50-query vetted set
+    showed blockhadamard slightly ahead on recall@10, but on the full 200-query
+    set block16 is marginally better (90.75% vs 90.60%); the difference is
+    within noise for this sample size
+  - latency is also within noise between the two lanes (6-8ms range)
+  - both lanes remain valid operating points; neither clearly dominates
+
 - block16_packed4_topk helper parity screen (2026-04-03, vetted Gutenberg):
   - parity-against block16_packed4 at seed=42: `order_diff=1`, `set_diff=0`
   - parity-against block16_packed4 at seed=123: `order_diff=1`, `set_diff=0`
