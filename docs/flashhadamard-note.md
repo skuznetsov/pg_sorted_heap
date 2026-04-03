@@ -123,9 +123,24 @@ second-stage rerank on a small shortlist fixes most of them.
 Sweet spot: **M=12 with SQ8 rerank** — 100% hit@1, 96.2% recall@10,
 11.5ms p50, 4320 bytes/vec (3× compression vs float32).
 
-Current latency is dominated by Python overhead. A fused C helper path
-(packed shortlist → SQ8 gather → rerank → top-k in one call) should
-bring this under 5ms.
+**Latency breakdown (SQ8 rerank M=12 on full 103K):**
+
+| Stage | p50 ms | Share |
+|-------|--------|-------|
+| Hadamard transform | 0.15 | 1% |
+| C packed scorer (8 threads) | 6.6 | 89% |
+| SQ8 gather + rerank + topk | 0.5 | 7% |
+| Python overhead | 0.3 | 3% |
+| **Total** | **~7.5** | |
+
+The packed scorer dominates (6.6ms). It scans 103K × 1440 bytes = 149MB
+per query. M2 Max theoretical bandwidth floor: ~0.75ms. The 6.6ms includes
+per-byte LUT lookups, thread sync, and cache effects. Rerank overhead is
+negligible (<0.5ms for M=12).
+
+Fusing rerank into C would save ~0.3ms Python overhead. The path to
+materially faster serving requires either a smaller scan (IVF at larger
+scale) or a faster memory access pattern in the packed scorer itself.
 
 ## Open Work
 
