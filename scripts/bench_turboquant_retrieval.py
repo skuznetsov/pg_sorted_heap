@@ -2234,6 +2234,44 @@ class TurboQuantTwoPassBlockwiseMethod(RetrievalMethod):
         return total
 
 
+class FlashHadamardRerankMethod(RetrievalMethod):
+    """Two-stage: FlashHadamard packed shortlist → exact float32 rerank.
+
+    Stage 1: run the inner packed method with shortlist_m candidates
+    Stage 2: rerank shortlist by exact float32 dot product against stored base
+    """
+
+    def __init__(self, inner: RetrievalMethod, shortlist_m: int = 50) -> None:
+        super().__init__(f"{inner.name}_rerank{shortlist_m}")
+        self.inner = inner
+        self.shortlist_m = shortlist_m
+        self._base_normalized: np.ndarray | None = None
+
+    def fit(self, base: np.ndarray) -> None:
+        self.inner.fit(base)
+        # Store normalized base for exact rerank
+        norms = np.linalg.norm(base, axis=1, keepdims=True)
+        self._base_normalized = (base / np.maximum(norms, 1e-12)).astype(np.float32)
+
+    def search(self, query: np.ndarray, k: int) -> np.ndarray:
+        if self._base_normalized is None:
+            raise RuntimeError("fit must run first")
+        # Stage 1: packed shortlist
+        shortlist_ids = self.inner.search(query, self.shortlist_m)
+        # Stage 2: exact rerank
+        candidates = self._base_normalized[shortlist_ids]
+        q_norm = query / max(np.linalg.norm(query), 1e-12)
+        exact_scores = candidates @ q_norm
+        reranked = np.argsort(exact_scores)[::-1][:k]
+        return shortlist_ids[reranked]
+
+    def bytes_per_vec(self) -> float:
+        return self.inner.bytes_per_vec()
+
+    def metadata_bytes(self) -> int:
+        return self.inner.metadata_bytes()
+
+
 class TurboQuantProdMethod(RetrievalMethod):
     def __init__(self, bits: int, seed: int) -> None:
         super().__init__("turboquant_prod")
@@ -2441,6 +2479,10 @@ def method_factories(base: np.ndarray, args: argparse.Namespace) -> list[tuple[s
         ("turboquant_blockhadamard_packed4_topk", lambda: TurboQuantBlockHadamardPackedTopKMethod(args.turbo_bits, args.seed)),
         ("turboquant_block16_packed4", lambda: TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16)),
         ("turboquant_block16_packed4_topk", lambda: TurboQuantBlock32PackedTopKMethod(args.turbo_bits, args.seed, group_size=16)),
+        ("turboquant_block16_packed4_rerank20", lambda: FlashHadamardRerankMethod(TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16), shortlist_m=20)),
+        ("turboquant_block16_packed4_rerank50", lambda: FlashHadamardRerankMethod(TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16), shortlist_m=50)),
+        ("turboquant_block16_packed4_rerank100", lambda: FlashHadamardRerankMethod(TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16), shortlist_m=100)),
+        ("turboquant_block16_packed4_rerank200", lambda: FlashHadamardRerankMethod(TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16), shortlist_m=200)),
         ("turboquant_block32_packed4", lambda: TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed)),
         ("turboquant_block32_packed4_topk", lambda: TurboQuantBlock32PackedTopKMethod(args.turbo_bits, args.seed)),
         ("turboquant_block32_dither_packed4", lambda: TurboQuantBlock32DitherPackedMethod(args.turbo_bits, args.seed)),
