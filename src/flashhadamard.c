@@ -479,85 +479,83 @@ flashhadamard_build(PG_FUNCTION_ARGS)
     if (!source_name)
         ereport(ERROR, (errmsg("flashhadamard_build: source table not found")));
 
-    /* Step 1: Read vectors via SPI with binary Datum access (no text parsing) */
+    /* Step 1: Read vectors via direct table AM scan (streaming, no SPI materialization) */
     {
-        int             row_idx;
+        Relation        rel;
+        TupleDesc       td;
+        TableScanDesc   scan;
+        TupleTableSlot *slot;
+        AttrNumber      embed_attno;
+        Oid             embed_typid;
         bool            is_halfvec = false;
+        Snapshot        snapshot;
+        int             row_idx;
+        int             pass1_count = 0;
 
-        SPI_connect();
-
-        /* Detect column type */
+        rel = table_open(source_oid, AccessShareLock);
+        td = RelationGetDescr(rel);
+        embed_attno = get_attnum(source_oid, embed_col);
+        if (embed_attno == InvalidAttrNumber)
         {
-            StringInfoData type_sql;
-            initStringInfo(&type_sql);
-            appendStringInfo(&type_sql,
-                "SELECT format_type(atttypid, atttypmod) FROM pg_attribute "
-                "WHERE attrelid = %u AND attname = '%s'",
-                source_oid, embed_col);
-            ret = SPI_execute(type_sql.data, true, 1);
-            if (ret == SPI_OK_SELECT && SPI_processed > 0)
-            {
-                char *typname = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-                if (typname && (strstr(typname, "half") || strstr(typname, "hsvec")))
-                    is_halfvec = true;
-            }
+            table_close(rel, AccessShareLock);
+            ereport(ERROR, (errmsg("flashhadamard_build: column \"%s\" not found", embed_col)));
         }
 
-        /* Read all vectors via SPI — access binary Datum, not text */
+        embed_typid = TupleDescAttr(td, embed_attno - 1)->atttypid;
         {
-            StringInfoData vec_sql;
-            initStringInfo(&vec_sql);
-            appendStringInfo(&vec_sql, "SELECT %s FROM %s ORDER BY ctid",
-                             quote_identifier(embed_col), quote_identifier(source_name));
-            ret = SPI_execute(vec_sql.data, true, 0);
-            if (ret != SPI_OK_SELECT)
-            {
-                SPI_finish();
-                ereport(ERROR, (errmsg("flashhadamard_build: failed to read vectors")));
-            }
+            char *typname = format_type_be(embed_typid);
+            if (typname && (strstr(typname, "half") || strstr(typname, "hsvec")))
+                is_halfvec = true;
+            if (typname) pfree(typname);
         }
 
-        n_rows = SPI_processed;
-        if (n_rows == 0)
+        /* Pass 1: count rows + get dim */
+        snapshot = GetTransactionSnapshot();
+        slot = table_slot_create(rel, NULL);
+        scan = table_beginscan(rel, snapshot, 0, NULL);
+        dim = 0;
+        while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
         {
-            SPI_finish();
+            if (dim == 0)
+            {
+                bool isnull;
+                Datum d_val = slot_getattr(slot, embed_attno, &isnull);
+                if (!isnull)
+                {
+                    Svec *sv = (Svec *) PG_DETOAST_DATUM(d_val);
+                    dim = sv->dim;
+                    if (sv != (Svec *) DatumGetPointer(d_val))
+                        pfree(sv);
+                }
+            }
+            pass1_count++;
+            ExecClearTuple(slot);
+        }
+        table_endscan(scan);
+
+        n_rows = pass1_count;
+        if (n_rows == 0 || dim == 0)
+        {
+            ExecDropSingleTupleTableSlot(slot);
+            table_close(rel, AccessShareLock);
             PG_RETURN_INT32(0);
-        }
-
-        /* Get dim from first vector */
-        {
-            bool isnull;
-            Datum d_val = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
-            if (isnull)
-            {
-                SPI_finish();
-                PG_RETURN_INT32(0);
-            }
-            /* Svec/Vector/Hsvec all have same header: vl_len + int16 dim */
-            {
-                Svec *sv = (Svec *) PG_DETOAST_DATUM(d_val);
-                dim = sv->dim;
-                if (sv != (Svec *) DatumGetPointer(d_val))
-                    pfree(sv);
-            }
         }
 
         n_bytes = (dim + 1) / 2;
         n_groups = (dim + group_size - 1) / group_size;
 
         /* Allocate buffers */
-        {
-            Size alloc_size = sizeof(float) * (Size)n_rows * dim;
-            all_vecs = (float *) MemoryContextAllocHuge(CurrentMemoryContext, alloc_size);
-        }
+        all_vecs = (float *) MemoryContextAllocHuge(CurrentMemoryContext,
+                                                      sizeof(float) * (Size)n_rows * dim);
         norms = (float *) palloc(sizeof(float) * n_rows);
 
-        /* Extract vectors from SPI result tuples (binary access) */
-        for (row_idx = 0; row_idx < n_rows; row_idx++)
+        /* Pass 2: read vectors into buffer */
+        scan = table_beginscan(rel, snapshot, 0, NULL);
+        row_idx = 0;
+        while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
         {
             bool isnull;
-            Datum d_val = SPI_getbinval(SPI_tuptable->vals[row_idx],
-                                         SPI_tuptable->tupdesc, 1, &isnull);
+            Datum d_val = slot_getattr(slot, embed_attno, &isnull);
             float *v = all_vecs + (Size)row_idx * dim;
             float norm = 0.0f;
 
@@ -565,6 +563,8 @@ flashhadamard_build(PG_FUNCTION_ARGS)
             {
                 memset(v, 0, sizeof(float) * dim);
                 norms[row_idx] = 1e-12f;
+                row_idx++;
+                ExecClearTuple(slot);
                 continue;
             }
 
@@ -598,11 +598,16 @@ flashhadamard_build(PG_FUNCTION_ARGS)
             norms[row_idx] = sqrtf(norm);
             if (norms[row_idx] < 1e-12f)
                 norms[row_idx] = 1e-12f;
-
-            /* Normalize in-place */
             for (d = 0; d < dim; d++)
                 v[d] /= norms[row_idx];
+
+            row_idx++;
+            ExecClearTuple(slot);
         }
+        n_rows = row_idx;
+        table_endscan(scan);
+        ExecDropSingleTupleTableSlot(slot);
+        table_close(rel, AccessShareLock);
     }
 
     /* Step 2: Build rotation params */
@@ -722,8 +727,9 @@ flashhadamard_build(PG_FUNCTION_ARGS)
         }
     }
 
-    /* Step 8: Create sidecar table and store everything */
-    elog(NOTICE, "fh_build: step 8 start, creating sidecar '%s'", sidecar);
+    /* Step 8: Create sidecar table and store everything (SPI for DDL+INSERT) */
+    elog(NOTICE, "fh_build: creating sidecar '%s' (%d rows, %d dim)", sidecar, n_rows, dim);
+    SPI_connect();
     initStringInfo(&sql);
     appendStringInfo(&sql, "DROP TABLE IF EXISTS %s", quote_identifier(sidecar));
     SPI_execute(sql.data, false, 0);
