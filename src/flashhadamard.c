@@ -276,7 +276,17 @@ fh_score_worker(void *arg)
     float   min_score = -FLT_MAX;
 
     scores = (float *)malloc(sizeof(float) * rows);
-    if (!scores) return NULL;
+    if (!scores)
+    {
+        /* Alloc failure: mark all outputs as invalid */
+        int idx;
+        for (idx = 0; idx < t->topk; idx++)
+        {
+            t->top_ids[idx] = -1;
+            t->top_scores[idx] = -FLT_MAX;
+        }
+        return NULL;
+    }
     memset(scores, 0, sizeof(float) * rows);
 
     /* 2-byte fused scoring for this row range */
@@ -378,12 +388,36 @@ fh_packed_score_topk_t(const uint8 *packed_t, const float *byte_tables,
             tasks[i].top_ids = all_ids + i * topk;
             tasks[i].top_scores = all_scores + i * topk;
 
-            pthread_create(&threads[i], NULL, fh_score_worker, &tasks[i]);
-            launched++;
+            if (pthread_create(&threads[i], NULL, fh_score_worker, &tasks[i]) == 0)
+                launched++;
+            else
+            {
+                /* Thread creation failed: mark outputs invalid, don't join */
+                int idx;
+                for (idx = 0; idx < topk; idx++)
+                {
+                    tasks[i].top_ids[idx] = -1;
+                    tasks[i].top_scores[idx] = -FLT_MAX;
+                }
+                break;  /* stop launching more threads */
+            }
         }
 
         for (i = 0; i < launched; i++)
-            pthread_join(threads[i], NULL);
+        {
+            int jret = pthread_join(threads[i], NULL);
+            (void)jret;  /* best-effort join */
+        }
+
+        if (launched == 0)
+        {
+            /* All thread creation failed — single-thread below will handle */
+            pfree(all_ids);
+            pfree(all_scores);
+            n_threads = 1;  /* force single-thread path */
+        }
+        else
+        {
 
         /* Merge per-thread top-k into global top-k */
         *filled = 0;
@@ -398,6 +432,7 @@ fh_packed_score_topk_t(const uint8 *packed_t, const float *byte_tables,
         pfree(all_ids);
         pfree(all_scores);
         return;
+        } /* end else launched > 0 */
     }
 #endif /* !_WIN32 */
 
