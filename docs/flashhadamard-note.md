@@ -236,32 +236,50 @@ Caveats:
 **Refuted optimizations:**
 - Per-row early-exit pruning: 0% rows pruned after Hadamard (bounds too loose)
 - NEON vtbl nibble lookup: doesn't apply to 256-entry float byte tables
+- Segment pruning at 103K scale: overhead exceeds savings (see below)
 
-**Remaining regime changes (not current scope):**
-1. Segment-level hierarchical prefilter (coarse sketch, skip whole segments)
-2. Integer/NEON kernel redesign (nibble tables, fixed-point accumulation)
-3. PG-native parallel model (replace experimental pthread)
-6. Planner/index AM integration (later, if earned)
+## Segment Pruning (Research, Not Recommended at 103K)
 
-This is a real AM project comparable in scope to sorted_hnsw.
-Not current scope — documented for future work.
+Per-segment centroids in FH search space. Content-sorted store.
+Parity gate: nprobe=n_segments = exhaustive (100% recall, by construction).
+
+| nprobe | segments | recall@10 | Notes |
+|--------|----------|-----------|-------|
+| 4 | 15% | 93.5% | real pruning quality |
+| 8-20 | 31-77% | 93.5% | flat — not probe-count dependent |
+| 26 | 100% | 100% | parity gate PASS |
+
+Verdict:
+- 6.5% recall loss is real, from boundary vectors in low-scoring segments
+- Flat frontier means **segment design is the bottleneck**, not probe count
+- Thread-per-segment overhead eats latency savings at 103K
+- Exhaustive parallel (5-8ms) already faster than pruned parallel
+
+Not recommended at current scale. Becomes relevant at 500K+ where
+fewer probed segments = materially less data to scan.
+
+Next research direction (not current scope):
+- Better segment construction (k-means in FH space, multi-centroid)
+- Integer/NEON kernel redesign
+- PG-native parallel model (replace experimental pthread)
 
 ## Status
 
-The exhaustive CPU serving path is done enough for the current workload.
-Further local tweaks (fused C rerank, scorer micro-optimizations) have
-low expected payoff — the scorer at 6.6ms dominates and is memory-bandwidth
-constrained.
+**Recommended 103K serving path: exhaustive parallel (5-8ms).**
+
+Single-thread scorer at kernel parity with C helper (40ms).
+Parallel 8-thread scorer beats Python helper path (6.9ms vs 8.7ms).
+Segment pruning is research-only — not recommended at this scale.
 
 ## Open Work
 
-1. **Sub-3ms serving.** Requires a regime change, not local tweaks:
-   - GPU scorer (Metal compute pipeline, extending cogni-ml's infrastructure)
-   - IVF prefilter at 500K+ scale (centroid caching ready)
-   - New memory layout / execution substrate
-2. **Higher dimensions.** Synthetic scaling to 65536D shows tractability,
-   but real recall numbers at very high dim are missing.
-3. **Official TurboQuant comparison.** No public implementation was
+1. **Engine hardening.** Thread count env knob, regression tests for
+   partial launch / dim mismatch / old store fallback.
+2. **Better segment construction.** FH-space k-means, multi-centroid
+   summaries. Gate: low nprobe must beat 93.5% recall.
+3. **Integer/SIMD kernel.** Outside PG first, ARM NEON, then Intel AVX.
+4. **Larger scale (500K+).** Where pruning and IVF become relevant.
+5. **Official TurboQuant comparison.** No public implementation was
    available at time of writing.
 4. **Diversity-based memory routing.** The naive similarity routing failed.
    Coverage/MMR-based selection might succeed but is untested. (Parked.)
