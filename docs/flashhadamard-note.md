@@ -192,6 +192,22 @@ payload) is no longer a pure 4-bit lane. This is a two-tier storage
 tradeoff: fast packed scan for shortlisting + higher-fidelity SQ8 for
 boundary disambiguation.
 
+## Engine Integration Status
+
+PG extension prototype (`flashhadamard_build` + `flashhadamard_scan`):
+
+| Scale | Build | Scan | Notes |
+|-------|-------|------|-------|
+| 5 × 8D | <1ms | 0.17ms | Correctness verified |
+| 1000 × 2880D | 63ms | 1.6ms | Local PG |
+| 5000 × 2880D | 290ms | 34ms | Chunked (2 segments) |
+| **103K × 2880D** | **12.5s** | pending | **Chunked (26 segments), k8s container** |
+
+Architecture: streaming 3-pass build (no all_vecs buffer), chunked
+sidecar storage (4096 rows/segment), chunk-by-chunk scan with global
+top-k merge. Scan on 5K is 34ms (vs 5.8ms monolithic) due to per-chunk
+SPI overhead — needs fused scorer port for production parity.
+
 ## Status
 
 The exhaustive CPU serving path is done enough for the current workload.
