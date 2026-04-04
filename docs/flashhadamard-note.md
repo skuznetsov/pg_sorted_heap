@@ -212,9 +212,28 @@ helper benchmark: ~8ms. Gap: 23-87×. Bottleneck: per-chunk SPI (26
 calls), TOAST decompression of 153MB bytea, single-threaded scorer,
 no 2-byte fused optimization.
 
-**Verdict: engine path proves feasibility but is not competitive with
-external serving. Closing gap requires porting fused scorer mechanics
-and eliminating per-chunk SPI in the hot path.**
+**Verdict: current SPI + bytea sidecar prototype proves correctness
+but is not competitive with external serving (23-87× gap). The gap
+is NOT just SPI — it is SPI + TOAST decompression + row/bytea layout
+combined. Closing it requires AM-level storage redesign, not SPI
+optimization.**
+
+What the prototype DID prove:
+- Build pipeline works at 103K scale (streaming, bounded memory)
+- Scorer produces correct results
+- SQL surface is usable
+- Chunked sidecar pattern is viable for bounded memory
+
+What the prototype did NOT achieve:
+- Competitive scan latency (185-700ms vs ~8ms benchmark)
+- TOAST-free hot path
+- Page-native packed code layout
+
+**Next-generation path (not current scope):** AM-level FlashHadamard
+storage where packed codes live in page-native fixed-layout segments,
+scorer reads contiguous buffers without TOAST/SPI, and fused 2-byte
+scoring runs directly on page-local data. This is a real AM project
+(like sorted_hnsw), not a sidecar-table project.
 
 ## Status
 
