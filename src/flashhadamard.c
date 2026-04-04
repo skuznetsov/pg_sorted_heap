@@ -479,7 +479,12 @@ flashhadamard_build(PG_FUNCTION_ARGS)
     if (!source_name)
         ereport(ERROR, (errmsg("flashhadamard_build: source table not found")));
 
-    /* Step 1: Read vectors via direct table AM scan (streaming, no SPI materialization) */
+    /* Streaming 3-pass build: no all_vecs buffer needed.
+     * Pass 1: count + dim + running group RMS stats
+     * Pass 2: rotate + quantize + pack + SQ8 encode (row by row)
+     *         Output: packed_codes[n_rows × n_bytes], sq8_codes[n_rows × dim], norms[n_rows]
+     * Step 3: Transpose packed_codes → packed_t
+     */
     {
         Relation        rel;
         TupleDesc       td;
@@ -490,7 +495,11 @@ flashhadamard_build(PG_FUNCTION_ARGS)
         bool            is_halfvec = false;
         Snapshot        snapshot;
         int             row_idx;
-        int             pass1_count = 0;
+        float          *vec_buf;    /* single-row temp buffer [dim] */
+        float          *rot_buf;    /* single-row rotated buffer [dim] */
+        float          *expanded;   /* [dim] expanded group scales */
+        double         *group_sum_sq; /* running RMS accumulator */
+        int            *group_count;
 
         rel = table_open(source_oid, AccessShareLock);
         td = RelationGetDescr(rel);
@@ -500,7 +509,6 @@ flashhadamard_build(PG_FUNCTION_ARGS)
             table_close(rel, AccessShareLock);
             ereport(ERROR, (errmsg("flashhadamard_build: column \"%s\" not found", embed_col)));
         }
-
         embed_typid = TupleDescAttr(td, embed_attno - 1)->atttypid;
         {
             char *typname = format_type_be(embed_typid);
@@ -509,11 +517,13 @@ flashhadamard_build(PG_FUNCTION_ARGS)
             if (typname) pfree(typname);
         }
 
-        /* Pass 1: count rows + get dim */
         snapshot = GetTransactionSnapshot();
         slot = table_slot_create(rel, NULL);
+
+        /* --- Pass 1: count + dim + group RMS stats --- */
         scan = table_beginscan(rel, snapshot, 0, NULL);
         dim = 0;
+        n_rows = 0;
         while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
         {
             if (dim == 0)
@@ -528,12 +538,11 @@ flashhadamard_build(PG_FUNCTION_ARGS)
                         pfree(sv);
                 }
             }
-            pass1_count++;
+            n_rows++;
             ExecClearTuple(slot);
         }
         table_endscan(scan);
 
-        n_rows = pass1_count;
         if (n_rows == 0 || dim == 0)
         {
             ExecDropSingleTupleTableSlot(slot);
@@ -544,187 +553,275 @@ flashhadamard_build(PG_FUNCTION_ARGS)
         n_bytes = (dim + 1) / 2;
         n_groups = (dim + group_size - 1) / group_size;
 
-        /* Allocate buffers */
-        all_vecs = (float *) MemoryContextAllocHuge(CurrentMemoryContext,
-                                                      sizeof(float) * (Size)n_rows * dim);
-        norms = (float *) palloc(sizeof(float) * n_rows);
+        /* Build rotation params */
+        params.dim = dim;
+        params.group_size = group_size;
+        params.seed = seed;
+        params.n_groups = n_groups;
+        params.perm = palloc(sizeof(int) * dim);
+        params.signs = palloc(sizeof(float) * dim);
+        params.centers = (float *)fh_lloyd_max_16;
+        fh_generate_perm_signs(dim, seed, params.perm, params.signs);
 
-        /* Pass 2: read vectors into buffer */
-        scan = table_beginscan(rel, snapshot, 0, NULL);
-        row_idx = 0;
-        while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+        /* Compute group RMS: stream vectors, rotate, accumulate stats */
+        vec_buf = palloc(sizeof(float) * dim);
+        rot_buf = palloc(sizeof(float) * dim);
+        group_sum_sq = palloc0(sizeof(double) * n_groups);
+        group_count = palloc0(sizeof(int) * n_groups);
+
         {
-            bool isnull;
-            Datum d_val = slot_getattr(slot, embed_attno, &isnull);
-            float *v = all_vecs + (Size)row_idx * dim;
-            float norm = 0.0f;
+            float sqrt_dim = sqrtf((float)dim);
+            int g;
 
-            if (isnull)
+            scan = table_beginscan(rel, snapshot, 0, NULL);
+            while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
             {
-                memset(v, 0, sizeof(float) * dim);
-                norms[row_idx] = 1e-12f;
+                bool isnull;
+                Datum d_val = slot_getattr(slot, embed_attno, &isnull);
+                float norm = 0.0f;
+
+                if (isnull) { ExecClearTuple(slot); continue; }
+
+                /* Extract + normalize into vec_buf */
+                if (is_halfvec)
+                {
+                    Hsvec *hv = (Hsvec *) PG_DETOAST_DATUM(d_val);
+                    for (d = 0; d < Min(hv->dim, dim); d++)
+                    { vec_buf[d] = HalfToFloat4(hv->x[d]); norm += vec_buf[d]*vec_buf[d]; }
+                    for (d = Min(hv->dim, dim); d < dim; d++) vec_buf[d] = 0;
+                    if (hv != (Hsvec *) DatumGetPointer(d_val)) pfree(hv);
+                }
+                else
+                {
+                    Svec *sv = (Svec *) PG_DETOAST_DATUM(d_val);
+                    memcpy(vec_buf, sv->x, sizeof(float) * Min(sv->dim, dim));
+                    for (d = Min(sv->dim, dim); d < dim; d++) vec_buf[d] = 0;
+                    for (d = 0; d < Min(sv->dim, dim); d++) norm += vec_buf[d]*vec_buf[d];
+                    if (sv != (Svec *) DatumGetPointer(d_val)) pfree(sv);
+                }
+                norm = sqrtf(norm);
+                if (norm < 1e-12f) norm = 1e-12f;
+                for (d = 0; d < dim; d++) vec_buf[d] /= norm;
+
+                /* Rotate + accumulate group stats */
+                fh_rotate_vec(vec_buf, rot_buf, &params);
+                for (d = 0; d < dim; d++) rot_buf[d] *= sqrt_dim;
+
+                for (g = 0; g < n_groups; g++)
+                {
+                    int gstart = g * group_size;
+                    int gend = Min(gstart + group_size, dim);
+                    for (d = gstart; d < gend; d++)
+                    {
+                        group_sum_sq[g] += (double)rot_buf[d] * rot_buf[d];
+                        group_count[g]++;
+                    }
+                }
+                ExecClearTuple(slot);
+            }
+            table_endscan(scan);
+
+            /* Compute final group scales */
+            group_scales = palloc(sizeof(float) * n_groups);
+            for (g = 0; g < n_groups; g++)
+            {
+                group_scales[g] = (float)sqrt(group_sum_sq[g] / Max(group_count[g], 1));
+                if (group_scales[g] < 1e-4f) group_scales[g] = 1e-4f;
+            }
+            params.group_scales = group_scales;
+            pfree(group_sum_sq);
+            pfree(group_count);
+        }
+
+        /* Expand group scales for encoding */
+        expanded = palloc(sizeof(float) * dim);
+        {
+            int g;
+            for (g = 0; g < n_groups; g++)
+            {
+                int gstart = g * group_size;
+                int gend = Min(gstart + group_size, dim);
+                for (d = gstart; d < gend; d++)
+                    expanded[d] = group_scales[g];
+            }
+        }
+
+        /* SQ8 min/max: need a pass to find per-column extremes.
+         * We'll initialize and update during the encoding pass. */
+        sq8_mins = palloc(sizeof(float) * dim);
+        sq8_scales = palloc(sizeof(float) * dim);
+        for (d = 0; d < dim; d++) { sq8_mins[d] = FLT_MAX; sq8_scales[d] = -FLT_MAX; }
+        /* sq8_scales temporarily holds col_max */
+
+        /* Allocate output buffers (no all_vecs needed!) */
+        packed_codes = MemoryContextAllocHuge(CurrentMemoryContext, (Size)n_rows * n_bytes);
+        norms = palloc(sizeof(float) * n_rows);
+
+        /* --- Pass 2: rotate + quantize + pack + SQ8 min/max --- */
+        /* Also store normalized vectors for SQ8 in a separate buffer */
+        /* We need all normalized vectors for SQ8 encoding (two-pass per column).
+         * But to avoid 1.2GB buffer, do SQ8 in a third pass reading packed sidecar.
+         * Actually: SQ8 needs original normalized vectors, not rotated.
+         * Alternative: store SQ8 codes computed from normalized vectors during this pass.
+         * For SQ8, we need global min/max first → requires one more pass.
+         * Compromise: compute min/max during this pass, then do SQ8 in a third pass. */
+
+        {
+            float sqrt_dim = sqrtf((float)dim);
+
+            scan = table_beginscan(rel, snapshot, 0, NULL);
+            row_idx = 0;
+            while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+            {
+                bool isnull;
+                Datum d_val = slot_getattr(slot, embed_attno, &isnull);
+                float norm = 0.0f;
+
+                if (isnull)
+                {
+                    memset(packed_codes + (Size)row_idx * n_bytes, 0, n_bytes);
+                    norms[row_idx] = 1e-12f;
+                    row_idx++;
+                    ExecClearTuple(slot);
+                    continue;
+                }
+
+                /* Extract + normalize */
+                if (is_halfvec)
+                {
+                    Hsvec *hv = (Hsvec *) PG_DETOAST_DATUM(d_val);
+                    for (d = 0; d < Min(hv->dim, dim); d++)
+                    { vec_buf[d] = HalfToFloat4(hv->x[d]); norm += vec_buf[d]*vec_buf[d]; }
+                    for (d = Min(hv->dim, dim); d < dim; d++) vec_buf[d] = 0;
+                    if (hv != (Hsvec *) DatumGetPointer(d_val)) pfree(hv);
+                }
+                else
+                {
+                    Svec *sv = (Svec *) PG_DETOAST_DATUM(d_val);
+                    memcpy(vec_buf, sv->x, sizeof(float) * Min(sv->dim, dim));
+                    for (d = Min(sv->dim, dim); d < dim; d++) vec_buf[d] = 0;
+                    for (d = 0; d < Min(sv->dim, dim); d++) norm += vec_buf[d]*vec_buf[d];
+                    if (sv != (Svec *) DatumGetPointer(d_val)) pfree(sv);
+                }
+                norm = sqrtf(norm);
+                if (norm < 1e-12f) norm = 1e-12f;
+                for (d = 0; d < dim; d++) vec_buf[d] /= norm;
+                norms[row_idx] = norm;
+
+                /* Update SQ8 min/max (on normalized vectors) */
+                for (d = 0; d < dim; d++)
+                {
+                    if (vec_buf[d] < sq8_mins[d]) sq8_mins[d] = vec_buf[d];
+                    if (vec_buf[d] > sq8_scales[d]) sq8_scales[d] = vec_buf[d]; /* temp: col_max */
+                }
+
+                /* Rotate + equalize + quantize + pack */
+                fh_rotate_vec(vec_buf, rot_buf, &params);
+                for (d = 0; d < dim; d++) rot_buf[d] *= sqrt_dim;
+                {
+                    uint8 *row_packed = packed_codes + (Size)row_idx * n_bytes;
+                    memset(row_packed, 0, n_bytes);
+                    for (d = 0; d < dim; d++)
+                    {
+                        float eq = rot_buf[d] / expanded[d];
+                        int code = fh_digitize(eq);
+                        int byte_idx = d / 2;
+                        if (d % 2 == 0)
+                            row_packed[byte_idx] |= (uint8)(code & 0x0F);
+                        else
+                            row_packed[byte_idx] |= (uint8)((code & 0x0F) << 4);
+                    }
+                }
+
                 row_idx++;
                 ExecClearTuple(slot);
-                continue;
             }
-
-            if (is_halfvec)
-            {
-                Hsvec *hv = (Hsvec *) PG_DETOAST_DATUM(d_val);
-                int vdim = Min(hv->dim, dim);
-                for (d = 0; d < vdim; d++)
-                {
-                    v[d] = HalfToFloat4(hv->x[d]);
-                    norm += v[d] * v[d];
-                }
-                for (d = vdim; d < dim; d++)
-                    v[d] = 0.0f;
-                if (hv != (Hsvec *) DatumGetPointer(d_val))
-                    pfree(hv);
-            }
-            else
-            {
-                Svec *sv = (Svec *) PG_DETOAST_DATUM(d_val);
-                int vdim = Min(sv->dim, dim);
-                memcpy(v, sv->x, sizeof(float) * vdim);
-                for (d = vdim; d < dim; d++)
-                    v[d] = 0.0f;
-                for (d = 0; d < vdim; d++)
-                    norm += v[d] * v[d];
-                if (sv != (Svec *) DatumGetPointer(d_val))
-                    pfree(sv);
-            }
-
-            norms[row_idx] = sqrtf(norm);
-            if (norms[row_idx] < 1e-12f)
-                norms[row_idx] = 1e-12f;
-            for (d = 0; d < dim; d++)
-                v[d] /= norms[row_idx];
-
-            row_idx++;
-            ExecClearTuple(slot);
-        }
-        n_rows = row_idx;
-        table_endscan(scan);
-        ExecDropSingleTupleTableSlot(slot);
-        table_close(rel, AccessShareLock);
-    }
-
-    /* Step 2: Build rotation params */
-    params.dim = dim;
-    params.group_size = group_size;
-    params.seed = seed;
-    params.n_groups = n_groups;
-    params.perm = palloc(sizeof(int) * dim);
-    params.signs = palloc(sizeof(float) * dim);
-    params.centers = (float *)fh_lloyd_max_16; /* const, don't free */
-    fh_generate_perm_signs(dim, seed, params.perm, params.signs);
-
-    /* Step 3: Rotate all vectors */
-    rotated = MemoryContextAllocHuge(CurrentMemoryContext, sizeof(float) * (Size)n_rows * dim);
-    {
-        float inv_sqrt_dim = 1.0f / sqrtf((float)dim);
-        float sqrt_dim = sqrtf((float)dim);
-
-        for (i = 0; i < n_rows; i++)
-        {
-            fh_rotate_vec(all_vecs + i * dim, rotated + i * dim, &params);
-            /* Scale by sqrt(dim) as in Python harness */
-            for (d = 0; d < dim; d++)
-                rotated[i * dim + d] *= sqrt_dim;
-        }
-    }
-
-    /* Step 4: Group RMS scales */
-    group_scales = palloc0(sizeof(float) * n_groups);
-    {
-        for (j = 0; j < n_groups; j++)
-        {
-            int start = j * group_size;
-            int end = Min(start + group_size, dim);
-            double sum_sq = 0.0;
-            int count = 0;
-
-            for (i = 0; i < n_rows; i++)
-                for (d = start; d < end; d++)
-                {
-                    float val = rotated[i * dim + d];
-                    sum_sq += (double)val * val;
-                    count++;
-                }
-            group_scales[j] = (float)sqrt(sum_sq / Max(count, 1));
-            if (group_scales[j] < 1e-4f) group_scales[j] = 1e-4f;
-        }
-    }
-    params.group_scales = group_scales;
-
-    /* Step 5: Equalize + quantize → packed codes */
-    packed_codes = MemoryContextAllocHuge(CurrentMemoryContext, (Size)n_rows * n_bytes);
-    {
-        float *expanded = palloc(sizeof(float) * dim);
-        int g;
-        for (g = 0; g < n_groups; g++)
-        {
-            int start = g * group_size;
-            int end = Min(start + group_size, dim);
-            for (d = start; d < end; d++)
-                expanded[d] = group_scales[g];
+            n_rows = row_idx;
+            table_endscan(scan);
         }
 
-        for (i = 0; i < n_rows; i++)
-        {
-            uint8 *row_packed = packed_codes + i * n_bytes;
-            memset(row_packed, 0, n_bytes);
-
-            for (d = 0; d < dim; d++)
-            {
-                float eq = rotated[i * dim + d] / expanded[d];
-                int code = fh_digitize(eq);
-                int byte_idx = d / 2;
-
-                if (d % 2 == 0)
-                    row_packed[byte_idx] |= (uint8)(code & 0x0F);
-                else
-                    row_packed[byte_idx] |= (uint8)((code & 0x0F) << 4);
-            }
-        }
-        pfree(expanded);
-    }
-
-    /* Step 6: Transpose packed codes */
-    packed_t = MemoryContextAllocHuge(CurrentMemoryContext, (Size)n_bytes * n_rows);
-    for (i = 0; i < n_rows; i++)
-        for (j = 0; j < n_bytes; j++)
-            packed_t[j * n_rows + i] = packed_codes[i * n_bytes + j];
-
-    /* Step 7: SQ8 encode (per-column min/max on original normalized vectors) */
-    sq8_codes = MemoryContextAllocHuge(CurrentMemoryContext, (Size)n_rows * dim);
-    sq8_mins = palloc(sizeof(float) * dim);
-    sq8_scales = palloc(sizeof(float) * dim);
-    {
+        /* Finalize SQ8 scales */
         for (d = 0; d < dim; d++)
         {
-            float col_min = FLT_MAX, col_max = -FLT_MAX;
-            for (i = 0; i < n_rows; i++)
-            {
-                float v = all_vecs[i * dim + d];
-                if (v < col_min) col_min = v;
-                if (v > col_max) col_max = v;
-            }
-            float range = col_max - col_min;
+            float range = sq8_scales[d] - sq8_mins[d]; /* col_max - col_min */
             if (range < 1e-8f) range = 1e-8f;
-            sq8_mins[d] = col_min;
             sq8_scales[d] = range / 255.0f;
-
-            for (i = 0; i < n_rows; i++)
-            {
-                float v = all_vecs[i * dim + d];
-                int code = (int)roundf((v - col_min) / sq8_scales[d]);
-                if (code < 0) code = 0;
-                if (code > 255) code = 255;
-                sq8_codes[i * dim + d] = (uint8)code;
-            }
         }
+
+        /* --- Pass 3: SQ8 encode (needs global min/max from pass 2) --- */
+        sq8_codes = MemoryContextAllocHuge(CurrentMemoryContext, (Size)n_rows * dim);
+        {
+            scan = table_beginscan(rel, snapshot, 0, NULL);
+            row_idx = 0;
+            while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+            {
+                bool isnull;
+                Datum d_val = slot_getattr(slot, embed_attno, &isnull);
+                float norm;
+
+                if (isnull)
+                {
+                    memset(sq8_codes + (Size)row_idx * dim, 0, dim);
+                    row_idx++;
+                    ExecClearTuple(slot);
+                    continue;
+                }
+
+                /* Extract + normalize (same as pass 2) */
+                norm = 0.0f;
+                if (is_halfvec)
+                {
+                    Hsvec *hv = (Hsvec *) PG_DETOAST_DATUM(d_val);
+                    for (d = 0; d < Min(hv->dim, dim); d++)
+                    { vec_buf[d] = HalfToFloat4(hv->x[d]); norm += vec_buf[d]*vec_buf[d]; }
+                    for (d = Min(hv->dim, dim); d < dim; d++) vec_buf[d] = 0;
+                    if (hv != (Hsvec *) DatumGetPointer(d_val)) pfree(hv);
+                }
+                else
+                {
+                    Svec *sv = (Svec *) PG_DETOAST_DATUM(d_val);
+                    memcpy(vec_buf, sv->x, sizeof(float) * Min(sv->dim, dim));
+                    for (d = Min(sv->dim, dim); d < dim; d++) vec_buf[d] = 0;
+                    for (d = 0; d < Min(sv->dim, dim); d++) norm += vec_buf[d]*vec_buf[d];
+                    if (sv != (Svec *) DatumGetPointer(d_val)) pfree(sv);
+                }
+                norm = sqrtf(norm);
+                if (norm < 1e-12f) norm = 1e-12f;
+                for (d = 0; d < dim; d++) vec_buf[d] /= norm;
+
+                /* SQ8 encode */
+                {
+                    uint8 *row_sq8 = sq8_codes + (Size)row_idx * dim;
+                    for (d = 0; d < dim; d++)
+                    {
+                        int code = (int)roundf((vec_buf[d] - sq8_mins[d]) / sq8_scales[d]);
+                        if (code < 0) code = 0;
+                        if (code > 255) code = 255;
+                        row_sq8[d] = (uint8)code;
+                    }
+                }
+
+                row_idx++;
+                ExecClearTuple(slot);
+            }
+            table_endscan(scan);
+        }
+
+        /* Transpose packed codes */
+        packed_t = MemoryContextAllocHuge(CurrentMemoryContext, (Size)n_bytes * n_rows);
+        for (i = 0; i < n_rows; i++)
+            for (j = 0; j < n_bytes; j++)
+                packed_t[j * n_rows + i] = packed_codes[i * n_bytes + j];
+
+        /* Free row-major packed codes (no longer needed after transpose) */
+        pfree(packed_codes);
+        packed_codes = NULL;
+
+        pfree(vec_buf);
+        pfree(rot_buf);
+        pfree(expanded);
+        ExecDropSingleTupleTableSlot(slot);
+        table_close(rel, AccessShareLock);
     }
 
     /* Step 8: Create sidecar table and store everything (SPI for DDL+INSERT) */
