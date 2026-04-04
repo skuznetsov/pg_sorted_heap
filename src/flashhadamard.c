@@ -10,10 +10,78 @@
  */
 
 #include "flashhadamard.h"
+#include "svec.h"
+
+#include "fmgr.h"
+#include "funcapi.h"
+#include "executor/spi.h"
+#include "utils/builtins.h"
+#include "utils/array.h"
+#include "utils/lsyscache.h"
+#include "catalog/pg_type.h">
 
 #include <math.h>
 #include <string.h>
 #include <float.h>
+#include <stdlib.h>
+
+/* Gaussian Lloyd-Max centers for 4-bit (precomputed, matching Python harness) */
+static const float fh_lloyd_max_16[16] = {
+    -2.1519927f, -1.5341205f, -1.1503494f, -0.8326452f,
+    -0.5485528f, -0.2822760f, -0.0248825f,  0.2279585f,
+     0.4809854f,  0.7405728f,  1.0137205f,  1.3106381f,
+     1.6481531f,  2.0637655f,  2.6476993f,  3.7169876f
+};
+
+/* Gaussian Lloyd-Max boundaries for 4-bit (for digitize) */
+static const float fh_lloyd_max_bounds_17[17] = {
+    -INFINITY,
+    -1.8430566f, -1.3422349f, -0.9914973f, -0.6905990f,
+    -0.4154144f, -0.1535793f,  0.1015380f,  0.3544720f,
+     0.6107791f,  0.8771467f,  1.1621793f,  1.4793956f,
+     1.8559593f,  2.3557324f,  3.1823435f,
+     INFINITY
+};
+
+/* Digitize: map continuous value to Lloyd-Max level index [0..15] */
+static int
+fh_digitize(float val)
+{
+    int i;
+    for (i = 1; i < 17; i++)
+        if (val < fh_lloyd_max_bounds_17[i])
+            return i - 1;
+    return 15;
+}
+
+/* Splitmix64-style hash for seed-derived random permutation/signs */
+static uint64
+fh_splitmix64(uint64 *state)
+{
+    uint64 z = (*state += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+/* Generate seed-derived permutation and signs (matches numpy default_rng) */
+static void
+fh_generate_perm_signs(int dim, int seed, int *perm, float *signs)
+{
+    /* Simple Fisher-Yates shuffle using splitmix64 */
+    uint64 state = (uint64)seed;
+    int i, j;
+
+    for (i = 0; i < dim; i++)
+        perm[i] = i;
+    for (i = dim - 1; i > 0; i--)
+    {
+        j = (int)(fh_splitmix64(&state) % (uint64)(i + 1));
+        { int tmp = perm[i]; perm[i] = perm[j]; perm[j] = tmp; }
+    }
+    for (i = 0; i < dim; i++)
+        signs[i] = (fh_splitmix64(&state) & 1) ? 1.0f : -1.0f;
+}
 
 /* ================================================================
  * FWHT: Fast Walsh-Hadamard Transform (in-place, normalized)
@@ -356,4 +424,461 @@ fh_search(const FHCodes *codes, const FHParams *params,
 
         return out_k;
     }
+}
+
+
+/* ================================================================
+ * PG FUNCTION: flashhadamard_build
+ *
+ * flashhadamard_build(
+ *   source_tbl  regclass,
+ *   embed_col   text,     -- column name with vector/halfvec embeddings
+ *   sidecar_tbl text,     -- name for the sidecar table to create
+ *   seed        int4 DEFAULT 42,
+ *   group_size  int4 DEFAULT 16
+ * ) RETURNS int4  -- number of vectors encoded
+ *
+ * Creates a sidecar table with:
+ *   row_id      int4 PRIMARY KEY
+ *   packed_t    bytea   (transposed packed 4-bit codes)
+ *   sq8_codes   bytea   (SQ8 rerank codes)
+ *   -- metadata stored as first row with row_id = -1
+ * ================================================================ */
+
+PG_FUNCTION_INFO_V1(flashhadamard_build);
+Datum
+flashhadamard_build(PG_FUNCTION_ARGS)
+{
+    Oid         source_oid = PG_GETARG_OID(0);
+    char       *embed_col  = text_to_cstring(PG_GETARG_TEXT_PP(1));
+    char       *sidecar    = text_to_cstring(PG_GETARG_TEXT_PP(2));
+    int         seed       = PG_GETARG_INT32(3);
+    int         group_size = PG_GETARG_INT32(4);
+    char       *source_name;
+    StringInfoData sql;
+    int         ret, n_rows, dim, n_bytes, n_groups;
+    int         i, j, d;
+    float      *all_vecs = NULL;     /* [n_rows × dim] */
+    float      *norms = NULL;        /* [n_rows] */
+    float      *rotated = NULL;      /* [n_rows × dim] */
+    float      *group_scales = NULL; /* [n_groups] */
+    uint8      *packed_codes = NULL; /* [n_rows × n_bytes] row-major */
+    uint8      *packed_t = NULL;     /* [n_bytes × n_rows] transposed */
+    uint8      *sq8_codes = NULL;    /* [n_rows × dim] */
+    float      *sq8_mins = NULL;     /* [dim] */
+    float      *sq8_scales = NULL;   /* [dim] */
+    FHParams    params;
+
+    source_name = get_rel_name(source_oid);
+    if (!source_name)
+        ereport(ERROR, (errmsg("flashhadamard_build: source table not found")));
+
+    SPI_connect();
+
+    /* Step 1: Read all vectors */
+    initStringInfo(&sql);
+    appendStringInfo(&sql, "SELECT (%s)::vector::text FROM %s ORDER BY ctid",
+                     embed_col, quote_identifier(source_name));
+    ret = SPI_execute(sql.data, true, 0);
+    if (ret != SPI_OK_SELECT)
+    {
+        SPI_finish();
+        ereport(ERROR, (errmsg("flashhadamard_build: failed to read vectors")));
+    }
+
+    n_rows = SPI_processed;
+    if (n_rows == 0)
+    {
+        SPI_finish();
+        PG_RETURN_INT32(0);
+    }
+
+    /* Parse first vector to get dim */
+    {
+        char *vtext = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+        /* Count commas + 1 = dim, skip leading '[' */
+        dim = 1;
+        for (char *p = vtext; *p; p++)
+            if (*p == ',') dim++;
+    }
+
+    n_bytes = (dim + 1) / 2;
+    n_groups = (dim + group_size - 1) / group_size;
+
+    /* Allocate */
+    all_vecs = palloc(sizeof(float) * n_rows * dim);
+    norms = palloc(sizeof(float) * n_rows);
+
+    /* Parse all vectors */
+    for (i = 0; i < n_rows; i++)
+    {
+        char *vtext = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
+        float *v = all_vecs + i * dim;
+        char *p = vtext + 1; /* skip '[' */
+        float norm = 0.0f;
+
+        for (d = 0; d < dim; d++)
+        {
+            v[d] = strtof(p, &p);
+            norm += v[d] * v[d];
+            if (*p == ',') p++;
+        }
+        norms[i] = sqrtf(norm);
+        if (norms[i] < 1e-12f) norms[i] = 1e-12f;
+
+        /* Normalize in-place */
+        for (d = 0; d < dim; d++)
+            v[d] /= norms[i];
+    }
+
+    /* Step 2: Build rotation params */
+    params.dim = dim;
+    params.group_size = group_size;
+    params.seed = seed;
+    params.n_groups = n_groups;
+    params.perm = palloc(sizeof(int) * dim);
+    params.signs = palloc(sizeof(float) * dim);
+    params.centers = (float *)fh_lloyd_max_16; /* const, don't free */
+    fh_generate_perm_signs(dim, seed, params.perm, params.signs);
+
+    /* Step 3: Rotate all vectors */
+    rotated = palloc(sizeof(float) * n_rows * dim);
+    {
+        float inv_sqrt_dim = 1.0f / sqrtf((float)dim);
+        float sqrt_dim = sqrtf((float)dim);
+
+        for (i = 0; i < n_rows; i++)
+        {
+            fh_rotate_vec(all_vecs + i * dim, rotated + i * dim, &params);
+            /* Scale by sqrt(dim) as in Python harness */
+            for (d = 0; d < dim; d++)
+                rotated[i * dim + d] *= sqrt_dim;
+        }
+    }
+
+    /* Step 4: Group RMS scales */
+    group_scales = palloc0(sizeof(float) * n_groups);
+    {
+        for (j = 0; j < n_groups; j++)
+        {
+            int start = j * group_size;
+            int end = Min(start + group_size, dim);
+            double sum_sq = 0.0;
+            int count = 0;
+
+            for (i = 0; i < n_rows; i++)
+                for (d = start; d < end; d++)
+                {
+                    float val = rotated[i * dim + d];
+                    sum_sq += (double)val * val;
+                    count++;
+                }
+            group_scales[j] = (float)sqrt(sum_sq / Max(count, 1));
+            if (group_scales[j] < 1e-4f) group_scales[j] = 1e-4f;
+        }
+    }
+    params.group_scales = group_scales;
+
+    /* Step 5: Equalize + quantize → packed codes */
+    packed_codes = palloc(sizeof(uint8) * n_rows * n_bytes);
+    {
+        float *expanded = palloc(sizeof(float) * dim);
+        int g;
+        for (g = 0; g < n_groups; g++)
+        {
+            int start = g * group_size;
+            int end = Min(start + group_size, dim);
+            for (d = start; d < end; d++)
+                expanded[d] = group_scales[g];
+        }
+
+        for (i = 0; i < n_rows; i++)
+        {
+            uint8 *row_packed = packed_codes + i * n_bytes;
+            memset(row_packed, 0, n_bytes);
+
+            for (d = 0; d < dim; d++)
+            {
+                float eq = rotated[i * dim + d] / expanded[d];
+                int code = fh_digitize(eq);
+                int byte_idx = d / 2;
+
+                if (d % 2 == 0)
+                    row_packed[byte_idx] |= (uint8)(code & 0x0F);
+                else
+                    row_packed[byte_idx] |= (uint8)((code & 0x0F) << 4);
+            }
+        }
+        pfree(expanded);
+    }
+
+    /* Step 6: Transpose packed codes */
+    packed_t = palloc(sizeof(uint8) * n_bytes * n_rows);
+    for (i = 0; i < n_rows; i++)
+        for (j = 0; j < n_bytes; j++)
+            packed_t[j * n_rows + i] = packed_codes[i * n_bytes + j];
+
+    /* Step 7: SQ8 encode (per-column min/max on original normalized vectors) */
+    sq8_codes = palloc(sizeof(uint8) * n_rows * dim);
+    sq8_mins = palloc(sizeof(float) * dim);
+    sq8_scales = palloc(sizeof(float) * dim);
+    {
+        for (d = 0; d < dim; d++)
+        {
+            float col_min = FLT_MAX, col_max = -FLT_MAX;
+            for (i = 0; i < n_rows; i++)
+            {
+                float v = all_vecs[i * dim + d];
+                if (v < col_min) col_min = v;
+                if (v > col_max) col_max = v;
+            }
+            float range = col_max - col_min;
+            if (range < 1e-8f) range = 1e-8f;
+            sq8_mins[d] = col_min;
+            sq8_scales[d] = range / 255.0f;
+
+            for (i = 0; i < n_rows; i++)
+            {
+                float v = all_vecs[i * dim + d];
+                int code = (int)roundf((v - col_min) / sq8_scales[d]);
+                if (code < 0) code = 0;
+                if (code > 255) code = 255;
+                sq8_codes[i * dim + d] = (uint8)code;
+            }
+        }
+    }
+
+    /* Step 8: Create sidecar table and store everything */
+    resetStringInfo(&sql);
+    appendStringInfo(&sql, "DROP TABLE IF EXISTS %s", quote_identifier(sidecar));
+    SPI_execute(sql.data, false, 0);
+
+    resetStringInfo(&sql);
+    appendStringInfo(&sql,
+        "CREATE TABLE %s ("
+        "  row_id int4 NOT NULL,"
+        "  packed_t bytea,"
+        "  sq8_codes bytea,"
+        "  meta_group_scales bytea,"
+        "  meta_sq8_mins bytea,"
+        "  meta_sq8_scales bytea,"
+        "  meta_norms bytea,"
+        "  meta_dim int4,"
+        "  meta_seed int4,"
+        "  meta_group_size int4,"
+        "  meta_n_rows int4"
+        ")", quote_identifier(sidecar));
+    SPI_execute(sql.data, false, 0);
+
+    /* Insert metadata row (row_id = -1) */
+    {
+        bytea *gs_bytes = (bytea *)palloc(VARHDRSZ + sizeof(float) * n_groups);
+        bytea *mins_bytes = (bytea *)palloc(VARHDRSZ + sizeof(float) * dim);
+        bytea *scales_bytes = (bytea *)palloc(VARHDRSZ + sizeof(float) * dim);
+        bytea *norms_bytes = (bytea *)palloc(VARHDRSZ + sizeof(float) * n_rows);
+        bytea *pt_bytes = (bytea *)palloc(VARHDRSZ + n_bytes * n_rows);
+        bytea *sq_bytes = (bytea *)palloc(VARHDRSZ + n_rows * dim);
+
+        SET_VARSIZE(gs_bytes, VARHDRSZ + sizeof(float) * n_groups);
+        memcpy(VARDATA(gs_bytes), group_scales, sizeof(float) * n_groups);
+        SET_VARSIZE(mins_bytes, VARHDRSZ + sizeof(float) * dim);
+        memcpy(VARDATA(mins_bytes), sq8_mins, sizeof(float) * dim);
+        SET_VARSIZE(scales_bytes, VARHDRSZ + sizeof(float) * dim);
+        memcpy(VARDATA(scales_bytes), sq8_scales, sizeof(float) * dim);
+        SET_VARSIZE(norms_bytes, VARHDRSZ + sizeof(float) * n_rows);
+        memcpy(VARDATA(norms_bytes), norms, sizeof(float) * n_rows);
+        SET_VARSIZE(pt_bytes, VARHDRSZ + n_bytes * n_rows);
+        memcpy(VARDATA(pt_bytes), packed_t, n_bytes * n_rows);
+        SET_VARSIZE(sq_bytes, VARHDRSZ + n_rows * dim);
+        memcpy(VARDATA(sq_bytes), sq8_codes, n_rows * dim);
+
+        {
+            Datum values[11];
+            bool nulls[11];
+            Oid argtypes[11] = {INT4OID, BYTEAOID, BYTEAOID, BYTEAOID, BYTEAOID, BYTEAOID, BYTEAOID, INT4OID, INT4OID, INT4OID, INT4OID};
+
+            memset(nulls, false, sizeof(nulls));
+            values[0] = Int32GetDatum(-1);
+            values[1] = PointerGetDatum(pt_bytes);
+            values[2] = PointerGetDatum(sq_bytes);
+            values[3] = PointerGetDatum(gs_bytes);
+            values[4] = PointerGetDatum(mins_bytes);
+            values[5] = PointerGetDatum(scales_bytes);
+            values[6] = PointerGetDatum(norms_bytes);
+            values[7] = Int32GetDatum(dim);
+            values[8] = Int32GetDatum(seed);
+            values[9] = Int32GetDatum(group_size);
+            values[10] = Int32GetDatum(n_rows);
+
+            resetStringInfo(&sql);
+            appendStringInfo(&sql,
+                "INSERT INTO %s (row_id, packed_t, sq8_codes, meta_group_scales, "
+                "meta_sq8_mins, meta_sq8_scales, meta_norms, meta_dim, meta_seed, "
+                "meta_group_size, meta_n_rows) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+                quote_identifier(sidecar));
+
+            ret = SPI_execute_with_args(sql.data, 11, argtypes, values, NULL, false, 0);
+            if (ret != SPI_OK_INSERT)
+                ereport(WARNING, (errmsg("flashhadamard_build: metadata insert failed")));
+        }
+    }
+
+    SPI_finish();
+
+    /* Cleanup */
+    pfree(all_vecs);
+    pfree(norms);
+    pfree(rotated);
+    pfree(packed_codes);
+    pfree(packed_t);
+    pfree(sq8_codes);
+    pfree(sq8_mins);
+    pfree(sq8_scales);
+    pfree(params.perm);
+    pfree(params.signs);
+
+    PG_RETURN_INT32(n_rows);
+}
+
+
+/* ================================================================
+ * PG FUNCTION: flashhadamard_scan
+ *
+ * flashhadamard_scan(
+ *   sidecar_tbl text,
+ *   query       vector,
+ *   k           int4 DEFAULT 10,
+ *   shortlist_m int4 DEFAULT 12
+ * ) RETURNS TABLE(row_id int4, score float8)
+ * ================================================================ */
+
+PG_FUNCTION_INFO_V1(flashhadamard_scan);
+Datum
+flashhadamard_scan(PG_FUNCTION_ARGS)
+{
+    ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    char       *sidecar = text_to_cstring(PG_GETARG_TEXT_PP(0));
+    /* query is vector type — extract float array */
+    Datum       query_datum = PG_GETARG_DATUM(1);
+    int         k = PG_GETARG_INT32(2);
+    int         shortlist_m = PG_GETARG_INT32(3);
+
+    StringInfoData sql;
+    int         ret;
+    int         dim, seed, group_size_val, n_rows, n_bytes, n_groups;
+    FHParams    params;
+    FHCodes     codes;
+    float      *query_vec;
+    int32      *out_ids;
+    float      *out_scores;
+    int         n_results, i;
+    TupleDesc   tupdesc;
+    Tuplestorestate *tupstore;
+
+    /* Setup materialized SRF */
+    InitMaterializedSRF(fcinfo, 0);
+    tupstore = rsinfo->setResult;
+    tupdesc = rsinfo->setDesc;
+
+    SPI_connect();
+
+    /* Load metadata from sidecar (row_id = -1) */
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+        "SELECT packed_t, sq8_codes, meta_group_scales, meta_sq8_mins, "
+        "meta_sq8_scales, meta_norms, meta_dim, meta_seed, meta_group_size, "
+        "meta_n_rows FROM %s WHERE row_id = -1",
+        quote_identifier(sidecar));
+    ret = SPI_execute(sql.data, true, 1);
+
+    if (ret != SPI_OK_SELECT || SPI_processed != 1)
+    {
+        SPI_finish();
+        ereport(ERROR, (errmsg("flashhadamard_scan: sidecar metadata not found")));
+    }
+
+    /* Extract metadata */
+    {
+        HeapTuple tup = SPI_tuptable->vals[0];
+        TupleDesc tdesc = SPI_tuptable->tupdesc;
+        bool isnull;
+        bytea *pt_bytes, *sq_bytes, *gs_bytes, *mins_bytes, *scales_bytes, *norms_bytes;
+
+        dim = DatumGetInt32(SPI_getbinval(tup, tdesc, 7, &isnull));
+        seed = DatumGetInt32(SPI_getbinval(tup, tdesc, 8, &isnull));
+        group_size_val = DatumGetInt32(SPI_getbinval(tup, tdesc, 9, &isnull));
+        n_rows = DatumGetInt32(SPI_getbinval(tup, tdesc, 10, &isnull));
+        n_bytes = (dim + 1) / 2;
+        n_groups = (dim + group_size_val - 1) / group_size_val;
+
+        pt_bytes = DatumGetByteaP(SPI_getbinval(tup, tdesc, 1, &isnull));
+        sq_bytes = DatumGetByteaP(SPI_getbinval(tup, tdesc, 2, &isnull));
+        gs_bytes = DatumGetByteaP(SPI_getbinval(tup, tdesc, 3, &isnull));
+        mins_bytes = DatumGetByteaP(SPI_getbinval(tup, tdesc, 4, &isnull));
+        scales_bytes = DatumGetByteaP(SPI_getbinval(tup, tdesc, 5, &isnull));
+        norms_bytes = DatumGetByteaP(SPI_getbinval(tup, tdesc, 6, &isnull));
+
+        /* Build params */
+        params.dim = dim;
+        params.group_size = group_size_val;
+        params.seed = seed;
+        params.n_groups = n_groups;
+        params.perm = palloc(sizeof(int) * dim);
+        params.signs = palloc(sizeof(float) * dim);
+        params.centers = (float *)fh_lloyd_max_16;
+        params.group_scales = palloc(sizeof(float) * n_groups);
+        memcpy(params.group_scales, VARDATA_ANY(gs_bytes), sizeof(float) * n_groups);
+        fh_generate_perm_signs(dim, seed, params.perm, params.signs);
+
+        /* Build codes */
+        codes.n_rows = n_rows;
+        codes.dim = dim;
+        codes.n_bytes = n_bytes;
+        codes.packed_t = palloc(n_bytes * n_rows);
+        memcpy(codes.packed_t, VARDATA_ANY(pt_bytes), n_bytes * n_rows);
+        codes.sq8_codes = palloc(n_rows * dim);
+        memcpy(codes.sq8_codes, VARDATA_ANY(sq_bytes), n_rows * dim);
+        codes.sq8_mins = palloc(sizeof(float) * dim);
+        memcpy(codes.sq8_mins, VARDATA_ANY(mins_bytes), sizeof(float) * dim);
+        codes.sq8_scales = palloc(sizeof(float) * dim);
+        memcpy(codes.sq8_scales, VARDATA_ANY(scales_bytes), sizeof(float) * dim);
+        codes.norms = palloc(sizeof(float) * n_rows);
+        memcpy(codes.norms, VARDATA_ANY(norms_bytes), sizeof(float) * n_rows);
+    }
+
+    SPI_finish();
+
+    /* Extract query vector from pgvector's vector type */
+    {
+        /* pgvector stores vector as: varlena header + uint16 dim + uint16 unused + float[] */
+        bytea *raw = DatumGetByteaP(query_datum);
+        int query_dim = *(uint16 *)(VARDATA(raw));
+        float *qdata = (float *)(VARDATA(raw) + 2 * sizeof(uint16));
+
+        if (query_dim != dim)
+            ereport(ERROR, (errmsg("flashhadamard_scan: query dim %d != sidecar dim %d",
+                                    query_dim, dim)));
+        query_vec = palloc(sizeof(float) * dim);
+        memcpy(query_vec, qdata, sizeof(float) * dim);
+    }
+
+    /* Run search */
+    out_ids = palloc(sizeof(int32) * k);
+    out_scores = palloc(sizeof(float) * k);
+    n_results = fh_search(&codes, &params, query_vec, k, shortlist_m,
+                           out_ids, out_scores);
+
+    /* Emit results */
+    for (i = 0; i < n_results; i++)
+    {
+        Datum vals[2];
+        bool nulls[2] = {false, false};
+
+        vals[0] = Int32GetDatum(out_ids[i]);
+        vals[1] = Float8GetDatum((float8)out_scores[i]);
+        tuplestore_putvalues(tupstore, tupdesc, vals, nulls);
+    }
+
+    PG_RETURN_NULL();
 }
