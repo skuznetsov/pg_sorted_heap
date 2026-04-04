@@ -1670,13 +1670,13 @@ flashhadamard_store_build(PG_FUNCTION_ARGS)
             if (is_halfvec) { Hsvec *hv=(Hsvec*)PG_DETOAST_DATUM(dv); for(d=0;d<Min(hv->dim,dim);d++){vec_buf[d]=HalfToFloat4(hv->x[d]);norm+=vec_buf[d]*vec_buf[d];} for(d=Min(hv->dim,dim);d<dim;d++)vec_buf[d]=0; if(hv!=(Hsvec*)DatumGetPointer(dv))pfree(hv); }
             else { Svec *sv=(Svec*)PG_DETOAST_DATUM(dv); memcpy(vec_buf,sv->x,sizeof(float)*Min(sv->dim,dim)); for(d=Min(sv->dim,dim);d<dim;d++)vec_buf[d]=0; for(d=0;d<Min(sv->dim,dim);d++)norm+=vec_buf[d]*vec_buf[d]; if(sv!=(Svec*)DatumGetPointer(dv))pfree(sv); }
             norm=sqrtf(norm); if(norm<1e-12f)norm=1e-12f; for(d=0;d<dim;d++)vec_buf[d]/=norm; norms[row_idx]=norm;
-            /* Accumulate centroid for this segment */
-            { int seg_id = row_idx / FH_SEGMENT_SIZE;
-              float *cen = centroids + (Size)seg_id * dim;
-              for(d=0;d<dim;d++) cen[d] += vec_buf[d];
-              seg_counts[seg_id]++; }
             for(d=0;d<dim;d++){if(vec_buf[d]<sq8_mins[d])sq8_mins[d]=vec_buf[d]; if(vec_buf[d]>sq8_scales[d])sq8_scales[d]=vec_buf[d];}
             fh_rotate_vec(vec_buf, rot_buf, &params); for(d=0;d<dim;d++)rot_buf[d]*=sqrt_dim;
+            /* Accumulate centroid in equalized rotated space (rot/expanded, same as quantizer input) */
+            { int seg_id = row_idx / FH_SEGMENT_SIZE;
+              float *cen = centroids + (Size)seg_id * dim;
+              for(d=0;d<dim;d++) cen[d] += rot_buf[d] / expanded[d];
+              seg_counts[seg_id]++; }
             { uint8 *rp = packed_codes+(Size)row_idx*n_bytes; memset(rp,0,n_bytes);
               for(d=0;d<dim;d++){float eq=rot_buf[d]/expanded[d]; int code=fh_digitize(eq); int bi=d/2;
               if(d%2==0)rp[bi]|=(uint8)(code&0x0F); else rp[bi]|=(uint8)((code&0x0F)<<4);} }

@@ -325,26 +325,32 @@ fh_store_scan(const char *path, const FHParams *params,
         int     n_probe;
         int     s;
 
-        /* Normalize query for centroid comparison */
-        float  *q_norm_seg = palloc(sizeof(float) * dim);
-        {
-            float qn = 0;
-            for (i = 0; i < dim; i++) qn += query_vec[i] * query_vec[i];
-            qn = sqrtf(qn);
-            if (qn < 1e-12f) qn = 1e-12f;
-            for (i = 0; i < dim; i++) q_norm_seg[i] = query_vec[i] / qn;
-        }
-
-        /* Compute dot product with each centroid */
+        /* Rank segments using FH search-space coefficients (rotated query × expanded scales / sqrt(dim))
+         * This matches the centroid space (equalized rotated vectors). */
         seg_scores = palloc(sizeof(float) * n_seg);
-        for (s = 0; s < n_seg; s++)
         {
-            float *cen = centroids_ptr + (Size)s * dim;
-            float dot = 0;
-            for (j = 0; j < dim; j++) dot += q_norm_seg[j] * cen[j];
-            seg_scores[s] = dot;
+            /* Recompute coeffs for segment ranking (same as byte_table coeffs) */
+            float *seg_coeffs = palloc(sizeof(float) * dim);
+            float *seg_rotated = palloc(sizeof(float) * dim);
+            float seg_inv_sqrt = 1.0f / sqrtf((float)dim);
+
+            fh_rotate_vec(query_vec, seg_rotated, params);
+            for (j = 0; j < dim; j++)
+            {
+                int g = j / params->group_size;
+                seg_coeffs[j] = seg_rotated[j] * params->group_scales[g] * seg_inv_sqrt;
+            }
+
+            for (s = 0; s < n_seg; s++)
+            {
+                float *cen = centroids_ptr + (Size)s * dim;
+                float dot = 0;
+                for (j = 0; j < dim; j++) dot += seg_coeffs[j] * cen[j];
+                seg_scores[s] = dot;
+            }
+            pfree(seg_coeffs);
+            pfree(seg_rotated);
         }
-        pfree(q_norm_seg);
 
         /* Sort segments by descending score */
         seg_order = palloc(sizeof(int) * n_seg);
@@ -354,9 +360,16 @@ fh_store_scan(const char *path, const FHParams *params,
                 if (seg_scores[seg_order[j]] > seg_scores[seg_order[i]])
                 { int tmp = seg_order[i]; seg_order[i] = seg_order[j]; seg_order[j] = tmp; }
 
-        /* Probe top-P segments (default: half, min all if few segments) */
-        n_probe = (n_seg + 1) / 2;
-        if (n_probe < 3) n_probe = n_seg;  /* don't prune if very few segments */
+        /* Probe top-P segments (default: 75%, configurable via env var) */
+        {
+            const char *env_probe = getenv("FH_NPROBE_SEGMENTS");
+            if (env_probe)
+                n_probe = atoi(env_probe);
+            else
+                n_probe = (n_seg * 3 + 3) / 4;  /* 75% */
+            if (n_probe < 1) n_probe = 1;
+            if (n_probe > n_seg) n_probe = n_seg;
+        }
 
         /* Score only probed segments using parallel scorer */
         for (s = 0; s < n_probe; s++)
