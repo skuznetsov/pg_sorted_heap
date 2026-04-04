@@ -229,11 +229,33 @@ What the prototype did NOT achieve:
 - TOAST-free hot path
 - Page-native packed code layout
 
-**Next-generation path (not current scope):** AM-level FlashHadamard
-storage where packed codes live in page-native fixed-layout segments,
-scorer reads contiguous buffers without TOAST/SPI, and fused 2-byte
-scoring runs directly on page-local data. This is a real AM project
-(like sorted_hnsw), not a sidecar-table project.
+**Next-generation path: FlashHadamard segment store**
+
+Goal: page-native packed code storage where scorer reads contiguous
+buffers without TOAST/SPI overhead.
+
+Design:
+1. **Meta page** — version, dim, centers, seed, group_scales (small, read once)
+2. **Packed segment pages** — transposed packed codes in page-native layout,
+   4096 rows/segment, contiguous byte columns for sequential scoring
+3. **SQ8 payload pages** — row-major SQ8 codes, fetched ONLY for shortlisted
+   candidates (not eagerly loaded during stage-1 scan)
+
+Scan pipeline:
+- Load one packed segment → run fused scorer on page buffer → merge top-k
+- After all segments: fetch SQ8 payload for shortlist rows only → rerank
+- No SPI, no TOAST, no varlena overhead in hot path
+
+Implementation order:
+1. Metapage + segment file format
+2. Build writer (streaming, same 3-pass algorithm)
+3. Packed segment scan + global shortlist
+4. SQ8 fetch for shortlist only
+5. Parity benchmark vs C helper
+6. Planner/index AM integration (later, if earned)
+
+This is a real AM project comparable in scope to sorted_hnsw.
+Not current scope — documented for future work.
 
 ## Status
 
