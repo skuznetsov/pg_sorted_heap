@@ -242,7 +242,6 @@ fh_packed_score_t(const uint8 *packed_t, const float *byte_tables,
 
 /* ================================================================
  * Fused packed score + top-k (no full scores array allocation)
- * Scores all rows, maintains top-k heap inline.
  * ================================================================ */
 
 void
@@ -256,11 +255,10 @@ fh_packed_score_topk_t(const uint8 *packed_t, const float *byte_tables,
     int     min_pos = 0;
     float   min_score = -FLT_MAX;
 
-    /* Allocate per-row scores (needed for 2-byte fused accumulation) */
     scores = palloc(sizeof(float) * n_rows);
     memset(scores, 0, sizeof(float) * n_rows);
 
-    /* 2-byte fused scoring (same as fh_packed_score_t) */
+    /* 2-byte fused scoring */
     byte_idx = 0;
     for (; byte_idx + 1 < n_bytes; byte_idx += 2)
     {
