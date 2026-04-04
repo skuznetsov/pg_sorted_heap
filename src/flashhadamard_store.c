@@ -275,6 +275,7 @@ fh_store_scan(const char *path, const FHParams *params,
     uint8  *packed_ptr;
     float  *norms_ptr;
 
+    elog(NOTICE, "fh_store_scan: entry, path=%s", path);
     /* Get or create backend-local cache (persistent mmap) */
     cache = fh_store_cache_get(path);
     if (!cache)
@@ -284,6 +285,8 @@ fh_store_scan(const char *path, const FHParams *params,
     dim = meta->dim;
     n_rows = meta->n_rows;
     n_bytes = meta->n_bytes;
+    elog(NOTICE, "fh_store_scan: dim=%d n_rows=%d n_bytes=%d n_seg=%d seg_size=%d off_cen=%lld",
+         dim, n_rows, n_bytes, meta->n_segments, meta->segment_size, (long long)meta->off_centroids);
     inv_sqrt_dim = 1.0f / sqrtf((float)dim);
 
     /* Rotate query + build byte tables */
@@ -314,7 +317,9 @@ fh_store_scan(const char *path, const FHParams *params,
     packed_ptr = (uint8 *)cache->mapped + meta->off_packed;
     norms_ptr = (float *)((char *)cache->mapped + meta->off_norms);
 
-    if (meta->n_segments > 1 && meta->off_centroids > 0)
+    if (meta->n_segments > 1 && meta->n_segments <= 10000 &&
+        meta->off_centroids > 0 && meta->off_centroids < (int64)cache->mapped_size &&
+        meta->segment_size > 0)
     {
         /* Segment pruning: rank segments by centroid similarity, scan top-P */
         float  *centroids_ptr = (float *)((char *)cache->mapped + meta->off_centroids);
@@ -371,26 +376,23 @@ fh_store_scan(const char *path, const FHParams *params,
             if (n_probe > n_seg) n_probe = n_seg;
         }
 
-        /* Score only probed segments using parallel scorer */
+        /* Score probed segments — global top-k state persists across segments */
+        {
+            int global_min_pos = 0;
+            float global_min_score = -FLT_MAX;
+
         for (s = 0; s < n_probe; s++)
         {
             int sid = seg_order[s];
             int rstart = sid * seg_size;
             int rcount = Min(seg_size, n_rows - rstart);
-            /* Create virtual packed_t pointer for this segment */
-            /* packed_t is transposed: packed_t[col * n_rows + row] */
-            /* For a segment [rstart..rstart+rcount), we need offsets within each column */
-            /* Pass the full packed_t + n_rows, and let scorer handle the range */
-            /* Actually: the parallel scorer already shards by row range.
-             * We need to call score_topk on the segment's row range.
-             * But fh_packed_score_topk_t scores ALL rows. Need a range variant. */
 
-            /* Simple: score this segment's rows directly (single-thread per segment) */
+            /* Guard: skip empty/invalid segments */
+            if (rcount <= 0) continue;
+
             {
                 float *seg_row_scores = palloc(sizeof(float) * rcount);
                 int byte_idx, row;
-                int min_pos = 0;
-                float min_score_local = -FLT_MAX;
 
                 memset(seg_row_scores, 0, sizeof(float) * rcount);
 
@@ -425,11 +427,12 @@ fh_store_scan(const char *path, const FHParams *params,
                     float sc = norms_ptr ? seg_row_scores[row] * norms_ptr[rstart + row]
                                           : seg_row_scores[row];
                     fh_topk_insert(sc, rstart + row, top_scores, top_ids, shortlist_m,
-                                    &filled, &min_pos, &min_score_local);
+                                    &filled, &global_min_pos, &global_min_score);
                 }
                 pfree(seg_row_scores);
             }
         }
+        } /* end global_min_pos block */
 
         pfree(seg_scores);
         pfree(seg_order);
