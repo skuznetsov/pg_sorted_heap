@@ -404,35 +404,52 @@ fh_packed_score_topk_t(const uint8 *packed_t, const float *byte_tables,
         }
 
         for (i = 0; i < launched; i++)
+            pthread_join(threads[i], NULL);
+
+        /* If partial launch: score remaining rows single-thread */
+        if (launched > 0 && launched < n_threads)
         {
-            int jret = pthread_join(threads[i], NULL);
-            (void)jret;  /* best-effort join */
+            int remaining_start = launched * chunk;
+            if (remaining_start < n_rows)
+            {
+                /* Score the unassigned tail in-line */
+                FHScoreTask tail;
+                tail.packed_t = packed_t;
+                tail.byte_tables = byte_tables;
+                tail.norms = norms;
+                tail.n_rows = n_rows;
+                tail.n_bytes = n_bytes;
+                tail.row_start = remaining_start;
+                tail.row_end = n_rows;
+                tail.topk = topk;
+                tail.top_ids = all_ids + launched * topk;
+                tail.top_scores = all_scores + launched * topk;
+                fh_score_worker(&tail);
+                launched++;  /* count the inline "thread" for merge */
+            }
         }
 
         if (launched == 0)
         {
-            /* All thread creation failed — single-thread below will handle */
             pfree(all_ids);
             pfree(all_scores);
-            n_threads = 1;  /* force single-thread path */
+            /* Fall through to single-thread path below */
         }
         else
         {
-
-        /* Merge per-thread top-k into global top-k */
-        *filled = 0;
-        for (i = 0; i < launched * topk; i++)
-        {
-            if (all_ids[i] < 0) continue;
-            fh_topk_insert(all_scores[i], all_ids[i],
-                            top_scores, top_ids, topk,
-                            filled, &min_pos, &min_score);
+            /* Merge all per-thread top-k into global top-k */
+            *filled = 0;
+            for (i = 0; i < launched * topk; i++)
+            {
+                if (all_ids[i] < 0) continue;
+                fh_topk_insert(all_scores[i], all_ids[i],
+                                top_scores, top_ids, topk,
+                                filled, &min_pos, &min_score);
+            }
+            pfree(all_ids);
+            pfree(all_scores);
+            return;
         }
-
-        pfree(all_ids);
-        pfree(all_scores);
-        return;
-        } /* end else launched > 0 */
     }
 #endif /* !_WIN32 */
 
