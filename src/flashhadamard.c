@@ -546,7 +546,10 @@ flashhadamard_build(PG_FUNCTION_ARGS)
         n_groups = (dim + group_size - 1) / group_size;
 
         /* Allocate buffers */
-        all_vecs = (float *) palloc(sizeof(float) * (Size)n_rows * dim);
+        {
+            Size alloc_size = sizeof(float) * (Size)n_rows * dim;
+            all_vecs = (float *) MemoryContextAllocHuge(CurrentMemoryContext, alloc_size);
+        }
         norms = (float *) palloc(sizeof(float) * n_rows);
 
         /* Extract vectors from SPI result tuples (binary access) */
@@ -613,7 +616,7 @@ flashhadamard_build(PG_FUNCTION_ARGS)
     fh_generate_perm_signs(dim, seed, params.perm, params.signs);
 
     /* Step 3: Rotate all vectors */
-    rotated = palloc(sizeof(float) * n_rows * dim);
+    rotated = MemoryContextAllocHuge(CurrentMemoryContext, sizeof(float) * (Size)n_rows * dim);
     {
         float inv_sqrt_dim = 1.0f / sqrtf((float)dim);
         float sqrt_dim = sqrtf((float)dim);
@@ -651,7 +654,7 @@ flashhadamard_build(PG_FUNCTION_ARGS)
     params.group_scales = group_scales;
 
     /* Step 5: Equalize + quantize → packed codes */
-    packed_codes = palloc(sizeof(uint8) * n_rows * n_bytes);
+    packed_codes = MemoryContextAllocHuge(CurrentMemoryContext, (Size)n_rows * n_bytes);
     {
         float *expanded = palloc(sizeof(float) * dim);
         int g;
@@ -684,13 +687,13 @@ flashhadamard_build(PG_FUNCTION_ARGS)
     }
 
     /* Step 6: Transpose packed codes */
-    packed_t = palloc(sizeof(uint8) * n_bytes * n_rows);
+    packed_t = MemoryContextAllocHuge(CurrentMemoryContext, (Size)n_bytes * n_rows);
     for (i = 0; i < n_rows; i++)
         for (j = 0; j < n_bytes; j++)
             packed_t[j * n_rows + i] = packed_codes[i * n_bytes + j];
 
     /* Step 7: SQ8 encode (per-column min/max on original normalized vectors) */
-    sq8_codes = palloc(sizeof(uint8) * n_rows * dim);
+    sq8_codes = MemoryContextAllocHuge(CurrentMemoryContext, (Size)n_rows * dim);
     sq8_mins = palloc(sizeof(float) * dim);
     sq8_scales = palloc(sizeof(float) * dim);
     {
@@ -751,8 +754,8 @@ flashhadamard_build(PG_FUNCTION_ARGS)
         bytea *mins_bytes = (bytea *)palloc(VARHDRSZ + sizeof(float) * dim);
         bytea *scales_bytes = (bytea *)palloc(VARHDRSZ + sizeof(float) * dim);
         bytea *norms_bytes = (bytea *)palloc(VARHDRSZ + sizeof(float) * n_rows);
-        bytea *pt_bytes = (bytea *)palloc(VARHDRSZ + n_bytes * n_rows);
-        bytea *sq_bytes = (bytea *)palloc(VARHDRSZ + n_rows * dim);
+        bytea *pt_bytes = (bytea *)MemoryContextAllocHuge(CurrentMemoryContext, VARHDRSZ + (Size)n_bytes * n_rows);
+        bytea *sq_bytes = (bytea *)MemoryContextAllocHuge(CurrentMemoryContext, VARHDRSZ + (Size)n_rows * dim);
 
         SET_VARSIZE(gs_bytes, VARHDRSZ + sizeof(float) * n_groups);
         memcpy(VARDATA(gs_bytes), group_scales, sizeof(float) * n_groups);
@@ -900,10 +903,10 @@ flashhadamard_scan(PG_FUNCTION_ARGS)
         codes.n_rows = n_rows;
         codes.dim = dim;
         codes.n_bytes = n_bytes;
-        codes.packed_t = palloc(n_bytes * n_rows);
-        memcpy(codes.packed_t, VARDATA_ANY(pt_bytes), n_bytes * n_rows);
-        codes.sq8_codes = palloc(n_rows * dim);
-        memcpy(codes.sq8_codes, VARDATA_ANY(sq_bytes), n_rows * dim);
+        codes.packed_t = MemoryContextAllocHuge(CurrentMemoryContext, (Size)n_bytes * n_rows);
+        memcpy(codes.packed_t, VARDATA_ANY(pt_bytes), (Size)n_bytes * n_rows);
+        codes.sq8_codes = MemoryContextAllocHuge(CurrentMemoryContext, (Size)n_rows * dim);
+        memcpy(codes.sq8_codes, VARDATA_ANY(sq_bytes), (Size)n_rows * dim);
         codes.sq8_mins = palloc(sizeof(float) * dim);
         memcpy(codes.sq8_mins, VARDATA_ANY(mins_bytes), sizeof(float) * dim);
         codes.sq8_scales = palloc(sizeof(float) * dim);
