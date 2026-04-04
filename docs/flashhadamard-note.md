@@ -214,12 +214,16 @@ PG extension prototype (`flashhadamard_build` + `flashhadamard_scan`):
 | Python C helper (8 threads) | ~8ms | 1× | benchmark |
 
 **Final verdict:**
-- Engine path is feasible and integrated at 49ms
-- External C helper remains recommended serving path (~8ms)
-- 6.1× gap is from single-thread vs 8-thread scorer
-- The 2-byte fused scoring algorithm is already identical between both paths
-- Further improvement requires threading or smaller scan (IVF at larger scale)
-- **Engine path: packaged as experimental, not actively optimized further**
+- Engine path achieves **41ms** (with backend-local mmap cache)
+- **Single-thread kernel parity verified:** helper 1-thread = 40.0ms,
+  engine mmap = 40-41ms. No hidden single-thread optimization remains.
+- Entire gap to ~8ms is from 8× threading in the C helper
+- Refuted: per-row early-exit pruning (0% rows pruned after Hadamard)
+
+**Next regime changes (from SQ8 0.11 playbook):**
+1. Parallel segment scan (PG shared memory, cross-backend sharding)
+2. Segment-level hierarchical prefilter (coarse per-segment sketch)
+3. Integer/NEON kernel redesign (nibble tables, fixed-point accumulation)
 6. Planner/index AM integration (later, if earned)
 
 This is a real AM project comparable in scope to sorted_hnsw.
