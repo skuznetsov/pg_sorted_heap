@@ -388,8 +388,16 @@ fh_store_scan(const char *path, const FHParams *params,
             if (n_probe > n_seg) n_probe = n_seg;
         }
 
-        /* Build ranges array for parallel scorer */
+        /* If all segments probed, use canonical exhaustive path (guaranteed parity) */
+        if (n_probe >= n_seg)
         {
+            fh_packed_score_topk_t(packed_ptr, byte_tables, norms_ptr,
+                                    n_rows, n_bytes, shortlist_m,
+                                    top_ids, top_scores, &filled);
+        }
+        else
+        {
+            /* Build ranges for kept segments */
             int *ranges = palloc(sizeof(int) * n_probe * 2);
             int actual_ranges = 0;
 
@@ -404,7 +412,6 @@ fh_store_scan(const char *path, const FHParams *params,
                 actual_ranges++;
             }
 
-            /* Parallel score all kept segments */
             fh_packed_score_ranges_topk(packed_ptr, byte_tables, norms_ptr,
                                          n_rows, n_bytes,
                                          ranges, actual_ranges,
@@ -417,7 +424,7 @@ fh_store_scan(const char *path, const FHParams *params,
     }
     else
     {
-        /* No pruning: exhaustive parallel scan */
+        /* No pruning: exhaustive parallel scan (canonical path) */
         fh_packed_score_topk_t(packed_ptr, byte_tables, norms_ptr,
                                 n_rows, n_bytes, shortlist_m,
                                 top_ids, top_scores, &filled);
