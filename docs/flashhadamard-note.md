@@ -40,34 +40,71 @@ implements the hot scoring path: per-query byte-table build, 2-byte-fused
 transposed scorer with 4× row unrolling, optional multi-threaded row
 sharding, and fused per-thread top-k with merge. No external dependencies.
 
-## Validated Operating Points
+## Canonical Operating Points
 
-Full Gutenberg benchmark (103210 vectors, 2880 dimensions, cosine, k=10,
-4 bits/dim):
+**Setup:** Full Gutenberg, 103210 base vectors (50 held out as queries),
+2880 dimensions, cosine metric, k=10, seed=42, 8-thread C helper,
+Apple M2 Max.
 
-| Lane | hit@1 | recall@10 | p50 ms | metadata | status |
-|------|-------|-----------|--------|----------|--------|
-| float32 exact | 100% | 100% | 17.3 | - | baseline |
-| **FlashHadamard-16** (block16_packed4_topk) | 80% | **89.4%** | **8.0** | 0.8 KB | best recall exhaustive |
-| **FlashHadamard-Base** (blockhadamard_packed4_topk) | **86%** | 87.8% | 7.9 | 0.1 KB | best hit@1 exhaustive |
-| IVF32 nprobe=4 | 82% | 86.2% | 7.8 | 371 KB | not recommended |
-| SQ8 linear | ~99% | ~99% | - | 0 | quality ceiling (8× more bytes) |
-| PQ k-means (16 sub) | ~45% | ~67% | - | codebooks | baseline |
+### Single-stage (packed-only)
 
-Robustness: stable across seeds 42/123/7/999 on vetted 50-query subset.
-200-query runs confirm 50-query results within noise (see consumer-plan.md).
+| Lane | hit@1 | recall@10 | p50 ms | bytes/vec | bits/dim |
+|------|-------|-----------|--------|-----------|----------|
+| FlashHadamard-16 (topk) | 80% | **89.4%** | 8.7 | 1440 | 4 |
+| FlashHadamard-Base (topk) | **86%** | 87.8% | 7.9 | 1440 | 4 |
 
-Compression: 4 bits/dim = 1440 bytes/vec for 2880D (8× less than float32,
-4× less than SQ8). Metadata is negligible (seed + 90 group scales for
-FlashHadamard-16).
+### Two-stage (packed shortlist → rerank)
 
-Latency breakdown (vetted Gutenberg, packed4 helper with 8 threads):
-- Query transform (Hadamard rotation): ~0.15 ms
-- Byte-table build in C: ~0.23 ms
-- Packed scoring + top-k: ~6 ms (dominates)
-- Total: ~8 ms
+| Config | hit@1 | recall@10 | p50 ms | avg ms | p95 ms | bytes/vec | bits/dim |
+|--------|-------|-----------|--------|--------|--------|-----------|----------|
+| **SQ8 rerank M=12** | **94%** | **92.8%** | **9.2** | **9.4** | **11.0** | **4320** | **12** |
+| SQ8 rerank M=20 | 94% | 95.8% | 11.4 | 11.8 | 15.4 | 4320 | 12 |
+| FP32 rerank M=20 | 100% | 99.6% | 11.4 | 11.7 | 14.2 | (resident fp32) | - |
 
-**Naming:**
+### Reference baselines
+
+| Method | hit@1 | recall@10 | bytes/vec |
+|--------|-------|-----------|-----------|
+| float32 exact | 100% | 100% | 11520 |
+| SQ8 linear | ~99% | ~99% | 2880 |
+| PQ k-means | ~45% | ~67% | 16 + codebooks |
+| IVF32 nprobe=4 | 82% | 86.2% | 1444 + centroids |
+
+### Recommended serving point
+
+**FlashHadamard-16 + SQ8 rerank M=12**: best current exhaustive CPU
+operating point. 94% hit@1, 92.8% recall@10, 9.2ms p50, 4320 bytes/vec
+(12 bits/dim = 2.7× compression vs float32).
+
+For applications where hit@1 matters most and storage is tight, packed-only
+FlashHadamard-Base at 4 bits/dim provides 86% hit@1 at 7.9ms.
+
+### Latency breakdown
+
+| Stage | p50 ms | Share |
+|-------|--------|-------|
+| Hadamard transform | 0.15 | 2% |
+| C packed scorer (8 threads) | 6.6 | 72% |
+| Argpartition / top-k | 0.9 | 10% |
+| SQ8 gather + rerank | 0.5 | 5% |
+| Python overhead | 1.0 | 11% |
+| **Total** | **~9.2** | |
+
+The packed scorer is the dominant cost (~6.6ms), scanning 103K × 1440 bytes
+= 149MB per query. This is the current dominant cost under the present
+exhaustive CPU layout, not a fundamental limit. Shortlist size M has
+minimal impact on latency (8.5-9.5ms for M=8-20) because the scorer cost
+is fixed. Rerank overhead is negligible (<0.5ms for M=12).
+
+### Robustness
+
+Stable across seeds 42/123/7/999 on vetted 50-query subset. 200-query
+runs confirm 50-query results within noise (see consumer-plan.md).
+Earlier numbers in the evidence trail used different setups (non-TopK inner,
+different holdout splits); the canonical numbers above supersede them.
+
+### Naming
+
 - **FlashHadamard** — the family
 - **FlashHadamard-16** — group_size=16, best recall@10
 - **FlashHadamard-Base** — no group scaling, best hit@1
@@ -155,16 +192,25 @@ payload) is no longer a pure 4-bit lane. This is a two-tier storage
 tradeoff: fast packed scan for shortlisting + higher-fidelity SQ8 for
 boundary disambiguation.
 
+## Status
+
+The exhaustive CPU serving path is done enough for the current workload.
+Further local tweaks (fused C rerank, scorer micro-optimizations) have
+low expected payoff — the scorer at 6.6ms dominates and is memory-bandwidth
+constrained.
+
 ## Open Work
 
-1. **Larger datasets.** IVF becomes relevant at 500K+ vectors. The centroid
-   caching infrastructure is ready but not yet tested at that scale.
-2. **Higher dimensions.** Synthetic scaling to 65536D shows the approach
-   remains tractable, but real recall numbers at very high dim are missing.
+1. **Sub-3ms serving.** Requires a regime change, not local tweaks:
+   - GPU scorer (Metal compute pipeline, extending cogni-ml's infrastructure)
+   - IVF prefilter at 500K+ scale (centroid caching ready)
+   - New memory layout / execution substrate
+2. **Higher dimensions.** Synthetic scaling to 65536D shows tractability,
+   but real recall numbers at very high dim are missing.
 3. **Official TurboQuant comparison.** No public implementation was
    available at time of writing.
 4. **Diversity-based memory routing.** The naive similarity routing failed.
-   Coverage/MMR-based selection might succeed but is untested.
+   Coverage/MMR-based selection might succeed but is untested. (Parked.)
 5. **Engine integration.** The current evaluator + C helper is a research
    harness, not a production index path. Integration into pg_sorted_heap
    as a native quantization mode is the logical next step.
