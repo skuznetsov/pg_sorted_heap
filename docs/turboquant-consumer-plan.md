@@ -1009,3 +1009,33 @@ The enlarged unpublished `0.13` should be treated as:
 not as:
 
 > more routed/segmented infrastructure
+
+## FlashHadamard Engine Summary (2026-04-04)
+
+The FlashHadamard research branch has been productized as an experimental
+engine path inside pg_sorted_heap.
+
+**Production path at 103K × 2880D: exhaustive parallel scan**
+- PG engine mmap + pthread (8t): **5-8ms** p50
+- Beats Python C helper benchmark path (8.7ms) by ~1.3×
+- Single-thread kernel at parity with helper (40ms vs 41ms)
+
+**External serving path: Python C helper**
+- Still valid reference implementation
+- 8-thread fused scorer + packed ADC + transposed layout
+- Same algorithm as engine, with Python/ctypes overhead
+
+**Engine hardening:**
+- FH_THREADS env knob (1-16, default 8)
+- Store version gate (v1/v2, clean errors)
+- Dim mismatch → clean error, not crash
+- 5 regression tests, all passing
+- `make test-flashhadamard` + `make bench-flashhadamard`
+
+**Segment pruning: research-only**
+- Parity gate PASS (nprobe=n_segments = exhaustive)
+- 93.5% recall@10 at any nprobe 4-20 (flat frontier)
+- Bottleneck: segment design, not probe count
+- Not recommended at 103K (exhaustive already 5-8ms)
+
+**Full research note:** `docs/flashhadamard-note.md`

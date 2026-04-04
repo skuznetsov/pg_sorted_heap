@@ -271,14 +271,34 @@ Single-thread scorer at kernel parity with C helper (40ms).
 Parallel 8-thread scorer beats Python helper path (6.9ms vs 8.7ms).
 Segment pruning is research-only — not recommended at this scale.
 
-## Open Work
+## Reproducibility
 
-1. **Engine hardening.** Thread count env knob, regression tests for
-   partial launch / dim mismatch / old store fallback.
-2. **Better segment construction.** FH-space k-means, multi-centroid
+```sh
+# Regression tests (5 tests: correctness, dim mismatch, missing store, score, medium build)
+PGDATABASE=fh_test make test-flashhadamard
+
+# Benchmark (requires gutenberg_local table with 103K × 2880D vectors)
+PGDATABASE=fh_test make bench-flashhadamard
+
+# Thread control (set before PG start)
+export FH_THREADS=8   # default; 1-16 supported
+```
+
+Source:
+- Engine: `src/flashhadamard.c`, `src/flashhadamard_store.c`
+- Headers: `src/flashhadamard.h`, `src/flashhadamard_store.h`
+- SQL: `sql/flashhadamard_experimental.sql`
+- Tests: `scripts/test_flashhadamard.sql`
+- Python harness: `scripts/bench_turboquant_retrieval.py`
+- C helper: `scripts/turboquant_packed_adc.c`
+
+## Open Work (Research Only)
+
+1. **Better segment construction.** FH-space k-means, multi-centroid
    summaries. Gate: low nprobe must beat 93.5% recall.
-3. **Integer/SIMD kernel.** Outside PG first, ARM NEON, then Intel AVX.
-4. **Larger scale (500K+).** Where pruning and IVF become relevant.
+2. **Integer/SIMD kernel.** Outside PG first, ARM NEON, then Intel AVX.
+3. **Larger scale (500K+).** Where pruning and IVF become relevant.
+4. **PG-native parallel model.** Replace experimental pthread.
 5. **Official TurboQuant comparison.** No public implementation was
    available at time of writing.
 4. **Diversity-based memory routing.** The naive similarity routing failed.
