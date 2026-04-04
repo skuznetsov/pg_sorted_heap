@@ -56,6 +56,12 @@ extern void fh_topk_insert(float score, int32 row_id, float *top_scores,
                             int32 *top_ids, int k, int *filled,
                             int *min_pos, float *min_score);
 
+/* Fused packed score + top-k (avoids full scores array) */
+extern void fh_packed_score_topk_t(const uint8 *packed_t, const float *byte_tables,
+                                    const float *norms, int n_rows, int n_bytes,
+                                    int topk, int32 *top_ids, float *top_scores,
+                                    int *filled);
+
 /* Two-stage search: packed shortlist → SQ8 rerank */
 extern int fh_search(const FHCodes *codes, const FHParams *params,
                       const float *query, int k, int shortlist_m,

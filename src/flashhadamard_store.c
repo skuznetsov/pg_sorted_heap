@@ -22,6 +22,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 
 /* Simple file-based store: write/read raw pages to a file in PG data dir.
  * This avoids buffer manager complexity for the first AM-lite prototype.
@@ -256,32 +257,43 @@ fh_store_scan(const char *path, const FHParams *params,
     top_scores = palloc(sizeof(float) * shortlist_m);
 
     {
-        Size    total_packed = (Size)n_bytes * n_rows;
-        uint8  *packed_buf;
-        float  *scores;
+        /* mmap the entire file for zero-copy access to packed codes + norms */
+        struct stat st;
+        void *mapped = MAP_FAILED;
+        uint8 *packed_ptr;
+        float *norms_ptr;
 
-        /* Bulk raw read — single pread per section, no page framing */
-        packed_buf = MemoryContextAllocHuge(CurrentMemoryContext, total_packed);
-        fh_read_raw(fd, meta->off_packed, packed_buf, total_packed);
+        if (fstat(fd, &st) == 0 && st.st_size > 0)
+            mapped = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
 
-        /* Read norms */
+        if (mapped != MAP_FAILED)
         {
-            float *norms = palloc(sizeof(float) * n_rows);
-            fh_read_raw(fd, meta->off_norms, norms, sizeof(float) * n_rows);
+            /* Direct pointer into mmap'd region — zero copy */
+            packed_ptr = (uint8 *)mapped + meta->off_packed;
+            norms_ptr = (float *)((char *)mapped + meta->off_norms);
 
-            /* Score all rows */
-            scores = palloc(sizeof(float) * n_rows);
-            fh_packed_score_t(packed_buf, byte_tables, norms, n_rows, n_bytes, scores);
-            pfree(norms);
+            fh_packed_score_topk_t(packed_ptr, byte_tables, norms_ptr,
+                                    n_rows, n_bytes, shortlist_m,
+                                    top_ids, top_scores, &filled);
+        }
+        else
+        {
+            /* Fallback: read() */
+            Size total_packed = (Size)n_bytes * n_rows;
+            uint8 *packed_buf = MemoryContextAllocHuge(CurrentMemoryContext, total_packed);
+            float *norms_buf = palloc(sizeof(float) * n_rows);
+            fh_read_raw(fd, meta->off_packed, packed_buf, total_packed);
+            fh_read_raw(fd, meta->off_norms, norms_buf, sizeof(float) * n_rows);
+            fh_packed_score_topk_t(packed_buf, byte_tables, norms_buf,
+                                    n_rows, n_bytes, shortlist_m,
+                                    top_ids, top_scores, &filled);
+            pfree(norms_buf);
+            pfree(packed_buf);
         }
 
-        /* Build shortlist */
-        for (i = 0; i < n_rows; i++)
-            fh_topk_insert(scores[i], i, top_scores, top_ids, shortlist_m,
-                         &filled, &min_pos, &min_score);
-
-        pfree(scores);
-        pfree(packed_buf);
+        /* munmap if used */
+        if (mapped != MAP_FAILED)
+            munmap(mapped, st.st_size);
     }
 
     /* Stage 2: SQ8 rerank if shortlist_m > k */

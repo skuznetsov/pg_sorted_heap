@@ -241,6 +241,65 @@ fh_packed_score_t(const uint8 *packed_t, const float *byte_tables,
 }
 
 /* ================================================================
+ * Fused packed score + top-k (no full scores array allocation)
+ * Scores all rows, maintains top-k heap inline.
+ * ================================================================ */
+
+void
+fh_packed_score_topk_t(const uint8 *packed_t, const float *byte_tables,
+                        const float *norms, int n_rows, int n_bytes,
+                        int topk, int32 *top_ids, float *top_scores,
+                        int *filled)
+{
+    int     row, byte_idx;
+    float  *scores;
+    int     min_pos = 0;
+    float   min_score = -FLT_MAX;
+
+    /* Allocate per-row scores (needed for 2-byte fused accumulation) */
+    scores = palloc(sizeof(float) * n_rows);
+    memset(scores, 0, sizeof(float) * n_rows);
+
+    /* 2-byte fused scoring (same as fh_packed_score_t) */
+    byte_idx = 0;
+    for (; byte_idx + 1 < n_bytes; byte_idx += 2)
+    {
+        const uint8 *codes0 = packed_t + (Size)byte_idx * n_rows;
+        const uint8 *codes1 = packed_t + (Size)(byte_idx + 1) * n_rows;
+        const float *table0 = byte_tables + byte_idx * 256;
+        const float *table1 = byte_tables + (byte_idx + 1) * 256;
+
+        for (row = 0; row + 3 < n_rows; row += 4)
+        {
+            scores[row + 0] += table0[codes0[row + 0]] + table1[codes1[row + 0]];
+            scores[row + 1] += table0[codes0[row + 1]] + table1[codes1[row + 1]];
+            scores[row + 2] += table0[codes0[row + 2]] + table1[codes1[row + 2]];
+            scores[row + 3] += table0[codes0[row + 3]] + table1[codes1[row + 3]];
+        }
+        for (; row < n_rows; row++)
+            scores[row] += table0[codes0[row]] + table1[codes1[row]];
+    }
+    if (byte_idx < n_bytes)
+    {
+        const uint8 *codes = packed_t + (Size)byte_idx * n_rows;
+        const float *table = byte_tables + byte_idx * 256;
+        for (row = 0; row < n_rows; row++)
+            scores[row] += table[codes[row]];
+    }
+
+    /* Apply norms + select top-k in one pass */
+    *filled = 0;
+    for (row = 0; row < n_rows; row++)
+    {
+        float s = norms ? scores[row] * norms[row] : scores[row];
+        fh_topk_insert(s, row, top_scores, top_ids, topk,
+                        filled, &min_pos, &min_score);
+    }
+
+    pfree(scores);
+}
+
+/* ================================================================
  * Top-k selection via linear scan (simple for small k)
  * ================================================================ */
 
