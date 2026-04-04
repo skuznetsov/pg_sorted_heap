@@ -213,17 +213,34 @@ PG extension prototype (`flashhadamard_build` + `flashhadamard_scan`):
 | **mmap + fused top-k** | **49ms** | **6.1×** | **-21% from mmap + fused** |
 | Python C helper (8 threads) | ~8ms | 1× | benchmark |
 
-**Final verdict:**
-- Engine path achieves **41ms** (with backend-local mmap cache)
-- **Single-thread kernel parity verified:** helper 1-thread = 40.0ms,
-  engine mmap = 40-41ms. No hidden single-thread optimization remains.
-- Entire gap to ~8ms is from 8× threading in the C helper
-- Refuted: per-row early-exit pruning (0% rows pruned after Hadamard)
+**Final engine numbers (103K × 2880D, warm, pre-fetched query):**
 
-**Next regime changes (from SQ8 0.11 playbook):**
-1. Parallel segment scan (PG shared memory, cross-backend sharding)
-2. Segment-level hierarchical prefilter (coarse per-segment sketch)
-3. Integer/NEON kernel redesign (nibble tables, fixed-point accumulation)
+| Path | p50 ms | Notes |
+|------|--------|-------|
+| SPI + TOAST sidecar | 185-700 | initial prototype |
+| mmap single-thread | 41 | kernel parity with helper 1t (40ms) |
+| **mmap + pthread (8t)** | **5-8** | **beats Python helper path (8.7ms)** |
+
+Apples-to-apples (same corpus, same query, 8 threads):
+- PG engine mmap: 6.9ms p50
+- Python C helper: 8.7ms p50
+- Engine wins by ~1.3× (no Python/ctypes overhead)
+
+Caveats:
+- "Beats helper" means the Python-wrapped benchmark path, not a raw C
+  apples-to-apples outside the harness
+- pthread inside PG backend is experimental: no PG cancel/error
+  integration, no signal handling in worker threads
+- Partial thread-launch failure handled correctly (inline tail scoring)
+
+**Refuted optimizations:**
+- Per-row early-exit pruning: 0% rows pruned after Hadamard (bounds too loose)
+- NEON vtbl nibble lookup: doesn't apply to 256-entry float byte tables
+
+**Remaining regime changes (not current scope):**
+1. Segment-level hierarchical prefilter (coarse sketch, skip whole segments)
+2. Integer/NEON kernel redesign (nibble tables, fixed-point accumulation)
+3. PG-native parallel model (replace experimental pthread)
 6. Planner/index AM integration (later, if earned)
 
 This is a real AM project comparable in scope to sorted_hnsw.
