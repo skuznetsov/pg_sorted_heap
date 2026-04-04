@@ -15,6 +15,9 @@
 #include "storage/bufmgr.h"
 
 #define FH_STORE_MAGIC      0x46484D31  /* "FHM1" */
+#define FH_STORE_VERSION_1  1           /* no centroids */
+#define FH_STORE_VERSION_2  2           /* with segment centroids */
+#define FH_STORE_VERSION    FH_STORE_VERSION_2
 #define FH_SEGMENT_SIZE     4096        /* rows per segment for pruning */
 #define FH_META_BLKNO       0
 

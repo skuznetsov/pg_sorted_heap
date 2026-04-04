@@ -1737,7 +1737,7 @@ flashhadamard_store_build(PG_FUNCTION_ARGS)
         FHMetaPageDataV2 meta;
         memset(&meta, 0, sizeof(meta));
         meta.magic = FH_STORE_MAGIC;
-        meta.version = 1;
+        meta.version = FH_STORE_VERSION;
         meta.dim = dim;
         meta.n_rows = n_rows;
         meta.n_bytes = n_bytes;
@@ -1805,12 +1805,17 @@ flashhadamard_store_scan(PG_FUNCTION_ARGS)
         memcpy(query_vec, qdata, sizeof(float) * dim);
     }
 
-    /* Build params from seed + cached meta */
+    /* Build params from seed + cached meta (with dim validation) */
     {
         FHStoreCache *cache = fh_store_cache_get(store_path);
         int n_groups;
+        int store_dim;
         if (!cache)
             ereport(ERROR, (errmsg("flashhadamard_store_scan: cannot open '%s'", store_path)));
+
+        store_dim = cache->meta.dim;
+        if (dim != store_dim)
+            ereport(ERROR, (errmsg("flashhadamard_store_scan: query dim %d != store dim %d", dim, store_dim)));
 
         n_groups = (dim + group_size - 1) / group_size;
         params.dim = dim;

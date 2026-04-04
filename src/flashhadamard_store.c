@@ -275,18 +275,30 @@ fh_store_scan(const char *path, const FHParams *params,
     uint8  *packed_ptr;
     float  *norms_ptr;
 
-    elog(NOTICE, "fh_store_scan: entry, path=%s", path);
     /* Get or create backend-local cache (persistent mmap) */
     cache = fh_store_cache_get(path);
     if (!cache)
         return -1;
 
     meta = &cache->meta;
+
+    /* Hard validation */
+    if (meta->version < FH_STORE_VERSION_1 || meta->version > FH_STORE_VERSION)
+    {
+        elog(WARNING, "fh_store_scan: unsupported store version %d (expected %d-%d)",
+             meta->version, FH_STORE_VERSION_1, FH_STORE_VERSION);
+        return -1;
+    }
+
     dim = meta->dim;
     n_rows = meta->n_rows;
     n_bytes = meta->n_bytes;
-    elog(NOTICE, "fh_store_scan: dim=%d n_rows=%d n_bytes=%d n_seg=%d seg_size=%d off_cen=%lld",
-         dim, n_rows, n_bytes, meta->n_segments, meta->segment_size, (long long)meta->off_centroids);
+
+    if (dim <= 0 || dim > 32000 || n_rows <= 0 || n_bytes != (dim + 1) / 2)
+    {
+        elog(WARNING, "fh_store_scan: invalid meta (dim=%d n_rows=%d n_bytes=%d)", dim, n_rows, n_bytes);
+        return -1;
+    }
     inv_sqrt_dim = 1.0f / sqrtf((float)dim);
 
     /* Rotate query + build byte tables */
