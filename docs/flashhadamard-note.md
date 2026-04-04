@@ -201,57 +201,25 @@ PG extension prototype (`flashhadamard_build` + `flashhadamard_scan`):
 | 5 × 8D | <1ms | 0.17ms | Correctness verified |
 | 1000 × 2880D | 63ms | 1.6ms | Local PG |
 | 5000 × 2880D | 290ms | 34ms | Chunked (2 segments) |
-| **103K × 2880D** | **17.2s** | **185-700ms** | **Chunked (26 segments), local PG** |
+| 103K × 2880D (SPI+TOAST) | 17.2s | 185-700ms | Chunked sidecar, local PG |
+| **103K × 2880D (mmap store)** | **10s** | **49ms** | **Raw file store, mmap, fused top-k** |
 
-Architecture: streaming 3-pass build (no all_vecs buffer), chunked
-sidecar storage (4096 rows/segment), chunk-by-chunk scan with global
-top-k merge.
+**Engine scan evolution (103K × 2880D, warm, pre-fetched query):**
 
-103K scan: 185ms (cached) to 700ms (TOAST decompression). Python C
-helper benchmark: ~8ms. Gap: 23-87×. Bottleneck: per-chunk SPI (26
-calls), TOAST decompression of 153MB bytea, single-threaded scorer,
-no 2-byte fused optimization.
+| Path | Scan | vs benchmark | Change |
+|------|------|--------------|--------|
+| SPI + TOAST chunked sidecar | 185-700ms | 23-87× | initial |
+| Raw file read() store | 62ms | 7.7× | -68% from raw I/O |
+| **mmap + fused top-k** | **49ms** | **6.1×** | **-21% from mmap + fused** |
+| Python C helper (8 threads) | ~8ms | 1× | benchmark |
 
-**Verdict: current SPI + bytea sidecar prototype proves correctness
-but is not competitive with external serving (23-87× gap). The gap
-is NOT just SPI — it is SPI + TOAST decompression + row/bytea layout
-combined. Closing it requires AM-level storage redesign, not SPI
-optimization.**
-
-What the prototype DID prove:
-- Build pipeline works at 103K scale (streaming, bounded memory)
-- Scorer produces correct results
-- SQL surface is usable
-- Chunked sidecar pattern is viable for bounded memory
-
-What the prototype did NOT achieve:
-- Competitive scan latency (185-700ms vs ~8ms benchmark)
-- TOAST-free hot path
-- Page-native packed code layout
-
-**Next-generation path: FlashHadamard segment store**
-
-Goal: page-native packed code storage where scorer reads contiguous
-buffers without TOAST/SPI overhead.
-
-Design:
-1. **Meta page** — version, dim, centers, seed, group_scales (small, read once)
-2. **Packed segment pages** — transposed packed codes in page-native layout,
-   4096 rows/segment, contiguous byte columns for sequential scoring
-3. **SQ8 payload pages** — row-major SQ8 codes, fetched ONLY for shortlisted
-   candidates (not eagerly loaded during stage-1 scan)
-
-Scan pipeline:
-- Load one packed segment → run fused scorer on page buffer → merge top-k
-- After all segments: fetch SQ8 payload for shortlist rows only → rerank
-- No SPI, no TOAST, no varlena overhead in hot path
-
-Implementation order:
-1. Metapage + segment file format
-2. Build writer (streaming, same 3-pass algorithm)
-3. Packed segment scan + global shortlist
-4. SQ8 fetch for shortlist only
-5. Parity benchmark vs C helper
+**Final verdict:**
+- Engine path is feasible and integrated at 49ms
+- External C helper remains recommended serving path (~8ms)
+- 6.1× gap is from single-thread vs 8-thread scorer
+- The 2-byte fused scoring algorithm is already identical between both paths
+- Further improvement requires threading or smaller scan (IVF at larger scale)
+- **Engine path: packaged as experimental, not actively optimized further**
 6. Planner/index AM integration (later, if earned)
 
 This is a real AM project comparable in scope to sorted_hnsw.
