@@ -241,8 +241,93 @@ fh_packed_score_t(const uint8 *packed_t, const float *byte_tables,
 }
 
 /* ================================================================
- * Fused packed score + top-k (no full scores array allocation)
+ * Fused packed score + top-k with parallel row sharding
  * ================================================================ */
+
+#ifndef _WIN32
+#include <pthread.h>
+
+#define FH_MAX_THREADS 16
+#define FH_DEFAULT_THREADS 8
+#define FH_MIN_ROWS_PER_THREAD 4096
+
+typedef struct FHScoreTask
+{
+    const uint8 *packed_t;
+    const float *byte_tables;
+    const float *norms;
+    int          n_rows;      /* total rows (for column pointer math) */
+    int          n_bytes;
+    int          row_start;
+    int          row_end;
+    int          topk;
+    int32       *top_ids;     /* per-thread top-k output */
+    float       *top_scores;
+} FHScoreTask;
+
+static void *
+fh_score_worker(void *arg)
+{
+    FHScoreTask *t = (FHScoreTask *)arg;
+    int     rows = t->row_end - t->row_start;
+    float  *scores;
+    int     row, byte_idx;
+    int     filled = 0, min_pos = 0;
+    float   min_score = -FLT_MAX;
+
+    scores = (float *)malloc(sizeof(float) * rows);
+    if (!scores) return NULL;
+    memset(scores, 0, sizeof(float) * rows);
+
+    /* 2-byte fused scoring for this row range */
+    byte_idx = 0;
+    for (; byte_idx + 1 < t->n_bytes; byte_idx += 2)
+    {
+        const uint8 *codes0 = t->packed_t + (Size)byte_idx * t->n_rows + t->row_start;
+        const uint8 *codes1 = t->packed_t + (Size)(byte_idx + 1) * t->n_rows + t->row_start;
+        const float *table0 = t->byte_tables + byte_idx * 256;
+        const float *table1 = t->byte_tables + (byte_idx + 1) * 256;
+
+        for (row = 0; row + 3 < rows; row += 4)
+        {
+            scores[row + 0] += table0[codes0[row + 0]] + table1[codes1[row + 0]];
+            scores[row + 1] += table0[codes0[row + 1]] + table1[codes1[row + 1]];
+            scores[row + 2] += table0[codes0[row + 2]] + table1[codes1[row + 2]];
+            scores[row + 3] += table0[codes0[row + 3]] + table1[codes1[row + 3]];
+        }
+        for (; row < rows; row++)
+            scores[row] += table0[codes0[row]] + table1[codes1[row]];
+    }
+    if (byte_idx < t->n_bytes)
+    {
+        const uint8 *codes = t->packed_t + (Size)byte_idx * t->n_rows + t->row_start;
+        const float *table = t->byte_tables + byte_idx * 256;
+        for (row = 0; row < rows; row++)
+            scores[row] += table[codes[row]];
+    }
+
+    /* Per-thread top-k with norms */
+    for (row = 0; row < rows; row++)
+    {
+        float s = t->norms ? scores[row] * t->norms[t->row_start + row] : scores[row];
+        fh_topk_insert(s, t->row_start + row, t->top_scores, t->top_ids,
+                        t->topk, &filled, &min_pos, &min_score);
+    }
+
+    /* Mark unfilled slots */
+    {
+        int i;
+        for (i = filled; i < t->topk; i++)
+        {
+            t->top_ids[i] = -1;
+            t->top_scores[i] = -FLT_MAX;
+        }
+    }
+
+    free(scores);
+    return NULL;
+}
+#endif /* !_WIN32 */
 
 void
 fh_packed_score_topk_t(const uint8 *packed_t, const float *byte_tables,
@@ -250,51 +335,117 @@ fh_packed_score_topk_t(const uint8 *packed_t, const float *byte_tables,
                         int topk, int32 *top_ids, float *top_scores,
                         int *filled)
 {
-    int     row, byte_idx;
-    float  *scores;
-    int     min_pos = 0;
-    float   min_score = -FLT_MAX;
+#ifndef _WIN32
+    int     n_threads = FH_DEFAULT_THREADS;
+    int     i, j;
 
-    scores = palloc(sizeof(float) * n_rows);
-    memset(scores, 0, sizeof(float) * n_rows);
+    /* Adjust thread count */
+    if (n_rows < FH_MIN_ROWS_PER_THREAD * 2)
+        n_threads = 1;
+    if (n_threads > FH_MAX_THREADS)
+        n_threads = FH_MAX_THREADS;
+    if (n_threads > n_rows / FH_MIN_ROWS_PER_THREAD)
+        n_threads = Max(1, n_rows / FH_MIN_ROWS_PER_THREAD);
 
-    /* 2-byte fused scoring */
-    byte_idx = 0;
-    for (; byte_idx + 1 < n_bytes; byte_idx += 2)
+    if (n_threads > 1)
     {
-        const uint8 *codes0 = packed_t + (Size)byte_idx * n_rows;
-        const uint8 *codes1 = packed_t + (Size)(byte_idx + 1) * n_rows;
-        const float *table0 = byte_tables + byte_idx * 256;
-        const float *table1 = byte_tables + (byte_idx + 1) * 256;
+        pthread_t       threads[FH_MAX_THREADS];
+        FHScoreTask     tasks[FH_MAX_THREADS];
+        int32          *all_ids;
+        float          *all_scores;
+        int             chunk = (n_rows + n_threads - 1) / n_threads;
+        int             launched = 0;
+        int             min_pos = 0;
+        float           min_score = -FLT_MAX;
 
-        for (row = 0; row + 3 < n_rows; row += 4)
+        all_ids = palloc(sizeof(int32) * n_threads * topk);
+        all_scores = palloc(sizeof(float) * n_threads * topk);
+
+        for (i = 0; i < n_threads; i++)
         {
-            scores[row + 0] += table0[codes0[row + 0]] + table1[codes1[row + 0]];
-            scores[row + 1] += table0[codes0[row + 1]] + table1[codes1[row + 1]];
-            scores[row + 2] += table0[codes0[row + 2]] + table1[codes1[row + 2]];
-            scores[row + 3] += table0[codes0[row + 3]] + table1[codes1[row + 3]];
+            int start = i * chunk;
+            if (start >= n_rows) break;
+            int end = Min(start + chunk, n_rows);
+
+            tasks[i].packed_t = packed_t;
+            tasks[i].byte_tables = byte_tables;
+            tasks[i].norms = norms;
+            tasks[i].n_rows = n_rows;
+            tasks[i].n_bytes = n_bytes;
+            tasks[i].row_start = start;
+            tasks[i].row_end = end;
+            tasks[i].topk = topk;
+            tasks[i].top_ids = all_ids + i * topk;
+            tasks[i].top_scores = all_scores + i * topk;
+
+            pthread_create(&threads[i], NULL, fh_score_worker, &tasks[i]);
+            launched++;
         }
-        for (; row < n_rows; row++)
-            scores[row] += table0[codes0[row]] + table1[codes1[row]];
+
+        for (i = 0; i < launched; i++)
+            pthread_join(threads[i], NULL);
+
+        /* Merge per-thread top-k into global top-k */
+        *filled = 0;
+        for (i = 0; i < launched * topk; i++)
+        {
+            if (all_ids[i] < 0) continue;
+            fh_topk_insert(all_scores[i], all_ids[i],
+                            top_scores, top_ids, topk,
+                            filled, &min_pos, &min_score);
+        }
+
+        pfree(all_ids);
+        pfree(all_scores);
+        return;
     }
-    if (byte_idx < n_bytes)
+#endif /* !_WIN32 */
+
+    /* Single-thread fallback */
     {
-        const uint8 *codes = packed_t + (Size)byte_idx * n_rows;
-        const float *table = byte_tables + byte_idx * 256;
+        int     row, byte_idx;
+        float  *scores;
+        int     min_pos = 0;
+        float   min_score = -FLT_MAX;
+
+        scores = palloc(sizeof(float) * n_rows);
+        memset(scores, 0, sizeof(float) * n_rows);
+
+        byte_idx = 0;
+        for (; byte_idx + 1 < n_bytes; byte_idx += 2)
+        {
+            const uint8 *codes0 = packed_t + (Size)byte_idx * n_rows;
+            const uint8 *codes1 = packed_t + (Size)(byte_idx + 1) * n_rows;
+            const float *table0 = byte_tables + byte_idx * 256;
+            const float *table1 = byte_tables + (byte_idx + 1) * 256;
+
+            for (row = 0; row + 3 < n_rows; row += 4)
+            {
+                scores[row + 0] += table0[codes0[row + 0]] + table1[codes1[row + 0]];
+                scores[row + 1] += table0[codes0[row + 1]] + table1[codes1[row + 1]];
+                scores[row + 2] += table0[codes0[row + 2]] + table1[codes1[row + 2]];
+                scores[row + 3] += table0[codes0[row + 3]] + table1[codes1[row + 3]];
+            }
+            for (; row < n_rows; row++)
+                scores[row] += table0[codes0[row]] + table1[codes1[row]];
+        }
+        if (byte_idx < n_bytes)
+        {
+            const uint8 *codes = packed_t + (Size)byte_idx * n_rows;
+            const float *table = byte_tables + byte_idx * 256;
+            for (row = 0; row < n_rows; row++)
+                scores[row] += table[codes[row]];
+        }
+
+        *filled = 0;
         for (row = 0; row < n_rows; row++)
-            scores[row] += table[codes[row]];
+        {
+            float s = norms ? scores[row] * norms[row] : scores[row];
+            fh_topk_insert(s, row, top_scores, top_ids, topk,
+                            filled, &min_pos, &min_score);
+        }
+        pfree(scores);
     }
-
-    /* Apply norms + select top-k in one pass */
-    *filled = 0;
-    for (row = 0; row < n_rows; row++)
-    {
-        float s = norms ? scores[row] * norms[row] : scores[row];
-        fh_topk_insert(s, row, top_scores, top_ids, topk,
-                        filled, &min_pos, &min_score);
-    }
-
-    pfree(scores);
 }
 
 /* ================================================================
