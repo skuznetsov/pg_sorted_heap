@@ -11,13 +11,19 @@
 
 #include "flashhadamard.h"
 #include "svec.h"
+#include "hsvec.h"
 
 #include "fmgr.h"
 #include "funcapi.h"
 #include "executor/spi.h"
+#include "access/table.h"
+#include "access/tableam.h"
+#include "executor/tuptable.h"
 #include "utils/builtins.h"
 #include "utils/array.h"
 #include "utils/lsyscache.h"
+#include "utils/snapmgr.h"
+#include "utils/rel.h"
 #include "catalog/pg_type.h">
 
 #include <math.h>
@@ -473,62 +479,127 @@ flashhadamard_build(PG_FUNCTION_ARGS)
     if (!source_name)
         ereport(ERROR, (errmsg("flashhadamard_build: source table not found")));
 
-    SPI_connect();
-
-    /* Step 1: Read all vectors */
-    initStringInfo(&sql);
-    appendStringInfo(&sql, "SELECT (%s)::vector::text FROM %s ORDER BY ctid",
-                     embed_col, quote_identifier(source_name));
-    ret = SPI_execute(sql.data, true, 0);
-    if (ret != SPI_OK_SELECT)
+    /* Step 1: Read vectors via SPI with binary Datum access (no text parsing) */
     {
-        SPI_finish();
-        ereport(ERROR, (errmsg("flashhadamard_build: failed to read vectors")));
-    }
+        int             row_idx;
+        bool            is_halfvec = false;
 
-    n_rows = SPI_processed;
-    if (n_rows == 0)
-    {
-        SPI_finish();
-        PG_RETURN_INT32(0);
-    }
+        SPI_connect();
 
-    /* Parse first vector to get dim */
-    {
-        char *vtext = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-        /* Count commas + 1 = dim, skip leading '[' */
-        dim = 1;
-        for (char *p = vtext; *p; p++)
-            if (*p == ',') dim++;
-    }
-
-    n_bytes = (dim + 1) / 2;
-    n_groups = (dim + group_size - 1) / group_size;
-
-    /* Allocate */
-    all_vecs = palloc(sizeof(float) * n_rows * dim);
-    norms = palloc(sizeof(float) * n_rows);
-
-    /* Parse all vectors */
-    for (i = 0; i < n_rows; i++)
-    {
-        char *vtext = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
-        float *v = all_vecs + i * dim;
-        char *p = vtext + 1; /* skip '[' */
-        float norm = 0.0f;
-
-        for (d = 0; d < dim; d++)
+        /* Detect column type */
         {
-            v[d] = strtof(p, &p);
-            norm += v[d] * v[d];
-            if (*p == ',') p++;
+            StringInfoData type_sql;
+            initStringInfo(&type_sql);
+            appendStringInfo(&type_sql,
+                "SELECT format_type(atttypid, atttypmod) FROM pg_attribute "
+                "WHERE attrelid = %u AND attname = '%s'",
+                source_oid, embed_col);
+            ret = SPI_execute(type_sql.data, true, 1);
+            if (ret == SPI_OK_SELECT && SPI_processed > 0)
+            {
+                char *typname = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+                if (typname && (strstr(typname, "half") || strstr(typname, "hsvec")))
+                    is_halfvec = true;
+            }
         }
-        norms[i] = sqrtf(norm);
-        if (norms[i] < 1e-12f) norms[i] = 1e-12f;
 
-        /* Normalize in-place */
-        for (d = 0; d < dim; d++)
-            v[d] /= norms[i];
+        /* Read all vectors via SPI — access binary Datum, not text */
+        {
+            StringInfoData vec_sql;
+            initStringInfo(&vec_sql);
+            appendStringInfo(&vec_sql, "SELECT %s FROM %s ORDER BY ctid",
+                             quote_identifier(embed_col), quote_identifier(source_name));
+            ret = SPI_execute(vec_sql.data, true, 0);
+            if (ret != SPI_OK_SELECT)
+            {
+                SPI_finish();
+                ereport(ERROR, (errmsg("flashhadamard_build: failed to read vectors")));
+            }
+        }
+
+        n_rows = SPI_processed;
+        if (n_rows == 0)
+        {
+            SPI_finish();
+            PG_RETURN_INT32(0);
+        }
+
+        /* Get dim from first vector */
+        {
+            bool isnull;
+            Datum d_val = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+            if (isnull)
+            {
+                SPI_finish();
+                PG_RETURN_INT32(0);
+            }
+            /* Svec/Vector/Hsvec all have same header: vl_len + int16 dim */
+            {
+                Svec *sv = (Svec *) PG_DETOAST_DATUM(d_val);
+                dim = sv->dim;
+                if (sv != (Svec *) DatumGetPointer(d_val))
+                    pfree(sv);
+            }
+        }
+
+        n_bytes = (dim + 1) / 2;
+        n_groups = (dim + group_size - 1) / group_size;
+
+        /* Allocate buffers */
+        all_vecs = (float *) palloc(sizeof(float) * (Size)n_rows * dim);
+        norms = (float *) palloc(sizeof(float) * n_rows);
+
+        /* Extract vectors from SPI result tuples (binary access) */
+        for (row_idx = 0; row_idx < n_rows; row_idx++)
+        {
+            bool isnull;
+            Datum d_val = SPI_getbinval(SPI_tuptable->vals[row_idx],
+                                         SPI_tuptable->tupdesc, 1, &isnull);
+            float *v = all_vecs + (Size)row_idx * dim;
+            float norm = 0.0f;
+
+            if (isnull)
+            {
+                memset(v, 0, sizeof(float) * dim);
+                norms[row_idx] = 1e-12f;
+                continue;
+            }
+
+            if (is_halfvec)
+            {
+                Hsvec *hv = (Hsvec *) PG_DETOAST_DATUM(d_val);
+                int vdim = Min(hv->dim, dim);
+                for (d = 0; d < vdim; d++)
+                {
+                    v[d] = HalfToFloat4(hv->x[d]);
+                    norm += v[d] * v[d];
+                }
+                for (d = vdim; d < dim; d++)
+                    v[d] = 0.0f;
+                if (hv != (Hsvec *) DatumGetPointer(d_val))
+                    pfree(hv);
+            }
+            else
+            {
+                Svec *sv = (Svec *) PG_DETOAST_DATUM(d_val);
+                int vdim = Min(sv->dim, dim);
+                memcpy(v, sv->x, sizeof(float) * vdim);
+                for (d = vdim; d < dim; d++)
+                    v[d] = 0.0f;
+                for (d = 0; d < vdim; d++)
+                    norm += v[d] * v[d];
+                if (sv != (Svec *) DatumGetPointer(d_val))
+                    pfree(sv);
+            }
+
+            norms[row_idx] = sqrtf(norm);
+            if (norms[row_idx] < 1e-12f)
+                norms[row_idx] = 1e-12f;
+
+            /* Normalize in-place */
+            for (d = 0; d < dim; d++)
+                v[d] /= norms[row_idx];
+        }
     }
 
     /* Step 2: Build rotation params */
@@ -649,7 +720,8 @@ flashhadamard_build(PG_FUNCTION_ARGS)
     }
 
     /* Step 8: Create sidecar table and store everything */
-    resetStringInfo(&sql);
+    elog(NOTICE, "fh_build: step 8 start, creating sidecar '%s'", sidecar);
+    initStringInfo(&sql);
     appendStringInfo(&sql, "DROP TABLE IF EXISTS %s", quote_identifier(sidecar));
     SPI_execute(sql.data, false, 0);
 
@@ -669,6 +741,9 @@ flashhadamard_build(PG_FUNCTION_ARGS)
         "  meta_n_rows int4"
         ")", quote_identifier(sidecar));
     SPI_execute(sql.data, false, 0);
+
+    elog(NOTICE, "fh_build: table created, inserting metadata (packed_t=%d, sq8=%d, norms=%d bytes)",
+         n_bytes * n_rows, n_rows * dim, (int)(sizeof(float) * n_rows));
 
     /* Insert metadata row (row_id = -1) */
     {
@@ -726,18 +801,8 @@ flashhadamard_build(PG_FUNCTION_ARGS)
 
     SPI_finish();
 
-    /* Cleanup */
-    pfree(all_vecs);
-    pfree(norms);
-    pfree(rotated);
-    pfree(packed_codes);
-    pfree(packed_t);
-    pfree(sq8_codes);
-    pfree(sq8_mins);
-    pfree(sq8_scales);
-    pfree(params.perm);
-    pfree(params.signs);
-
+    /* Memory allocated in SPI context is already freed by SPI_finish.
+     * Do NOT pfree here — just return. */
     PG_RETURN_INT32(n_rows);
 }
 
