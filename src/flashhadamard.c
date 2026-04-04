@@ -501,6 +501,160 @@ fh_packed_score_topk_t(const uint8 *packed_t, const float *byte_tables,
 }
 
 /* ================================================================
+ * Multi-range parallel scorer: scores non-contiguous row ranges,
+ * one thread per range, merges per-range top-k into global result.
+ * ================================================================ */
+
+void
+fh_packed_score_ranges_topk(const uint8 *packed_t, const float *byte_tables,
+                             const float *norms, int n_rows_total, int n_bytes,
+                             const int *ranges, int n_ranges,
+                             int topk, int32 *top_ids, float *top_scores,
+                             int *filled)
+{
+#ifndef _WIN32
+    if (n_ranges > 0)
+    {
+        pthread_t       threads[FH_MAX_THREADS];
+        FHScoreTask     tasks[FH_MAX_THREADS];
+        int32          *all_ids;
+        float          *all_scores;
+        int             launched = 0;
+        int             min_pos = 0;
+        float           min_score = -FLT_MAX;
+        int             i;
+
+        /* Cap threads to available ranges */
+        int n_threads = Min(n_ranges, FH_MAX_THREADS);
+
+        all_ids = palloc(sizeof(int32) * n_threads * topk);
+        all_scores = palloc(sizeof(float) * n_threads * topk);
+
+        for (i = 0; i < n_threads; i++)
+        {
+            int rstart = ranges[i * 2];
+            int rcount = ranges[i * 2 + 1];
+
+            if (rcount <= 0) continue;
+
+            tasks[launched].packed_t = packed_t;
+            tasks[launched].byte_tables = byte_tables;
+            tasks[launched].norms = norms;
+            tasks[launched].n_rows = n_rows_total;  /* stride */
+            tasks[launched].n_bytes = n_bytes;
+            tasks[launched].row_start = rstart;
+            tasks[launched].row_end = rstart + rcount;
+            tasks[launched].topk = topk;
+            tasks[launched].top_ids = all_ids + launched * topk;
+            tasks[launched].top_scores = all_scores + launched * topk;
+
+            if (pthread_create(&threads[launched], NULL, fh_score_worker, &tasks[launched]) == 0)
+                launched++;
+            else
+            {
+                /* Inline fallback for this range */
+                fh_score_worker(&tasks[launched]);
+                launched++;
+            }
+        }
+
+        /* If more ranges than threads, score remaining inline */
+        for (i = n_threads; i < n_ranges; i++)
+        {
+            int rstart = ranges[i * 2];
+            int rcount = ranges[i * 2 + 1];
+            FHScoreTask tail;
+
+            if (rcount <= 0) continue;
+
+            tail.packed_t = packed_t;
+            tail.byte_tables = byte_tables;
+            tail.norms = norms;
+            tail.n_rows = n_rows_total;
+            tail.n_bytes = n_bytes;
+            tail.row_start = rstart;
+            tail.row_end = rstart + rcount;
+            tail.topk = topk;
+
+            /* Reuse one of the completed thread's output slots */
+            /* Actually: need separate output. Extend all_ids/all_scores. */
+            /* For simplicity: just use a local small buffer */
+            {
+                int32 local_ids[64];  /* topk typically 12-20 */
+                float local_scores[64];
+                int local_filled = 0, local_min_pos = 0;
+                float local_min_score = -FLT_MAX;
+                int row, byte_idx;
+                float *scores;
+                int rows = rcount;
+
+                scores = (float *)malloc(sizeof(float) * rows);
+                if (!scores) continue;
+                memset(scores, 0, sizeof(float) * rows);
+
+                for (byte_idx = 0; byte_idx + 1 < n_bytes; byte_idx += 2)
+                {
+                    const uint8 *c0 = packed_t + (Size)byte_idx * n_rows_total + rstart;
+                    const uint8 *c1 = packed_t + (Size)(byte_idx+1) * n_rows_total + rstart;
+                    const float *t0 = byte_tables + byte_idx * 256;
+                    const float *t1 = byte_tables + (byte_idx+1) * 256;
+                    for (row = 0; row + 3 < rows; row += 4)
+                    {
+                        scores[row+0] += t0[c0[row+0]] + t1[c1[row+0]];
+                        scores[row+1] += t0[c0[row+1]] + t1[c1[row+1]];
+                        scores[row+2] += t0[c0[row+2]] + t1[c1[row+2]];
+                        scores[row+3] += t0[c0[row+3]] + t1[c1[row+3]];
+                    }
+                    for (; row < rows; row++) scores[row] += t0[c0[row]] + t1[c1[row]];
+                }
+                if (byte_idx < n_bytes)
+                {
+                    const uint8 *c = packed_t + (Size)byte_idx * n_rows_total + rstart;
+                    const float *t = byte_tables + byte_idx * 256;
+                    for (row = 0; row < rows; row++) scores[row] += t[c[row]];
+                }
+
+                for (row = 0; row < rows; row++)
+                {
+                    float s = norms ? scores[row] * norms[rstart + row] : scores[row];
+                    fh_topk_insert(s, rstart + row, local_scores, local_ids, topk,
+                                    &local_filled, &local_min_pos, &local_min_score);
+                }
+                /* Merge local into global */
+                for (row = 0; row < local_filled; row++)
+                    fh_topk_insert(local_scores[row], local_ids[row],
+                                    top_scores, top_ids, topk,
+                                    filled, &min_pos, &min_score);
+                free(scores);
+            }
+        }
+
+        /* Join launched threads */
+        for (i = 0; i < launched; i++)
+            pthread_join(threads[i], NULL);
+
+        /* Merge per-thread top-k into global */
+        *filled = 0;
+        min_pos = 0;
+        min_score = -FLT_MAX;
+        for (i = 0; i < launched * topk; i++)
+        {
+            if (all_ids[i] < 0) continue;
+            fh_topk_insert(all_scores[i], all_ids[i],
+                            top_scores, top_ids, topk,
+                            filled, &min_pos, &min_score);
+        }
+
+        pfree(all_ids);
+        pfree(all_scores);
+        return;
+    }
+#endif
+    /* Empty ranges — nothing to score */
+    *filled = 0;
+}
+
+/* ================================================================
  * Top-k selection via linear scan (simple for small k)
  * ================================================================ */
 

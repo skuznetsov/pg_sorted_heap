@@ -388,63 +388,29 @@ fh_store_scan(const char *path, const FHParams *params,
             if (n_probe > n_seg) n_probe = n_seg;
         }
 
-        /* Score probed segments — global top-k state persists across segments */
+        /* Build ranges array for parallel scorer */
         {
-            int global_min_pos = 0;
-            float global_min_score = -FLT_MAX;
+            int *ranges = palloc(sizeof(int) * n_probe * 2);
+            int actual_ranges = 0;
 
-        for (s = 0; s < n_probe; s++)
-        {
-            int sid = seg_order[s];
-            int rstart = sid * seg_size;
-            int rcount = Min(seg_size, n_rows - rstart);
-
-            /* Guard: skip empty/invalid segments */
-            if (rcount <= 0) continue;
-
+            for (s = 0; s < n_probe; s++)
             {
-                float *seg_row_scores = palloc(sizeof(float) * rcount);
-                int byte_idx, row;
-
-                memset(seg_row_scores, 0, sizeof(float) * rcount);
-
-                for (byte_idx = 0; byte_idx + 1 < n_bytes; byte_idx += 2)
-                {
-                    const uint8 *codes0 = packed_ptr + (Size)byte_idx * n_rows + rstart;
-                    const uint8 *codes1 = packed_ptr + (Size)(byte_idx + 1) * n_rows + rstart;
-                    const float *table0 = byte_tables + byte_idx * 256;
-                    const float *table1 = byte_tables + (byte_idx + 1) * 256;
-
-                    for (row = 0; row + 3 < rcount; row += 4)
-                    {
-                        seg_row_scores[row+0] += table0[codes0[row+0]] + table1[codes1[row+0]];
-                        seg_row_scores[row+1] += table0[codes0[row+1]] + table1[codes1[row+1]];
-                        seg_row_scores[row+2] += table0[codes0[row+2]] + table1[codes1[row+2]];
-                        seg_row_scores[row+3] += table0[codes0[row+3]] + table1[codes1[row+3]];
-                    }
-                    for (; row < rcount; row++)
-                        seg_row_scores[row] += table0[codes0[row]] + table1[codes1[row]];
-                }
-                if (byte_idx < n_bytes)
-                {
-                    const uint8 *codes = packed_ptr + (Size)byte_idx * n_rows + rstart;
-                    const float *table = byte_tables + byte_idx * 256;
-                    for (row = 0; row < rcount; row++)
-                        seg_row_scores[row] += table[codes[row]];
-                }
-
-                /* Merge into global top-k */
-                for (row = 0; row < rcount; row++)
-                {
-                    float sc = norms_ptr ? seg_row_scores[row] * norms_ptr[rstart + row]
-                                          : seg_row_scores[row];
-                    fh_topk_insert(sc, rstart + row, top_scores, top_ids, shortlist_m,
-                                    &filled, &global_min_pos, &global_min_score);
-                }
-                pfree(seg_row_scores);
+                int sid = seg_order[s];
+                int rstart = sid * seg_size;
+                int rcount = Min(seg_size, n_rows - rstart);
+                if (rcount <= 0) continue;
+                ranges[actual_ranges * 2] = rstart;
+                ranges[actual_ranges * 2 + 1] = rcount;
+                actual_ranges++;
             }
+
+            /* Parallel score all kept segments */
+            fh_packed_score_ranges_topk(packed_ptr, byte_tables, norms_ptr,
+                                         n_rows, n_bytes,
+                                         ranges, actual_ranges,
+                                         shortlist_m, top_ids, top_scores, &filled);
+            pfree(ranges);
         }
-        } /* end global_min_pos block */
 
         pfree(seg_scores);
         pfree(seg_order);
