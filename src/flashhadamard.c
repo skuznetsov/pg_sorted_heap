@@ -1571,9 +1571,14 @@ flashhadamard_store_scan(PG_FUNCTION_ARGS)
         memcpy(query_vec, qdata, sizeof(float) * dim);
     }
 
-    /* Build params from seed (same as build) */
+    /* Build params from seed + cached meta */
     {
-        int n_groups = (dim + group_size - 1) / group_size;
+        FHStoreCache *cache = fh_store_cache_get(store_path);
+        int n_groups;
+        if (!cache)
+            ereport(ERROR, (errmsg("flashhadamard_store_scan: cannot open '%s'", store_path)));
+
+        n_groups = (dim + group_size - 1) / group_size;
         params.dim = dim;
         params.group_size = group_size;
         params.seed = seed;
@@ -1581,26 +1586,10 @@ flashhadamard_store_scan(PG_FUNCTION_ARGS)
         params.perm = palloc(sizeof(int) * dim);
         params.signs = palloc(sizeof(float) * dim);
         params.centers = (float *)fh_lloyd_max_16;
-        /* group_scales will be loaded from file by fh_store_scan */
         params.group_scales = palloc(sizeof(float) * n_groups);
         fh_generate_perm_signs(dim, seed, params.perm, params.signs);
-
-        /* Read group_scales from file meta page */
-        {
-            int fd = open(store_path, O_RDONLY);
-            if (fd < 0)
-                ereport(ERROR, (errmsg("flashhadamard_store_scan: cannot open '%s'", store_path)));
-            {
-                char meta_page[8192];
-                FHMetaPageDataV2 *meta;
-                if (read(fd, meta_page, 8192) != 8192)
-                { close(fd); ereport(ERROR, (errmsg("flashhadamard_store_scan: read error"))); }
-                meta = (FHMetaPageDataV2 *)(meta_page + sizeof(FHFilePageHeader));
-                memcpy(params.group_scales, meta->group_scales,
-                       sizeof(float) * Min(n_groups, FH_MAX_GROUPS));
-            }
-            close(fd);
-        }
+        memcpy(params.group_scales, cache->meta.group_scales,
+               sizeof(float) * Min(n_groups, FH_MAX_GROUPS));
     }
 
     out_ids = palloc(sizeof(int32) * k);

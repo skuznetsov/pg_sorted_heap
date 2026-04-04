@@ -30,6 +30,56 @@
 
 #define FH_PAGE_SIZE  BLCKSZ  /* 8192 bytes */
 
+/* Backend-local store cache instance */
+FHStoreCache fh_cache = { .path = "", .fd = -1, .mapped = MAP_FAILED };
+
+FHStoreCache *
+fh_store_cache_get(const char *path)
+{
+    /* Return cached if same path */
+    if (fh_cache.fd >= 0 && strcmp(fh_cache.path, path) == 0 && fh_cache.mapped != MAP_FAILED)
+        return &fh_cache;
+
+    /* Close old cache */
+    if (fh_cache.mapped != MAP_FAILED)
+    { munmap(fh_cache.mapped, fh_cache.mapped_size); fh_cache.mapped = MAP_FAILED; }
+    if (fh_cache.fd >= 0)
+    { close(fh_cache.fd); fh_cache.fd = -1; }
+
+    /* Open new */
+    fh_cache.fd = open(path, O_RDONLY);
+    if (fh_cache.fd < 0)
+        return NULL;
+
+    {
+        struct stat st;
+        char meta_page[FH_PAGE_SIZE];
+        FHMetaPageDataV2 *m;
+
+        if (fstat(fh_cache.fd, &st) < 0 || st.st_size < FH_PAGE_SIZE)
+        { close(fh_cache.fd); fh_cache.fd = -1; return NULL; }
+
+        fh_cache.mapped_size = st.st_size;
+        fh_cache.mapped = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fh_cache.fd, 0);
+        if (fh_cache.mapped == MAP_FAILED)
+        { close(fh_cache.fd); fh_cache.fd = -1; return NULL; }
+
+        /* Parse meta from mapped region */
+        m = (FHMetaPageDataV2 *)((char *)fh_cache.mapped + sizeof(FHFilePageHeader));
+        if (m->magic != FH_STORE_MAGIC)
+        { munmap(fh_cache.mapped, fh_cache.mapped_size); fh_cache.mapped = MAP_FAILED; close(fh_cache.fd); fh_cache.fd = -1; return NULL; }
+
+        memcpy(&fh_cache.meta, m, sizeof(FHMetaPageDataV2));
+        strncpy(fh_cache.path, path, sizeof(fh_cache.path) - 1);
+
+        /* Cache SQ8 params pointers into mmap'd region */
+        fh_cache.sq8_mins = (float *)((char *)fh_cache.mapped + fh_cache.meta.off_sq8_params);
+        fh_cache.sq8_scales = fh_cache.sq8_mins + fh_cache.meta.dim;
+    }
+
+    return &fh_cache;
+}
+
 /* Write raw contiguous bytes (no page framing) and return bytes written */
 static Size
 fh_write_raw(int fd, const void *data, Size total_bytes)
@@ -203,8 +253,7 @@ fh_store_scan(const char *path, const FHParams *params,
               const float *query_vec, int k, int shortlist_m,
               int32 *out_ids, float *out_scores)
 {
-    int     fd;
-    char    meta_page[FH_PAGE_SIZE];
+    FHStoreCache *cache;
     FHMetaPageDataV2 *meta;
     int     dim, n_rows, n_bytes;
     float  *byte_tables;
@@ -212,22 +261,18 @@ fh_store_scan(const char *path, const FHParams *params,
     float  *rotated_q;
     int32  *top_ids;
     float  *top_scores;
-    int     filled = 0, min_pos = 0;
-    float   min_score = -FLT_MAX;
+    int     filled = 0;
     int     i, j;
     float   inv_sqrt_dim;
+    uint8  *packed_ptr;
+    float  *norms_ptr;
 
-    fd = open(path, O_RDONLY);
-    if (fd < 0)
+    /* Get or create backend-local cache (persistent mmap) */
+    cache = fh_store_cache_get(path);
+    if (!cache)
         return -1;
 
-    /* Read meta */
-    if (read(fd, meta_page, FH_PAGE_SIZE) != FH_PAGE_SIZE)
-    { close(fd); return -1; }
-    meta = (FHMetaPageDataV2 *)(meta_page + sizeof(FHFilePageHeader));
-    if (meta->magic != FH_STORE_MAGIC)
-    { close(fd); return -1; }
-
+    meta = &cache->meta;
     dim = meta->dim;
     n_rows = meta->n_rows;
     n_bytes = meta->n_bytes;
@@ -248,74 +293,40 @@ fh_store_scan(const char *path, const FHParams *params,
                 coeffs[j] = rotated_q[j] * params->group_scales[g] * inv_sqrt_dim;
         }
     }
+    pfree(rotated_q);
 
     byte_tables = palloc(sizeof(float) * n_bytes * 256);
     fh_build_byte_tables(coeffs, params->centers, dim, byte_tables);
+    pfree(coeffs);
 
-    /* Stage 1: Score packed codes page by page */
+    /* Stage 1: Fused score + top-k directly on mmap'd region */
     top_ids = palloc(sizeof(int32) * shortlist_m);
     top_scores = palloc(sizeof(float) * shortlist_m);
 
-    {
-        /* mmap the entire file for zero-copy access to packed codes + norms */
-        struct stat st;
-        void *mapped = MAP_FAILED;
-        uint8 *packed_ptr;
-        float *norms_ptr;
+    packed_ptr = (uint8 *)cache->mapped + meta->off_packed;
+    norms_ptr = (float *)((char *)cache->mapped + meta->off_norms);
 
-        if (fstat(fd, &st) == 0 && st.st_size > 0)
-            mapped = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    fh_packed_score_topk_t(packed_ptr, byte_tables, norms_ptr,
+                            n_rows, n_bytes, shortlist_m,
+                            top_ids, top_scores, &filled);
+    pfree(byte_tables);
 
-        if (mapped != MAP_FAILED)
-        {
-            /* Direct pointer into mmap'd region — zero copy */
-            packed_ptr = (uint8 *)mapped + meta->off_packed;
-            norms_ptr = (float *)((char *)mapped + meta->off_norms);
-
-            fh_packed_score_topk_t(packed_ptr, byte_tables, norms_ptr,
-                                    n_rows, n_bytes, shortlist_m,
-                                    top_ids, top_scores, &filled);
-        }
-        else
-        {
-            /* Fallback: read() */
-            Size total_packed = (Size)n_bytes * n_rows;
-            uint8 *packed_buf = MemoryContextAllocHuge(CurrentMemoryContext, total_packed);
-            float *norms_buf = palloc(sizeof(float) * n_rows);
-            fh_read_raw(fd, meta->off_packed, packed_buf, total_packed);
-            fh_read_raw(fd, meta->off_norms, norms_buf, sizeof(float) * n_rows);
-            fh_packed_score_topk_t(packed_buf, byte_tables, norms_buf,
-                                    n_rows, n_bytes, shortlist_m,
-                                    top_ids, top_scores, &filled);
-            pfree(norms_buf);
-            pfree(packed_buf);
-        }
-
-        /* munmap if used */
-        if (mapped != MAP_FAILED)
-            munmap(mapped, st.st_size);
-    }
-
-    /* Stage 2: SQ8 rerank if shortlist_m > k */
+    /* Stage 2: SQ8 rerank using cached params + mmap'd SQ8 payload */
     if (shortlist_m > k && filled > k)
     {
-        float  *sq8_mins_local, *sq8_scales_local;
         float  *q_norm;
         int32  *final_ids = palloc(sizeof(int32) * k);
         float  *final_scores = palloc(sizeof(float) * k);
         int     final_filled = 0, final_min_pos = 0;
         float   final_min_score = -FLT_MAX;
 
-        /* Read SQ8 params (raw) */
-        {
-            Size params_size = sizeof(float) * dim * 2;
-            float *params_buf = palloc(params_size);
-            fh_read_raw(fd, meta->off_sq8_params, params_buf, params_size);
-            sq8_mins_local = params_buf;
-            sq8_scales_local = params_buf + dim;
-        }
+        /* SQ8 params from cache (already points into mmap) */
+        float *sq8_mins_local = cache->sq8_mins;
+        float *sq8_scales_local = cache->sq8_scales;
 
-        /* Normalize query */
+        /* SQ8 payload pointer (mmap'd) */
+        uint8 *sq8_base = (uint8 *)cache->mapped + meta->off_sq8;
+
         q_norm = palloc(sizeof(float) * dim);
         {
             float norm = 0.0f;
@@ -325,14 +336,11 @@ fh_store_scan(const char *path, const FHParams *params,
             for (i = 0; i < dim; i++) q_norm[i] = query_vec[i] / norm;
         }
 
-        /* Rerank each shortlist candidate */
         for (i = 0; i < filled; i++)
         {
             int row = top_ids[i];
-            /* Raw pread of this row's SQ8 codes */
-            uint8 row_codes[8192]; /* max dim */
+            uint8 *row_codes = sq8_base + (Size)row * dim;
             float dot = 0.0f;
-            fh_read_raw(fd, meta->off_sq8 + (off_t)row * dim, row_codes, dim);
 
             for (j = 0; j < dim; j++)
             {
@@ -344,7 +352,9 @@ fh_store_scan(const char *path, const FHParams *params,
                          &final_filled, &final_min_pos, &final_min_score);
         }
 
-        /* Sort final results */
+        pfree(q_norm);
+
+        /* Sort */
         for (i = 0; i < final_filled; i++)
             for (j = i + 1; j < final_filled; j++)
                 if (final_scores[j] > final_scores[i])
@@ -355,7 +365,8 @@ fh_store_scan(const char *path, const FHParams *params,
 
         memcpy(out_ids, final_ids, sizeof(int32) * Min(final_filled, k));
         memcpy(out_scores, final_scores, sizeof(float) * Min(final_filled, k));
-        close(fd);
+        pfree(final_ids); pfree(final_scores);
+        pfree(top_ids); pfree(top_scores);
         return Min(final_filled, k);
     }
 
@@ -371,7 +382,7 @@ fh_store_scan(const char *path, const FHParams *params,
                 }
         memcpy(out_ids, top_ids, sizeof(int32) * out_k);
         memcpy(out_scores, top_scores, sizeof(float) * out_k);
-        close(fd);
+        pfree(top_ids); pfree(top_scores);
         return out_k;
     }
 }

@@ -96,6 +96,20 @@ typedef struct FHFilePageHeader
 
 #define FH_DATA_PER_PAGE  (BLCKSZ - (int)sizeof(FHFilePageHeader))
 
+/* Backend-local cache (persistent mmap across queries) */
+typedef struct FHStoreCache
+{
+    char        path[1024];
+    int         fd;
+    void       *mapped;
+    size_t      mapped_size;
+    FHMetaPageDataV2 meta;
+    float      *sq8_mins;
+    float      *sq8_scales;
+} FHStoreCache;
+
+extern FHStoreCache *fh_store_cache_get(const char *path);
+
 /* Store API */
 extern int fh_store_write(const char *path,
                            const FHMetaPageDataV2 *meta,
