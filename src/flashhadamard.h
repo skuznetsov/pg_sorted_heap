@@ -51,6 +51,11 @@ extern void fh_packed_score_t(const uint8 *packed_t, const float *byte_tables,
                                const float *norms, int n_rows, int n_bytes,
                                float *out_scores);
 
+/* Top-k heap insert */
+extern void fh_topk_insert(float score, int32 row_id, float *top_scores,
+                            int32 *top_ids, int k, int *filled,
+                            int *min_pos, float *min_score);
+
 /* Two-stage search: packed shortlist → SQ8 rerank */
 extern int fh_search(const FHCodes *codes, const FHParams *params,
                       const float *query, int k, int shortlist_m,

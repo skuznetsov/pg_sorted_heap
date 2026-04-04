@@ -32,3 +32,33 @@ LANGUAGE C STABLE;
 COMMENT ON FUNCTION flashhadamard_scan(text, vector, int4, int4) IS
 'Two-stage FlashHadamard search: packed ADC shortlist → SQ8 rerank → top-k. '
 'Experimental — not part of the stable sorted_heap/HNSW path.';
+
+-- File-based segment store (AM-lite, no TOAST/SPI in hot path)
+CREATE OR REPLACE FUNCTION flashhadamard_store_build(
+    source_tbl  regclass,
+    embed_col   text,
+    store_path  text,
+    seed        int4 DEFAULT 42,
+    group_size  int4 DEFAULT 16
+) RETURNS int4
+AS '$libdir/pg_sorted_heap', 'flashhadamard_store_build'
+LANGUAGE C VOLATILE;
+
+COMMENT ON FUNCTION flashhadamard_store_build(regclass, text, text, int4, int4) IS
+'Build FlashHadamard file-based segment store (AM-lite). '
+'Writes packed codes + SQ8 payload to a raw binary file, no TOAST.';
+
+CREATE OR REPLACE FUNCTION flashhadamard_store_scan(
+    store_path  text,
+    query       vector,
+    k           int4 DEFAULT 10,
+    shortlist_m int4 DEFAULT 12,
+    seed        int4 DEFAULT 42,
+    group_size  int4 DEFAULT 16
+) RETURNS TABLE(row_id int4, score float8)
+AS '$libdir/pg_sorted_heap', 'flashhadamard_store_scan'
+LANGUAGE C STABLE;
+
+COMMENT ON FUNCTION flashhadamard_store_scan(text, vector, int4, int4, int4, int4) IS
+'Scan FlashHadamard file-based segment store. '
+'No SPI/TOAST in hot path — reads raw pages directly.';

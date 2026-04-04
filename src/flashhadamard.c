@@ -10,6 +10,7 @@
  */
 
 #include "flashhadamard.h"
+#include "flashhadamard_store.h"
 #include "svec.h"
 #include "hsvec.h"
 
@@ -71,7 +72,7 @@ fh_splitmix64(uint64 *state)
 }
 
 /* Generate seed-derived permutation and signs (matches numpy default_rng) */
-static void
+void
 fh_generate_perm_signs(int dim, int seed, int *perm, float *signs)
 {
     /* Simple Fisher-Yates shuffle using splitmix64 */
@@ -243,8 +244,8 @@ fh_packed_score_t(const uint8 *packed_t, const float *byte_tables,
  * Top-k selection via linear scan (simple for small k)
  * ================================================================ */
 
-static void
-topk_insert(float score, int32 row_id, float *top_scores, int32 *top_ids,
+void
+fh_topk_insert(float score, int32 row_id, float *top_scores, int32 *top_ids,
             int k, int *filled, int *min_pos, float *min_score)
 {
     if (*filled < k)
@@ -340,7 +341,7 @@ fh_search(const FHCodes *codes, const FHParams *params,
     filled = 0; min_pos = 0; min_score = -FLT_MAX;
 
     for (i = 0; i < n_rows; i++)
-        topk_insert(adc_scores[i], i, shortlist_scores, shortlist_ids,
+        fh_topk_insert(adc_scores[i], i, shortlist_scores, shortlist_ids,
                      shortlist_m, &filled, &min_pos, &min_score);
 
     /* Step 5: SQ8 rerank on shortlist */
@@ -382,7 +383,7 @@ fh_search(const FHCodes *codes, const FHParams *params,
             float rk_min_score = -FLT_MAX;
 
             for (i = 0; i < filled; i++)
-                topk_insert(rerank_scores[i], shortlist_ids[i],
+                fh_topk_insert(rerank_scores[i], shortlist_ids[i],
                              out_scores, out_ids, k,
                              &rk_filled, &rk_min_pos, &rk_min_score);
 
@@ -1141,7 +1142,7 @@ flashhadamard_scan(PG_FUNCTION_ARGS)
 
         /* Merge into global top-k */
         for (i = 0; i < rcount; i++)
-            topk_insert(chunk_scores[i], rstart + i,
+            fh_topk_insert(chunk_scores[i], rstart + i,
                          global_top_scores, global_top_ids, shortlist_m,
                          &global_filled, &global_min_pos, &global_min_score);
 
@@ -1225,7 +1226,7 @@ flashhadamard_scan(PG_FUNCTION_ARGS)
 
         /* Final top-k from reranked scores */
         for (i = 0; i < global_filled; i++)
-            topk_insert(rerank_scores[i], global_top_ids[i],
+            fh_topk_insert(rerank_scores[i], global_top_ids[i],
                          final_scores, final_ids, k,
                          &final_filled, &final_min_pos, &final_min_score);
 
@@ -1273,6 +1274,129 @@ flashhadamard_scan(PG_FUNCTION_ARGS)
                 tuplestore_putvalues(tupstore, tupdesc, vals, nulls);
             }
         }
+    }
+
+    PG_RETURN_NULL();
+}
+
+
+/* ================================================================
+ * PG FUNCTION: flashhadamard_store_build
+ *
+ * Builds file-based segment store (AM-lite, no TOAST in hot path).
+ * Uses streaming 3-pass build + fh_store_write.
+ * ================================================================ */
+
+PG_FUNCTION_INFO_V1(flashhadamard_store_build);
+Datum
+flashhadamard_store_build(PG_FUNCTION_ARGS)
+{
+    Oid         source_oid = PG_GETARG_OID(0);
+    char       *embed_col  = text_to_cstring(PG_GETARG_TEXT_PP(1));
+    char       *store_path = text_to_cstring(PG_GETARG_TEXT_PP(2));
+    int         seed       = PG_GETARG_INT32(3);
+    int         group_size = PG_GETARG_INT32(4);
+
+    /* Reuse the SPI-based build to get all encoded data, then write to file store */
+    /* For this prototype: build into memory, then call fh_store_write */
+
+    /* Actually: the SPI build already produces packed_t, sq8_codes, norms, etc.
+     * We need those arrays. The cleanest path: factor out the encoding from
+     * flashhadamard_build into a shared helper, then call fh_store_write.
+     *
+     * For now: quick path — call flashhadamard_build to create a sidecar table,
+     * then export from sidecar to file store. This is a bridge, not final. */
+
+    ereport(ERROR, (errmsg("flashhadamard_store_build: not yet implemented — use flashhadamard_build + manual export for now")));
+    PG_RETURN_INT32(0);
+}
+
+
+/* ================================================================
+ * PG FUNCTION: flashhadamard_store_scan
+ *
+ * Scans file-based segment store directly (no SPI/TOAST).
+ * ================================================================ */
+
+PG_FUNCTION_INFO_V1(flashhadamard_store_scan);
+Datum
+flashhadamard_store_scan(PG_FUNCTION_ARGS)
+{
+    ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    char       *store_path = text_to_cstring(PG_GETARG_TEXT_PP(0));
+    Datum       query_datum = PG_GETARG_DATUM(1);
+    int         k = PG_GETARG_INT32(2);
+    int         shortlist_m = PG_GETARG_INT32(3);
+    int         seed = PG_GETARG_INT32(4);
+    int         group_size = PG_GETARG_INT32(5);
+
+    float      *query_vec;
+    int         dim;
+    FHParams    params;
+    int32      *out_ids;
+    float      *out_scores;
+    int         n_results, i;
+    TupleDesc   tupdesc;
+    Tuplestorestate *tupstore;
+
+    InitMaterializedSRF(fcinfo, 0);
+    tupstore = rsinfo->setResult;
+    tupdesc = rsinfo->setDesc;
+
+    /* Extract query vector */
+    {
+        bytea *raw = DatumGetByteaP(query_datum);
+        int query_dim = *(uint16 *)(VARDATA(raw));
+        float *qdata = (float *)(VARDATA(raw) + 2 * sizeof(uint16));
+        dim = query_dim;
+        query_vec = palloc(sizeof(float) * dim);
+        memcpy(query_vec, qdata, sizeof(float) * dim);
+    }
+
+    /* Build params from seed (same as build) */
+    {
+        int n_groups = (dim + group_size - 1) / group_size;
+        params.dim = dim;
+        params.group_size = group_size;
+        params.seed = seed;
+        params.n_groups = n_groups;
+        params.perm = palloc(sizeof(int) * dim);
+        params.signs = palloc(sizeof(float) * dim);
+        params.centers = (float *)fh_lloyd_max_16;
+        /* group_scales will be loaded from file by fh_store_scan */
+        params.group_scales = palloc(sizeof(float) * n_groups);
+        fh_generate_perm_signs(dim, seed, params.perm, params.signs);
+
+        /* Read group_scales from file meta page */
+        {
+            int fd = open(store_path, O_RDONLY);
+            if (fd < 0)
+                ereport(ERROR, (errmsg("flashhadamard_store_scan: cannot open '%s'", store_path)));
+            {
+                char meta_page[8192];
+                FHMetaPageDataV2 *meta;
+                if (read(fd, meta_page, 8192) != 8192)
+                { close(fd); ereport(ERROR, (errmsg("flashhadamard_store_scan: read error"))); }
+                meta = (FHMetaPageDataV2 *)(meta_page + sizeof(FHFilePageHeader));
+                memcpy(params.group_scales, meta->group_scales,
+                       sizeof(float) * Min(n_groups, FH_MAX_GROUPS));
+            }
+            close(fd);
+        }
+    }
+
+    out_ids = palloc(sizeof(int32) * k);
+    out_scores = palloc(sizeof(float) * k);
+    n_results = fh_store_scan(store_path, &params, query_vec, k, shortlist_m,
+                               out_ids, out_scores);
+
+    for (i = 0; i < n_results; i++)
+    {
+        Datum vals[2];
+        bool nulls[2] = {false, false};
+        vals[0] = Int32GetDatum(out_ids[i]);
+        vals[1] = Float8GetDatum((float8)out_scores[i]);
+        tuplestore_putvalues(tupstore, tupdesc, vals, nulls);
     }
 
     PG_RETURN_NULL();
