@@ -824,91 +824,148 @@ flashhadamard_build(PG_FUNCTION_ARGS)
         table_close(rel, AccessShareLock);
     }
 
-    /* Step 8: Create sidecar table and store everything (SPI for DDL+INSERT) */
-    elog(NOTICE, "fh_build: creating sidecar '%s' (%d rows, %d dim)", sidecar, n_rows, dim);
-    SPI_connect();
-    initStringInfo(&sql);
-    appendStringInfo(&sql, "DROP TABLE IF EXISTS %s", quote_identifier(sidecar));
-    SPI_execute(sql.data, false, 0);
-
-    resetStringInfo(&sql);
-    appendStringInfo(&sql,
-        "CREATE TABLE %s ("
-        "  row_id int4 NOT NULL,"
-        "  packed_t bytea,"
-        "  sq8_codes bytea,"
-        "  meta_group_scales bytea,"
-        "  meta_sq8_mins bytea,"
-        "  meta_sq8_scales bytea,"
-        "  meta_norms bytea,"
-        "  meta_dim int4,"
-        "  meta_seed int4,"
-        "  meta_group_size int4,"
-        "  meta_n_rows int4"
-        ")", quote_identifier(sidecar));
-    SPI_execute(sql.data, false, 0);
-
-    elog(NOTICE, "fh_build: table created, inserting metadata (packed_t=%d, sq8=%d, norms=%d bytes)",
-         n_bytes * n_rows, n_rows * dim, (int)(sizeof(float) * n_rows));
-
-    /* Insert metadata row (row_id = -1) */
+    /* Step 8: Create chunked sidecar table (bounded memory per INSERT) */
     {
-        bytea *gs_bytes = (bytea *)palloc(VARHDRSZ + sizeof(float) * n_groups);
-        bytea *mins_bytes = (bytea *)palloc(VARHDRSZ + sizeof(float) * dim);
-        bytea *scales_bytes = (bytea *)palloc(VARHDRSZ + sizeof(float) * dim);
-        bytea *norms_bytes = (bytea *)palloc(VARHDRSZ + sizeof(float) * n_rows);
-        bytea *pt_bytes = (bytea *)MemoryContextAllocHuge(CurrentMemoryContext, VARHDRSZ + (Size)n_bytes * n_rows);
-        bytea *sq_bytes = (bytea *)MemoryContextAllocHuge(CurrentMemoryContext, VARHDRSZ + (Size)n_rows * dim);
+#define FH_CHUNK_ROWS 4096
+        int     n_chunks = (n_rows + FH_CHUNK_ROWS - 1) / FH_CHUNK_ROWS;
+        int     seg;
 
-        SET_VARSIZE(gs_bytes, VARHDRSZ + sizeof(float) * n_groups);
-        memcpy(VARDATA(gs_bytes), group_scales, sizeof(float) * n_groups);
-        SET_VARSIZE(mins_bytes, VARHDRSZ + sizeof(float) * dim);
-        memcpy(VARDATA(mins_bytes), sq8_mins, sizeof(float) * dim);
-        SET_VARSIZE(scales_bytes, VARHDRSZ + sizeof(float) * dim);
-        memcpy(VARDATA(scales_bytes), sq8_scales, sizeof(float) * dim);
-        SET_VARSIZE(norms_bytes, VARHDRSZ + sizeof(float) * n_rows);
-        memcpy(VARDATA(norms_bytes), norms, sizeof(float) * n_rows);
-        SET_VARSIZE(pt_bytes, VARHDRSZ + n_bytes * n_rows);
-        memcpy(VARDATA(pt_bytes), packed_t, n_bytes * n_rows);
-        SET_VARSIZE(sq_bytes, VARHDRSZ + n_rows * dim);
-        memcpy(VARDATA(sq_bytes), sq8_codes, n_rows * dim);
+        elog(NOTICE, "fh_build: creating sidecar '%s' (%d rows, %d dim, %d chunks)",
+             sidecar, n_rows, dim, n_chunks);
 
+        SPI_connect();
+        initStringInfo(&sql);
+
+        /* DDL */
+        appendStringInfo(&sql, "DROP TABLE IF EXISTS %s", quote_identifier(sidecar));
+        SPI_execute(sql.data, false, 0);
+
+        resetStringInfo(&sql);
+        appendStringInfo(&sql,
+            "CREATE TABLE %s ("
+            "  segment_id int4 NOT NULL,"      /* -1 = metadata, 0..N = data chunks */
+            "  row_start int4,"
+            "  row_count int4,"
+            "  packed_t bytea,"
+            "  sq8_codes bytea,"
+            "  meta_group_scales bytea,"
+            "  meta_sq8_mins bytea,"
+            "  meta_sq8_scales bytea,"
+            "  meta_norms bytea,"
+            "  meta_dim int4,"
+            "  meta_seed int4,"
+            "  meta_group_size int4,"
+            "  meta_n_rows int4,"
+            "  meta_n_chunks int4"
+            ")", quote_identifier(sidecar));
+        SPI_execute(sql.data, false, 0);
+
+        /* Insert metadata row (segment_id = -1, small params only) */
         {
-            Datum values[11];
-            bool nulls[11];
-            Oid argtypes[11] = {INT4OID, BYTEAOID, BYTEAOID, BYTEAOID, BYTEAOID, BYTEAOID, BYTEAOID, INT4OID, INT4OID, INT4OID, INT4OID};
+            bytea *gs_bytes = (bytea *)palloc(VARHDRSZ + sizeof(float) * n_groups);
+            bytea *mins_bytes = (bytea *)palloc(VARHDRSZ + sizeof(float) * dim);
+            bytea *scales_bytes = (bytea *)palloc(VARHDRSZ + sizeof(float) * dim);
 
-            memset(nulls, false, sizeof(nulls));
-            values[0] = Int32GetDatum(-1);
-            values[1] = PointerGetDatum(pt_bytes);
-            values[2] = PointerGetDatum(sq_bytes);
-            values[3] = PointerGetDatum(gs_bytes);
-            values[4] = PointerGetDatum(mins_bytes);
-            values[5] = PointerGetDatum(scales_bytes);
-            values[6] = PointerGetDatum(norms_bytes);
-            values[7] = Int32GetDatum(dim);
-            values[8] = Int32GetDatum(seed);
-            values[9] = Int32GetDatum(group_size);
-            values[10] = Int32GetDatum(n_rows);
+            SET_VARSIZE(gs_bytes, VARHDRSZ + sizeof(float) * n_groups);
+            memcpy(VARDATA(gs_bytes), group_scales, sizeof(float) * n_groups);
+            SET_VARSIZE(mins_bytes, VARHDRSZ + sizeof(float) * dim);
+            memcpy(VARDATA(mins_bytes), sq8_mins, sizeof(float) * dim);
+            SET_VARSIZE(scales_bytes, VARHDRSZ + sizeof(float) * dim);
+            memcpy(VARDATA(scales_bytes), sq8_scales, sizeof(float) * dim);
 
-            resetStringInfo(&sql);
-            appendStringInfo(&sql,
-                "INSERT INTO %s (row_id, packed_t, sq8_codes, meta_group_scales, "
-                "meta_sq8_mins, meta_sq8_scales, meta_norms, meta_dim, meta_seed, "
-                "meta_group_size, meta_n_rows) "
-                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
-                quote_identifier(sidecar));
+            {
+                Datum vals[9];
+                bool nls[9];
+                Oid types[9] = {INT4OID, INT4OID, INT4OID, BYTEAOID, BYTEAOID, BYTEAOID, INT4OID, INT4OID, INT4OID};
+                memset(nls, false, sizeof(nls));
+                vals[0] = Int32GetDatum(-1);        /* segment_id */
+                vals[1] = Int32GetDatum(0);         /* row_start (unused) */
+                vals[2] = Int32GetDatum(0);         /* row_count (unused) */
+                vals[3] = PointerGetDatum(gs_bytes);
+                vals[4] = PointerGetDatum(mins_bytes);
+                vals[5] = PointerGetDatum(scales_bytes);
+                vals[6] = Int32GetDatum(dim);
+                vals[7] = Int32GetDatum(seed);
+                vals[8] = Int32GetDatum(group_size);
 
-            ret = SPI_execute_with_args(sql.data, 11, argtypes, values, NULL, false, 0);
-            if (ret != SPI_OK_INSERT)
-                ereport(WARNING, (errmsg("flashhadamard_build: metadata insert failed")));
+                resetStringInfo(&sql);
+                appendStringInfo(&sql,
+                    "INSERT INTO %s (segment_id, row_start, row_count, "
+                    "meta_group_scales, meta_sq8_mins, meta_sq8_scales, "
+                    "meta_dim, meta_seed, meta_group_size) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+                    quote_identifier(sidecar));
+                ret = SPI_execute_with_args(sql.data, 9, types, vals, NULL, false, 0);
+                if (ret != SPI_OK_INSERT)
+                    ereport(WARNING, (errmsg("fh_build: metadata insert failed")));
+            }
         }
+
+        /* Insert data chunks */
+        for (seg = 0; seg < n_chunks; seg++)
+        {
+            int     rstart = seg * FH_CHUNK_ROWS;
+            int     rcount = Min(FH_CHUNK_ROWS, n_rows - rstart);
+            Size    pt_size = (Size)n_bytes * rcount;
+            Size    sq_size = (Size)dim * rcount;
+            Size    norm_size = sizeof(float) * rcount;
+            bytea  *pt_bytes, *sq_bytes, *norm_bytes;
+
+            /* Build transposed packed_t for this chunk */
+            pt_bytes = (bytea *)palloc(VARHDRSZ + pt_size);
+            SET_VARSIZE(pt_bytes, VARHDRSZ + pt_size);
+            {
+                /* packed_t is already fully transposed: packed_t[byte_idx * n_rows + row] */
+                /* Extract chunk: for each byte_idx, copy rows [rstart..rstart+rcount) */
+                uint8 *dst = (uint8 *)VARDATA(pt_bytes);
+                for (j = 0; j < n_bytes; j++)
+                    memcpy(dst + j * rcount,
+                           packed_t + (Size)j * n_rows + rstart,
+                           rcount);
+            }
+
+            sq_bytes = (bytea *)palloc(VARHDRSZ + sq_size);
+            SET_VARSIZE(sq_bytes, VARHDRSZ + sq_size);
+            memcpy(VARDATA(sq_bytes), sq8_codes + (Size)rstart * dim, sq_size);
+
+            norm_bytes = (bytea *)palloc(VARHDRSZ + norm_size);
+            SET_VARSIZE(norm_bytes, VARHDRSZ + norm_size);
+            memcpy(VARDATA(norm_bytes), norms + rstart, norm_size);
+
+            {
+                Datum vals[6];
+                bool nls[6];
+                Oid types[6] = {INT4OID, INT4OID, INT4OID, BYTEAOID, BYTEAOID, BYTEAOID};
+                memset(nls, false, sizeof(nls));
+                vals[0] = Int32GetDatum(seg);
+                vals[1] = Int32GetDatum(rstart);
+                vals[2] = Int32GetDatum(rcount);
+                vals[3] = PointerGetDatum(pt_bytes);
+                vals[4] = PointerGetDatum(sq_bytes);
+                vals[5] = PointerGetDatum(norm_bytes);
+
+                resetStringInfo(&sql);
+                appendStringInfo(&sql,
+                    "INSERT INTO %s (segment_id, row_start, row_count, "
+                    "packed_t, sq8_codes, meta_norms) "
+                    "VALUES ($1,$2,$3,$4,$5,$6)",
+                    quote_identifier(sidecar));
+                ret = SPI_execute_with_args(sql.data, 6, types, vals, NULL, false, 0);
+                if (ret != SPI_OK_INSERT)
+                    ereport(WARNING, (errmsg("fh_build: chunk %d insert failed", seg)));
+            }
+
+            pfree(pt_bytes);
+            pfree(sq_bytes);
+            pfree(norm_bytes);
+
+            if ((seg + 1) % 5 == 0 || seg == n_chunks - 1)
+                elog(NOTICE, "fh_build: inserted chunk %d/%d", seg + 1, n_chunks);
+        }
+
+        SPI_finish();
     }
 
-    SPI_finish();
-
-    /* Memory allocated in SPI context is already freed by SPI_finish.
-     * Do NOT pfree here — just return. */
     PG_RETURN_INT32(n_rows);
 }
 
@@ -930,67 +987,63 @@ flashhadamard_scan(PG_FUNCTION_ARGS)
 {
     ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
     char       *sidecar = text_to_cstring(PG_GETARG_TEXT_PP(0));
-    /* query is vector type — extract float array */
     Datum       query_datum = PG_GETARG_DATUM(1);
     int         k = PG_GETARG_INT32(2);
     int         shortlist_m = PG_GETARG_INT32(3);
 
     StringInfoData sql;
     int         ret;
-    int         dim, seed, group_size_val, n_rows, n_bytes, n_groups;
+    int         dim, seed, group_size_val, n_bytes, n_groups;
     FHParams    params;
-    FHCodes     codes;
     float      *query_vec;
-    int32      *out_ids;
-    float      *out_scores;
-    int         n_results, i;
+    float      *rotated_q;
+    float      *coeffs;
+    float      *byte_tables;
+    int32      *global_top_ids;
+    float      *global_top_scores;
+    int         global_filled = 0, global_min_pos = 0;
+    float       global_min_score = -FLT_MAX;
+    int         n_chunks, seg;
+    int         i, j;
     TupleDesc   tupdesc;
     Tuplestorestate *tupstore;
 
-    /* Setup materialized SRF */
     InitMaterializedSRF(fcinfo, 0);
     tupstore = rsinfo->setResult;
     tupdesc = rsinfo->setDesc;
 
     SPI_connect();
 
-    /* Load metadata from sidecar (row_id = -1) */
+    /* Load metadata (segment_id = -1) */
     initStringInfo(&sql);
     appendStringInfo(&sql,
-        "SELECT packed_t, sq8_codes, meta_group_scales, meta_sq8_mins, "
-        "meta_sq8_scales, meta_norms, meta_dim, meta_seed, meta_group_size, "
-        "meta_n_rows FROM %s WHERE row_id = -1",
+        "SELECT meta_group_scales, meta_sq8_mins, meta_sq8_scales, "
+        "meta_dim, meta_seed, meta_group_size "
+        "FROM %s WHERE segment_id = -1",
         quote_identifier(sidecar));
     ret = SPI_execute(sql.data, true, 1);
-
     if (ret != SPI_OK_SELECT || SPI_processed != 1)
     {
         SPI_finish();
-        ereport(ERROR, (errmsg("flashhadamard_scan: sidecar metadata not found")));
+        ereport(ERROR, (errmsg("flashhadamard_scan: metadata not found")));
     }
 
-    /* Extract metadata */
     {
         HeapTuple tup = SPI_tuptable->vals[0];
         TupleDesc tdesc = SPI_tuptable->tupdesc;
         bool isnull;
-        bytea *pt_bytes, *sq_bytes, *gs_bytes, *mins_bytes, *scales_bytes, *norms_bytes;
+        bytea *gs_bytes, *mins_bytes, *scales_bytes;
 
-        dim = DatumGetInt32(SPI_getbinval(tup, tdesc, 7, &isnull));
-        seed = DatumGetInt32(SPI_getbinval(tup, tdesc, 8, &isnull));
-        group_size_val = DatumGetInt32(SPI_getbinval(tup, tdesc, 9, &isnull));
-        n_rows = DatumGetInt32(SPI_getbinval(tup, tdesc, 10, &isnull));
+        dim = DatumGetInt32(SPI_getbinval(tup, tdesc, 4, &isnull));
+        seed = DatumGetInt32(SPI_getbinval(tup, tdesc, 5, &isnull));
+        group_size_val = DatumGetInt32(SPI_getbinval(tup, tdesc, 6, &isnull));
         n_bytes = (dim + 1) / 2;
         n_groups = (dim + group_size_val - 1) / group_size_val;
 
-        pt_bytes = DatumGetByteaP(SPI_getbinval(tup, tdesc, 1, &isnull));
-        sq_bytes = DatumGetByteaP(SPI_getbinval(tup, tdesc, 2, &isnull));
-        gs_bytes = DatumGetByteaP(SPI_getbinval(tup, tdesc, 3, &isnull));
-        mins_bytes = DatumGetByteaP(SPI_getbinval(tup, tdesc, 4, &isnull));
-        scales_bytes = DatumGetByteaP(SPI_getbinval(tup, tdesc, 5, &isnull));
-        norms_bytes = DatumGetByteaP(SPI_getbinval(tup, tdesc, 6, &isnull));
+        gs_bytes = DatumGetByteaP(SPI_getbinval(tup, tdesc, 1, &isnull));
+        mins_bytes = DatumGetByteaP(SPI_getbinval(tup, tdesc, 2, &isnull));
+        scales_bytes = DatumGetByteaP(SPI_getbinval(tup, tdesc, 3, &isnull));
 
-        /* Build params */
         params.dim = dim;
         params.group_size = group_size_val;
         params.seed = seed;
@@ -1002,53 +1055,224 @@ flashhadamard_scan(PG_FUNCTION_ARGS)
         memcpy(params.group_scales, VARDATA_ANY(gs_bytes), sizeof(float) * n_groups);
         fh_generate_perm_signs(dim, seed, params.perm, params.signs);
 
-        /* Build codes */
-        codes.n_rows = n_rows;
-        codes.dim = dim;
-        codes.n_bytes = n_bytes;
-        codes.packed_t = MemoryContextAllocHuge(CurrentMemoryContext, (Size)n_bytes * n_rows);
-        memcpy(codes.packed_t, VARDATA_ANY(pt_bytes), (Size)n_bytes * n_rows);
-        codes.sq8_codes = MemoryContextAllocHuge(CurrentMemoryContext, (Size)n_rows * dim);
-        memcpy(codes.sq8_codes, VARDATA_ANY(sq_bytes), (Size)n_rows * dim);
-        codes.sq8_mins = palloc(sizeof(float) * dim);
-        memcpy(codes.sq8_mins, VARDATA_ANY(mins_bytes), sizeof(float) * dim);
-        codes.sq8_scales = palloc(sizeof(float) * dim);
-        memcpy(codes.sq8_scales, VARDATA_ANY(scales_bytes), sizeof(float) * dim);
-        codes.norms = palloc(sizeof(float) * n_rows);
-        memcpy(codes.norms, VARDATA_ANY(norms_bytes), sizeof(float) * n_rows);
+        /* SQ8 params for rerank */
+        /* Store in params struct extension or separate vars */
     }
 
-    SPI_finish();
-
-    /* Extract query vector from pgvector's vector type */
+    /* Extract + rotate query (once) */
     {
-        /* pgvector stores vector as: varlena header + uint16 dim + uint16 unused + float[] */
         bytea *raw = DatumGetByteaP(query_datum);
         int query_dim = *(uint16 *)(VARDATA(raw));
         float *qdata = (float *)(VARDATA(raw) + 2 * sizeof(uint16));
+        float inv_sqrt_dim = 1.0f / sqrtf((float)dim);
 
         if (query_dim != dim)
-            ereport(ERROR, (errmsg("flashhadamard_scan: query dim %d != sidecar dim %d",
-                                    query_dim, dim)));
+            ereport(ERROR, (errmsg("flashhadamard_scan: query dim %d != %d", query_dim, dim)));
+
         query_vec = palloc(sizeof(float) * dim);
         memcpy(query_vec, qdata, sizeof(float) * dim);
+
+        /* Rotate query + build coefficients + byte tables */
+        rotated_q = palloc(sizeof(float) * dim);
+        fh_rotate_vec(query_vec, rotated_q, &params);
+
+        coeffs = palloc(sizeof(float) * dim);
+        {
+            float *expanded = palloc(sizeof(float) * dim);
+            int g;
+            for (g = 0; g < n_groups; g++)
+            {
+                int gstart = g * group_size_val;
+                int gend = Min(gstart + group_size_val, dim);
+                int dd;
+                for (dd = gstart; dd < gend; dd++)
+                    expanded[dd] = params.group_scales[g];
+            }
+            for (i = 0; i < dim; i++)
+                coeffs[i] = rotated_q[i] * expanded[i] * inv_sqrt_dim;
+            pfree(expanded);
+        }
+
+        byte_tables = palloc(sizeof(float) * n_bytes * 256);
+        fh_build_byte_tables(coeffs, params.centers, dim, byte_tables);
     }
 
-    /* Run search */
-    out_ids = palloc(sizeof(int32) * k);
-    out_scores = palloc(sizeof(float) * k);
-    n_results = fh_search(&codes, &params, query_vec, k, shortlist_m,
-                           out_ids, out_scores);
+    /* Global top-k heap (shortlist_m candidates across all chunks) */
+    global_top_ids = palloc(sizeof(int32) * shortlist_m);
+    global_top_scores = palloc(sizeof(float) * shortlist_m);
 
-    /* Emit results */
-    for (i = 0; i < n_results; i++)
+    /* Count chunks */
+    resetStringInfo(&sql);
+    appendStringInfo(&sql,
+        "SELECT count(*) FROM %s WHERE segment_id >= 0",
+        quote_identifier(sidecar));
+    ret = SPI_execute(sql.data, true, 1);
+    n_chunks = (ret == SPI_OK_SELECT && SPI_processed > 0)
+        ? DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &(bool){false}))
+        : 0;
+
+    /* Process each chunk: score + merge into global top-k */
+    for (seg = 0; seg < n_chunks; seg++)
     {
-        Datum vals[2];
-        bool nulls[2] = {false, false};
+        bytea *pt_bytes, *norm_bytes;
+        int rstart, rcount;
+        float *chunk_scores;
+        bool isnull;
 
-        vals[0] = Int32GetDatum(out_ids[i]);
-        vals[1] = Float8GetDatum((float8)out_scores[i]);
-        tuplestore_putvalues(tupstore, tupdesc, vals, nulls);
+        resetStringInfo(&sql);
+        appendStringInfo(&sql,
+            "SELECT row_start, row_count, packed_t, meta_norms "
+            "FROM %s WHERE segment_id = %d",
+            quote_identifier(sidecar), seg);
+        ret = SPI_execute(sql.data, true, 1);
+        if (ret != SPI_OK_SELECT || SPI_processed != 1)
+            continue;
+
+        rstart = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+        rcount = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull));
+        pt_bytes = DatumGetByteaP(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3, &isnull));
+        norm_bytes = DatumGetByteaP(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4, &isnull));
+
+        /* Score this chunk */
+        chunk_scores = palloc(sizeof(float) * rcount);
+        fh_packed_score_t((uint8 *)VARDATA_ANY(pt_bytes), byte_tables,
+                           (float *)VARDATA_ANY(norm_bytes),
+                           rcount, n_bytes, chunk_scores);
+
+        /* Merge into global top-k */
+        for (i = 0; i < rcount; i++)
+            topk_insert(chunk_scores[i], rstart + i,
+                         global_top_scores, global_top_ids, shortlist_m,
+                         &global_filled, &global_min_pos, &global_min_score);
+
+        pfree(chunk_scores);
+    }
+
+    /* SQ8 rerank if shortlist_m > k */
+    if (shortlist_m > k && global_filled > k)
+    {
+        /* Load SQ8 params from metadata */
+        bytea *mins_bytes, *scales_bytes;
+        float *sq8_mins_local, *sq8_scales_local;
+        float *q_norm;
+        float *rerank_scores;
+        int32 *final_ids;
+        float *final_scores;
+        int final_filled = 0, final_min_pos = 0;
+        float final_min_score = -FLT_MAX;
+
+        resetStringInfo(&sql);
+        appendStringInfo(&sql,
+            "SELECT meta_sq8_mins, meta_sq8_scales FROM %s WHERE segment_id = -1",
+            quote_identifier(sidecar));
+        ret = SPI_execute(sql.data, true, 1);
+        {
+            bool isnull;
+            mins_bytes = DatumGetByteaP(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+            scales_bytes = DatumGetByteaP(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull));
+        }
+        sq8_mins_local = (float *)VARDATA_ANY(mins_bytes);
+        sq8_scales_local = (float *)VARDATA_ANY(scales_bytes);
+
+        /* Normalize query for rerank */
+        q_norm = palloc(sizeof(float) * dim);
+        {
+            float norm = 0.0f;
+            for (i = 0; i < dim; i++) norm += query_vec[i] * query_vec[i];
+            norm = sqrtf(norm);
+            if (norm < 1e-12f) norm = 1e-12f;
+            for (i = 0; i < dim; i++) q_norm[i] = query_vec[i] / norm;
+        }
+
+        /* For each shortlist candidate, load its SQ8 codes and rerank */
+        rerank_scores = palloc(sizeof(float) * global_filled);
+        final_ids = palloc(sizeof(int32) * k);
+        final_scores = palloc(sizeof(float) * k);
+
+        for (i = 0; i < global_filled; i++)
+        {
+            int row = global_top_ids[i];
+            /* Find which chunk this row belongs to */
+            int chunk_id = row / FH_CHUNK_ROWS;
+            int chunk_offset = row % FH_CHUNK_ROWS;
+            bytea *sq_bytes;
+            uint8 *row_sq8;
+            float dot = 0.0f;
+
+            resetStringInfo(&sql);
+            appendStringInfo(&sql,
+                "SELECT sq8_codes FROM %s WHERE segment_id = %d",
+                quote_identifier(sidecar), chunk_id);
+            ret = SPI_execute(sql.data, true, 1);
+            if (ret != SPI_OK_SELECT || SPI_processed != 1)
+            {
+                rerank_scores[i] = -FLT_MAX;
+                continue;
+            }
+            {
+                bool isnull;
+                sq_bytes = DatumGetByteaP(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+            }
+            row_sq8 = (uint8 *)VARDATA_ANY(sq_bytes) + (Size)chunk_offset * dim;
+
+            for (j = 0; j < dim; j++)
+            {
+                float decoded = (float)row_sq8[j] * sq8_scales_local[j] + sq8_mins_local[j];
+                dot += decoded * q_norm[j];
+            }
+            rerank_scores[i] = dot;
+        }
+
+        /* Final top-k from reranked scores */
+        for (i = 0; i < global_filled; i++)
+            topk_insert(rerank_scores[i], global_top_ids[i],
+                         final_scores, final_ids, k,
+                         &final_filled, &final_min_pos, &final_min_score);
+
+        /* Sort final results */
+        for (i = 0; i < final_filled; i++)
+            for (j = i + 1; j < final_filled; j++)
+                if (final_scores[j] > final_scores[i])
+                {
+                    float ts = final_scores[i]; final_scores[i] = final_scores[j]; final_scores[j] = ts;
+                    int32 ti = final_ids[i]; final_ids[i] = final_ids[j]; final_ids[j] = ti;
+                }
+
+        SPI_finish();
+
+        for (i = 0; i < final_filled; i++)
+        {
+            Datum vals[2];
+            bool nulls[2] = {false, false};
+            vals[0] = Int32GetDatum(final_ids[i]);
+            vals[1] = Float8GetDatum((float8)final_scores[i]);
+            tuplestore_putvalues(tupstore, tupdesc, vals, nulls);
+        }
+    }
+    else
+    {
+        /* No rerank: sort and emit shortlist directly */
+        for (i = 0; i < global_filled; i++)
+            for (j = i + 1; j < global_filled; j++)
+                if (global_top_scores[j] > global_top_scores[i])
+                {
+                    float ts = global_top_scores[i]; global_top_scores[i] = global_top_scores[j]; global_top_scores[j] = ts;
+                    int32 ti = global_top_ids[i]; global_top_ids[i] = global_top_ids[j]; global_top_ids[j] = ti;
+                }
+
+        SPI_finish();
+
+        {
+            int out_k = Min(global_filled, k);
+            for (i = 0; i < out_k; i++)
+            {
+                Datum vals[2];
+                bool nulls[2] = {false, false};
+                vals[0] = Int32GetDatum(global_top_ids[i]);
+                vals[1] = Float8GetDatum((float8)global_top_scores[i]);
+                tuplestore_putvalues(tupstore, tupdesc, vals, nulls);
+            }
+        }
     }
 
     PG_RETURN_NULL();
