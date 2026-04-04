@@ -1563,6 +1563,8 @@ flashhadamard_store_build(PG_FUNCTION_ARGS)
     float      *sq8_mins = NULL, *sq8_scales = NULL;
     float      *norms = NULL;
     uint8      *packed_codes = NULL, *packed_t = NULL, *sq8_codes = NULL;
+    float      *centroids = NULL;
+    int         n_seg = 0;
     FHParams    params;
 
     source_name = get_rel_name(source_oid);
@@ -1650,8 +1652,15 @@ flashhadamard_store_build(PG_FUNCTION_ARGS)
         sq8_mins = palloc(sizeof(float)*dim); sq8_scales = palloc(sizeof(float)*dim);
         for(d=0;d<dim;d++){sq8_mins[d]=FLT_MAX; sq8_scales[d]=-FLT_MAX;}
 
-        /* Pass 2: rotate + quantize + pack + SQ8 min/max */
-        elog(NOTICE, "fh_store_build: pass 2 encoding %d vectors", n_rows);
+        /* Segment centroid accumulators */
+        {
+            int *seg_counts;
+            n_seg = (n_rows + FH_SEGMENT_SIZE - 1) / FH_SEGMENT_SIZE;
+            centroids = palloc0(sizeof(float) * (Size)n_seg * dim);
+            seg_counts = palloc0(sizeof(int) * n_seg);
+
+        /* Pass 2: rotate + quantize + pack + SQ8 min/max + centroid accumulation */
+        elog(NOTICE, "fh_store_build: pass 2 encoding %d vectors (%d segments)", n_rows, n_seg);
         { float sqrt_dim = sqrtf((float)dim);
           scan = table_beginscan(rel, snapshot, 0, NULL);
           row_idx = 0;
@@ -1661,6 +1670,11 @@ flashhadamard_store_build(PG_FUNCTION_ARGS)
             if (is_halfvec) { Hsvec *hv=(Hsvec*)PG_DETOAST_DATUM(dv); for(d=0;d<Min(hv->dim,dim);d++){vec_buf[d]=HalfToFloat4(hv->x[d]);norm+=vec_buf[d]*vec_buf[d];} for(d=Min(hv->dim,dim);d<dim;d++)vec_buf[d]=0; if(hv!=(Hsvec*)DatumGetPointer(dv))pfree(hv); }
             else { Svec *sv=(Svec*)PG_DETOAST_DATUM(dv); memcpy(vec_buf,sv->x,sizeof(float)*Min(sv->dim,dim)); for(d=Min(sv->dim,dim);d<dim;d++)vec_buf[d]=0; for(d=0;d<Min(sv->dim,dim);d++)norm+=vec_buf[d]*vec_buf[d]; if(sv!=(Svec*)DatumGetPointer(dv))pfree(sv); }
             norm=sqrtf(norm); if(norm<1e-12f)norm=1e-12f; for(d=0;d<dim;d++)vec_buf[d]/=norm; norms[row_idx]=norm;
+            /* Accumulate centroid for this segment */
+            { int seg_id = row_idx / FH_SEGMENT_SIZE;
+              float *cen = centroids + (Size)seg_id * dim;
+              for(d=0;d<dim;d++) cen[d] += vec_buf[d];
+              seg_counts[seg_id]++; }
             for(d=0;d<dim;d++){if(vec_buf[d]<sq8_mins[d])sq8_mins[d]=vec_buf[d]; if(vec_buf[d]>sq8_scales[d])sq8_scales[d]=vec_buf[d];}
             fh_rotate_vec(vec_buf, rot_buf, &params); for(d=0;d<dim;d++)rot_buf[d]*=sqrt_dim;
             { uint8 *rp = packed_codes+(Size)row_idx*n_bytes; memset(rp,0,n_bytes);
@@ -1671,6 +1685,21 @@ flashhadamard_store_build(PG_FUNCTION_ARGS)
           n_rows = row_idx;
           table_endscan(scan);
         }
+
+        /* Finalize centroids: divide by count, L2 normalize */
+        { int s;
+          n_seg = (n_rows + FH_SEGMENT_SIZE - 1) / FH_SEGMENT_SIZE;
+          for (s = 0; s < n_seg; s++)
+          { float *cen = centroids + (Size)s * dim;
+            float cnorm = 0;
+            int cnt = Max(seg_counts[s], 1);
+            for(d=0;d<dim;d++) { cen[d] /= cnt; cnorm += cen[d]*cen[d]; }
+            cnorm = sqrtf(cnorm);
+            if (cnorm > 1e-12f) for(d=0;d<dim;d++) cen[d] /= cnorm;
+          }
+          pfree(seg_counts);
+        }
+        } /* end segment centroid accumulators block */
         for(d=0;d<dim;d++){float r=sq8_scales[d]-sq8_mins[d]; if(r<1e-8f)r=1e-8f; sq8_scales[d]=r/255.0f;}
 
         /* Pass 3: SQ8 encode */
@@ -1718,10 +1747,14 @@ flashhadamard_store_build(PG_FUNCTION_ARGS)
         memcpy(meta.centers, fh_lloyd_max_16, sizeof(float) * FH_MAX_CENTERS);
         memcpy(meta.group_scales, group_scales, sizeof(float) * Min(n_groups, FH_MAX_GROUPS));
 
+        meta.n_segments = n_seg;
+        meta.segment_size = FH_SEGMENT_SIZE;
+
         ret = fh_store_write(store_path, &meta, sq8_mins, sq8_scales,
                               packed_t, (Size)n_bytes * n_rows,
                               sq8_codes, (Size)n_rows * dim,
-                              norms, n_rows);
+                              norms, n_rows,
+                              centroids, n_seg);
         if (ret != 0)
             ereport(ERROR, (errmsg("fh_store_build: write failed")));
     }

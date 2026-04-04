@@ -15,6 +15,7 @@
 #include "storage/bufmgr.h"
 
 #define FH_STORE_MAGIC      0x46484D31  /* "FHM1" */
+#define FH_SEGMENT_SIZE     4096        /* rows per segment for pruning */
 #define FH_META_BLKNO       0
 
 /* Usable bytes per page (after page header + opaque) */
@@ -77,6 +78,9 @@ typedef struct FHMetaPageDataV2
     int64       off_packed;         /* packed_t[n_bytes * n_rows] */
     int64       off_sq8;            /* sq8_codes[n_rows * dim] */
     int64       off_norms;          /* norms[n_rows] */
+    int64       off_centroids;      /* segment centroids [n_segments × dim] float32 */
+    int32       n_segments;         /* number of segments (ceil(n_rows / segment_size)) */
+    int32       segment_size;       /* rows per segment (e.g. 4096) */
     int64       off_end;            /* total file size */
     float       centers[FH_MAX_CENTERS];
     float       group_scales[FH_MAX_GROUPS];
@@ -116,7 +120,8 @@ extern int fh_store_write(const char *path,
                            const float *sq8_mins, const float *sq8_scales,
                            const uint8 *packed_t, Size packed_t_size,
                            const uint8 *sq8_codes, Size sq8_size,
-                           const float *norms, int n_rows);
+                           const float *norms, int n_rows,
+                           const float *centroids, int n_segments);
 
 extern int fh_store_scan(const char *path, const FHParams *params,
                           const float *query_vec, int k, int shortlist_m,

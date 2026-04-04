@@ -178,12 +178,13 @@ fh_store_write(const char *path,
                const float *sq8_mins, const float *sq8_scales,
                const uint8 *packed_t, Size packed_t_size,
                const uint8 *sq8_codes, Size sq8_size,
-               const float *norms, int n_rows)
+               const float *norms, int n_rows,
+               const float *centroids, int n_segments)
 {
     int     fd;
     char    meta_page[FH_PAGE_SIZE];
     int     sq8_params_pages = 0, packed_pages = 0, sq8_pages = 0, norm_pages = 0;
-    off_t   sq8_params_offset, packed_offset, sq8_data_offset, norm_offset;
+    off_t   sq8_params_offset, packed_offset, sq8_data_offset, norm_offset, centroid_offset;
 
     fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0600);
     if (fd < 0)
@@ -228,13 +229,20 @@ fh_store_write(const char *path,
         norm_offset = sq8_data_offset + (off_t)sq8_size;
         fh_write_raw(fd, norms, sizeof(float) * n_rows);
 
+        centroid_offset = norm_offset + (off_t)(sizeof(float) * n_rows);
+        if (centroids && n_segments > 0)
+            fh_write_raw(fd, centroids, sizeof(float) * (Size)n_segments * meta->dim);
+
         /* Rewrite meta page with exact byte offsets */
         m = (FHMetaPageDataV2 *)(meta_page + sizeof(FHFilePageHeader));
         m->off_sq8_params = sq8_params_offset;
         m->off_packed = packed_offset;
         m->off_sq8 = sq8_data_offset;
         m->off_norms = norm_offset;
-        m->off_end = norm_offset + (off_t)(sizeof(float) * n_rows);
+        m->off_centroids = centroid_offset;
+        m->n_segments = n_segments;
+        m->segment_size = FH_SEGMENT_SIZE;
+        m->off_end = centroid_offset + (centroids ? sizeof(float) * (Size)n_segments * meta->dim : 0);
 
         lseek(fd, 0, SEEK_SET);
         write(fd, meta_page, FH_PAGE_SIZE);
@@ -299,16 +307,127 @@ fh_store_scan(const char *path, const FHParams *params,
     fh_build_byte_tables(coeffs, params->centers, dim, byte_tables);
     pfree(coeffs);
 
-    /* Stage 1: Fused score + top-k directly on mmap'd region */
+    /* Stage 1: Score with optional segment pruning */
     top_ids = palloc(sizeof(int32) * shortlist_m);
     top_scores = palloc(sizeof(float) * shortlist_m);
 
     packed_ptr = (uint8 *)cache->mapped + meta->off_packed;
     norms_ptr = (float *)((char *)cache->mapped + meta->off_norms);
 
-    fh_packed_score_topk_t(packed_ptr, byte_tables, norms_ptr,
-                            n_rows, n_bytes, shortlist_m,
-                            top_ids, top_scores, &filled);
+    if (meta->n_segments > 1 && meta->off_centroids > 0)
+    {
+        /* Segment pruning: rank segments by centroid similarity, scan top-P */
+        float  *centroids_ptr = (float *)((char *)cache->mapped + meta->off_centroids);
+        int     n_seg = meta->n_segments;
+        int     seg_size = meta->segment_size;
+        float  *seg_scores;
+        int    *seg_order;
+        int     n_probe;
+        int     s;
+
+        /* Normalize query for centroid comparison */
+        float  *q_norm_seg = palloc(sizeof(float) * dim);
+        {
+            float qn = 0;
+            for (i = 0; i < dim; i++) qn += query_vec[i] * query_vec[i];
+            qn = sqrtf(qn);
+            if (qn < 1e-12f) qn = 1e-12f;
+            for (i = 0; i < dim; i++) q_norm_seg[i] = query_vec[i] / qn;
+        }
+
+        /* Compute dot product with each centroid */
+        seg_scores = palloc(sizeof(float) * n_seg);
+        for (s = 0; s < n_seg; s++)
+        {
+            float *cen = centroids_ptr + (Size)s * dim;
+            float dot = 0;
+            for (j = 0; j < dim; j++) dot += q_norm_seg[j] * cen[j];
+            seg_scores[s] = dot;
+        }
+        pfree(q_norm_seg);
+
+        /* Sort segments by descending score */
+        seg_order = palloc(sizeof(int) * n_seg);
+        for (s = 0; s < n_seg; s++) seg_order[s] = s;
+        for (i = 0; i < n_seg; i++)
+            for (j = i + 1; j < n_seg; j++)
+                if (seg_scores[seg_order[j]] > seg_scores[seg_order[i]])
+                { int tmp = seg_order[i]; seg_order[i] = seg_order[j]; seg_order[j] = tmp; }
+
+        /* Probe top-P segments (default: half, min all if few segments) */
+        n_probe = (n_seg + 1) / 2;
+        if (n_probe < 3) n_probe = n_seg;  /* don't prune if very few segments */
+
+        /* Score only probed segments using parallel scorer */
+        for (s = 0; s < n_probe; s++)
+        {
+            int sid = seg_order[s];
+            int rstart = sid * seg_size;
+            int rcount = Min(seg_size, n_rows - rstart);
+            /* Create virtual packed_t pointer for this segment */
+            /* packed_t is transposed: packed_t[col * n_rows + row] */
+            /* For a segment [rstart..rstart+rcount), we need offsets within each column */
+            /* Pass the full packed_t + n_rows, and let scorer handle the range */
+            /* Actually: the parallel scorer already shards by row range.
+             * We need to call score_topk on the segment's row range.
+             * But fh_packed_score_topk_t scores ALL rows. Need a range variant. */
+
+            /* Simple: score this segment's rows directly (single-thread per segment) */
+            {
+                float *seg_row_scores = palloc(sizeof(float) * rcount);
+                int byte_idx, row;
+                int min_pos = 0;
+                float min_score_local = -FLT_MAX;
+
+                memset(seg_row_scores, 0, sizeof(float) * rcount);
+
+                for (byte_idx = 0; byte_idx + 1 < n_bytes; byte_idx += 2)
+                {
+                    const uint8 *codes0 = packed_ptr + (Size)byte_idx * n_rows + rstart;
+                    const uint8 *codes1 = packed_ptr + (Size)(byte_idx + 1) * n_rows + rstart;
+                    const float *table0 = byte_tables + byte_idx * 256;
+                    const float *table1 = byte_tables + (byte_idx + 1) * 256;
+
+                    for (row = 0; row + 3 < rcount; row += 4)
+                    {
+                        seg_row_scores[row+0] += table0[codes0[row+0]] + table1[codes1[row+0]];
+                        seg_row_scores[row+1] += table0[codes0[row+1]] + table1[codes1[row+1]];
+                        seg_row_scores[row+2] += table0[codes0[row+2]] + table1[codes1[row+2]];
+                        seg_row_scores[row+3] += table0[codes0[row+3]] + table1[codes1[row+3]];
+                    }
+                    for (; row < rcount; row++)
+                        seg_row_scores[row] += table0[codes0[row]] + table1[codes1[row]];
+                }
+                if (byte_idx < n_bytes)
+                {
+                    const uint8 *codes = packed_ptr + (Size)byte_idx * n_rows + rstart;
+                    const float *table = byte_tables + byte_idx * 256;
+                    for (row = 0; row < rcount; row++)
+                        seg_row_scores[row] += table[codes[row]];
+                }
+
+                /* Merge into global top-k */
+                for (row = 0; row < rcount; row++)
+                {
+                    float sc = norms_ptr ? seg_row_scores[row] * norms_ptr[rstart + row]
+                                          : seg_row_scores[row];
+                    fh_topk_insert(sc, rstart + row, top_scores, top_ids, shortlist_m,
+                                    &filled, &min_pos, &min_score_local);
+                }
+                pfree(seg_row_scores);
+            }
+        }
+
+        pfree(seg_scores);
+        pfree(seg_order);
+    }
+    else
+    {
+        /* No pruning: exhaustive parallel scan */
+        fh_packed_score_topk_t(packed_ptr, byte_tables, norms_ptr,
+                                n_rows, n_bytes, shortlist_m,
+                                top_ids, top_scores, &filled);
+    }
     pfree(byte_tables);
 
     /* Stage 2: SQ8 rerank using cached params + mmap'd SQ8 payload */
