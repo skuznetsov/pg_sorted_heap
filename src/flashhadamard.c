@@ -346,14 +346,20 @@ fh_packed_score_topk_t(const uint8 *packed_t, const float *byte_tables,
                         int *filled)
 {
 #ifndef _WIN32
-    int     n_threads = FH_DEFAULT_THREADS;
+    int     n_threads;
     int     i, j;
 
-    /* Adjust thread count */
+    /* Runtime thread count: FH_THREADS env or default 8 */
+    {
+        const char *env_t = getenv("FH_THREADS");
+        n_threads = (env_t && env_t[0]) ? atoi(env_t) : FH_DEFAULT_THREADS;
+        if (n_threads < 1) n_threads = 1;
+        if (n_threads > FH_MAX_THREADS) n_threads = FH_MAX_THREADS;
+    }
+
+    /* Adjust for data size */
     if (n_rows < FH_MIN_ROWS_PER_THREAD * 2)
         n_threads = 1;
-    if (n_threads > FH_MAX_THREADS)
-        n_threads = FH_MAX_THREADS;
     if (n_threads > n_rows / FH_MIN_ROWS_PER_THREAD)
         n_threads = Max(1, n_rows / FH_MIN_ROWS_PER_THREAD);
 

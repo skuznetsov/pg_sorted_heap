@@ -100,6 +100,9 @@ TURBOQUANT_GUTENBERG_SCREEN_METHODS ?= turboquant_blockhadamard_packed4,turboqua
 TURBOQUANT_LOCAL_CUBE_PORT ?= 30432
 TURBOQUANT_LOCAL_CUBE_DB ?= cogniformerus
 TURBOQUANT_ARGS ?=
+FH_PG_DSN ?=
+FH_STORE_PATH ?= /tmp/fh_bench.store
+FH_THREADS ?= 8
 TMP_CLEAN_MIN_AGE_S ?= 0
 PLANNER_PROBE_ROWS ?= 1000,10000,50000
 PLANNER_PROBE_PORT ?= 65496
@@ -712,6 +715,26 @@ policy-lint:
 
 policy-lint-strict:
 	POLICY_LINT_WARNINGS_MAX=0 ./scripts/lint_comparator_policy.sh
+
+# ---- FlashHadamard targets ----
+
+test-flashhadamard:
+	psql -f ./scripts/test_flashhadamard.sql
+
+bench-flashhadamard:
+	@echo "FlashHadamard benchmark (FH_THREADS=$(FH_THREADS))"
+	@psql -c "\i sql/flashhadamard_experimental.sql" 2>/dev/null || true
+	@echo "Building store..."
+	@psql -c "\\timing on" \
+		-c "SELECT flashhadamard_store_build('gutenberg_local'::regclass, 'embedding', '$(FH_STORE_PATH)', 42, 16)" \
+		2>&1 | grep -E "Time:|done"
+	@echo "Benchmark (10 queries, warm)..."
+	@psql -c "CREATE TEMP TABLE _fhbq AS SELECT embedding FROM gutenberg_local ORDER BY id LIMIT 10" \
+		-c "SELECT count(*) FROM flashhadamard_store_scan('$(FH_STORE_PATH)', (SELECT embedding FROM _fhbq LIMIT 1), 10, 12, 42, 16)" \
+		-c "\\timing on" \
+		-c "SELECT sum(c) FROM (SELECT (SELECT count(*) FROM flashhadamard_store_scan('$(FH_STORE_PATH)', q.embedding, 10, 12, 42, 16)) c FROM _fhbq q) t" \
+		2>&1 | grep -E "Time:|sum"
+	@echo "Done. Set FH_THREADS=N before PG start to control parallelism."
 
 help:
 	@echo "pg_sorted_heap custom targets:"
