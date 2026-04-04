@@ -201,12 +201,20 @@ PG extension prototype (`flashhadamard_build` + `flashhadamard_scan`):
 | 5 × 8D | <1ms | 0.17ms | Correctness verified |
 | 1000 × 2880D | 63ms | 1.6ms | Local PG |
 | 5000 × 2880D | 290ms | 34ms | Chunked (2 segments) |
-| **103K × 2880D** | **12.5s** | pending | **Chunked (26 segments), k8s container** |
+| **103K × 2880D** | **17.2s** | **185-700ms** | **Chunked (26 segments), local PG** |
 
 Architecture: streaming 3-pass build (no all_vecs buffer), chunked
 sidecar storage (4096 rows/segment), chunk-by-chunk scan with global
-top-k merge. Scan on 5K is 34ms (vs 5.8ms monolithic) due to per-chunk
-SPI overhead — needs fused scorer port for production parity.
+top-k merge.
+
+103K scan: 185ms (cached) to 700ms (TOAST decompression). Python C
+helper benchmark: ~8ms. Gap: 23-87×. Bottleneck: per-chunk SPI (26
+calls), TOAST decompression of 153MB bytea, single-threaded scorer,
+no 2-byte fused optimization.
+
+**Verdict: engine path proves feasibility but is not competitive with
+external serving. Closing gap requires porting fused scorer mechanics
+and eliminating per-chunk SPI in the hot path.**
 
 ## Status
 
