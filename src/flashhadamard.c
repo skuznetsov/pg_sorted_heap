@@ -1296,19 +1296,178 @@ flashhadamard_store_build(PG_FUNCTION_ARGS)
     char       *store_path = text_to_cstring(PG_GETARG_TEXT_PP(2));
     int         seed       = PG_GETARG_INT32(3);
     int         group_size = PG_GETARG_INT32(4);
+    char       *source_name;
+    int         ret, n_rows = 0, dim = 0, n_bytes, n_groups;
+    int         i, j, d;
+    float      *group_scales = NULL;
+    float      *sq8_mins = NULL, *sq8_scales = NULL;
+    float      *norms = NULL;
+    uint8      *packed_codes = NULL, *packed_t = NULL, *sq8_codes = NULL;
+    FHParams    params;
 
-    /* Reuse the SPI-based build to get all encoded data, then write to file store */
-    /* For this prototype: build into memory, then call fh_store_write */
+    source_name = get_rel_name(source_oid);
+    if (!source_name)
+        ereport(ERROR, (errmsg("flashhadamard_store_build: table not found")));
 
-    /* Actually: the SPI build already produces packed_t, sq8_codes, norms, etc.
-     * We need those arrays. The cleanest path: factor out the encoding from
-     * flashhadamard_build into a shared helper, then call fh_store_write.
-     *
-     * For now: quick path — call flashhadamard_build to create a sidecar table,
-     * then export from sidecar to file store. This is a bridge, not final. */
+    /* Streaming 3-pass encode (same as flashhadamard_build) */
+    {
+        Relation        rel;
+        TupleDesc       td;
+        TableScanDesc   scan;
+        TupleTableSlot *slot;
+        AttrNumber      embed_attno;
+        bool            is_halfvec = false;
+        Snapshot        snapshot;
+        int             row_idx;
+        float          *vec_buf, *rot_buf, *expanded;
+        double         *group_sum_sq;
+        int            *group_count_arr;
+        Oid             embed_typid;
 
-    ereport(ERROR, (errmsg("flashhadamard_store_build: not yet implemented — use flashhadamard_build + manual export for now")));
-    PG_RETURN_INT32(0);
+        rel = table_open(source_oid, AccessShareLock);
+        td = RelationGetDescr(rel);
+        embed_attno = get_attnum(source_oid, embed_col);
+        if (embed_attno == InvalidAttrNumber)
+        { table_close(rel, AccessShareLock); ereport(ERROR, (errmsg("column \"%s\" not found", embed_col))); }
+
+        embed_typid = TupleDescAttr(td, embed_attno - 1)->atttypid;
+        { char *tn = format_type_be(embed_typid); if (tn && (strstr(tn,"half")||strstr(tn,"hsvec"))) is_halfvec = true; if (tn) pfree(tn); }
+
+        snapshot = GetTransactionSnapshot();
+        slot = table_slot_create(rel, NULL);
+
+        /* Pass 1: count + dim + group RMS */
+        scan = table_beginscan(rel, snapshot, 0, NULL);
+        while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+        {
+            if (dim == 0)
+            { bool isn; Datum dv = slot_getattr(slot, embed_attno, &isn);
+              if (!isn) { Svec *sv = (Svec*)PG_DETOAST_DATUM(dv); dim = sv->dim; if (sv!=(Svec*)DatumGetPointer(dv)) pfree(sv); } }
+            n_rows++;
+            ExecClearTuple(slot);
+        }
+        table_endscan(scan);
+        if (n_rows == 0 || dim == 0) { ExecDropSingleTupleTableSlot(slot); table_close(rel, AccessShareLock); PG_RETURN_INT32(0); }
+
+        n_bytes = (dim + 1) / 2;
+        n_groups = (dim + group_size - 1) / group_size;
+        params.dim = dim; params.group_size = group_size; params.seed = seed;
+        params.n_groups = n_groups;
+        params.perm = palloc(sizeof(int)*dim); params.signs = palloc(sizeof(float)*dim);
+        params.centers = (float*)fh_lloyd_max_16;
+        fh_generate_perm_signs(dim, seed, params.perm, params.signs);
+
+        vec_buf = palloc(sizeof(float)*dim); rot_buf = palloc(sizeof(float)*dim);
+        group_sum_sq = palloc0(sizeof(double)*n_groups);
+        group_count_arr = palloc0(sizeof(int)*n_groups);
+
+        /* Pass 1b: accumulate group RMS stats */
+        { float sqrt_dim = sqrtf((float)dim); int g;
+          scan = table_beginscan(rel, snapshot, 0, NULL);
+          while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+          { bool isn; Datum dv = slot_getattr(slot, embed_attno, &isn); float norm = 0;
+            if (isn) { ExecClearTuple(slot); continue; }
+            if (is_halfvec) { Hsvec *hv=(Hsvec*)PG_DETOAST_DATUM(dv); for(d=0;d<Min(hv->dim,dim);d++){vec_buf[d]=HalfToFloat4(hv->x[d]);norm+=vec_buf[d]*vec_buf[d];} for(d=Min(hv->dim,dim);d<dim;d++)vec_buf[d]=0; if(hv!=(Hsvec*)DatumGetPointer(dv))pfree(hv); }
+            else { Svec *sv=(Svec*)PG_DETOAST_DATUM(dv); memcpy(vec_buf,sv->x,sizeof(float)*Min(sv->dim,dim)); for(d=Min(sv->dim,dim);d<dim;d++)vec_buf[d]=0; for(d=0;d<Min(sv->dim,dim);d++)norm+=vec_buf[d]*vec_buf[d]; if(sv!=(Svec*)DatumGetPointer(dv))pfree(sv); }
+            norm=sqrtf(norm); if(norm<1e-12f)norm=1e-12f; for(d=0;d<dim;d++)vec_buf[d]/=norm;
+            fh_rotate_vec(vec_buf, rot_buf, &params); for(d=0;d<dim;d++)rot_buf[d]*=sqrt_dim;
+            for(g=0;g<n_groups;g++){int gs=g*group_size,ge=Min(gs+group_size,dim); for(d=gs;d<ge;d++){group_sum_sq[g]+=(double)rot_buf[d]*rot_buf[d];group_count_arr[g]++;}}
+            ExecClearTuple(slot);
+          }
+          table_endscan(scan);
+          group_scales = palloc(sizeof(float)*n_groups);
+          for(g=0;g<n_groups;g++){group_scales[g]=(float)sqrt(group_sum_sq[g]/Max(group_count_arr[g],1)); if(group_scales[g]<1e-4f)group_scales[g]=1e-4f;}
+          params.group_scales = group_scales;
+          pfree(group_sum_sq); pfree(group_count_arr);
+        }
+
+        expanded = palloc(sizeof(float)*dim);
+        { int g; for(g=0;g<n_groups;g++){int gs=g*group_size,ge=Min(gs+group_size,dim); for(d=gs;d<ge;d++)expanded[d]=group_scales[g];} }
+
+        /* Allocate output buffers */
+        packed_codes = MemoryContextAllocHuge(CurrentMemoryContext, (Size)n_rows*n_bytes);
+        norms = palloc(sizeof(float)*n_rows);
+        sq8_mins = palloc(sizeof(float)*dim); sq8_scales = palloc(sizeof(float)*dim);
+        for(d=0;d<dim;d++){sq8_mins[d]=FLT_MAX; sq8_scales[d]=-FLT_MAX;}
+
+        /* Pass 2: rotate + quantize + pack + SQ8 min/max */
+        elog(NOTICE, "fh_store_build: pass 2 encoding %d vectors", n_rows);
+        { float sqrt_dim = sqrtf((float)dim);
+          scan = table_beginscan(rel, snapshot, 0, NULL);
+          row_idx = 0;
+          while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+          { bool isn; Datum dv = slot_getattr(slot, embed_attno, &isn); float norm = 0;
+            if (isn) { memset(packed_codes+(Size)row_idx*n_bytes,0,n_bytes); norms[row_idx]=1e-12f; row_idx++; ExecClearTuple(slot); continue; }
+            if (is_halfvec) { Hsvec *hv=(Hsvec*)PG_DETOAST_DATUM(dv); for(d=0;d<Min(hv->dim,dim);d++){vec_buf[d]=HalfToFloat4(hv->x[d]);norm+=vec_buf[d]*vec_buf[d];} for(d=Min(hv->dim,dim);d<dim;d++)vec_buf[d]=0; if(hv!=(Hsvec*)DatumGetPointer(dv))pfree(hv); }
+            else { Svec *sv=(Svec*)PG_DETOAST_DATUM(dv); memcpy(vec_buf,sv->x,sizeof(float)*Min(sv->dim,dim)); for(d=Min(sv->dim,dim);d<dim;d++)vec_buf[d]=0; for(d=0;d<Min(sv->dim,dim);d++)norm+=vec_buf[d]*vec_buf[d]; if(sv!=(Svec*)DatumGetPointer(dv))pfree(sv); }
+            norm=sqrtf(norm); if(norm<1e-12f)norm=1e-12f; for(d=0;d<dim;d++)vec_buf[d]/=norm; norms[row_idx]=norm;
+            for(d=0;d<dim;d++){if(vec_buf[d]<sq8_mins[d])sq8_mins[d]=vec_buf[d]; if(vec_buf[d]>sq8_scales[d])sq8_scales[d]=vec_buf[d];}
+            fh_rotate_vec(vec_buf, rot_buf, &params); for(d=0;d<dim;d++)rot_buf[d]*=sqrt_dim;
+            { uint8 *rp = packed_codes+(Size)row_idx*n_bytes; memset(rp,0,n_bytes);
+              for(d=0;d<dim;d++){float eq=rot_buf[d]/expanded[d]; int code=fh_digitize(eq); int bi=d/2;
+              if(d%2==0)rp[bi]|=(uint8)(code&0x0F); else rp[bi]|=(uint8)((code&0x0F)<<4);} }
+            row_idx++; ExecClearTuple(slot);
+          }
+          n_rows = row_idx;
+          table_endscan(scan);
+        }
+        for(d=0;d<dim;d++){float r=sq8_scales[d]-sq8_mins[d]; if(r<1e-8f)r=1e-8f; sq8_scales[d]=r/255.0f;}
+
+        /* Pass 3: SQ8 encode */
+        sq8_codes = MemoryContextAllocHuge(CurrentMemoryContext, (Size)n_rows*dim);
+        elog(NOTICE, "fh_store_build: pass 3 SQ8 encoding");
+        { scan = table_beginscan(rel, snapshot, 0, NULL);
+          row_idx = 0;
+          while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+          { bool isn; Datum dv = slot_getattr(slot, embed_attno, &isn); float norm;
+            if (isn) { memset(sq8_codes+(Size)row_idx*dim,0,dim); row_idx++; ExecClearTuple(slot); continue; }
+            norm=0;
+            if (is_halfvec) { Hsvec *hv=(Hsvec*)PG_DETOAST_DATUM(dv); for(d=0;d<Min(hv->dim,dim);d++){vec_buf[d]=HalfToFloat4(hv->x[d]);norm+=vec_buf[d]*vec_buf[d];} for(d=Min(hv->dim,dim);d<dim;d++)vec_buf[d]=0; if(hv!=(Hsvec*)DatumGetPointer(dv))pfree(hv); }
+            else { Svec *sv=(Svec*)PG_DETOAST_DATUM(dv); memcpy(vec_buf,sv->x,sizeof(float)*Min(sv->dim,dim)); for(d=Min(sv->dim,dim);d<dim;d++)vec_buf[d]=0; for(d=0;d<Min(sv->dim,dim);d++)norm+=vec_buf[d]*vec_buf[d]; if(sv!=(Svec*)DatumGetPointer(dv))pfree(sv); }
+            norm=sqrtf(norm); if(norm<1e-12f)norm=1e-12f; for(d=0;d<dim;d++)vec_buf[d]/=norm;
+            { uint8 *rsq = sq8_codes+(Size)row_idx*dim;
+              for(d=0;d<dim;d++){int c=(int)roundf((vec_buf[d]-sq8_mins[d])/sq8_scales[d]); if(c<0)c=0; if(c>255)c=255; rsq[d]=(uint8)c;} }
+            row_idx++; ExecClearTuple(slot);
+          }
+          table_endscan(scan);
+        }
+
+        /* Transpose packed codes */
+        packed_t = MemoryContextAllocHuge(CurrentMemoryContext, (Size)n_bytes*n_rows);
+        for(i=0;i<n_rows;i++) for(j=0;j<n_bytes;j++) packed_t[j*n_rows+i] = packed_codes[i*n_bytes+j];
+        pfree(packed_codes); packed_codes = NULL;
+
+        pfree(vec_buf); pfree(rot_buf); pfree(expanded);
+        ExecDropSingleTupleTableSlot(slot);
+        table_close(rel, AccessShareLock);
+    }
+
+    /* Write to file store */
+    elog(NOTICE, "fh_store_build: writing store '%s' (%d rows, %d dim)", store_path, n_rows, dim);
+    {
+        FHMetaPageDataV2 meta;
+        memset(&meta, 0, sizeof(meta));
+        meta.magic = FH_STORE_MAGIC;
+        meta.version = 1;
+        meta.dim = dim;
+        meta.n_rows = n_rows;
+        meta.n_bytes = n_bytes;
+        meta.group_size = group_size;
+        meta.n_groups = n_groups;
+        meta.seed = seed;
+        memcpy(meta.centers, fh_lloyd_max_16, sizeof(float) * FH_MAX_CENTERS);
+        memcpy(meta.group_scales, group_scales, sizeof(float) * Min(n_groups, FH_MAX_GROUPS));
+
+        ret = fh_store_write(store_path, &meta, sq8_mins, sq8_scales,
+                              packed_t, (Size)n_bytes * n_rows,
+                              sq8_codes, (Size)n_rows * dim,
+                              norms, n_rows);
+        if (ret != 0)
+            ereport(ERROR, (errmsg("fh_store_build: write failed")));
+    }
+
+    elog(NOTICE, "fh_store_build: done");
+    PG_RETURN_INT32(n_rows);
 }
 
 

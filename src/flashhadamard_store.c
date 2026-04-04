@@ -29,7 +29,40 @@
 
 #define FH_PAGE_SIZE  BLCKSZ  /* 8192 bytes */
 
-/* Write raw bytes to sequential pages in a file */
+/* Write raw contiguous bytes (no page framing) and return bytes written */
+static Size
+fh_write_raw(int fd, const void *data, Size total_bytes)
+{
+    Size written = 0;
+    while (written < total_bytes)
+    {
+        ssize_t n = write(fd, (const char *)data + written,
+                          Min(total_bytes - written, (Size)64 * 1024 * 1024));
+        if (n <= 0)
+            return written;
+        written += n;
+    }
+    return written;
+}
+
+/* Read raw contiguous bytes */
+static Size
+fh_read_raw(int fd, off_t offset, void *out, Size total_bytes)
+{
+    Size got = 0;
+    lseek(fd, offset, SEEK_SET);
+    while (got < total_bytes)
+    {
+        ssize_t n = read(fd, (char *)out + got,
+                         Min(total_bytes - got, (Size)64 * 1024 * 1024));
+        if (n <= 0)
+            return got;
+        got += n;
+    }
+    return got;
+}
+
+/* Write raw bytes to sequential pages in a file (legacy, kept for meta page) */
 static int
 fh_write_section(int fd, const void *data, Size total_bytes, int *page_count)
 {
@@ -118,41 +151,39 @@ fh_store_write(const char *path,
     if (write(fd, meta_page, FH_PAGE_SIZE) != FH_PAGE_SIZE)
     { close(fd); return -1; }
 
-    /* SQ8 params: sq8_mins[dim] + sq8_scales[dim] */
-    sq8_params_offset = FH_PAGE_SIZE;
+    /* Raw contiguous sections (no page framing for bulk data) */
+    /* Layout after meta page: [sq8_params | packed_t | sq8_codes | norms] */
     {
-        Size params_size = sizeof(float) * meta->dim * 2;
-        float *params_buf = malloc(params_size);
+        Size sq8_params_size = sizeof(float) * meta->dim * 2;
+        float *params_buf = malloc(sq8_params_size);
+        off_t section_pos;
+        FHMetaPageDataV2 *m;
+
         if (!params_buf) { close(fd); return -1; }
         memcpy(params_buf, sq8_mins, sizeof(float) * meta->dim);
         memcpy(params_buf + meta->dim, sq8_scales, sizeof(float) * meta->dim);
-        fh_write_section(fd, params_buf, params_size, &sq8_params_pages);
+
+        /* Section offsets stored as byte positions from file start */
+        sq8_params_offset = FH_PAGE_SIZE;  /* right after meta page */
+        fh_write_raw(fd, params_buf, sq8_params_size);
         free(params_buf);
-    }
 
-    /* Packed codes (transposed) */
-    packed_offset = sq8_params_offset + (off_t)sq8_params_pages * FH_PAGE_SIZE;
-    fh_write_section(fd, packed_t, packed_t_size, &packed_pages);
+        packed_offset = sq8_params_offset + (off_t)sq8_params_size;
+        fh_write_raw(fd, packed_t, packed_t_size);
 
-    /* SQ8 payload */
-    sq8_data_offset = packed_offset + (off_t)packed_pages * FH_PAGE_SIZE;
-    fh_write_section(fd, sq8_codes, sq8_size, &sq8_pages);
+        sq8_data_offset = packed_offset + (off_t)packed_t_size;
+        fh_write_raw(fd, sq8_codes, sq8_size);
 
-    /* Norms */
-    norm_offset = sq8_data_offset + (off_t)sq8_pages * FH_PAGE_SIZE;
-    fh_write_section(fd, norms, sizeof(float) * n_rows, &norm_pages);
+        norm_offset = sq8_data_offset + (off_t)sq8_size;
+        fh_write_raw(fd, norms, sizeof(float) * n_rows);
 
-    /* Rewrite meta page with offsets */
-    {
-        FHMetaPageDataV2 *m = (FHMetaPageDataV2 *)(meta_page + sizeof(FHFilePageHeader));
-        m->sq8_params_start = 1;  /* page 1 */
-        m->sq8_params_npages = sq8_params_pages;
-        m->packed_start = 1 + sq8_params_pages;
-        m->packed_npages = packed_pages;
-        m->sq8_start = m->packed_start + packed_pages;
-        m->sq8_npages = sq8_pages;
-        m->norm_start = m->sq8_start + sq8_pages;
-        m->norm_npages = norm_pages;
+        /* Rewrite meta page with exact byte offsets */
+        m = (FHMetaPageDataV2 *)(meta_page + sizeof(FHFilePageHeader));
+        m->off_sq8_params = sq8_params_offset;
+        m->off_packed = packed_offset;
+        m->off_sq8 = sq8_data_offset;
+        m->off_norms = norm_offset;
+        m->off_end = norm_offset + (off_t)(sizeof(float) * n_rows);
 
         lseek(fd, 0, SEEK_SET);
         write(fd, meta_page, FH_PAGE_SIZE);
@@ -225,21 +256,18 @@ fh_store_scan(const char *path, const FHParams *params,
     top_scores = palloc(sizeof(float) * shortlist_m);
 
     {
-        off_t   packed_file_offset = (off_t)meta->packed_start * FH_PAGE_SIZE;
         Size    total_packed = (Size)n_bytes * n_rows;
         uint8  *packed_buf;
         float  *scores;
 
-        /* For this prototype: read entire packed section into memory.
-         * For large datasets, could be page-at-a-time with partial scoring. */
+        /* Bulk raw read — single pread per section, no page framing */
         packed_buf = MemoryContextAllocHuge(CurrentMemoryContext, total_packed);
-        fh_read_section(fd, packed_file_offset, packed_buf, total_packed);
+        fh_read_raw(fd, meta->off_packed, packed_buf, total_packed);
 
         /* Read norms */
         {
-            off_t norm_file_offset = (off_t)meta->norm_start * FH_PAGE_SIZE;
             float *norms = palloc(sizeof(float) * n_rows);
-            fh_read_section(fd, norm_file_offset, norms, sizeof(float) * n_rows);
+            fh_read_raw(fd, meta->off_norms, norms, sizeof(float) * n_rows);
 
             /* Score all rows */
             scores = palloc(sizeof(float) * n_rows);
@@ -266,12 +294,11 @@ fh_store_scan(const char *path, const FHParams *params,
         int     final_filled = 0, final_min_pos = 0;
         float   final_min_score = -FLT_MAX;
 
-        /* Read SQ8 params */
+        /* Read SQ8 params (raw) */
         {
-            off_t sq8p_offset = (off_t)meta->sq8_params_start * FH_PAGE_SIZE;
             Size params_size = sizeof(float) * dim * 2;
             float *params_buf = palloc(params_size);
-            fh_read_section(fd, sq8p_offset, params_buf, params_size);
+            fh_read_raw(fd, meta->off_sq8_params, params_buf, params_size);
             sq8_mins_local = params_buf;
             sq8_scales_local = params_buf + dim;
         }
@@ -290,60 +317,10 @@ fh_store_scan(const char *path, const FHParams *params,
         for (i = 0; i < filled; i++)
         {
             int row = top_ids[i];
-            off_t sq8_offset = (off_t)meta->sq8_start * FH_PAGE_SIZE;
-            /* Read just this row's SQ8 codes */
-            /* For this prototype: read the page(s) containing this row */
-            Size row_byte_offset = (Size)row * dim;
-            Size row_page_start = (row_byte_offset / FH_DATA_PER_PAGE) * FH_PAGE_SIZE;
+            /* Raw pread of this row's SQ8 codes */
             uint8 row_codes[8192]; /* max dim */
             float dot = 0.0f;
-
-            /* Simple: read from section offset */
-            {
-                char page_buf[FH_PAGE_SIZE];
-                Size read_offset = 0;
-                Size remaining = dim;
-
-                lseek(fd, sq8_offset, SEEK_SET);
-                /* Skip to the right position */
-                {
-                    Size skip = row_byte_offset;
-                    while (skip > 0)
-                    {
-                        FHFilePageHeader hdr;
-                        if (read(fd, page_buf, FH_PAGE_SIZE) != FH_PAGE_SIZE)
-                            break;
-                        memcpy(&hdr, page_buf, sizeof(hdr));
-                        if ((Size)hdr.length <= skip)
-                        {
-                            skip -= hdr.length;
-                        }
-                        else
-                        {
-                            /* Partial page: copy what we need */
-                            Size avail = hdr.length - skip;
-                            Size take = Min(avail, remaining);
-                            memcpy(row_codes, page_buf + sizeof(FHFilePageHeader) + skip, take);
-                            read_offset += take;
-                            remaining -= take;
-                            skip = 0;
-                        }
-                    }
-                }
-                /* Continue reading if needed */
-                while (remaining > 0)
-                {
-                    FHFilePageHeader hdr;
-                    Size take;
-                    if (read(fd, page_buf, FH_PAGE_SIZE) != FH_PAGE_SIZE)
-                        break;
-                    memcpy(&hdr, page_buf, sizeof(hdr));
-                    take = Min((Size)hdr.length, remaining);
-                    memcpy(row_codes + read_offset, page_buf + sizeof(FHFilePageHeader), take);
-                    read_offset += take;
-                    remaining -= take;
-                }
-            }
+            fh_read_raw(fd, meta->off_sq8 + (off_t)row * dim, row_codes, dim);
 
             for (j = 0; j < dim; j++)
             {

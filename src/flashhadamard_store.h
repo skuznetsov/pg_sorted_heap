@@ -72,16 +72,13 @@ typedef struct FHMetaPageDataV2
     int32       group_size;
     int32       n_groups;
     int32       seed;
-    BlockNumber packed_start;
-    int32       packed_npages;
-    BlockNumber sq8_start;
-    int32       sq8_npages;
-    BlockNumber norm_start;
-    int32       norm_npages;
-    BlockNumber sq8_params_start;   /* pages for sq8_mins + sq8_scales */
-    int32       sq8_params_npages;
+    /* Byte offsets within the store file for raw contiguous sections */
+    int64       off_sq8_params;     /* sq8_mins[dim] + sq8_scales[dim] */
+    int64       off_packed;         /* packed_t[n_bytes * n_rows] */
+    int64       off_sq8;            /* sq8_codes[n_rows * dim] */
+    int64       off_norms;          /* norms[n_rows] */
+    int64       off_end;            /* total file size */
     float       centers[FH_MAX_CENTERS];
-    /* group_scales stored inline if n_groups <= FH_MAX_GROUPS */
     float       group_scales[FH_MAX_GROUPS];
 } FHMetaPageDataV2;
 
