@@ -120,6 +120,9 @@ different holdout splits); the canonical numbers above supersede them.
 | Per-dimension whitening | Refuted | Underperforms plain block-Hadamard on recall@10 across 2–4 bits | Code-graph 1124×768D |
 | Companding (power β=0.75) | Refuted | Worse than block-Hadamard at all tested bit rates | Code-graph 1124×768D |
 | D4 lattice quantization | Refuted | Worse recall + 25× slower encode in Python | Code-graph 1124×768D |
+| FH-space RP-sort segments | Refuted | 1D random projection of 2880D vectors loses cluster structure; recall@10 = 20.8% at nprobe=4 vs 93.5% content-sort baseline. | Gutenberg 103K×2880D |
+| FH-space k-means segments | Refuted | 26-cluster Lloyd's k-means in FH equalized-rotated space; recall@10 = 54.0% at nprobe=4. 2.6× better than RP-sort but still far below 93.5% content-sort baseline. FH space doesn't cluster well enough for segment pruning at 2880D. | Gutenberg 103K×2880D |
+| AVX2 int16 kernel (Intel) | Refuted | Same 256-entry int16 LUT approach as NEON, but 2× SLOWER on Intel Xeon Platinum 8223CL (110ms vs 57ms float). The NEON win is Apple Silicon-specific (vaddw_s16 microarchitecture advantage). On Intel, the compiler's float path + AVX auto-vectorization is already strong; int16 LUT lookups don't improve cache utilization enough to offset the widening overhead. | Synthetic 103K×2880D, c5.large |
 
 ## Interpretation
 
@@ -292,11 +295,76 @@ Source:
 - Python harness: `scripts/bench_turboquant_retrieval.py`
 - C helper: `scripts/turboquant_packed_adc.c`
 
+## NEON Int16 Kernel (Experimental)
+
+**Status:** Integrated behind `FH_INT16=1` env var. Promising, partially validated.
+
+**Mechanism:** 256-entry int16 LUTs (quantized from float at scale=2048) + NEON
+`vaddw_s16` widening accumulation in int32. Converts to float for top-k + SQ8 rerank.
+Works in both single-thread and multi-thread paths.
+
+**End-to-end SQ8-reranked quality (50 Gutenberg queries, vs 8t float baseline):**
+
+| Config | hit@1 | top-10 overlap | max reranked score diff |
+|--------|-------|----------------|------------------------|
+| 1t float | 50/50 | 100.0% | - |
+| 1t int16 | 50/50 | 100.0% | 0.00000000 |
+| 8t int16 | 50/50 | 77.6% | 0.00000000 |
+
+**Latency (10 queries, best of 3 rounds):**
+
+| Config | Total | Per query | vs float |
+|--------|-------|-----------|----------|
+| 1t float | 404 ms | 40.4 ms | baseline |
+| 1t int16 | 368 ms | 36.8 ms | -8.9% |
+| 8t float | 77 ms | 7.7 ms | baseline |
+| 8t int16 | 70 ms | 7.0 ms | -9.0% |
+
+**Why it works:** Smaller LUT entries (2 bytes vs 4) → better L1 cache utilization.
+Zero clipping at scale=2048 on real query coefficients. Standalone microbench shows
+14% kernel-only improvement; end-to-end is 9% due to fixed overhead (SQ8 rerank,
+table quantization, PG runtime).
+
+**Reproduce:**
+```sh
+# Build store (once)
+psql -d fh_test -c "SELECT flashhadamard_store_build('gutenberg_local'::regclass,
+  'embedding', '/tmp/fh_gutenberg.store', 42, 4)"
+
+# For each config: stop PG, export vars, start PG, run quality script
+#   Configs: FH_THREADS=1, FH_THREADS=1 FH_INT16=1,
+#            FH_THREADS=8, FH_THREADS=8 FH_INT16=1
+psql -d fh_test -v config=8t_float -f scripts/bench_fh_int16_quality.sql
+# ... restart with FH_INT16=1, repeat with config=8t_int16 ...
+
+# Compare all configs (tables persist across sessions)
+psql -d fh_test -f scripts/bench_fh_int16_compare.sql
+```
+
+**Caveats:**
+- 8t int16 top-10 overlap is 77.6% — int16 shortlist differs at the boundary.
+  Reranked scores for overlapping results are identical (zero diff).
+- 1t int16 is quality-identical to float (100% overlap, zero diff).
+- Standalone kernel microbench (`scripts/bench_fh_kernel.c`) shows larger speedup
+  (14-19%) than end-to-end (9%) — the gap is fixed per-query overhead.
+- Not yet default. 50 queries on one dataset is a start, not comprehensive validation.
+- **Intel/AVX2 int16: refuted.** Same int16 LUT approach is 2× slower on Xeon.
+  The NEON int16 win is Apple Silicon-specific.
+- **Intel/AVX2 float gather: promising.** `_mm256_i32gather_ps` gives 28% kernel
+  speedup on Xeon (54.4→39.1ms). Not yet integrated into engine. Zero quality
+  risk (bit-identical float output). See `scripts/bench_fh_kernel.c` k4.
+
 ## Open Work (Research Only)
 
-1. **Better segment construction.** FH-space k-means, multi-centroid
-   summaries. Gate: low nprobe must beat 93.5% recall.
-2. **Integer/SIMD kernel.** Outside PG first, ARM NEON, then Intel AVX.
+1. **Segment construction.** Both RP-sort and FH-space k-means refuted.
+   Content-sort (93.5%) remains best. Pruning branch is **parked** at 103K scale.
+   Infrastructure preserved: nprobe SQL parameter, offline k-means script.
+   Revisit at 500K+ where exhaustive becomes expensive.
+2. **SIMD kernel candidates (standalone microbench, not yet in engine).**
+   - Apple NEON int16 LUT: -17% kernel (integrated as `FH_INT16=1`, ~9% e2e)
+   - Intel AVX2 gather (`_mm256_i32gather_ps`): **-28% kernel** (not yet integrated)
+   - Intel AVX2 int16 LUT: refuted (+92%, slower)
+   - See `scripts/bench_fh_kernel.c` for all variants and repro commands.
 3. **Larger scale (500K+).** Where pruning and IVF become relevant.
 4. **PG-native parallel model.** Replace experimental pthread.
 5. **Official TurboQuant comparison.** No public implementation was
