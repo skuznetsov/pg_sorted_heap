@@ -259,6 +259,7 @@ fh_store_write(const char *path,
 int
 fh_store_scan(const char *path, const FHParams *params,
               const float *query_vec, int k, int shortlist_m,
+              int nprobe_override,
               int32 *out_ids, float *out_scores)
 {
     FHStoreCache *cache;
@@ -377,13 +378,17 @@ fh_store_scan(const char *path, const FHParams *params,
                 if (seg_scores[seg_order[j]] > seg_scores[seg_order[i]])
                 { int tmp = seg_order[i]; seg_order[i] = seg_order[j]; seg_order[j] = tmp; }
 
-        /* Probe top-P segments (default: 75%, configurable via env var) */
+        /* Probe top-P segments (nprobe_override > 0 takes precedence, then env, then 75%) */
         {
-            const char *env_probe = getenv("FH_NPROBE_SEGMENTS");
-            if (env_probe)
-                n_probe = atoi(env_probe);
-            else
-                n_probe = (n_seg * 3 + 3) / 4;  /* 75% */
+            if (nprobe_override > 0)
+                n_probe = nprobe_override;
+            else {
+                const char *env_probe = getenv("FH_NPROBE_SEGMENTS");
+                if (env_probe)
+                    n_probe = atoi(env_probe);
+                else
+                    n_probe = (n_seg * 3 + 3) / 4;  /* 75% */
+            }
             if (n_probe < 1) n_probe = 1;
             if (n_probe > n_seg) n_probe = n_seg;
         }

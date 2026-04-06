@@ -54,11 +54,12 @@ CREATE OR REPLACE FUNCTION flashhadamard_store_scan(
     k           int4 DEFAULT 10,
     shortlist_m int4 DEFAULT 12,
     seed        int4 DEFAULT 42,
-    group_size  int4 DEFAULT 16
+    group_size  int4 DEFAULT 16,
+    nprobe      int4 DEFAULT 0   -- 0 = use env/default (75%)
 ) RETURNS TABLE(row_id int4, score float8)
 AS '$libdir/pg_sorted_heap', 'flashhadamard_store_scan'
 LANGUAGE C STABLE;
 
-COMMENT ON FUNCTION flashhadamard_store_scan(text, vector, int4, int4, int4, int4) IS
+COMMENT ON FUNCTION flashhadamard_store_scan(text, vector, int4, int4, int4, int4, int4) IS
 'Scan FlashHadamard file-based segment store. '
-'No SPI/TOAST in hot path — reads raw pages directly.';
+'nprobe=0 uses FH_NPROBE_SEGMENTS env or default 75%. Set nprobe>0 to override.';

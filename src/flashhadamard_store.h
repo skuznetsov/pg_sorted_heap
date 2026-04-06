@@ -128,6 +128,7 @@ extern int fh_store_write(const char *path,
 
 extern int fh_store_scan(const char *path, const FHParams *params,
                           const float *query_vec, int k, int shortlist_m,
+                          int nprobe_override, /* <=0 = use env/default */
                           int32 *out_ids, float *out_scores);
 
 #endif /* FLASHHADAMARD_STORE_H */

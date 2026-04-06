@@ -32,6 +32,16 @@
 #include <float.h>
 #include <stdlib.h>
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#define FH_HAS_NEON 1
+#else
+#define FH_HAS_NEON 0
+#endif
+
+/* Int16 kernel scale factor (2048 = 11 bits, zero clipping on Gutenberg) */
+#define FH_INT16_SCALE 2048.0f
+
 /* Gaussian Lloyd-Max centers for 4-bit (precomputed, matching Python harness) */
 static const float fh_lloyd_max_16[16] = {
     -2.1519927f, -1.5341205f, -1.1503494f, -0.8326452f,
@@ -263,6 +273,9 @@ typedef struct FHScoreTask
     int          topk;
     int32       *top_ids;     /* per-thread top-k output */
     float       *top_scores;
+#if FH_HAS_NEON
+    const int16 *int16_tables; /* NULL = use float path */
+#endif
 } FHScoreTask;
 
 static void *
@@ -270,60 +283,113 @@ fh_score_worker(void *arg)
 {
     FHScoreTask *t = (FHScoreTask *)arg;
     int     rows = t->row_end - t->row_start;
-    float  *scores;
     int     row, byte_idx;
     int     filled = 0, min_pos = 0;
     float   min_score = -FLT_MAX;
 
-    scores = (float *)malloc(sizeof(float) * rows);
-    if (!scores)
+#if FH_HAS_NEON
+    /* Int16 NEON path: accumulate in int32, convert to float for top-k */
+    if (t->int16_tables)
     {
-        /* Alloc failure: mark all outputs as invalid */
-        int idx;
-        for (idx = 0; idx < t->topk; idx++)
-        {
-            t->top_ids[idx] = -1;
-            t->top_scores[idx] = -FLT_MAX;
-        }
-        return NULL;
-    }
-    memset(scores, 0, sizeof(float) * rows);
+        int32 *iscores = (int32 *)malloc(sizeof(int32) * rows);
+        if (!iscores) goto alloc_fail;
+        memset(iscores, 0, sizeof(int32) * rows);
 
-    /* 2-byte fused scoring for this row range */
-    byte_idx = 0;
-    for (; byte_idx + 1 < t->n_bytes; byte_idx += 2)
-    {
-        const uint8 *codes0 = t->packed_t + (Size)byte_idx * t->n_rows + t->row_start;
-        const uint8 *codes1 = t->packed_t + (Size)(byte_idx + 1) * t->n_rows + t->row_start;
-        const float *table0 = t->byte_tables + byte_idx * 256;
-        const float *table1 = t->byte_tables + (byte_idx + 1) * 256;
-
-        for (row = 0; row + 3 < rows; row += 4)
+        for (byte_idx = 0; byte_idx + 1 < t->n_bytes; byte_idx += 2)
         {
-            scores[row + 0] += table0[codes0[row + 0]] + table1[codes1[row + 0]];
-            scores[row + 1] += table0[codes0[row + 1]] + table1[codes1[row + 1]];
-            scores[row + 2] += table0[codes0[row + 2]] + table1[codes1[row + 2]];
-            scores[row + 3] += table0[codes0[row + 3]] + table1[codes1[row + 3]];
+            const uint8 *c0 = t->packed_t + (Size)byte_idx * t->n_rows + t->row_start;
+            const uint8 *c1 = t->packed_t + (Size)(byte_idx+1) * t->n_rows + t->row_start;
+            const int16 *t0 = t->int16_tables + byte_idx * 256;
+            const int16 *t1 = t->int16_tables + (byte_idx+1) * 256;
+
+            for (row = 0; row + 7 < rows; row += 8)
+            {
+                int16 v0[8], v1[8];
+                v0[0]=t0[c0[row+0]]; v1[0]=t1[c1[row+0]];
+                v0[1]=t0[c0[row+1]]; v1[1]=t1[c1[row+1]];
+                v0[2]=t0[c0[row+2]]; v1[2]=t1[c1[row+2]];
+                v0[3]=t0[c0[row+3]]; v1[3]=t1[c1[row+3]];
+                v0[4]=t0[c0[row+4]]; v1[4]=t1[c1[row+4]];
+                v0[5]=t0[c0[row+5]]; v1[5]=t1[c1[row+5]];
+                v0[6]=t0[c0[row+6]]; v1[6]=t1[c1[row+6]];
+                v0[7]=t0[c0[row+7]]; v1[7]=t1[c1[row+7]];
+
+                int16x8_t sum16 = vaddq_s16(vld1q_s16(v0), vld1q_s16(v1));
+                int32x4_t s_lo = vld1q_s32(iscores + row);
+                int32x4_t s_hi = vld1q_s32(iscores + row + 4);
+                s_lo = vaddw_s16(s_lo, vget_low_s16(sum16));
+                s_hi = vaddw_s16(s_hi, vget_high_s16(sum16));
+                vst1q_s32(iscores + row, s_lo);
+                vst1q_s32(iscores + row + 4, s_hi);
+            }
+            for (; row < rows; row++)
+                iscores[row] += (int32)t0[c0[row]] + (int32)t1[c1[row]];
         }
-        for (; row < rows; row++)
-            scores[row] += table0[codes0[row]] + table1[codes1[row]];
+        if (byte_idx < t->n_bytes)
+        {
+            const uint8 *c = t->packed_t + (Size)byte_idx * t->n_rows + t->row_start;
+            const int16 *tbl = t->int16_tables + byte_idx * 256;
+            for (row = 0; row < rows; row++) iscores[row] += (int32)tbl[c[row]];
+        }
+
+        /* Convert to float score and apply norms, insert into top-k */
+        {
+            float inv_scale = 1.0f / FH_INT16_SCALE;
+            for (row = 0; row < rows; row++)
+            {
+                float s = (float)iscores[row] * inv_scale;
+                if (t->norms) s *= t->norms[t->row_start + row];
+                fh_topk_insert(s, t->row_start + row, t->top_scores, t->top_ids,
+                                t->topk, &filled, &min_pos, &min_score);
+            }
+        }
+        free(iscores);
+        goto mark_unfilled;
     }
-    if (byte_idx < t->n_bytes)
+#endif /* FH_HAS_NEON */
+
+    /* Float path (production default) */
     {
-        const uint8 *codes = t->packed_t + (Size)byte_idx * t->n_rows + t->row_start;
-        const float *table = t->byte_tables + byte_idx * 256;
+        float *scores = (float *)malloc(sizeof(float) * rows);
+        if (!scores) goto alloc_fail;
+        memset(scores, 0, sizeof(float) * rows);
+
+        byte_idx = 0;
+        for (; byte_idx + 1 < t->n_bytes; byte_idx += 2)
+        {
+            const uint8 *codes0 = t->packed_t + (Size)byte_idx * t->n_rows + t->row_start;
+            const uint8 *codes1 = t->packed_t + (Size)(byte_idx + 1) * t->n_rows + t->row_start;
+            const float *table0 = t->byte_tables + byte_idx * 256;
+            const float *table1 = t->byte_tables + (byte_idx + 1) * 256;
+
+            for (row = 0; row + 3 < rows; row += 4)
+            {
+                scores[row + 0] += table0[codes0[row + 0]] + table1[codes1[row + 0]];
+                scores[row + 1] += table0[codes0[row + 1]] + table1[codes1[row + 1]];
+                scores[row + 2] += table0[codes0[row + 2]] + table1[codes1[row + 2]];
+                scores[row + 3] += table0[codes0[row + 3]] + table1[codes1[row + 3]];
+            }
+            for (; row < rows; row++)
+                scores[row] += table0[codes0[row]] + table1[codes1[row]];
+        }
+        if (byte_idx < t->n_bytes)
+        {
+            const uint8 *codes = t->packed_t + (Size)byte_idx * t->n_rows + t->row_start;
+            const float *table = t->byte_tables + byte_idx * 256;
+            for (row = 0; row < rows; row++)
+                scores[row] += table[codes[row]];
+        }
+
         for (row = 0; row < rows; row++)
-            scores[row] += table[codes[row]];
+        {
+            float s = t->norms ? scores[row] * t->norms[t->row_start + row] : scores[row];
+            fh_topk_insert(s, t->row_start + row, t->top_scores, t->top_ids,
+                            t->topk, &filled, &min_pos, &min_score);
+        }
+        free(scores);
     }
 
-    /* Per-thread top-k with norms */
-    for (row = 0; row < rows; row++)
-    {
-        float s = t->norms ? scores[row] * t->norms[t->row_start + row] : scores[row];
-        fh_topk_insert(s, t->row_start + row, t->top_scores, t->top_ids,
-                        t->topk, &filled, &min_pos, &min_score);
-    }
-
+mark_unfilled:
     /* Mark unfilled slots */
     {
         int i;
@@ -333,8 +399,17 @@ fh_score_worker(void *arg)
             t->top_scores[i] = -FLT_MAX;
         }
     }
+    return NULL;
 
-    free(scores);
+alloc_fail:
+    {
+        int idx;
+        for (idx = 0; idx < t->topk; idx++)
+        {
+            t->top_ids[idx] = -1;
+            t->top_scores[idx] = -FLT_MAX;
+        }
+    }
     return NULL;
 }
 #endif /* !_WIN32 */
@@ -348,6 +423,36 @@ fh_packed_score_topk_t(const uint8 *packed_t, const float *byte_tables,
 #ifndef _WIN32
     int     n_threads;
     int     i, j;
+#if FH_HAS_NEON
+    int16  *int16_tables = NULL;
+    int     use_int16 = 0;
+    { const char *env_i = getenv("FH_INT16");
+      use_int16 = (env_i && env_i[0] == '1'); }
+    if (use_int16)
+    {
+        int total_entries = n_bytes * 256;
+        float32x4_t vscale = vdupq_n_f32(FH_INT16_SCALE);
+        int16_tables = palloc(sizeof(int16) * total_entries);
+        /* Vectorized float→int16 quantization (8 entries per iteration) */
+        for (i = 0; i + 7 < total_entries; i += 8)
+        {
+            float32x4_t f0 = vmulq_f32(vld1q_f32(byte_tables + i), vscale);
+            float32x4_t f1 = vmulq_f32(vld1q_f32(byte_tables + i + 4), vscale);
+            int32x4_t i0 = vcvtnq_s32_f32(f0);
+            int32x4_t i1 = vcvtnq_s32_f32(f1);
+            int16x4_t lo = vqmovn_s32(i0);
+            int16x4_t hi = vqmovn_s32(i1);
+            vst1q_s16(int16_tables + i, vcombine_s16(lo, hi));
+        }
+        for (; i < total_entries; i++)
+        {
+            int32 q = (int32)roundf(byte_tables[i] * FH_INT16_SCALE);
+            if (q > 32767) q = 32767;
+            if (q < -32768) q = -32768;
+            int16_tables[i] = (int16)q;
+        }
+    }
+#endif
 
     /* Runtime thread count: FH_THREADS env or default 8 */
     {
@@ -393,6 +498,9 @@ fh_packed_score_topk_t(const uint8 *packed_t, const float *byte_tables,
             tasks[i].topk = topk;
             tasks[i].top_ids = all_ids + i * topk;
             tasks[i].top_scores = all_scores + i * topk;
+#if FH_HAS_NEON
+            tasks[i].int16_tables = int16_tables;
+#endif
 
             if (pthread_create(&threads[i], NULL, fh_score_worker, &tasks[i]) == 0)
                 launched++;
@@ -430,6 +538,9 @@ fh_packed_score_topk_t(const uint8 *packed_t, const float *byte_tables,
                 tail.topk = topk;
                 tail.top_ids = all_ids + launched * topk;
                 tail.top_scores = all_scores + launched * topk;
+#if FH_HAS_NEON
+                tail.int16_tables = int16_tables;
+#endif
                 fh_score_worker(&tail);
                 launched++;  /* count the inline "thread" for merge */
             }
@@ -454,6 +565,9 @@ fh_packed_score_topk_t(const uint8 *packed_t, const float *byte_tables,
             }
             pfree(all_ids);
             pfree(all_scores);
+#if FH_HAS_NEON
+            if (int16_tables) pfree(int16_tables);
+#endif
             return;
         }
     }
@@ -462,47 +576,109 @@ fh_packed_score_topk_t(const uint8 *packed_t, const float *byte_tables,
     /* Single-thread fallback */
     {
         int     row, byte_idx;
-        float  *scores;
         int     min_pos = 0;
         float   min_score = -FLT_MAX;
 
-        scores = palloc(sizeof(float) * n_rows);
-        memset(scores, 0, sizeof(float) * n_rows);
-
-        byte_idx = 0;
-        for (; byte_idx + 1 < n_bytes; byte_idx += 2)
+#if FH_HAS_NEON
+        /* Int16 single-thread path */
+        if (use_int16 && int16_tables)
         {
-            const uint8 *codes0 = packed_t + (Size)byte_idx * n_rows;
-            const uint8 *codes1 = packed_t + (Size)(byte_idx + 1) * n_rows;
-            const float *table0 = byte_tables + byte_idx * 256;
-            const float *table1 = byte_tables + (byte_idx + 1) * 256;
+            int32 *iscores = palloc(sizeof(int32) * n_rows);
+            float  inv_scale = 1.0f / FH_INT16_SCALE;
+            memset(iscores, 0, sizeof(int32) * n_rows);
 
-            for (row = 0; row + 3 < n_rows; row += 4)
+            for (byte_idx = 0; byte_idx + 1 < n_bytes; byte_idx += 2)
             {
-                scores[row + 0] += table0[codes0[row + 0]] + table1[codes1[row + 0]];
-                scores[row + 1] += table0[codes0[row + 1]] + table1[codes1[row + 1]];
-                scores[row + 2] += table0[codes0[row + 2]] + table1[codes1[row + 2]];
-                scores[row + 3] += table0[codes0[row + 3]] + table1[codes1[row + 3]];
-            }
-            for (; row < n_rows; row++)
-                scores[row] += table0[codes0[row]] + table1[codes1[row]];
-        }
-        if (byte_idx < n_bytes)
-        {
-            const uint8 *codes = packed_t + (Size)byte_idx * n_rows;
-            const float *table = byte_tables + byte_idx * 256;
-            for (row = 0; row < n_rows; row++)
-                scores[row] += table[codes[row]];
-        }
+                const uint8 *c0 = packed_t + (Size)byte_idx * n_rows;
+                const uint8 *c1 = packed_t + (Size)(byte_idx+1) * n_rows;
+                const int16 *t0 = int16_tables + byte_idx * 256;
+                const int16 *t1 = int16_tables + (byte_idx+1) * 256;
 
-        *filled = 0;
-        for (row = 0; row < n_rows; row++)
-        {
-            float s = norms ? scores[row] * norms[row] : scores[row];
-            fh_topk_insert(s, row, top_scores, top_ids, topk,
-                            filled, &min_pos, &min_score);
+                for (row = 0; row + 7 < n_rows; row += 8)
+                {
+                    int16 v0[8], v1[8];
+                    v0[0]=t0[c0[row+0]]; v1[0]=t1[c1[row+0]];
+                    v0[1]=t0[c0[row+1]]; v1[1]=t1[c1[row+1]];
+                    v0[2]=t0[c0[row+2]]; v1[2]=t1[c1[row+2]];
+                    v0[3]=t0[c0[row+3]]; v1[3]=t1[c1[row+3]];
+                    v0[4]=t0[c0[row+4]]; v1[4]=t1[c1[row+4]];
+                    v0[5]=t0[c0[row+5]]; v1[5]=t1[c1[row+5]];
+                    v0[6]=t0[c0[row+6]]; v1[6]=t1[c1[row+6]];
+                    v0[7]=t0[c0[row+7]]; v1[7]=t1[c1[row+7]];
+
+                    int16x8_t sum16 = vaddq_s16(vld1q_s16(v0), vld1q_s16(v1));
+                    int32x4_t s_lo = vld1q_s32(iscores + row);
+                    int32x4_t s_hi = vld1q_s32(iscores + row + 4);
+                    s_lo = vaddw_s16(s_lo, vget_low_s16(sum16));
+                    s_hi = vaddw_s16(s_hi, vget_high_s16(sum16));
+                    vst1q_s32(iscores + row, s_lo);
+                    vst1q_s32(iscores + row + 4, s_hi);
+                }
+                for (; row < n_rows; row++)
+                    iscores[row] += (int32)t0[c0[row]] + (int32)t1[c1[row]];
+            }
+            if (byte_idx < n_bytes)
+            {
+                const uint8 *c = packed_t + (Size)byte_idx * n_rows;
+                const int16 *tbl = int16_tables + byte_idx * 256;
+                for (row = 0; row < n_rows; row++) iscores[row] += (int32)tbl[c[row]];
+            }
+
+            *filled = 0;
+            for (row = 0; row < n_rows; row++)
+            {
+                float s = (float)iscores[row] * inv_scale;
+                if (norms) s *= norms[row];
+                fh_topk_insert(s, row, top_scores, top_ids, topk,
+                                filled, &min_pos, &min_score);
+            }
+            pfree(iscores);
+            pfree(int16_tables);
+            return;
         }
-        pfree(scores);
+        if (int16_tables) pfree(int16_tables);
+#endif /* FH_HAS_NEON */
+
+        /* Float single-thread path */
+        {
+            float *scores = palloc(sizeof(float) * n_rows);
+            memset(scores, 0, sizeof(float) * n_rows);
+
+            byte_idx = 0;
+            for (; byte_idx + 1 < n_bytes; byte_idx += 2)
+            {
+                const uint8 *codes0 = packed_t + (Size)byte_idx * n_rows;
+                const uint8 *codes1 = packed_t + (Size)(byte_idx + 1) * n_rows;
+                const float *table0 = byte_tables + byte_idx * 256;
+                const float *table1 = byte_tables + (byte_idx + 1) * 256;
+
+                for (row = 0; row + 3 < n_rows; row += 4)
+                {
+                    scores[row + 0] += table0[codes0[row + 0]] + table1[codes1[row + 0]];
+                    scores[row + 1] += table0[codes0[row + 1]] + table1[codes1[row + 1]];
+                    scores[row + 2] += table0[codes0[row + 2]] + table1[codes1[row + 2]];
+                    scores[row + 3] += table0[codes0[row + 3]] + table1[codes1[row + 3]];
+                }
+                for (; row < n_rows; row++)
+                    scores[row] += table0[codes0[row]] + table1[codes1[row]];
+            }
+            if (byte_idx < n_bytes)
+            {
+                const uint8 *codes = packed_t + (Size)byte_idx * n_rows;
+                const float *table = byte_tables + byte_idx * 256;
+                for (row = 0; row < n_rows; row++)
+                    scores[row] += table[codes[row]];
+            }
+
+            *filled = 0;
+            for (row = 0; row < n_rows; row++)
+            {
+                float s = norms ? scores[row] * norms[row] : scores[row];
+                fh_topk_insert(s, row, top_scores, top_ids, topk,
+                                filled, &min_pos, &min_score);
+            }
+            pfree(scores);
+        }
     }
 }
 
@@ -1819,8 +1995,8 @@ flashhadamard_store_build(PG_FUNCTION_ARGS)
             centroids = palloc0(sizeof(float) * (Size)n_seg * dim);
             seg_counts = palloc0(sizeof(int) * n_seg);
 
-        /* Pass 2: rotate + quantize + pack + SQ8 min/max + centroid accumulation */
-        elog(NOTICE, "fh_store_build: pass 2 encoding %d vectors (%d segments)", n_rows, n_seg);
+        /* Pass 2: rotate + quantize + pack + SQ8 min/max + segment centroids */
+        elog(NOTICE, "fh_store_build: pass 2 encoding %d vectors", n_rows);
         { float sqrt_dim = sqrtf((float)dim);
           scan = table_beginscan(rel, snapshot, 0, NULL);
           row_idx = 0;
@@ -1832,32 +2008,30 @@ flashhadamard_store_build(PG_FUNCTION_ARGS)
             norm=sqrtf(norm); if(norm<1e-12f)norm=1e-12f; for(d=0;d<dim;d++)vec_buf[d]/=norm; norms[row_idx]=norm;
             for(d=0;d<dim;d++){if(vec_buf[d]<sq8_mins[d])sq8_mins[d]=vec_buf[d]; if(vec_buf[d]>sq8_scales[d])sq8_scales[d]=vec_buf[d];}
             fh_rotate_vec(vec_buf, rot_buf, &params); for(d=0;d<dim;d++)rot_buf[d]*=sqrt_dim;
-            /* Accumulate centroid in equalized rotated space (rot/expanded, same as quantizer input) */
-            { int seg_id = row_idx / FH_SEGMENT_SIZE;
-              float *cen = centroids + (Size)seg_id * dim;
-              for(d=0;d<dim;d++) cen[d] += rot_buf[d] / expanded[d];
-              seg_counts[seg_id]++; }
             { uint8 *rp = packed_codes+(Size)row_idx*n_bytes; memset(rp,0,n_bytes);
               for(d=0;d<dim;d++){float eq=rot_buf[d]/expanded[d]; int code=fh_digitize(eq); int bi=d/2;
               if(d%2==0)rp[bi]|=(uint8)(code&0x0F); else rp[bi]|=(uint8)((code&0x0F)<<4);} }
+            /* Accumulate segment centroid from equalized coordinates */
+            { int seg = row_idx / FH_SEGMENT_SIZE;
+              float *cptr = centroids + (Size)seg * dim;
+              seg_counts[seg]++;
+              for(d=0;d<dim;d++) cptr[d] += rot_buf[d] / expanded[d]; }
             row_idx++; ExecClearTuple(slot);
           }
           n_rows = row_idx;
           table_endscan(scan);
         }
 
-        /* Finalize centroids: divide by count, L2 normalize */
+        /* Normalize segment centroids */
         { int s;
           n_seg = (n_rows + FH_SEGMENT_SIZE - 1) / FH_SEGMENT_SIZE;
-          for (s = 0; s < n_seg; s++)
-          { float *cen = centroids + (Size)s * dim;
-            float cnorm = 0;
-            int cnt = Max(seg_counts[s], 1);
-            for(d=0;d<dim;d++) { cen[d] /= cnt; cnorm += cen[d]*cen[d]; }
-            cnorm = sqrtf(cnorm);
-            if (cnorm > 1e-12f) for(d=0;d<dim;d++) cen[d] /= cnorm;
+          for(s=0; s<n_seg; s++) {
+              if(seg_counts[s] > 0) {
+                  float *cptr = centroids + (Size)s * dim;
+                  float inv = 1.0f / (float)seg_counts[s];
+                  for(d=0; d<dim; d++) cptr[d] *= inv;
+              }
           }
-          pfree(seg_counts);
         }
         } /* end segment centroid accumulators block */
         for(d=0;d<dim;d++){float r=sq8_scales[d]-sq8_mins[d]; if(r<1e-8f)r=1e-8f; sq8_scales[d]=r/255.0f;}
@@ -1941,6 +2115,7 @@ flashhadamard_store_scan(PG_FUNCTION_ARGS)
     int         shortlist_m = PG_GETARG_INT32(3);
     int         seed = PG_GETARG_INT32(4);
     int         group_size = PG_GETARG_INT32(5);
+    int         nprobe_override = PG_NARGS() > 6 ? PG_GETARG_INT32(6) : 0;
 
     float      *query_vec;
     int         dim;
@@ -1994,7 +2169,7 @@ flashhadamard_store_scan(PG_FUNCTION_ARGS)
     out_ids = palloc(sizeof(int32) * k);
     out_scores = palloc(sizeof(float) * k);
     n_results = fh_store_scan(store_path, &params, query_vec, k, shortlist_m,
-                               out_ids, out_scores);
+                               nprobe_override, out_ids, out_scores);
 
     for (i = 0; i < n_results; i++)
     {
