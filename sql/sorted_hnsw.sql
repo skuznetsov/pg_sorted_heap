@@ -52,9 +52,9 @@ RESET sorted_heap.hnsw_ef_patience;
 RESET enable_seqscan;
 EXPLAIN (COSTS OFF)
 SELECT id FROM hnsw_test ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec;
-EXPLAIN (COSTS OFF, FORMAT JSON)
+EXPLAIN (COSTS OFF)
 SELECT id FROM hnsw_test ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec LIMIT 40;
-EXPLAIN (COSTS OFF, FORMAT JSON)
+EXPLAIN (COSTS OFF)
 SELECT id FROM hnsw_test WHERE id > 10 ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec LIMIT 5;
 SET enable_seqscan = off;
 
