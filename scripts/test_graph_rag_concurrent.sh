@@ -76,14 +76,60 @@ cleanup() {
 }
 trap cleanup EXIT
 
+port_is_free() {
+  local port="$1"
+  python3 - "$port" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+    try:
+        s = socket.socket(family, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((host, port))
+        s.close()
+    except OSError:
+        sys.exit(1)
+sys.exit(0)
+PY
+}
+
+pick_free_port() {
+  local candidate="$1"
+  while ! port_is_free "$candidate"; do
+    candidate=$((candidate + 1))
+    if [ "$candidate" -ge 65535 ]; then
+      echo "ERROR: no free port found starting from $1" >&2
+      exit 1
+    fi
+  done
+  echo "$candidate"
+}
+
+start_cluster() {
+  "$PG_BINDIR/pg_ctl" -D "$TMP_DIR/data" -l "$TMP_DIR/postmaster.log" \
+    -o "-k $TMP_DIR -p $PORT" start >/dev/null
+  local i
+  for i in $(seq 1 30); do
+    if "$PG_BINDIR/psql" -h "$TMP_DIR" -p "$PORT" postgres -c "SELECT 1" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "ERROR: cluster at $TMP_DIR failed to start" >&2
+  cat "$TMP_DIR/postmaster.log" >&2
+  exit 1
+}
+
+PORT="$(pick_free_port "$PORT")"
 TMP_DIR="$(mktemp -d "$TMP_ROOT/pg_sorted_heap_graphrag_concurrent.XXXXXX")"
 "$PG_BINDIR/initdb" -D "$TMP_DIR/data" -A trust --no-locale >/dev/null 2>&1
 cat >> "$TMP_DIR/data/postgresql.conf" <<'PGCONF'
 log_min_messages = warning
 shared_preload_libraries = ''
 PGCONF
-"$PG_BINDIR/pg_ctl" -D "$TMP_DIR/data" -l "$TMP_DIR/postmaster.log" \
-  -o "-k $TMP_DIR -p $PORT" start >/dev/null
+start_cluster
 
 PSQL() {
   "$PG_BINDIR/psql" -h "$TMP_DIR" -p "$PORT" postgres -v ON_ERROR_STOP=1 -qtAX "$@"

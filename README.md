@@ -52,6 +52,15 @@ plus planner-integrated HNSW search.
 - Lower-level GraphRAG expand/rerank helpers and scan wrappers
 - Code-corpus and snippet-oriented GraphRAG contracts that currently live
   in benchmark/reference logic
+- FlashHadamard experimental retrieval path:
+  - SQL surface in `sql/flashhadamard_experimental.sql`
+  - current canonical point: exhaustive parallel engine scan on the
+    `103K x 2880D` Gutenberg workload
+  - `FH_INT16=1` is an Apple/NEON-only experimental optimization,
+    not the default execution path
+  - `pthread` inside the backend remains experimental architecture debt;
+    this path is documented, benchmarked, and tested, but not promoted to
+    the stable `0.13` release surface
 
 ### Legacy/manual
 
@@ -821,7 +830,8 @@ FROM sorted_heap_graph_rag(
 Recommended release positioning for `0.13`:
 
 - **stable**: the unified fact-shaped API above
-- **beta**: lower-level wrappers and helper composition
+- **beta**: lower-level wrappers/helper composition and the FlashHadamard
+  experimental retrieval lane
 - **reference logic**: code-corpus snippet/symbol/lexical contracts used by
   the benchmark harnesses
 
@@ -892,6 +902,8 @@ SET sorted_heap.ann_timing = on;                 -- timing breakdown in DEBUG1
 - [Benchmarks](docs/benchmarks.md) -- latency, throughput, vector search
 - [GraphRAG 0.13 Plan](docs/graphrag-0.13-plan.md) -- stable target and hardening gates
 - [Release 0.13.0 Draft](docs/release-0.13.0.md) -- repo-owned GitHub release note draft
+- [FlashHadamard Note](docs/flashhadamard-note.md) -- experimental retrieval lane and canonical operating points
+- [FlashHadamard Retrospective](docs/flashhadamard-retrospective.md) -- what was proved, refuted, and still unproven
 - [Limitations](docs/limitations.md)
 - [Changelog](CHANGELOG.md)
 - [Operations](OPERATIONS.md) -- make targets and diagnostics

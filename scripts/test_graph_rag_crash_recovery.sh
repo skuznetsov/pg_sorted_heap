@@ -66,6 +66,37 @@ PGCONF
   echo "$dir"
 }
 
+port_is_free() {
+  local port="$1"
+  python3 - "$port" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+    try:
+        s = socket.socket(family, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((host, port))
+        s.close()
+    except OSError:
+        sys.exit(1)
+sys.exit(0)
+PY
+}
+
+pick_free_port() {
+  local candidate="$1"
+  while ! port_is_free "$candidate"; do
+    candidate=$((candidate + 1))
+    if [ "$candidate" -ge 65530 ]; then
+      echo "ERROR: no free port found starting from $1" >&2
+      exit 1
+    fi
+  done
+  echo "$candidate"
+}
+
 start_cluster() {
   local dir="$1" port="$2"
   "$PG_BINDIR/pg_ctl" -D "$dir/data" -l "$dir/postmaster.log" \
@@ -229,7 +260,8 @@ SQL
 
 scenario_crash_after_committed_graph_setup() {
   echo "=== Scenario 1: Crash after committed GraphRAG setup ==="
-  local port=$((BASE_PORT))
+  local port
+  port=$(pick_free_port "$BASE_PORT")
   local dir
   dir=$(create_cluster "setup")
   start_cluster "$dir" "$port"
@@ -273,7 +305,8 @@ scenario_crash_after_committed_graph_setup() {
 
 scenario_crash_during_graph_insert() {
   echo "=== Scenario 2: Crash during insert into registered graph ==="
-  local port=$((BASE_PORT + 1))
+  local port
+  port=$(pick_free_port "$((BASE_PORT + 1))")
   local dir
   dir=$(create_cluster "insert")
   start_cluster "$dir" "$port"
@@ -330,7 +363,8 @@ scenario_crash_during_graph_insert() {
 
 scenario_crash_during_graph_compact() {
   echo "=== Scenario 3: Crash during compact on registered graph ==="
-  local port=$((BASE_PORT + 2))
+  local port
+  port=$(pick_free_port "$((BASE_PORT + 2))")
   local dir
   dir=$(create_cluster "compact")
   start_cluster "$dir" "$port"

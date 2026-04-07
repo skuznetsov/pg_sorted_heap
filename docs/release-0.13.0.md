@@ -47,6 +47,11 @@ Still beta:
     `_route_profile_config`, `_route_default_config`, etc.)
 - Lower-level GraphRAG expand/rerank helpers and scan wrappers
 - Code-corpus snippet/symbol/lexical retrieval contracts
+- FlashHadamard experimental retrieval lane:
+  - SQL surface from `sql/flashhadamard_experimental.sql`
+  - file-backed mmap store + exhaustive parallel engine scan
+  - optional `FH_INT16=1` Apple/NEON path
+  - documented tech debt around `pthread` inside the backend
 
 Legacy/manual:
 
@@ -178,6 +183,20 @@ The stats cover:
 These numbers describe the narrow stable fact-shaped contract, not the broader
 code-corpus reference workflows.
 
+### FlashHadamard experimental engine snapshot (`~103K x 2880D`)
+
+- canonical engine point: exhaustive parallel scan, `5-8 ms` p50 on the
+  local Gutenberg workload
+- benchmark-reference external helper path: `8.7 ms`
+- Apple/NEON `FH_INT16=1` remains experimental, with a current
+  approximately `9%` end-to-end win on the validated local query set
+- Intel AVX2 int16 LUT port is refuted for the current design; the stronger
+  x86 kernel branch is the separate AVX2 gather float experiment and is not
+  part of the `0.13` integrated release surface
+
+FlashHadamard is included in `0.13` as an experimental research lane, not as
+part of the stable GraphRAG contract or the default ANN path.
+
 ## Upgrade
 
 ```sql
@@ -208,7 +227,7 @@ bundle, including the narrower GraphRAG bundle.
 
 ## Release-candidate verification
 
-Fresh `0.13.0` release-candidate checks ran on `2026-04-01`:
+Fresh `0.13.0` release-candidate checks ran on `2026-04-07`:
 
 ```bash
 make test-release
@@ -236,7 +255,7 @@ This bundle covers the narrow stable GraphRAG surface directly:
 
 ## Extension-wide release-candidate checks
 
-Fresh extension-wide release checks ran on `2026-04-01`:
+Fresh extension-wide release checks ran on `2026-04-07`:
 
 ```bash
 make test-release
@@ -273,7 +292,8 @@ The clean `0.13` split is:
   fact-shaped GraphRAG API, and the unified routed GraphRAG app flow
   (`sorted_heap_graph_route` + `sorted_heap_graph_route_plan` + setup helpers)
 - **beta**: lower-level routed building blocks, expand/rerank helpers, scan
-  wrappers, deep catalog/introspection functions
+  wrappers, deep catalog/introspection functions, and the FlashHadamard
+  experimental retrieval lane
 - **reference logic**: code-corpus retrieval contracts from the benchmark
   harnesses
 

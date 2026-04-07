@@ -39,6 +39,22 @@
   - one-hop `score_mode := 'path'` being intentionally equivalent to
     `endpoint`
 
+### FlashHadamard experimental status
+
+- Added `sql/flashhadamard_experimental.sql` as the explicit experimental SQL
+  surface for the FlashHadamard retrieval branch.
+- The current canonical experimental point at `103K x 2880D` is the
+  exhaustive parallel engine scan via mmap-backed store, with `5-8 ms` local
+  p50 and a documented benchmark-reference helper path at `8.7 ms`.
+- Added `make test-flashhadamard` and `make bench-flashhadamard` as the
+  canonical experiment validation/benchmark entrypoints.
+- Documented the current execution-model caveat explicitly:
+  `pthread` inside a PostgreSQL backend remains experimental and is not part
+  of the stable `0.13` release contract.
+- Documented `FH_INT16=1` as an Apple/NEON-only experimental optimization
+  with a partially validated local end-to-end win; it remains opt-in and is
+  not the release default.
+
 ### Segmented GraphRAG scale verification
 
 - Consolidated the monolithic vs segmented `10M x 64D` comparison in
