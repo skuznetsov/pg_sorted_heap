@@ -4,7 +4,7 @@
   "description": "pg_sorted_heap physically sorts PostgreSQL table storage by primary key, prunes irrelevant heap blocks with per-page zone maps, and includes built-in vector types plus planner-integrated HNSW search.",
   "version": "0.13.0",
   "maintainer": [
-    "Sergey Kuznetsov <sergey@iterudit.com>"
+    "Sergey Kuznetsov <pgsql@rigelstar.com>"
   ],
   "license": {
     "PostgreSQL": "https://www.postgresql.org/about/licence"
