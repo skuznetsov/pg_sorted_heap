@@ -25,7 +25,7 @@
 #include "utils/lsyscache.h"
 #include "utils/snapmgr.h"
 #include "utils/rel.h"
-#include "catalog/pg_type.h">
+#include "catalog/pg_type.h"
 
 #include <math.h>
 #include <string.h>
@@ -82,7 +82,7 @@ fh_splitmix64(uint64 *state)
 }
 
 /* Generate seed-derived permutation and signs (matches numpy default_rng) */
-void
+static void
 fh_generate_perm_signs(int dim, int seed, int *perm, float *signs)
 {
     /* Simple Fisher-Yates shuffle using splitmix64 */
@@ -305,6 +305,10 @@ fh_score_worker(void *arg)
             for (row = 0; row + 7 < rows; row += 8)
             {
                 int16 v0[8], v1[8];
+                int16x8_t sum16;
+                int32x4_t s_lo;
+                int32x4_t s_hi;
+
                 v0[0]=t0[c0[row+0]]; v1[0]=t1[c1[row+0]];
                 v0[1]=t0[c0[row+1]]; v1[1]=t1[c1[row+1]];
                 v0[2]=t0[c0[row+2]]; v1[2]=t1[c1[row+2]];
@@ -314,9 +318,9 @@ fh_score_worker(void *arg)
                 v0[6]=t0[c0[row+6]]; v1[6]=t1[c1[row+6]];
                 v0[7]=t0[c0[row+7]]; v1[7]=t1[c1[row+7]];
 
-                int16x8_t sum16 = vaddq_s16(vld1q_s16(v0), vld1q_s16(v1));
-                int32x4_t s_lo = vld1q_s32(iscores + row);
-                int32x4_t s_hi = vld1q_s32(iscores + row + 4);
+                sum16 = vaddq_s16(vld1q_s16(v0), vld1q_s16(v1));
+                s_lo = vld1q_s32(iscores + row);
+                s_hi = vld1q_s32(iscores + row + 4);
                 s_lo = vaddw_s16(s_lo, vget_low_s16(sum16));
                 s_hi = vaddw_s16(s_hi, vget_high_s16(sum16));
                 vst1q_s32(iscores + row, s_lo);
@@ -422,7 +426,7 @@ fh_packed_score_topk_t(const uint8 *packed_t, const float *byte_tables,
 {
 #ifndef _WIN32
     int     n_threads;
-    int     i, j;
+    int     i;
 #if FH_HAS_NEON
     int16  *int16_tables = NULL;
     int     use_int16 = 0;
@@ -484,9 +488,12 @@ fh_packed_score_topk_t(const uint8 *packed_t, const float *byte_tables,
 
         for (i = 0; i < n_threads; i++)
         {
-            int start = i * chunk;
+            int start;
+            int end;
+
+            start = i * chunk;
             if (start >= n_rows) break;
-            int end = Min(start + chunk, n_rows);
+            end = Min(start + chunk, n_rows);
 
             tasks[i].packed_t = packed_t;
             tasks[i].byte_tables = byte_tables;
@@ -597,6 +604,10 @@ fh_packed_score_topk_t(const uint8 *packed_t, const float *byte_tables,
                 for (row = 0; row + 7 < n_rows; row += 8)
                 {
                     int16 v0[8], v1[8];
+                    int16x8_t sum16;
+                    int32x4_t s_lo;
+                    int32x4_t s_hi;
+
                     v0[0]=t0[c0[row+0]]; v1[0]=t1[c1[row+0]];
                     v0[1]=t0[c0[row+1]]; v1[1]=t1[c1[row+1]];
                     v0[2]=t0[c0[row+2]]; v1[2]=t1[c1[row+2]];
@@ -606,9 +617,9 @@ fh_packed_score_topk_t(const uint8 *packed_t, const float *byte_tables,
                     v0[6]=t0[c0[row+6]]; v1[6]=t1[c1[row+6]];
                     v0[7]=t0[c0[row+7]]; v1[7]=t1[c1[row+7]];
 
-                    int16x8_t sum16 = vaddq_s16(vld1q_s16(v0), vld1q_s16(v1));
-                    int32x4_t s_lo = vld1q_s32(iscores + row);
-                    int32x4_t s_hi = vld1q_s32(iscores + row + 4);
+                    sum16 = vaddq_s16(vld1q_s16(v0), vld1q_s16(v1));
+                    s_lo = vld1q_s32(iscores + row);
+                    s_hi = vld1q_s32(iscores + row + 4);
                     s_lo = vaddw_s16(s_lo, vget_low_s16(sum16));
                     s_hi = vaddw_s16(s_hi, vget_high_s16(sum16));
                     vst1q_s32(iscores + row, s_lo);
@@ -995,8 +1006,10 @@ fh_search(const FHCodes *codes, const FHParams *params,
                 for (j = i + 1; j < rk_filled; j++)
                     if (out_scores[j] > out_scores[i])
                     {
-                        float ts = out_scores[i]; out_scores[i] = out_scores[j]; out_scores[j] = ts;
-                        int32 ti = out_ids[i]; out_ids[i] = out_ids[j]; out_ids[j] = ti;
+                        float ts = out_scores[i];
+                        int32 ti = out_ids[i];
+                        out_scores[i] = out_scores[j]; out_scores[j] = ts;
+                        out_ids[i] = out_ids[j]; out_ids[j] = ti;
                     }
 
             return rk_filled;
@@ -1011,8 +1024,10 @@ fh_search(const FHCodes *codes, const FHParams *params,
             for (j = i + 1; j < filled; j++)
                 if (shortlist_scores[j] > shortlist_scores[i])
                 {
-                    float ts = shortlist_scores[i]; shortlist_scores[i] = shortlist_scores[j]; shortlist_scores[j] = ts;
-                    int32 ti = shortlist_ids[i]; shortlist_ids[i] = shortlist_ids[j]; shortlist_ids[j] = ti;
+                    float ts = shortlist_scores[i];
+                    int32 ti = shortlist_ids[i];
+                    shortlist_scores[i] = shortlist_scores[j]; shortlist_scores[j] = ts;
+                    shortlist_ids[i] = shortlist_ids[j]; shortlist_ids[j] = ti;
                 }
 
         memcpy(out_ids, shortlist_ids, sizeof(int32) * out_k);
@@ -1061,9 +1076,7 @@ flashhadamard_build(PG_FUNCTION_ARGS)
     StringInfoData sql;
     int         ret, n_rows, dim, n_bytes, n_groups;
     int         i, j, d;
-    float      *all_vecs = NULL;     /* [n_rows × dim] */
     float      *norms = NULL;        /* [n_rows] */
-    float      *rotated = NULL;      /* [n_rows × dim] */
     float      *group_scales = NULL; /* [n_groups] */
     uint8      *packed_codes = NULL; /* [n_rows × n_bytes] row-major */
     uint8      *packed_t = NULL;     /* [n_bytes × n_rows] transposed */
@@ -1629,7 +1642,7 @@ flashhadamard_scan(PG_FUNCTION_ARGS)
         HeapTuple tup = SPI_tuptable->vals[0];
         TupleDesc tdesc = SPI_tuptable->tupdesc;
         bool isnull;
-        bytea *gs_bytes, *mins_bytes, *scales_bytes;
+        bytea *gs_bytes;
 
         dim = DatumGetInt32(SPI_getbinval(tup, tdesc, 4, &isnull));
         seed = DatumGetInt32(SPI_getbinval(tup, tdesc, 5, &isnull));
@@ -1638,8 +1651,6 @@ flashhadamard_scan(PG_FUNCTION_ARGS)
         n_groups = (dim + group_size_val - 1) / group_size_val;
 
         gs_bytes = DatumGetByteaP(SPI_getbinval(tup, tdesc, 1, &isnull));
-        mins_bytes = DatumGetByteaP(SPI_getbinval(tup, tdesc, 2, &isnull));
-        scales_bytes = DatumGetByteaP(SPI_getbinval(tup, tdesc, 3, &isnull));
 
         params.dim = dim;
         params.group_size = group_size_val;
@@ -1831,8 +1842,10 @@ flashhadamard_scan(PG_FUNCTION_ARGS)
             for (j = i + 1; j < final_filled; j++)
                 if (final_scores[j] > final_scores[i])
                 {
-                    float ts = final_scores[i]; final_scores[i] = final_scores[j]; final_scores[j] = ts;
-                    int32 ti = final_ids[i]; final_ids[i] = final_ids[j]; final_ids[j] = ti;
+                    float ts = final_scores[i];
+                    int32 ti = final_ids[i];
+                    final_scores[i] = final_scores[j]; final_scores[j] = ts;
+                    final_ids[i] = final_ids[j]; final_ids[j] = ti;
                 }
 
         SPI_finish();
@@ -1853,8 +1866,10 @@ flashhadamard_scan(PG_FUNCTION_ARGS)
             for (j = i + 1; j < global_filled; j++)
                 if (global_top_scores[j] > global_top_scores[i])
                 {
-                    float ts = global_top_scores[i]; global_top_scores[i] = global_top_scores[j]; global_top_scores[j] = ts;
-                    int32 ti = global_top_ids[i]; global_top_ids[i] = global_top_ids[j]; global_top_ids[j] = ti;
+                    float ts = global_top_scores[i];
+                    int32 ti = global_top_ids[i];
+                    global_top_scores[i] = global_top_scores[j]; global_top_scores[j] = ts;
+                    global_top_ids[i] = global_top_ids[j]; global_top_ids[j] = ti;
                 }
 
         SPI_finish();

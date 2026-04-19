@@ -31,7 +31,7 @@
 #define FH_PAGE_SIZE  BLCKSZ  /* 8192 bytes */
 
 /* Backend-local store cache instance */
-FHStoreCache fh_cache = { .path = "", .fd = -1, .mapped = MAP_FAILED };
+static FHStoreCache fh_cache = { .path = "", .fd = -1, .mapped = MAP_FAILED };
 
 FHStoreCache *
 fh_store_cache_get(const char *path)
@@ -53,7 +53,6 @@ fh_store_cache_get(const char *path)
 
     {
         struct stat st;
-        char meta_page[FH_PAGE_SIZE];
         FHMetaPageDataV2 *m;
 
         if (fstat(fh_cache.fd, &st) < 0 || st.st_size < FH_PAGE_SIZE)
@@ -96,78 +95,6 @@ fh_write_raw(int fd, const void *data, Size total_bytes)
     return written;
 }
 
-/* Read raw contiguous bytes */
-static Size
-fh_read_raw(int fd, off_t offset, void *out, Size total_bytes)
-{
-    Size got = 0;
-    lseek(fd, offset, SEEK_SET);
-    while (got < total_bytes)
-    {
-        ssize_t n = read(fd, (char *)out + got,
-                         Min(total_bytes - got, (Size)64 * 1024 * 1024));
-        if (n <= 0)
-            return got;
-        got += n;
-    }
-    return got;
-}
-
-/* Write raw bytes to sequential pages in a file (legacy, kept for meta page) */
-static int
-fh_write_section(int fd, const void *data, Size total_bytes, int *page_count)
-{
-    Size    written = 0;
-    int     pages = 0;
-    char    page_buf[FH_PAGE_SIZE];
-
-    while (written < total_bytes)
-    {
-        FHFilePageHeader *hdr = (FHFilePageHeader *)page_buf;
-        Size chunk = Min(FH_DATA_PER_PAGE, total_bytes - written);
-
-        memset(page_buf, 0, FH_PAGE_SIZE);
-        hdr->magic = FH_STORE_MAGIC;
-        hdr->page_type = 0;  /* set by caller */
-        hdr->offset = (int32)written;
-        hdr->length = (int32)chunk;
-        memcpy(page_buf + sizeof(FHFilePageHeader), (const char *)data + written, chunk);
-
-        if (write(fd, page_buf, FH_PAGE_SIZE) != FH_PAGE_SIZE)
-            return -1;
-
-        written += chunk;
-        pages++;
-    }
-    *page_count = pages;
-    return 0;
-}
-
-/* Read a section from sequential pages */
-static int
-fh_read_section(int fd, off_t start_offset, void *out, Size total_bytes)
-{
-    Size    read_so_far = 0;
-    char    page_buf[FH_PAGE_SIZE];
-
-    if (lseek(fd, start_offset, SEEK_SET) < 0)
-        return -1;
-
-    while (read_so_far < total_bytes)
-    {
-        FHFilePageHeader *hdr = (FHFilePageHeader *)page_buf;
-        Size chunk;
-
-        if (read(fd, page_buf, FH_PAGE_SIZE) != FH_PAGE_SIZE)
-            return -1;
-
-        chunk = Min((Size)hdr->length, total_bytes - read_so_far);
-        memcpy((char *)out + read_so_far, page_buf + sizeof(FHFilePageHeader), chunk);
-        read_so_far += chunk;
-    }
-    return 0;
-}
-
 /* ================================================================
  * Build: write segment store file
  * ================================================================ */
@@ -183,7 +110,6 @@ fh_store_write(const char *path,
 {
     int     fd;
     char    meta_page[FH_PAGE_SIZE];
-    int     sq8_params_pages = 0, packed_pages = 0, sq8_pages = 0, norm_pages = 0;
     off_t   sq8_params_offset, packed_offset, sq8_data_offset, norm_offset, centroid_offset;
 
     fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0600);
@@ -208,7 +134,6 @@ fh_store_write(const char *path,
     {
         Size sq8_params_size = sizeof(float) * meta->dim * 2;
         float *params_buf = malloc(sq8_params_size);
-        off_t section_pos;
         FHMetaPageDataV2 *m;
 
         if (!params_buf) { close(fd); return -1; }
@@ -484,8 +409,10 @@ fh_store_scan(const char *path, const FHParams *params,
             for (j = i + 1; j < final_filled; j++)
                 if (final_scores[j] > final_scores[i])
                 {
-                    float ts = final_scores[i]; final_scores[i] = final_scores[j]; final_scores[j] = ts;
-                    int32 ti = final_ids[i]; final_ids[i] = final_ids[j]; final_ids[j] = ti;
+                    float ts = final_scores[i];
+                    int32 ti = final_ids[i];
+                    final_scores[i] = final_scores[j]; final_scores[j] = ts;
+                    final_ids[i] = final_ids[j]; final_ids[j] = ti;
                 }
 
         memcpy(out_ids, final_ids, sizeof(int32) * Min(final_filled, k));
@@ -502,8 +429,10 @@ fh_store_scan(const char *path, const FHParams *params,
             for (j = i + 1; j < filled; j++)
                 if (top_scores[j] > top_scores[i])
                 {
-                    float ts = top_scores[i]; top_scores[i] = top_scores[j]; top_scores[j] = ts;
-                    int32 ti = top_ids[i]; top_ids[i] = top_ids[j]; top_ids[j] = ti;
+                    float ts = top_scores[i];
+                    int32 ti = top_ids[i];
+                    top_scores[i] = top_scores[j]; top_scores[j] = ts;
+                    top_ids[i] = top_ids[j]; top_ids[j] = ti;
                 }
         memcpy(out_ids, top_ids, sizeof(int32) * out_k);
         memcpy(out_scores, top_scores, sizeof(float) * out_k);
