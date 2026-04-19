@@ -40,6 +40,12 @@ implements the hot scoring path: per-query byte-table build, 2-byte-fused
 transposed scorer with 4× row unrolling, optional multi-threaded row
 sharding, and fused per-thread top-k with merge. No external dependencies.
 
+**HIGGS-compatible byte-grid extension.** The packed layout can also host an
+experimental HIGGS-inspired p=2 quantizer: one byte indexes a joint 2D Gaussian
+grid instead of two independent scalar 4-bit Lloyd-Max codes. This keeps the
+same 1 byte / 2 dimensions storage shape, while changing only the encoder and
+per-query byte-table construction.
+
 ## Canonical Operating Points
 
 **Setup:** Full Gutenberg, 103210 base vectors (50 held out as queries),
@@ -78,6 +84,88 @@ operating point. 94% hit@1, 92.8% recall@10, 9.2ms p50, 4320 bytes/vec
 
 For applications where hit@1 matters most and storage is tight, packed-only
 FlashHadamard-Base at 4 bits/dim provides 86% hit@1 at 7.9ms.
+
+### FlashHIGGS2 research snapshot
+
+FlashHIGGS2 is a research lane inspired by HIGGS (`arXiv:2411.17525`). It
+tests whether the existing FlashHadamard byte layout can be strengthened by
+replacing two independent scalar nibbles with a single joint p=2 Gaussian grid
+code. In local Gaussian sanity testing, the p=2 grid reduced MSE per dimension
+by about 15.3% versus scalar p=1 Lloyd-Max.
+
+Important caveat: this repo's first FlashHIGGS2 spike uses deterministic
+MiniBatchKMeans over `N(0, I_2)` as a CLVQ approximation. The HIGGS paper uses
+Gaussian MSE-optimal grids computed by CLVQ and notes that `p=2` is preferable
+to `p=1` for their FLUTE-grid setting. Therefore this lane validates the
+systems shape first (same byte layout, different byte table), not exact
+paper-faithful HIGGS grid quality.
+
+Full Gutenberg result (`103260 x 2880D`, 50 reverse-order queries, cosine,
+seed 42, `TURBOQUANT_ADC_THREADS=8`):
+
+| Lane | hit@1 | recall@10 | p50 ms | avg ms | bytes/vec | bits/dim |
+|------|------:|----------:|-------:|-------:|----------:|---------:|
+| FlashHadamard-16 packed | 100.0 | 88.6 | 6.676 | 6.746 | 1440 | 4 |
+| FlashHIGGS2 packed | 100.0 | 91.0 | 7.284 | 7.328 | 1440 | 4 |
+| FlashHadamard-16 + SQ8 M=12 | 100.0 | 93.8 | 10.385 | 10.701 | 4320 | 12 |
+| FlashHIGGS2 + SQ8 M=12 | 100.0 | 95.8 | 10.354 | 10.388 | 4320 | 12 |
+| FlashHadamard-16 + SQ8 M=20 | 100.0 | 98.0 | 10.102 | 10.419 | 4320 | 12 |
+| FlashHIGGS2 + SQ8 M=20 | 100.0 | 98.0 | 10.624 | 10.734 | 4320 | 12 |
+
+Follow-up 4-seed quality sweep (`103260 x 2880D`, 200 fixed queries, seeds
+42/123/7/999, M sweep reusing one fitted inner quantizer per family):
+
+| M | scalar recall@10 | HIGGS2 recall@10 | delta |
+|---:|---:|---:|---:|
+| 8 | 76.67 | 77.33 | +0.65 |
+| 10 | 89.79 | 91.12 | +1.34 |
+| 12 | 94.10 | 94.89 | +0.79 |
+| 14 | 95.74 | 96.08 | +0.34 |
+| 16 | 96.38 | 96.56 | +0.19 |
+| 18 | 96.70 | 96.85 | +0.15 |
+| 20 | 96.88 | 96.99 | +0.11 |
+
+The HIGGS2 quality gain is consistent but modest and concentrated at smaller
+shortlists. Latency from these full sweeps is intentionally not treated as a
+product claim: repeated local runs moved by more than 2x under host
+load/thermal/memory pressure. HIGGS2 now has a chunked encoder and a C-side
+byte-table + fused top-k path, but latency needs a controlled raw-kernel or
+single-run benchmark before making speed claims.
+
+Controlled in-memory latency check after fit (`seed=42`, `k=20`, 200 queries,
+1 warmup run, 3 measured runs, C helper, `TURBOQUANT_ADC_THREADS=8`):
+
+| lane | fit ms | measured searches | p50 ms | p90 ms | p95 ms | avg ms |
+|---|---:|---:|---:|---:|---:|---:|
+| scalar FlashHadamard-16 | 27710.8 | 600 | 7.179 | 8.522 | 8.955 | 7.248 |
+| FlashHIGGS2 | 27374.8 | 600 | 7.025 | 8.460 | 8.895 | 7.186 |
+
+Interpretation: the C-side HIGGS2 byte-table path removes the obvious Python
+table-build penalty. HIGGS2 reached latency parity with scalar in this
+controlled run, but one HIGGS2 max-latency outlier was observed, so this is
+still a parity signal rather than a production speed claim.
+
+Interpretation: FlashHIGGS2 is a better candidate generator at smaller
+shortlists, not a universally better reranker. The initial single-seed snapshot
+showed a larger `M=12` gain (+2.0 recall@10), while the 4-seed 200-query sweep
+shows a smaller but more robust gain (+0.79 at M=12, +1.34 at M=10). At `M=20`,
+the scalar shortlist is already near saturation and HIGGS2 adds only +0.11
+recall@10. Encode is currently slower because p=2 assignment uses nearest-grid
+lookup; this is acceptable for a research lane but not yet a default engine
+path. The current encoder chunks the grid assignment to avoid materializing all
+dimension-pairs at once, and the search path builds HIGGS2 byte tables in C
+before the same fused top-k scorer.
+
+Decision: keep FlashHIGGS2 as an experimental benchmark/quantizer option. Do
+not promote it to the PG engine until a larger query set and preferably a
+raw-kernel latency benchmark prove that a smaller HIGGS2 shortlist can replace
+a larger scalar shortlist at equal or lower end-to-end latency.
+The evaluator exposes these sweep lanes as
+`turboquant_block16_{higgs2_,}packed4_sq8rerank{M}` for
+`M in {8,10,12,14,16,18,20,50,100}`.
+For full Gutenberg sweeps, prefer `scripts/bench_flashhiggs2_sweep.py`;
+it fits the scalar and HIGGS2 inner quantizers once each, then reuses the
+same max-M shortlist for all SQ8 rerank M values.
 
 ### Latency breakdown
 

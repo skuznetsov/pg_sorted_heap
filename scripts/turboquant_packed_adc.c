@@ -237,6 +237,26 @@ static int tq_blockhadamard_packed4_build_byte_tables(
     return 1;
 }
 
+static int tq_higgs2_build_byte_tables(
+    const float *TQ_RESTRICT coeffs,
+    const float *TQ_RESTRICT grid2,
+    size_t dim,
+    float *TQ_RESTRICT byte_tables
+) {
+    const size_t n_bytes = (dim + 1u) / 2u;
+    for (size_t byte_idx = 0; byte_idx < n_bytes; byte_idx++) {
+        const size_t lo_dim = byte_idx * 2u;
+        const size_t hi_dim = lo_dim + 1u;
+        const float lo_coeff = coeffs[lo_dim];
+        const float hi_coeff = hi_dim < dim ? coeffs[hi_dim] : 0.0f;
+        float *table = byte_tables + byte_idx * 256u;
+        for (size_t code = 0; code < 256u; code++) {
+            table[code] = lo_coeff * grid2[code * 2u] + hi_coeff * grid2[code * 2u + 1u];
+        }
+    }
+    return 1;
+}
+
 TQ_EXPORT void turboquant_blockhadamard_packed4_scores_t_f32(
     const uint8_t *TQ_RESTRICT packed_codes_t,
     const float *TQ_RESTRICT coeffs,
@@ -280,6 +300,59 @@ TQ_EXPORT void turboquant_blockhadamard_packed4_scores_t_f32(
     );
     g_tq_blockhadamard_packed4_score_ms += tq_now_ms() - score_t0;
     g_tq_blockhadamard_packed4_calls += 1;
+}
+
+static void tq_topk_insert_portable(
+    float score,
+    int32_t row_id,
+    float *top_scores,
+    int32_t *top_ids,
+    size_t k,
+    size_t *filled,
+    size_t *min_pos,
+    float *min_score
+) {
+    if (*filled < k) {
+        const size_t pos = *filled;
+        top_scores[pos] = score;
+        top_ids[pos] = row_id;
+        (*filled)++;
+        if (*filled == 1 || score < *min_score) {
+            *min_score = score;
+            *min_pos = pos;
+        }
+        return;
+    }
+    if (score <= *min_score) {
+        return;
+    }
+    top_scores[*min_pos] = score;
+    top_ids[*min_pos] = row_id;
+    size_t new_min_pos = 0;
+    float new_min_score = top_scores[0];
+    for (size_t idx = 1; idx < k; idx++) {
+        if (top_scores[idx] < new_min_score) {
+            new_min_score = top_scores[idx];
+            new_min_pos = idx;
+        }
+    }
+    *min_pos = new_min_pos;
+    *min_score = new_min_score;
+}
+
+static void tq_sort_topk_desc(int32_t *top_ids, float *top_scores, size_t filled) {
+    for (size_t i = 0; i < filled; i++) {
+        for (size_t j = i + 1; j < filled; j++) {
+            if (top_scores[j] > top_scores[i]) {
+                float ts = top_scores[i];
+                top_scores[i] = top_scores[j];
+                top_scores[j] = ts;
+                int32_t ti = top_ids[i];
+                top_ids[i] = top_ids[j];
+                top_ids[j] = ti;
+            }
+        }
+    }
 }
 
 #if !defined(_WIN32)
@@ -538,6 +611,212 @@ TQ_EXPORT void turboquant_packed_adc_scores_t_mt_f32(
         pthread_join(threads[idx], NULL);
     }
 #endif
+}
+
+TQ_EXPORT void turboquant_packed_adc_topk_t_mt_f32(
+    const uint8_t *TQ_RESTRICT packed_codes_t,
+    const float *TQ_RESTRICT byte_tables,
+    const float *TQ_RESTRICT norms,
+    size_t n_rows,
+    size_t n_bytes,
+    size_t n_threads,
+    size_t k,
+    int32_t *TQ_RESTRICT out_ids,
+    float *TQ_RESTRICT out_scores
+) {
+    if (k == 0) {
+        return;
+    }
+#if defined(_WIN32)
+    (void)n_threads;
+    float *scores = (float *)malloc(n_rows * sizeof(float));
+    if (scores == NULL) {
+        for (size_t idx = 0; idx < k; idx++) {
+            out_ids[idx] = -1;
+            out_scores[idx] = -INFINITY;
+        }
+        return;
+    }
+    turboquant_packed_adc_scores_t_f32(
+        packed_codes_t,
+        byte_tables,
+        norms,
+        n_rows,
+        n_bytes,
+        scores
+    );
+    size_t filled = 0;
+    size_t min_pos = 0;
+    float min_score = -INFINITY;
+    for (size_t row = 0; row < n_rows; row++) {
+        tq_topk_insert_portable(
+            scores[row],
+            (int32_t)row,
+            out_scores,
+            out_ids,
+            k,
+            &filled,
+            &min_pos,
+            &min_score
+        );
+    }
+    for (size_t idx = filled; idx < k; idx++) {
+        out_ids[idx] = -1;
+        out_scores[idx] = -INFINITY;
+    }
+    tq_sort_topk_desc(out_ids, out_scores, filled);
+    free(scores);
+#else
+    if (n_threads <= 1 || n_rows < 16384 || n_bytes < 256) {
+        float *scores = (float *)malloc(n_rows * sizeof(float));
+        if (scores == NULL) {
+            for (size_t idx = 0; idx < k; idx++) {
+                out_ids[idx] = -1;
+                out_scores[idx] = -INFINITY;
+            }
+            return;
+        }
+        turboquant_packed_adc_scores_t_f32(
+            packed_codes_t,
+            byte_tables,
+            norms,
+            n_rows,
+            n_bytes,
+            scores
+        );
+        size_t filled = 0;
+        size_t min_pos = 0;
+        float min_score = -INFINITY;
+        for (size_t row = 0; row < n_rows; row++) {
+            tq_topk_insert_portable(
+                scores[row],
+                (int32_t)row,
+                out_scores,
+                out_ids,
+                k,
+                &filled,
+                &min_pos,
+                &min_score
+            );
+        }
+        for (size_t idx = filled; idx < k; idx++) {
+            out_ids[idx] = -1;
+            out_scores[idx] = -INFINITY;
+        }
+        tq_sort_topk_desc(out_ids, out_scores, filled);
+        free(scores);
+        return;
+    }
+    if (n_threads > n_rows) {
+        n_threads = n_rows;
+    }
+    if (n_threads > 64) {
+        n_threads = 64;
+    }
+
+    pthread_t threads[64];
+    tq_packed_adc_topk_task_t tasks[64];
+    size_t chunk = (n_rows + n_threads - 1) / n_threads;
+    int32_t *all_ids = (int32_t *)malloc(n_threads * k * sizeof(int32_t));
+    float *all_scores = (float *)malloc(n_threads * k * sizeof(float));
+    if (all_ids == NULL || all_scores == NULL) {
+        for (size_t idx = 0; idx < k; idx++) {
+            out_ids[idx] = -1;
+            out_scores[idx] = -INFINITY;
+        }
+        free(all_ids);
+        free(all_scores);
+        return;
+    }
+    size_t launched = 0;
+    for (size_t idx = 0; idx < n_threads; idx++) {
+        size_t start = idx * chunk;
+        if (start >= n_rows) {
+            break;
+        }
+        size_t end = start + chunk;
+        if (end > n_rows) {
+            end = n_rows;
+        }
+        tasks[idx].packed_codes_t = packed_codes_t;
+        tasks[idx].byte_tables = byte_tables;
+        tasks[idx].norms = norms;
+        tasks[idx].n_rows = n_rows;
+        tasks[idx].n_bytes = n_bytes;
+        tasks[idx].row_start = start;
+        tasks[idx].row_end = end;
+        tasks[idx].k = k;
+        tasks[idx].top_ids = all_ids + idx * k;
+        tasks[idx].top_scores = all_scores + idx * k;
+        pthread_create(&threads[idx], NULL, tq_packed_adc_topk_worker, &tasks[idx]);
+        launched++;
+    }
+    for (size_t idx = 0; idx < launched; idx++) {
+        pthread_join(threads[idx], NULL);
+    }
+
+    size_t filled = 0;
+    size_t min_pos = 0;
+    float min_score = -INFINITY;
+    for (size_t idx = 0; idx < launched * k; idx++) {
+        if (all_ids[idx] < 0) {
+            continue;
+        }
+        tq_topk_insert_portable(
+            all_scores[idx],
+            all_ids[idx],
+            out_scores,
+            out_ids,
+            k,
+            &filled,
+            &min_pos,
+            &min_score
+        );
+    }
+    for (size_t idx = filled; idx < k; idx++) {
+        out_ids[idx] = -1;
+        out_scores[idx] = -INFINITY;
+    }
+    tq_sort_topk_desc(out_ids, out_scores, filled);
+    free(all_ids);
+    free(all_scores);
+#endif
+}
+
+TQ_EXPORT void turboquant_higgs2_topk_t_mt_f32(
+    const uint8_t *TQ_RESTRICT packed_codes_t,
+    const float *TQ_RESTRICT coeffs,
+    const float *TQ_RESTRICT grid2,
+    const float *TQ_RESTRICT norms,
+    size_t n_rows,
+    size_t dim,
+    size_t n_threads,
+    size_t k,
+    int32_t *TQ_RESTRICT out_ids,
+    float *TQ_RESTRICT out_scores
+) {
+    const size_t n_bytes = (dim + 1u) / 2u;
+    float *byte_tables = (float *)malloc(n_bytes * 256u * sizeof(float));
+    if (byte_tables == NULL) {
+        for (size_t idx = 0; idx < k; idx++) {
+            out_ids[idx] = -1;
+            out_scores[idx] = -INFINITY;
+        }
+        return;
+    }
+    tq_higgs2_build_byte_tables(coeffs, grid2, dim, byte_tables);
+    turboquant_packed_adc_topk_t_mt_f32(
+        packed_codes_t,
+        byte_tables,
+        norms,
+        n_rows,
+        n_bytes,
+        n_threads,
+        k,
+        out_ids,
+        out_scores
+    );
+    free(byte_tables);
 }
 
 TQ_EXPORT void turboquant_blockhadamard_packed4_scores_t_mt_f32(

@@ -44,7 +44,6 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-import io
 import json
 import math
 import os
@@ -63,6 +62,7 @@ import numpy as np
 import psycopg2
 import requests
 from scipy.stats import norm
+from scipy.spatial import cKDTree
 from sklearn.cluster import MiniBatchKMeans
 
 
@@ -139,6 +139,18 @@ def load_packed_adc_helper() -> ctypes.CDLL | None:
         ctypes.POINTER(ctypes.c_float),
     ]
     lib.turboquant_packed_adc_scores_t_mt_f32.restype = None
+    lib.turboquant_packed_adc_topk_t_mt_f32.argtypes = [
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.turboquant_packed_adc_topk_t_mt_f32.restype = None
     lib.turboquant_blockhadamard_packed4_scores_t_f32.argtypes = [
         ctypes.POINTER(ctypes.c_uint8),
         ctypes.POINTER(ctypes.c_float),
@@ -173,6 +185,19 @@ def load_packed_adc_helper() -> ctypes.CDLL | None:
         ctypes.POINTER(ctypes.c_float),
     ]
     lib.turboquant_blockhadamard_packed4_topk_t_mt_f32.restype = None
+    lib.turboquant_higgs2_topk_t_mt_f32.argtypes = [
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.turboquant_higgs2_topk_t_mt_f32.restype = None
     lib.turboquant_blockhadamard_packed4_profile_reset.argtypes = []
     lib.turboquant_blockhadamard_packed4_profile_reset.restype = None
     lib.turboquant_blockhadamard_packed4_profile_get.argtypes = [
@@ -384,6 +409,133 @@ def gaussian_lloyd_max(bits: int, n_iter: int = 64) -> tuple[np.ndarray, np.ndar
     bounds[-1] = np.inf
     bounds[1:-1] = 0.5 * (centers[:-1] + centers[1:])
     return centers.astype(np.float32), bounds.astype(np.float32)
+
+
+@lru_cache(maxsize=8)
+def gaussian_kmeans_grid2(levels: int = 256, sample_count: int = 200_000, seed: int = 42) -> np.ndarray:
+    """Approximate the HIGGS p=2 Gaussian MSE-optimal grid.
+
+    The HIGGS paper uses CLVQ grids. For this retrieval spike we use
+    deterministic MiniBatchKMeans over N(0, I_2), which tests the important
+    systems question first: can a joint 2D byte grid improve ranking while
+    preserving the existing packed 1-byte-per-2-dims scorer shape?
+    """
+    if levels <= 1 or levels > 256:
+        raise ValueError("gaussian_kmeans_grid2 supports 2..256 levels")
+    if sample_count < levels:
+        raise ValueError("sample_count must be >= levels")
+    rng = np.random.default_rng(seed)
+    samples = rng.standard_normal((sample_count, 2), dtype=np.float32)
+    km = MiniBatchKMeans(
+        n_clusters=levels,
+        random_state=seed,
+        n_init=3,
+        batch_size=min(8192, max(1024, levels * 16)),
+        max_iter=200,
+        reassignment_ratio=0.0,
+    )
+    km.fit(samples)
+    centers = km.cluster_centers_.astype(np.float32, copy=False)
+    # Stable ordering keeps JSON/debug diffs reproducible; code values are
+    # arbitrary as long as encoder and scorer share the same grid.
+    order = np.lexsort((centers[:, 1], centers[:, 0]))
+    return np.ascontiguousarray(centers[order], dtype=np.float32)
+
+
+def ckdtree_query_nearest(tree: cKDTree, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Use parallel cKDTree queries when SciPy supports the workers argument."""
+    try:
+        return tree.query(values, k=1, workers=-1)
+    except TypeError:
+        return tree.query(values, k=1)
+
+
+def nearest_grid2_codes(values: np.ndarray, grid: np.ndarray, chunk_size: int = 65_536) -> np.ndarray:
+    if values.ndim != 2 or values.shape[1] != 2:
+        raise ValueError("nearest_grid2_codes expects values shaped [n, 2]")
+    if grid.ndim != 2 or grid.shape[1] != 2 or grid.shape[0] > 256:
+        raise ValueError("nearest_grid2_codes expects grid shaped [<=256, 2]")
+    values = np.ascontiguousarray(values, dtype=np.float32)
+    grid = np.ascontiguousarray(grid, dtype=np.float32)
+    if grid.shape[0] >= 32:
+        tree = cKDTree(grid)
+        codes = np.empty(values.shape[0], dtype=np.uint8)
+        for start in range(0, values.shape[0], chunk_size):
+            stop = min(start + chunk_size, values.shape[0])
+            _, idx = ckdtree_query_nearest(tree, values[start:stop])
+            codes[start:stop] = idx.astype(np.uint8, copy=False)
+        return codes
+    grid_t = np.ascontiguousarray(grid.T, dtype=np.float32)
+    grid_sq = np.sum(grid * grid, axis=1, dtype=np.float32)
+    codes = np.empty(values.shape[0], dtype=np.uint8)
+    for start in range(0, values.shape[0], chunk_size):
+        stop = min(start + chunk_size, values.shape[0])
+        chunk = values[start:stop]
+        chunk_sq = np.sum(chunk * chunk, axis=1, dtype=np.float32)[:, None]
+        dists = chunk_sq + grid_sq[None, :] - 2.0 * (chunk @ grid_t)
+        codes[start:stop] = np.argmin(dists, axis=1).astype(np.uint8)
+    return codes
+
+
+def pair_columns_for_grid2(x: np.ndarray) -> np.ndarray:
+    if x.ndim != 2:
+        raise ValueError("pair_columns_for_grid2 expects a 2-D array")
+    if x.shape[1] % 2 == 0:
+        paired = x.reshape(x.shape[0], x.shape[1] // 2, 2)
+    else:
+        padded = np.zeros((x.shape[0], x.shape[1] + 1), dtype=np.float32)
+        padded[:, : x.shape[1]] = x
+        paired = padded.reshape(x.shape[0], (x.shape[1] + 1) // 2, 2)
+    return np.ascontiguousarray(paired.reshape(-1, 2), dtype=np.float32)
+
+
+def nearest_grid2_codes_by_rows(x: np.ndarray, grid: np.ndarray, row_chunk: int = 1024) -> np.ndarray:
+    """Encode a matrix into p=2 byte codes without materializing all pairs.
+
+    `pair_columns_for_grid2(x)` is convenient for small tests, but on
+    103K x 2880D it creates another ~1.2GB float32 copy. Chunking keeps peak
+    memory bounded while preserving the exact same code assignment.
+    """
+    if x.ndim != 2:
+        raise ValueError("nearest_grid2_codes_by_rows expects a 2-D array")
+    if grid.ndim != 2 or grid.shape[1] != 2 or grid.shape[0] > 256:
+        raise ValueError("nearest_grid2_codes_by_rows expects grid shaped [<=256, 2]")
+    if row_chunk <= 0:
+        raise ValueError("row_chunk must be positive")
+    x = np.asarray(x, dtype=np.float32)
+    grid = np.ascontiguousarray(grid, dtype=np.float32)
+    n_rows, dim = x.shape
+    n_bytes = (dim + 1) // 2
+    codes = np.empty((n_rows, n_bytes), dtype=np.uint8)
+    tree = cKDTree(grid) if grid.shape[0] >= 32 else None
+
+    for start in range(0, n_rows, row_chunk):
+        stop = min(start + row_chunk, n_rows)
+        chunk = np.ascontiguousarray(x[start:stop], dtype=np.float32)
+        if dim % 2 == 0:
+            pairs = chunk.reshape(-1, 2)
+        else:
+            padded = np.zeros((stop - start, dim + 1), dtype=np.float32)
+            padded[:, :dim] = chunk
+            pairs = padded.reshape(-1, 2)
+        if tree is not None:
+            _, idx = ckdtree_query_nearest(tree, pairs)
+            chunk_codes = idx.astype(np.uint8, copy=False)
+        else:
+            chunk_codes = nearest_grid2_codes(pairs, grid)
+        codes[start:stop] = chunk_codes.reshape(stop - start, n_bytes)
+    return codes
+
+
+def higgs2_byte_tables(coeffs: np.ndarray, grid: np.ndarray) -> np.ndarray:
+    if grid.ndim != 2 or grid.shape != (256, 2):
+        raise ValueError("higgs2_byte_tables expects grid shaped [256, 2]")
+    n_bytes = (coeffs.shape[0] + 1) // 2
+    lo = np.ascontiguousarray(coeffs[0::2], dtype=np.float32)
+    hi = np.zeros(n_bytes, dtype=np.float32)
+    hi[: coeffs[1::2].shape[0]] = coeffs[1::2]
+    tables = lo[:, None] * grid[None, :, 0] + hi[:, None] * grid[None, :, 1]
+    return np.ascontiguousarray(tables, dtype=np.float32)
 
 
 def random_orthogonal(dim: int, seed: int) -> np.ndarray:
@@ -755,6 +907,42 @@ def packed_lookup_scores_transposed(
     return scores
 
 
+def packed_topk_scores_transposed(
+    packed_codes_t: np.ndarray,
+    byte_tables: np.ndarray,
+    norms: np.ndarray | None,
+    k: int,
+) -> np.ndarray:
+    if byte_tables.ndim != 2 or byte_tables.shape[1] != 256:
+        raise ValueError("packed_topk_scores_transposed expects byte_tables shaped [n_bytes, 256]")
+    lib = load_packed_adc_helper()
+    if lib is None:
+        scores = packed_lookup_scores_transposed(packed_codes_t, byte_tables, norms)
+        return topk_indices(scores, k)
+    packed_codes_t = np.ascontiguousarray(packed_codes_t, dtype=np.uint8)
+    byte_tables = np.ascontiguousarray(byte_tables, dtype=np.float32)
+    norms_arr = None if norms is None else np.ascontiguousarray(norms, dtype=np.float32)
+    norm_ptr = (
+        ctypes.cast(0, ctypes.POINTER(ctypes.c_float))
+        if norms_arr is None
+        else norms_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    )
+    out_ids = np.empty(k, dtype=np.int32)
+    out_scores = np.empty(k, dtype=np.float32)
+    lib.turboquant_packed_adc_topk_t_mt_f32(
+        packed_codes_t.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        byte_tables.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        norm_ptr,
+        ctypes.c_size_t(packed_codes_t.shape[1]),
+        ctypes.c_size_t(packed_codes_t.shape[0]),
+        ctypes.c_size_t(packed_adc_thread_count()),
+        ctypes.c_size_t(k),
+        out_ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+        out_scores.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+    )
+    return out_ids[out_ids >= 0]
+
+
 def packed_lookup_scores_blockhadamard_packed4_transposed(
     packed_codes_t: np.ndarray,
     coeffs: np.ndarray,
@@ -834,6 +1022,49 @@ def packed_topk_blockhadamard_packed4_transposed(
         packed_codes_t.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
         coeffs.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         centers.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        norm_ptr,
+        ctypes.c_size_t(packed_codes_t.shape[1]),
+        ctypes.c_size_t(coeffs.shape[0]),
+        ctypes.c_size_t(packed_adc_thread_count()),
+        ctypes.c_size_t(k),
+        out_ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+        out_scores.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+    )
+    return out_ids[out_ids >= 0]
+
+
+def packed_topk_higgs2_transposed(
+    packed_codes_t: np.ndarray,
+    coeffs: np.ndarray,
+    grid: np.ndarray,
+    norms: np.ndarray | None,
+    k: int,
+) -> np.ndarray:
+    if grid.ndim != 2 or grid.shape != (256, 2):
+        raise ValueError("packed_topk_higgs2_transposed expects grid shaped [256, 2]")
+    lib = load_packed_adc_helper()
+    if lib is None:
+        return packed_topk_scores_transposed(
+            packed_codes_t,
+            higgs2_byte_tables(coeffs, grid),
+            norms,
+            k,
+        )
+    packed_codes_t = np.ascontiguousarray(packed_codes_t, dtype=np.uint8)
+    coeffs = np.ascontiguousarray(coeffs, dtype=np.float32)
+    grid = np.ascontiguousarray(grid, dtype=np.float32)
+    norms_arr = None if norms is None else np.ascontiguousarray(norms, dtype=np.float32)
+    norm_ptr = (
+        ctypes.cast(0, ctypes.POINTER(ctypes.c_float))
+        if norms_arr is None
+        else norms_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    )
+    out_ids = np.empty(k, dtype=np.int32)
+    out_scores = np.empty(k, dtype=np.float32)
+    lib.turboquant_higgs2_topk_t_mt_f32(
+        packed_codes_t.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        coeffs.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        grid.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         norm_ptr,
         ctypes.c_size_t(packed_codes_t.shape[1]),
         ctypes.c_size_t(coeffs.shape[0]),
@@ -1417,6 +1648,76 @@ class TurboQuantBlock32PackedTopKMethod(TurboQuantBlock32PackedMethod):
             "c_merge_ms_per_query": float(helper_profile["c_merge_ms_total"]) / calls,
             "c_calls": int(helper_profile["c_calls"]),
         }
+
+
+class TurboQuantBlockHiggs2PackedMethod(TurboQuantBlock32PackedMethod):
+    """HIGGS-inspired p=2 byte-grid packed scorer.
+
+    This keeps the FlashHadamard packed storage shape unchanged: one byte still
+    covers two rotated/equalized dimensions. Unlike scalar packed4, the byte is
+    a joint 2D code into a 256-point Gaussian grid rather than two independent
+    4-bit scalar Lloyd-Max codes.
+    """
+
+    def __init__(
+        self,
+        bits: int,
+        seed: int,
+        group_size: int = 16,
+        grid_samples: int = 200_000,
+    ) -> None:
+        super().__init__(bits, seed, group_size)
+        self.name = f"turboquant_block{group_size}_higgs2_packed4"
+        self.grid_samples = grid_samples
+        self.grid2: np.ndarray | None = None
+
+    def fit(self, base: np.ndarray) -> None:
+        if self.bits != 4:
+            raise ValueError(f"{self.name} currently requires --turbo-bits=4")
+        load_packed_adc_helper()
+        self.dim = base.shape[1]
+        rng = np.random.default_rng(self.seed)
+        self.perm = rng.permutation(self.dim).astype(np.int32)
+        self.signs = rng.choice(np.array([-1.0, 1.0], dtype=np.float32), size=self.dim, replace=True)
+        self.blocks = power_of_two_blocks(self.dim)
+        self.grid2 = gaussian_kmeans_grid2(256, self.grid_samples, self.seed)
+        norms = np.linalg.norm(base, axis=1).astype(np.float32)
+        unit = base / np.maximum(norms[:, None], 1e-12)
+        rotated = structured_block_hadamard(unit, self.perm, self.signs, self.blocks) * math.sqrt(self.dim)
+        group_scales, expanded_scales = grouped_rms_scales(rotated, self.group_size)
+        equalized = rotated / expanded_scales
+        codes = nearest_grid2_codes_by_rows(equalized, self.grid2)
+        self.packed_codes = np.ascontiguousarray(codes, dtype=np.uint8)
+        self.packed_codes_t = transpose_packed_codes(self.packed_codes)
+        self.norms = maybe_store_norms(norms)
+        self.group_scales = group_scales
+        self._expanded_scales = expand_group_scales(group_scales, self.dim, self.group_size)
+        self.transform_ms_total = 0.0
+        self.transform_calls = 0
+
+    def search(self, query: np.ndarray, k: int) -> np.ndarray:
+        if self.packed_codes_t is None or self.grid2 is None or self._expanded_scales is None:
+            raise RuntimeError("fit must run first")
+        t0 = time.perf_counter()
+        q_rot = structured_block_hadamard_vec(query, self.perm, self.signs, self.blocks)
+        self.transform_ms_total += (time.perf_counter() - t0) * 1000.0
+        self.transform_calls += 1
+        coeffs = (q_rot * self._expanded_scales / math.sqrt(self.dim)).astype(np.float32, copy=False)
+        return packed_topk_higgs2_transposed(
+            self.packed_codes_t,
+            coeffs,
+            self.grid2,
+            self.norms,
+            k,
+        )
+
+    def metadata_bytes(self) -> int:
+        total = 24
+        if self.grid2 is not None:
+            total += int(self.grid2.nbytes)
+        if self.group_scales is not None:
+            total += int(self.group_scales.nbytes)
+        return total
 
 
 class TurboQuantBlock32DitherPackedMethod(TurboQuantBlock32PackedMethod):
@@ -2474,6 +2775,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--ivf-clusters", type=int, default=0, help="Override n_clusters for IVF lanes (0=use factory default)")
     ap.add_argument("--ivf-nprobe", type=int, default=0, help="Override n_probe for IVF lanes (0=use factory default)")
     ap.add_argument("--ivf-cache-dir", type=str, default=None, help="Directory for IVF centroid cache (skip k-means on warm runs)")
+    ap.add_argument(
+        "--higgs-grid-samples",
+        type=int,
+        default=200_000,
+        help="Gaussian samples for experimental HIGGS p=2 grid fitting",
+    )
     ap.add_argument("--profile-packed-stages", action="store_true", help="Print packed blockhadamard stage timings")
     ap.add_argument("--pq-m", type=int, default=0, help="PQ subvector count (0=auto)")
     ap.add_argument("--pq-bits", type=int, default=8)
@@ -2507,8 +2814,11 @@ def parse_method_allowlist(value: str | None) -> list[str] | None:
     return names
 
 
+FLASHHADAMARD_SQ8_RERANK_SWEEP = (8, 10, 12, 14, 16, 18, 20, 50, 100)
+
+
 def method_factories(base: np.ndarray, args: argparse.Namespace) -> list[tuple[str, Callable[[], RetrievalMethod]]]:
-    return [
+    factories: list[tuple[str, Callable[[], RetrievalMethod]]] = [
         ("fp16", lambda: Fp16Method()),
         ("sq8_linear", lambda: Sq8LinearMethod()),
         ("pq_kmeans", lambda: PQKMeansMethod(auto_pq_m(base.shape[1], args.pq_m), args.pq_bits, args.pq_max_train, args.seed)),
@@ -2518,13 +2828,42 @@ def method_factories(base: np.ndarray, args: argparse.Namespace) -> list[tuple[s
         ("turboquant_blockhadamard_packed4_topk", lambda: TurboQuantBlockHadamardPackedTopKMethod(args.turbo_bits, args.seed)),
         ("turboquant_block16_packed4", lambda: TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16)),
         ("turboquant_block16_packed4_topk", lambda: TurboQuantBlock32PackedTopKMethod(args.turbo_bits, args.seed, group_size=16)),
-        ("turboquant_block16_packed4_sq8rerank20", lambda: FlashHadamardRerankMethod(TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16), shortlist_m=20, rerank_mode="sq8")),
-        ("turboquant_block16_packed4_sq8rerank50", lambda: FlashHadamardRerankMethod(TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16), shortlist_m=50, rerank_mode="sq8")),
-        ("turboquant_block16_packed4_sq8rerank100", lambda: FlashHadamardRerankMethod(TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16), shortlist_m=100, rerank_mode="sq8")),
-        ("turboquant_block16_packed4_rerank20", lambda: FlashHadamardRerankMethod(TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16), shortlist_m=20, rerank_mode="fp32")),
-        ("turboquant_block16_packed4_rerank50", lambda: FlashHadamardRerankMethod(TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16), shortlist_m=50, rerank_mode="fp32")),
+        (
+            "turboquant_block16_higgs2_packed4",
+            lambda: TurboQuantBlockHiggs2PackedMethod(
+                args.turbo_bits,
+                args.seed,
+                group_size=16,
+                grid_samples=args.higgs_grid_samples,
+            ),
+        ),
+        (
+            "turboquant_block16_packed4_rerank20",
+            lambda: FlashHadamardRerankMethod(
+                TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16),
+                shortlist_m=20,
+                rerank_mode="fp32",
+            ),
+        ),
+        (
+            "turboquant_block16_packed4_rerank50",
+            lambda: FlashHadamardRerankMethod(
+                TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16),
+                shortlist_m=50,
+                rerank_mode="fp32",
+            ),
+        ),
         ("turboquant_block32_packed4", lambda: TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed)),
         ("turboquant_block32_packed4_topk", lambda: TurboQuantBlock32PackedTopKMethod(args.turbo_bits, args.seed)),
+        (
+            "turboquant_block32_higgs2_packed4",
+            lambda: TurboQuantBlockHiggs2PackedMethod(
+                args.turbo_bits,
+                args.seed,
+                group_size=32,
+                grid_samples=args.higgs_grid_samples,
+            ),
+        ),
         ("turboquant_block32_dither_packed4", lambda: TurboQuantBlock32DitherPackedMethod(args.turbo_bits, args.seed)),
         ("turboquant_ivf32_block32_packed4", lambda: TurboQuantIVFBlock32PackedMethod(args.turbo_bits, args.seed, n_clusters=args.ivf_clusters or 32, n_probe=args.ivf_nprobe or 8, cache_dir=args.ivf_cache_dir)),
         ("turboquant_ivf64_block32_packed4", lambda: TurboQuantIVFBlock32PackedMethod(args.turbo_bits, args.seed, n_clusters=args.ivf_clusters or 64, n_probe=args.ivf_nprobe or 12, cache_dir=args.ivf_cache_dir)),
@@ -2546,6 +2885,33 @@ def method_factories(base: np.ndarray, args: argparse.Namespace) -> list[tuple[s
         ("turboquant_twopass_block32_dither", lambda: TurboQuantTwoPassBlockwiseDitheredMethod(args.turbo_bits, args.seed)),
         ("turboquant_prod", lambda: TurboQuantProdMethod(args.turbo_bits, args.seed)),
     ]
+    for shortlist_m in FLASHHADAMARD_SQ8_RERANK_SWEEP:
+        factories.append(
+            (
+                f"turboquant_block16_higgs2_packed4_sq8rerank{shortlist_m}",
+                lambda m=shortlist_m: FlashHadamardRerankMethod(
+                    TurboQuantBlockHiggs2PackedMethod(
+                        args.turbo_bits,
+                        args.seed,
+                        group_size=16,
+                        grid_samples=args.higgs_grid_samples,
+                    ),
+                    shortlist_m=m,
+                    rerank_mode="sq8",
+                ),
+            )
+        )
+        factories.append(
+            (
+                f"turboquant_block16_packed4_sq8rerank{shortlist_m}",
+                lambda m=shortlist_m: FlashHadamardRerankMethod(
+                    TurboQuantBlock32PackedMethod(args.turbo_bits, args.seed, group_size=16),
+                    shortlist_m=m,
+                    rerank_mode="sq8",
+                ),
+            )
+        )
+    return factories
 
 
 def default_method_names(args: argparse.Namespace) -> list[str]:
@@ -2596,7 +2962,7 @@ def build_methods(base: np.ndarray, args: argparse.Namespace) -> list[RetrievalM
     for name in selected_names:
         if name == "turboquant_prod" and args.turbo_bits < 2:
             raise SystemExit("turboquant_prod requires --turbo-bits >= 2")
-        if name in {"turboquant_blockhadamard_packed4", "turboquant_blockhadamard_packed4_topk", "turboquant_block16_packed4", "turboquant_block16_packed4_topk", "turboquant_block32_packed4", "turboquant_block32_packed4_topk", "turboquant_block32_dither_packed4", "turboquant_block32_dimdither_packed4"} and args.turbo_bits != 4:
+        if "packed4" in name and args.turbo_bits != 4:
             raise SystemExit(f"{name} currently requires --turbo-bits=4")
         methods.append(factory_map[name]())
     return methods
@@ -2755,6 +3121,10 @@ def main() -> int:
     print(
         "Packed4 research lanes reuse the same scalar quantizers but switch search to byte-packed "
         "ADC-style lookup tables; they are kernel-shape prototypes, not optimized kernels."
+    )
+    print(
+        "turboquant_block*_higgs2_packed4 is an experimental HIGGS-inspired p=2 lane: "
+        "one byte indexes a joint 2D Gaussian grid instead of two independent scalar nibbles."
     )
     if args.turbo_research:
         print(
