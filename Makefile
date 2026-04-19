@@ -596,13 +596,12 @@ bench-turboquant:
 	  $(TURBOQUANT_ARGS)
 
 bench-turboquant-sql:
-	@if [ -z "$(TURBOQUANT_PG_DSN)" ] || [ -z "$(TURBOQUANT_BASE_SQL)" ] || [ -z "$(TURBOQUANT_QUERY_SQL)" ]; then \
-		echo "bench-turboquant-sql requires TURBOQUANT_PG_DSN, TURBOQUANT_BASE_SQL, and TURBOQUANT_QUERY_SQL" >&2; \
+	@if [ -z "$$TURBOQUANT_PG_DSN" ] || [ -z "$(TURBOQUANT_BASE_SQL)" ] || [ -z "$(TURBOQUANT_QUERY_SQL)" ]; then \
+		echo "bench-turboquant-sql requires exported TURBOQUANT_PG_DSN, TURBOQUANT_BASE_SQL, and TURBOQUANT_QUERY_SQL" >&2; \
 		exit 2; \
 	fi
 	@PYTHON_BIN="$$(./scripts/find_vector_python.sh)" && \
 	"$$PYTHON_BIN" ./scripts/bench_turboquant_retrieval.py \
-	  --pg-dsn '$(TURBOQUANT_PG_DSN)' \
 	  --base-sql "$(TURBOQUANT_BASE_SQL)" \
 	  --query-sql "$(TURBOQUANT_QUERY_SQL)" \
 	  --metric $(TURBOQUANT_METRIC) \
@@ -616,13 +615,12 @@ bench-turboquant-sql:
 	  $(TURBOQUANT_ARGS)
 
 bench-turboquant-sql-holdout:
-	@if [ -z "$(TURBOQUANT_PG_DSN)" ] || [ -z "$(TURBOQUANT_SHARED_SQL)" ]; then \
-		echo "bench-turboquant-sql-holdout requires TURBOQUANT_PG_DSN and TURBOQUANT_SHARED_SQL" >&2; \
+	@if [ -z "$$TURBOQUANT_PG_DSN" ] || [ -z "$(TURBOQUANT_SHARED_SQL)" ]; then \
+		echo "bench-turboquant-sql-holdout requires exported TURBOQUANT_PG_DSN and TURBOQUANT_SHARED_SQL" >&2; \
 		exit 2; \
 	fi
 	@PYTHON_BIN="$$(./scripts/find_vector_python.sh)" && \
 	"$$PYTHON_BIN" ./scripts/bench_turboquant_retrieval.py \
-	  --pg-dsn '$(TURBOQUANT_PG_DSN)' \
 	  --shared-sql "$(TURBOQUANT_SHARED_SQL)" \
 	  --metric $(TURBOQUANT_METRIC) \
 	  --query-count $(TURBOQUANT_QUERY_COUNT) \
@@ -637,16 +635,9 @@ bench-turboquant-sql-holdout:
 	  $(TURBOQUANT_ARGS)
 
 define resolve_turboquant_local_cube_dsn
-	PG_DSN='$(TURBOQUANT_PG_DSN)'; \
-	if [ -z "$$PG_DSN" ]; then \
-		if command -v kubectl >/dev/null 2>&1 && kubectl get secret -n default pgvector-superuser >/dev/null 2>&1; then \
-			PGUSER_LOCAL=$$(kubectl get secret -n default pgvector-superuser -o jsonpath='{.data.username}' | base64 -d); \
-			PGPASS_LOCAL=$$(kubectl get secret -n default pgvector-superuser -o jsonpath='{.data.password}' | base64 -d); \
-			PG_DSN="postgresql://$$PGUSER_LOCAL:$$PGPASS_LOCAL@127.0.0.1:$(TURBOQUANT_LOCAL_CUBE_PORT)/$(TURBOQUANT_LOCAL_CUBE_DB)"; \
-		else \
-			echo "bench-turboquant-gutenberg requires TURBOQUANT_PG_DSN or a reachable local cube secret (default/pgvector-superuser)" >&2; \
-			exit 2; \
-		fi; \
+	if [ -z "$$TURBOQUANT_PG_DSN" ]; then \
+		echo "bench-turboquant-gutenberg requires exported TURBOQUANT_PG_DSN" >&2; \
+		exit 2; \
 	fi; \
 	PYTHON_BIN="$$(./scripts/find_vector_python.sh)"
 endef
@@ -656,7 +647,6 @@ bench-turboquant-gutenberg: bench-turboquant-gutenberg-vetted
 bench-turboquant-gutenberg-screen:
 	@$(resolve_turboquant_local_cube_dsn) && \
 	"$$PYTHON_BIN" ./scripts/bench_turboquant_packed_screen.py \
-	  --pg-dsn "$$PG_DSN" \
 	  --base-sql "SELECT embedding::text FROM public.gutenberg_gptoss_sh ORDER BY id" \
 	  --query-sql "SELECT q.qvec::text FROM public.bench_gptoss_queries q JOIN public.bench_hnsw_gt gt USING (qid) ORDER BY q.qid" \
 	  --metric cosine \
@@ -670,7 +660,6 @@ bench-turboquant-gutenberg-screen:
 bench-turboquant-gutenberg-vetted:
 	@$(resolve_turboquant_local_cube_dsn) && \
 	"$$PYTHON_BIN" ./scripts/bench_turboquant_retrieval.py \
-	  --pg-dsn "$$PG_DSN" \
 	  --base-sql "SELECT embedding::text FROM public.gutenberg_gptoss_sh ORDER BY id" \
 	  --query-sql "SELECT q.qvec::text FROM public.bench_gptoss_queries q JOIN public.bench_hnsw_gt gt USING (qid) ORDER BY q.qid" \
 	  --metric cosine \
@@ -687,7 +676,6 @@ bench-turboquant-gutenberg-vetted:
 bench-turboquant-gutenberg-full:
 	@$(resolve_turboquant_local_cube_dsn) && \
 	"$$PYTHON_BIN" ./scripts/bench_turboquant_retrieval.py \
-	  --pg-dsn "$$PG_DSN" \
 	  --base-sql "SELECT embedding::text FROM public.gutenberg_gptoss_sh ORDER BY id" \
 	  --query-sql "SELECT qvec::text FROM public.bench_gptoss_queries ORDER BY qid" \
 	  --metric cosine \
@@ -814,11 +802,11 @@ help:
 	@echo "  make bench-nomic-ann VECTOR_BENCH_DSN='<dsn>' VECTOR_GRAPH_TABLE=<graph_table> VECTOR_ENTRY_TABLE=<entry_table>"
 	@echo "  make build-turboquant-packed-helper"
 	@echo "  make bench-turboquant TURBOQUANT_DATASET=<glove-100|nytimes-256> TURBOQUANT_SAMPLE_SIZE=<n> TURBOQUANT_QUERY_COUNT=<n> TURBOQUANT_K=<k> TURBOQUANT_PQ_M=<0|m> TURBOQUANT_PQ_BITS=<bits> TURBOQUANT_PQ_MAX_TRAIN=<n> TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_ARGS='<extra args>'"
-	@echo "  make bench-turboquant-sql TURBOQUANT_PG_DSN='<dsn>' TURBOQUANT_BASE_SQL='<sql>' TURBOQUANT_QUERY_SQL='<sql>' TURBOQUANT_METRIC=<cosine|ip> TURBOQUANT_K=<k> TURBOQUANT_PQ_M=<0|m> TURBOQUANT_PQ_BITS=<bits> TURBOQUANT_PQ_MAX_TRAIN=<n> TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_ARGS='<extra args>'"
-	@echo "  make bench-turboquant-sql-holdout TURBOQUANT_PG_DSN='<dsn>' TURBOQUANT_SHARED_SQL='<sql>' TURBOQUANT_METRIC=<cosine|ip> TURBOQUANT_QUERY_COUNT=<n> TURBOQUANT_FOLDS=<n> TURBOQUANT_K=<k> TURBOQUANT_PQ_M=<0|m> TURBOQUANT_PQ_BITS=<bits> TURBOQUANT_PQ_MAX_TRAIN=<n> TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_ARGS='<extra args>'"
-	@echo "  make bench-turboquant-gutenberg-vetted TURBOQUANT_PG_DSN='<dsn|optional local cube auto-discovery>' TURBOQUANT_GUTENBERG_METHODS='<csv methods>' TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_K=<k> TURBOQUANT_ARGS='<extra args>'"
-	@echo "  make bench-turboquant-gutenberg-screen TURBOQUANT_PG_DSN='<dsn|optional local cube auto-discovery>' TURBOQUANT_GUTENBERG_SCREEN_METHODS='<csv packed methods>' TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_K=<k> TURBOQUANT_ARGS='<extra args>'"
-	@echo "  make bench-turboquant-gutenberg-full TURBOQUANT_PG_DSN='<dsn|optional local cube auto-discovery>' TURBOQUANT_GUTENBERG_METHODS='<csv methods>' TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_K=<k> TURBOQUANT_ARGS='<extra args>'"
+	@echo "  export TURBOQUANT_PG_DSN='<dsn>'; make bench-turboquant-sql TURBOQUANT_BASE_SQL='<sql>' TURBOQUANT_QUERY_SQL='<sql>' TURBOQUANT_METRIC=<cosine|ip> TURBOQUANT_K=<k> TURBOQUANT_PQ_M=<0|m> TURBOQUANT_PQ_BITS=<bits> TURBOQUANT_PQ_MAX_TRAIN=<n> TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_ARGS='<extra args>'"
+	@echo "  export TURBOQUANT_PG_DSN='<dsn>'; make bench-turboquant-sql-holdout TURBOQUANT_SHARED_SQL='<sql>' TURBOQUANT_METRIC=<cosine|ip> TURBOQUANT_QUERY_COUNT=<n> TURBOQUANT_FOLDS=<n> TURBOQUANT_K=<k> TURBOQUANT_PQ_M=<0|m> TURBOQUANT_PQ_BITS=<bits> TURBOQUANT_PQ_MAX_TRAIN=<n> TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_ARGS='<extra args>'"
+	@echo "  export TURBOQUANT_PG_DSN='<dsn>'; make bench-turboquant-gutenberg-vetted TURBOQUANT_GUTENBERG_METHODS='<csv methods>' TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_K=<k> TURBOQUANT_ARGS='<extra args>'"
+	@echo "  export TURBOQUANT_PG_DSN='<dsn>'; make bench-turboquant-gutenberg-screen TURBOQUANT_GUTENBERG_SCREEN_METHODS='<csv packed methods>' TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_K=<k> TURBOQUANT_ARGS='<extra args>'"
+	@echo "  export TURBOQUANT_PG_DSN='<dsn>'; make bench-turboquant-gutenberg-full TURBOQUANT_GUTENBERG_METHODS='<csv methods>' TURBOQUANT_TURBO_BITS=<bits> TURBOQUANT_K=<k> TURBOQUANT_ARGS='<extra args>'"
 	@echo "  make bench BENCH_PORT=<port> BENCH_SCALES=<comma-separated>"
 	@echo "  make policy-lint-strict"
 	@echo "  make policy-safety-selftest UNNEST_AB_SELFTEST_TMP_ROOT=<abs_tmp_dir> UNNEST_GATE_SELFTEST_TMP_ROOT=<abs_tmp_dir>"

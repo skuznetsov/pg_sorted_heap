@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 import pathlib
 import statistics
 import sys
@@ -28,7 +29,7 @@ def load_bench_module():
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Screen packed TurboQuant helper lanes on a real SQL-backed set")
-    ap.add_argument("--pg-dsn", required=True)
+    ap.add_argument("--pg-dsn", help="PostgreSQL DSN; defaults to TURBOQUANT_PG_DSN")
     ap.add_argument("--base-sql", required=True)
     ap.add_argument("--query-sql", required=True)
     ap.add_argument("--metric", choices=("cosine", "ip"), default="cosine")
@@ -80,9 +81,12 @@ def p50_ms(samples: list[float]) -> float:
 
 def main() -> int:
     args = parse_args()
+    pg_dsn = args.pg_dsn or os.environ.get("TURBOQUANT_PG_DSN")
+    if not pg_dsn:
+        raise SystemExit("--pg-dsn or TURBOQUANT_PG_DSN is required")
     mod = load_bench_module()
-    base = mod.load_pg_query_vectors(args.pg_dsn, args.base_sql)
-    queries = mod.load_pg_query_vectors(args.pg_dsn, args.query_sql)
+    base = mod.load_pg_query_vectors(pg_dsn, args.base_sql)
+    queries = mod.load_pg_query_vectors(pg_dsn, args.query_sql)
     if args.query_limit > 0:
         queries = queries[: args.query_limit]
     if base.ndim != 2 or queries.ndim != 2:

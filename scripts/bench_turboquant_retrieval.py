@@ -2753,11 +2753,12 @@ def print_results(title: str, rows: list[EvalResult]) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Offline TurboQuant retrieval evaluator")
-    src = ap.add_mutually_exclusive_group(required=True)
+    src = ap.add_mutually_exclusive_group()
     src.add_argument("--dataset", choices=sorted(DATASETS.keys()))
     src.add_argument("--vectors", type=Path, help="Base vectors (.npy or .npz with key 'base')")
-    src.add_argument("--pg-dsn", help="PostgreSQL DSN for SQL-driven vector input")
+    src.add_argument("--pg", action="store_true", help="Read vectors from PostgreSQL SQL queries")
 
+    ap.add_argument("--pg-dsn", help="PostgreSQL DSN for SQL-driven vector input; defaults to TURBOQUANT_PG_DSN")
     ap.add_argument("--queries", type=Path, help="Query vectors (.npy) for --vectors input")
     ap.add_argument("--base-sql", help="SQL returning one vector column for base vectors")
     ap.add_argument("--query-sql", help="SQL returning one vector column for query vectors")
@@ -3023,6 +3024,10 @@ def main() -> int:
     shared: np.ndarray | None = None
     input_nonfinite_rows = 0
     dropped_nonfinite_rows = 0
+    sql_mode = bool(args.pg or args.pg_dsn or args.base_sql or args.query_sql or args.shared_sql)
+    source_count = int(bool(args.dataset)) + int(bool(args.vectors)) + int(sql_mode)
+    if source_count != 1:
+        raise SystemExit("select exactly one input source: --dataset, --vectors, or SQL mode")
     if args.dataset:
         base, queries, metric = load_ann_dataset(
             args.dataset,
@@ -3037,12 +3042,15 @@ def main() -> int:
         base, queries = load_numpy_dataset(args.vectors, args.queries)
         metric = args.metric
     else:
+        pg_dsn = args.pg_dsn or os.environ.get("TURBOQUANT_PG_DSN")
+        if not pg_dsn:
+            raise SystemExit("--pg-dsn or TURBOQUANT_PG_DSN is required for SQL-driven vector input")
         if args.shared_sql:
             if args.base_sql or args.query_sql:
                 raise SystemExit("--shared-sql cannot be combined with --base-sql/--query-sql")
             if args.folds <= 0:
                 raise SystemExit("--folds must be positive")
-            shared = load_pg_query_vectors(args.pg_dsn, args.shared_sql)
+            shared = load_pg_query_vectors(pg_dsn, args.shared_sql)
             input_nonfinite_rows = nonfinite_row_count(shared)
             if input_nonfinite_rows:
                 if not args.drop_nonfinite:
@@ -3054,9 +3062,9 @@ def main() -> int:
             folds = args.folds
         else:
             if not args.base_sql or not args.query_sql:
-                raise SystemExit("--base-sql and --query-sql are required with --pg-dsn")
-            base = load_pg_query_vectors(args.pg_dsn, args.base_sql)
-            queries = load_pg_query_vectors(args.pg_dsn, args.query_sql)
+                raise SystemExit("--base-sql and --query-sql are required with --pg-dsn/TURBOQUANT_PG_DSN")
+            base = load_pg_query_vectors(pg_dsn, args.base_sql)
+            queries = load_pg_query_vectors(pg_dsn, args.query_sql)
             input_nonfinite_rows = nonfinite_row_count(base) + nonfinite_row_count(queries)
             if input_nonfinite_rows:
                 if not args.drop_nonfinite:
