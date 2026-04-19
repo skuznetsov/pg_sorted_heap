@@ -1,0 +1,10 @@
+# Keep generated release/source archives focused on extension sources and docs.
+.agents/** export-ignore
+.claude/** export-ignore
+.crystal_ball/** export-ignore
+.github/** export-ignore
+.ruff_cache/** export-ignore
+
+CLAUDE_*.md export-ignore
+TODO.md export-ignore
+docs/announcement-0.13.0.md export-ignore
