@@ -97,29 +97,34 @@ Use this short blurb when a site needs one paragraph.
 
 > We shipped `pg_sorted_heap v0.13.0`.
 >
-> The main change is that the narrow fact-shaped GraphRAG contract is now part
-> of the stable release surface inside PostgreSQL.
+> The main change in this release is that the narrow fact-shaped GraphRAG
+> contract is now part of the stable surface inside PostgreSQL.
 >
-> What is stable in `0.13.0`:
+> In practical terms, `0.13.0` brings together:
 >
-> - `sorted_heap` table AM
-> - `sorted_hnsw` index AM for `svec` and `hsvec`
+> - `sorted_heap` as a sorted table access method
+> - `sorted_hnsw` as the planner-integrated ANN path for `svec` and `hsvec`
 > - stable fact-shaped GraphRAG entry points
-> - stable routed GraphRAG dispatcher for multi-shard application flows
+> - a stable routed GraphRAG dispatcher for multi-shard application flows
 >
-> Some current benchmark anchors:
+> Some current anchors:
 >
 > - Gutenberg `~104K x 2880D`: `sorted_hnsw (hsvec)` at `1.404 ms`, `100.0% Recall@10`
 > - same corpus: pgvector `halfvec` at `2.031 ms`, `99.8% Recall@10`
 > - fact-shaped multihop GraphRAG (`5K` chains, `384D`): `0.962 ms` median on the path-aware helper
 >
-> We also spent a lot of effort on lifecycle hardening for this release:
-> upgrade, dump/restore, crash recovery, concurrent online operations, and
-> shared-cache correctness.
+> A big part of this release was also lifecycle hardening:
 >
-> FlashHadamard is included in `0.13.0`, but only as an experimental research
-> lane. The stable headline of this release is GraphRAG + planner-integrated
-> ANN inside PostgreSQL.
+> - extension upgrade
+> - dump/restore
+> - crash recovery
+> - concurrent online operations
+> - shared-cache correctness
+> - CI green on PostgreSQL 17 and 18, including `pg_upgrade 17 -> 18`
+>
+> FlashHadamard is included in `0.13.0`, but still explicitly experimental.
+> The stable headline of this release is GraphRAG + planner-integrated ANN
+> inside PostgreSQL.
 >
 > Release: https://github.com/skuznetsov/pg_sorted_heap/releases/tag/v0.13.0
 > Repo: https://github.com/skuznetsov/pg_sorted_heap
@@ -128,16 +133,17 @@ Use this short blurb when a site needs one paragraph.
 
 > We shipped `pg_sorted_heap v0.13.0`.
 >
-> The release makes the narrow fact-shaped GraphRAG contract stable inside
-> PostgreSQL, with planner-integrated `sorted_hnsw` for `svec`/`hsvec` and
-> routed GraphRAG as the app-facing multi-shard flow.
+> This release makes the narrow fact-shaped GraphRAG contract stable inside
+> PostgreSQL, with `sorted_hnsw` as the planner-integrated ANN path for
+> `svec`/`hsvec` and `sorted_heap_graph_route(...)` as the stable routed
+> dispatcher.
 >
 > Current anchors:
 >
 > - Gutenberg `~104K x 2880D`: `1.404 ms`, `100.0% Recall@10` (`hsvec`)
-> - fact-shaped multihop GraphRAG: `0.962 ms` median on the path-aware helper
+> - fact-shaped multihop GraphRAG (`5K` chains, `384D`): `0.962 ms` median
 >
-> FlashHadamard is included, but still experimental.
+> FlashHadamard is in the release, but remains experimental.
 >
 > Release: https://github.com/skuznetsov/pg_sorted_heap/releases/tag/v0.13.0
 
@@ -304,4 +310,3 @@ Reason:
 - HN needs the cleanest positioning and benefits from the fresh release link
 - PostgreSQL channels care more about lifecycle and operator credibility
 - `mempalace` outreach is stronger after the release is visibly public
-
