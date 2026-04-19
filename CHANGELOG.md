@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.13.0 (in development)
+## 0.13.0 (2026-04-19)
 
 ### GraphRAG release status
 

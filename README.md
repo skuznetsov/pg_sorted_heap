@@ -901,7 +901,7 @@ SET sorted_heap.ann_timing = on;                 -- timing breakdown in DEBUG1
 - [SQL API](docs/api.md) -- full function reference
 - [Benchmarks](docs/benchmarks.md) -- latency, throughput, vector search
 - [GraphRAG 0.13 Plan](docs/graphrag-0.13-plan.md) -- stable target and hardening gates
-- [Release 0.13.0 Draft](docs/release-0.13.0.md) -- repo-owned GitHub release note draft
+- [Release 0.13.0](docs/release-0.13.0.md) -- repo-owned GitHub release note
 - [FlashHadamard Note](docs/flashhadamard-note.md) -- experimental retrieval lane and canonical operating points
 - [FlashHadamard Retrospective](docs/flashhadamard-retrospective.md) -- what was proved, refuted, and still unproven
 - [Limitations](docs/limitations.md)

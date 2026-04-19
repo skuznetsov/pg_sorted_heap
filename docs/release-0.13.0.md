@@ -4,9 +4,9 @@ title: Release 0.13.0
 nav_order: 10
 ---
 
-# Release 0.13.0 draft
+# Release 0.13.0
 
-This page is the repo-owned draft for the `v0.13.0` GitHub release.
+This page is the repo-owned release note for `v0.13.0`.
 
 ## Summary
 
