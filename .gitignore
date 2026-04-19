@@ -23,3 +23,10 @@ __pycache__/
 
 # Agent tooling
 .agents/
+.claude/
+.crystal_ball/
+
+# Local benchmark scratch binaries
+/bench_kernel
+/bench_fh_kernel
+/bench_fh_kernel_real
