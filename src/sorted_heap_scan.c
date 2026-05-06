@@ -157,6 +157,13 @@ static void sorted_heap_compute_scan_ranges(SortedHeapRelInfo *info,
 											SortedHeapScanRange **ranges_out,
 											int *nranges_out,
 											BlockNumber *total_nblocks_out);
+static void sorted_heap_append_scan_range(SortedHeapScanRange **ranges,
+										  int *nranges,
+										  int *alloc,
+										  BlockNumber start,
+										  BlockNumber nblocks,
+										  bool sorted_prefix,
+										  BlockNumber *total_nblocks);
 static bool sorted_heap_zone_overlaps(SortedHeapZoneMapEntry *e,
 									  SortedHeapScanBounds *bounds);
 static bool zone_overlaps_in_values(SortedHeapZoneMapEntry *e,
@@ -496,8 +503,8 @@ sorted_heap_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	if (!sorted_heap_enable_scan_pruning)
 		return;
 
-	/* Only base relations with restrictions */
-	if (rel->reloptkind != RELOPT_BASEREL)
+	/* Only simple base/partition-member relations with restrictions */
+	if (!IS_SIMPLE_REL(rel))
 		return;
 	if (rte->rtekind != RTE_RELATION)
 		return;
@@ -1460,6 +1467,28 @@ sorted_heap_set_parallel_fallback_span(SortedHeapScanState *shstate)
  *  a final range unless safely skippable.
  * ---------------------------------------------------------------- */
 static void
+sorted_heap_append_scan_range(SortedHeapScanRange **ranges,
+							  int *nranges,
+							  int *alloc,
+							  BlockNumber start,
+							  BlockNumber nblocks,
+							  bool sorted_prefix,
+							  BlockNumber *total_nblocks)
+{
+	if (*nranges >= *alloc)
+	{
+		*alloc *= 2;
+		*ranges = repalloc(*ranges, sizeof(SortedHeapScanRange) * *alloc);
+	}
+
+	(*ranges)[*nranges].start = start;
+	(*ranges)[*nranges].nblocks = nblocks;
+	(*ranges)[*nranges].sorted_prefix = sorted_prefix;
+	*total_nblocks += nblocks;
+	(*nranges)++;
+}
+
+static void
 sorted_heap_compute_scan_ranges(SortedHeapRelInfo *info,
 								SortedHeapScanBounds *bounds,
 								int64 *in_values, int n_in_values,
@@ -1562,6 +1591,7 @@ sorted_heap_compute_scan_ranges(SortedHeapRelInfo *info,
 			/* Simple bounds: single binary search */
 			uint32	pfx_first_idx = 0;
 			uint32	pfx_last_idx = pfx_limit;
+			bool	refine_col2 = false;
 
 			if (bounds->has_lo)
 				pfx_first_idx = zm_bsearch_first(info, bounds->lo,
@@ -1572,7 +1602,70 @@ sorted_heap_compute_scan_ranges(SortedHeapRelInfo *info,
 												bounds->hi_inclusive,
 												pfx_limit);
 
-			if (pfx_first_idx < pfx_last_idx)
+			/*
+			 * When the first key is fixed and the second key is bounded,
+			 * refine the first-column prefix span with the second-column
+			 * zone-map entry.  This keeps common layouts like
+			 * (tenant_id, id) from scanning the whole tenant prefix for a
+			 * narrow id range.  The refinement is deliberately conservative:
+			 * it only uses already-materialized per-page min/max metadata and
+			 * falls back to the broader first-column range when col2 is not
+			 * tracked for a page.
+			 */
+			refine_col2 = bounds->has_lo && bounds->has_hi &&
+				bounds->lo_inclusive && bounds->hi_inclusive &&
+				bounds->lo == bounds->hi &&
+				(bounds->has_lo2 || bounds->has_hi2);
+
+			if (refine_col2 && pfx_first_idx < pfx_last_idx)
+			{
+				bool	local_run_active = false;
+				uint32	local_run_start = 0;
+				uint32	local_run_end = 0;
+				uint32	j;
+
+				for (j = pfx_first_idx; j < pfx_last_idx; j++)
+				{
+					SortedHeapZoneMapEntry *e =
+						sorted_heap_get_zm_entry(info, j);
+					bool	match = sorted_heap_zone_overlaps(e, bounds);
+
+					if (match)
+					{
+						if (local_run_active && j == local_run_end)
+							local_run_end = j + 1;
+						else
+						{
+							if (local_run_active)
+							{
+								sorted_heap_append_scan_range(&ranges,
+															  &nranges,
+															  &alloc,
+															  local_run_start + 1,
+															  local_run_end - local_run_start,
+															  true,
+															  &total_nblk);
+							}
+
+							local_run_start = j;
+							local_run_end = j + 1;
+							local_run_active = true;
+						}
+					}
+				}
+
+				if (local_run_active)
+				{
+					sorted_heap_append_scan_range(&ranges,
+												  &nranges,
+												  &alloc,
+												  local_run_start + 1,
+												  local_run_end - local_run_start,
+												  true,
+												  &total_nblk);
+				}
+			}
+			else if (pfx_first_idx < pfx_last_idx)
 			{
 				if (nranges >= alloc)
 				{

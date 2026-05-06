@@ -454,6 +454,37 @@ relative throughput under sustained load, not absolute query latency.
 - SH17 regression tests: point, range, mixed Const+Param prepared queries
   under `force_generic_plan`, correctness cross-checks against non-prepared
 
+### Composite-PK Pruning Refinement
+- For compacted sorted prefixes with equality on the first PK column and a
+  bounded second PK column, scan-range construction now refines the broad
+  first-column span with per-page second-column zone-map min/max metadata.
+- This keeps common `(tenant_id, id)` layouts from scanning an entire tenant
+  prefix for narrow `id` ranges while preserving conservative behavior when
+  the second column is not tracked.
+- SH21B regression covers bounded range and equality shapes and asserts both
+  correctness and tight zone-map block counts.
+
+### Declarative Partitioning First Pass
+- Partition parent queries now allow `SortedHeapScan` paths on PostgreSQL
+  partition-member relations after normal partition pruning.
+- New status/maintenance helpers:
+  - `sorted_heap_partition_status(parent)`
+  - `sorted_heap_compact_partitions(parent, fail_on_unsupported default true)`
+  - `sorted_heap_merge_partitions(parent, fail_on_unsupported default true)`
+  - `sorted_heap_rebuild_zonemap_partitions(parent, fail_on_unsupported default true)`
+- Helpers recurse to concrete leaves, preflight unsupported access methods and
+  sorted_heap leaves without primary keys by default, optionally skip those
+  leaves, and process supported leaves one at a time.
+- The disk-space model is leaf-scoped: only the current leaf rewrite needs
+  temporary headroom, but each processed leaf still takes the same lock class
+  as the underlying concrete-table operation.
+- SH23 regression covers concrete-table compatibility, two-leaf partition
+  parents, generic prepared runtime bounds, merge/rebuild wrappers, mixed
+  unsupported leaves, sorted_heap leaves without primary keys, and nested
+  partition trees.
+- `scripts/test_partition_lock_behavior.sh` manually verifies two-session
+  leaf-lock behavior with `lock_timeout`.
+
 ## Operational Notes
 
 ### pg_dump / pg_restore
@@ -461,6 +492,8 @@ Data is restored via COPY → `multi_insert`, which rebuilds physical data but
 does not set `SHM_FLAG_ZONEMAP_VALID`. Run `sorted_heap_compact()` (or
 `sorted_heap_merge()`) after restore to re-enable scan pruning. Tested:
 10 checks (data integrity, TOAST, secondary indexes, zone map rebuild).
+For partitioned parents, run the partition-scoped compact/merge helper and
+inspect leaf state with `sorted_heap_partition_status(parent)`.
 
 **HNSW sidecar tables:** `src_tid` values become stale after restore (heap
 TIDs change during COPY). Recall drops silently until the sidecar is rebuilt
@@ -483,7 +516,7 @@ after upgrade.
 
 ### Extension Upgrade Path
 Adjacent extension upgrade scripts exist for the shipped versions
-(`0.9.7 -> ... -> 0.9.13`). Upgrading from a version without a matching
+(`0.9.7 -> ... -> 0.13.0`). Upgrading from a version without a matching
 adjacent script still requires `DROP EXTENSION` + `CREATE EXTENSION`
 (table data preserved, zone map rebuilt on next compact).
 

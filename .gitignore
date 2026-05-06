@@ -11,6 +11,8 @@ results/
 log/
 tmp_check/
 tmp_check_iso/
+/outputs/
+/tmp/
 
 # OS/editor temporary files
 *.swp

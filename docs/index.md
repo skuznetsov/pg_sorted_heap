@@ -103,3 +103,16 @@ At 100M rows, a point query reads **1 buffer** (vs 8 for btree, 519,906 for seq 
 - **Beta:** Lower-level GraphRAG helpers/wrappers, code-corpus reference
   contracts, and the FlashHadamard experimental retrieval lane.
 - **Legacy/manual:** IVF-PQ and sidecar HNSW paths.
+
+## Contract specs
+
+- [Composite-PK Pruning](spec-composite-pk-pruning) -- first-pass two-column
+  pruning contract and follow-ups.
+- [Declarative Partitioning](spec-partitioning) -- parent helper and
+  leaf-scoped maintenance contract.
+- [Huge-Table Compaction](spec-huge-table-compaction) -- rewrite/free-space
+  operating model.
+- [Filtered ANN](spec-filtered-ann) -- proposed safe modes for filtered vector
+  retrieval.
+- [Online Lossy-PK Maintenance](spec-online-lossy-pk) -- future lossless
+  replay-key contract for UUID/text online maintenance.

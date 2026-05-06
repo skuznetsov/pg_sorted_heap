@@ -240,6 +240,123 @@ RETURNS text
 AS '$libdir/pg_sorted_heap', 'sorted_heap_zonemap_stats'
 LANGUAGE C STRICT;
 
+CREATE FUNCTION @extschema@.sorted_heap_partition_status(parent regclass)
+RETURNS TABLE (
+  parent_relid regclass,
+  leaf_relid regclass,
+  leaf_name text,
+  relkind "char",
+  am_name name,
+  is_sorted_heap boolean,
+  has_primary_key boolean,
+  zone_map_valid boolean,
+  zone_map_sorted boolean,
+  sorted_prefix_pages integer,
+  zone_map_entries integer,
+  overflow_pages integer,
+  relation_size_bytes bigint
+)
+AS $$
+DECLARE
+  parent_kind "char";
+  parent_am name;
+  rec record;
+  stats text;
+  flags text;
+  m text[];
+BEGIN
+  SELECT c.relkind, a.amname
+  INTO parent_kind, parent_am
+  FROM pg_catalog.pg_class c
+  LEFT JOIN pg_catalog.pg_am a ON a.oid = c.relam
+  WHERE c.oid = parent;
+
+  IF parent_kind IS NULL THEN
+    RAISE EXCEPTION 'relation % does not exist', parent;
+  END IF;
+
+  IF parent_kind <> 'p' AND NOT (parent_kind = 'r' AND parent_am = 'sorted_heap') THEN
+    RAISE EXCEPTION '% is neither a partitioned table nor a sorted_heap table', parent;
+  END IF;
+
+  FOR rec IN EXECUTE
+    CASE
+      WHEN parent_kind = 'p' THEN
+        'SELECT p.relid::regclass AS leaf_relid,
+                p.relid::text AS leaf_name,
+                c.relkind,
+                a.amname,
+                EXISTS (
+                  SELECT 1
+                  FROM pg_catalog.pg_index i
+                  WHERE i.indrelid = p.relid
+                    AND i.indisprimary
+                ) AS has_primary_key,
+                CASE
+                  WHEN c.relkind IN (''r'', ''t'', ''m'') THEN
+                    pg_catalog.pg_total_relation_size(p.relid)
+                  ELSE NULL::bigint
+                END AS relation_size_bytes
+         FROM pg_catalog.pg_partition_tree($1) AS p
+         JOIN pg_catalog.pg_class c ON c.oid = p.relid
+         LEFT JOIN pg_catalog.pg_am a ON a.oid = c.relam
+         WHERE p.isleaf
+         ORDER BY p.relid::text'
+      ELSE
+        'SELECT c.oid::regclass AS leaf_relid,
+                c.oid::text AS leaf_name,
+                c.relkind,
+                a.amname,
+                EXISTS (
+                  SELECT 1
+                  FROM pg_catalog.pg_index i
+                  WHERE i.indrelid = c.oid
+                    AND i.indisprimary
+                ) AS has_primary_key,
+                pg_catalog.pg_total_relation_size(c.oid) AS relation_size_bytes
+         FROM pg_catalog.pg_class c
+         LEFT JOIN pg_catalog.pg_am a ON a.oid = c.relam
+         WHERE c.oid = $1'
+    END
+    USING parent
+  LOOP
+    parent_relid := parent;
+    leaf_relid := rec.leaf_relid;
+    leaf_name := rec.leaf_name;
+    relkind := rec.relkind;
+    am_name := rec.amname;
+    is_sorted_heap := COALESCE(rec.amname = 'sorted_heap', false);
+    has_primary_key := rec.has_primary_key;
+    zone_map_valid := NULL;
+    zone_map_sorted := NULL;
+    sorted_prefix_pages := NULL;
+    zone_map_entries := NULL;
+    overflow_pages := NULL;
+    relation_size_bytes := rec.relation_size_bytes;
+
+    IF is_sorted_heap THEN
+      stats := @extschema@.sorted_heap_zonemap_stats(rec.leaf_relid);
+
+      m := pg_catalog.regexp_match(stats, 'flags=([^ ]+)');
+      flags := CASE WHEN m IS NULL THEN NULL ELSE m[1] END;
+      zone_map_valid := flags = 'valid' OR flags = 'valid,sorted';
+      zone_map_sorted := flags = 'sorted' OR flags = 'valid,sorted';
+
+      m := pg_catalog.regexp_match(stats, 'nentries=([0-9]+)');
+      zone_map_entries := CASE WHEN m IS NULL THEN NULL ELSE m[1]::integer END;
+
+      m := pg_catalog.regexp_match(stats, 'overflow_pages=([0-9]+)');
+      overflow_pages := CASE WHEN m IS NULL THEN NULL ELSE m[1]::integer END;
+
+      m := pg_catalog.regexp_match(stats, 'sorted_prefix=([0-9]+)');
+      sorted_prefix_pages := CASE WHEN m IS NULL THEN NULL ELSE m[1]::integer END;
+    END IF;
+
+    RETURN NEXT;
+  END LOOP;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
 CREATE FUNCTION @extschema@.sorted_heap_compact(regclass)
 RETURNS void
 AS '$libdir/pg_sorted_heap', 'sorted_heap_compact'
@@ -277,6 +394,141 @@ CREATE FUNCTION @extschema@.sorted_heap_merge(regclass)
 RETURNS void
 AS '$libdir/pg_sorted_heap', 'sorted_heap_merge'
 LANGUAGE C STRICT;
+
+CREATE FUNCTION @extschema@.sorted_heap_partition_maintenance(
+  parent regclass,
+  operation text,
+  fail_on_unsupported boolean DEFAULT true
+) RETURNS TABLE (
+  parent_relid regclass,
+  leaf_relid regclass,
+  leaf_name text,
+  operation_name text,
+  status text,
+  message text,
+  elapsed_ms double precision
+)
+AS $$
+DECLARE
+  rec record;
+  t0 timestamptz;
+BEGIN
+  IF operation NOT IN ('compact', 'merge', 'rebuild_zonemap') THEN
+    RAISE EXCEPTION 'unsupported sorted_heap partition maintenance operation: %', operation;
+  END IF;
+
+  IF fail_on_unsupported THEN
+    SELECT s.*
+    INTO rec
+    FROM @extschema@.sorted_heap_partition_status(parent) AS s
+    WHERE s.is_sorted_heap IS NOT TRUE
+       OR s.has_primary_key IS NOT TRUE
+    LIMIT 1;
+
+    IF FOUND THEN
+      IF rec.is_sorted_heap IS NOT TRUE THEN
+        RAISE EXCEPTION 'unsupported partition leaf %: access method is %',
+          rec.leaf_relid,
+          COALESCE(rec.am_name::text, rec.relkind::text);
+      ELSE
+        RAISE EXCEPTION 'unsupported sorted_heap partition leaf %: primary key is required',
+          rec.leaf_relid;
+      END IF;
+    END IF;
+  END IF;
+
+  FOR rec IN
+    SELECT s.*
+    FROM @extschema@.sorted_heap_partition_status(parent) AS s
+    ORDER BY s.leaf_name
+  LOOP
+    parent_relid := rec.parent_relid;
+    leaf_relid := rec.leaf_relid;
+    leaf_name := rec.leaf_name;
+    operation_name := operation;
+    elapsed_ms := 0;
+
+    IF rec.is_sorted_heap IS NOT TRUE THEN
+      status := 'skipped';
+      message := 'unsupported access method: ' || COALESCE(rec.am_name::text, rec.relkind::text);
+      RETURN NEXT;
+      CONTINUE;
+    END IF;
+
+    IF rec.has_primary_key IS NOT TRUE THEN
+      status := 'skipped';
+      message := 'primary key is required';
+      RETURN NEXT;
+      CONTINUE;
+    END IF;
+
+    t0 := pg_catalog.clock_timestamp();
+    IF operation = 'compact' THEN
+      PERFORM @extschema@.sorted_heap_compact(rec.leaf_relid);
+    ELSIF operation = 'merge' THEN
+      PERFORM @extschema@.sorted_heap_merge(rec.leaf_relid);
+    ELSE
+      PERFORM @extschema@.sorted_heap_rebuild_zonemap(rec.leaf_relid);
+    END IF;
+
+    elapsed_ms := 1000.0 * EXTRACT(EPOCH FROM (pg_catalog.clock_timestamp() - t0));
+    status := 'ok';
+    message := NULL;
+    RETURN NEXT;
+  END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION @extschema@.sorted_heap_compact_partitions(
+  parent regclass,
+  fail_on_unsupported boolean DEFAULT true
+) RETURNS TABLE (
+  parent_relid regclass,
+  leaf_relid regclass,
+  leaf_name text,
+  operation_name text,
+  status text,
+  message text,
+  elapsed_ms double precision
+)
+AS $$
+  SELECT *
+  FROM @extschema@.sorted_heap_partition_maintenance($1, 'compact', $2);
+$$ LANGUAGE SQL;
+
+CREATE FUNCTION @extschema@.sorted_heap_merge_partitions(
+  parent regclass,
+  fail_on_unsupported boolean DEFAULT true
+) RETURNS TABLE (
+  parent_relid regclass,
+  leaf_relid regclass,
+  leaf_name text,
+  operation_name text,
+  status text,
+  message text,
+  elapsed_ms double precision
+)
+AS $$
+  SELECT *
+  FROM @extschema@.sorted_heap_partition_maintenance($1, 'merge', $2);
+$$ LANGUAGE SQL;
+
+CREATE FUNCTION @extschema@.sorted_heap_rebuild_zonemap_partitions(
+  parent regclass,
+  fail_on_unsupported boolean DEFAULT true
+) RETURNS TABLE (
+  parent_relid regclass,
+  leaf_relid regclass,
+  leaf_name text,
+  operation_name text,
+  status text,
+  message text,
+  elapsed_ms double precision
+)
+AS $$
+  SELECT *
+  FROM @extschema@.sorted_heap_partition_maintenance($1, 'rebuild_zonemap', $2);
+$$ LANGUAGE SQL;
 
 CREATE PROCEDURE @extschema@.sorted_heap_merge_online(regclass)
 AS '$libdir/pg_sorted_heap', 'sorted_heap_merge_online'

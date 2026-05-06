@@ -30,6 +30,8 @@ supported** for tables with UUID, text, or varchar primary keys. The lossy
 int64 hash representation causes collisions during change replay.
 
 Use the offline variants (`sorted_heap_compact`, `sorted_heap_merge`) instead.
+See [Online Compact/Merge for Lossy PK Types](spec-online-lossy-pk) for the
+future lossless replay-key contract.
 
 ---
 
@@ -100,9 +102,24 @@ index.
 | `sorted_heap_merge` | AccessExclusiveLock |
 | `sorted_heap_compact_online` | ShareUpdateExclusiveLock during copy; brief AccessExclusiveLock for swap |
 | `sorted_heap_merge_online` | Same as compact\_online |
+| `sorted_heap_compact_partitions` | Calls `sorted_heap_compact` leaf-by-leaf |
+| `sorted_heap_merge_partitions` | Calls `sorted_heap_merge` leaf-by-leaf |
 
 Only one online compact/merge can run on a table at a time. A second
 concurrent attempt will fail.
+
+Partition parent helpers are operational wrappers, not global transactions:
+they preflight unsupported leaves and sorted_heap leaves without primary keys,
+then process concrete leaves one at a time. They reduce temporary disk-space
+requirements from "whole logical table" to "current leaf rewrite", but an
+individual leaf still needs rewrite headroom. If a later leaf fails, earlier
+leaves are not rolled back by the helper.
+
+The manual smoke `make test-partition-lock` verifies the expected lock
+behavior with two sessions and `lock_timeout`.
+
+See [Huge-Table Compaction Operating Model](spec-huge-table-compaction) for the
+detailed rewrite/free-space contract.
 
 ---
 
@@ -112,6 +129,24 @@ concurrent attempt will fail.
   re-enable scan pruning.
 - **pg_upgrade 17 to 18:** tested and verified. Data files (including zone map)
   are copied as-is.
+
+Post-restore checklist:
+
+```sql
+-- Concrete sorted_heap table:
+SELECT sorted_heap_compact('events'::regclass);
+
+-- Partitioned parent with sorted_heap leaves:
+SELECT *
+FROM sorted_heap_compact_partitions('events_parent'::regclass);
+
+-- Inspect storage state after maintenance:
+SELECT *
+FROM sorted_heap_partition_status('events_parent'::regclass);
+```
+
+For `sorted_hnsw`, rebuild the index/sidecar after restore. It stores physical
+heap TIDs, and `pg_restore` rewrites tuples with new TIDs.
 
 ---
 

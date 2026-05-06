@@ -2451,6 +2451,265 @@ DROP TABLE sh21;
 DROP FUNCTION sh21_plan_contains(text, text);
 DROP FUNCTION sh21_explain_has_ranges(text);
 
+-- ================================================================
+-- SH21B: Composite-key pruning for fixed first key + bounded second key
+-- (tenant_id, id) should not scan the whole tenant prefix when id is narrow.
+-- ================================================================
+CREATE TABLE sh21b(tenant_id int, id int, val text,
+                   PRIMARY KEY (tenant_id, id)) USING sorted_heap;
+INSERT INTO sh21b
+SELECT tenant_id, id, repeat('x', 80)
+FROM generate_series(1, 2) tenant_id,
+     generate_series(1, 10000) id;
+SELECT sorted_heap_compact('sh21b'::regclass);
+ANALYZE sh21b;
+
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+
+CREATE FUNCTION sh21b_zonemap_scanned(query text) RETURNS int AS $$
+DECLARE
+    r record;
+    m text[];
+BEGIN
+    FOR r IN EXECUTE 'EXPLAIN (COSTS OFF) ' || query LOOP
+        m := regexp_match(r."QUERY PLAN", 'Zone Map: ([0-9]+) of');
+        IF m IS NOT NULL THEN
+            RETURN m[1]::int;
+        END IF;
+    END LOOP;
+    RETURN -1;
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT sh21b_zonemap_scanned(
+    'SELECT * FROM sh21b WHERE tenant_id = 1 AND id BETWEEN 100 AND 110') <= 3
+    AS sh21b_composite_tight_range;
+SELECT count(*) AS sh21b_composite_count
+FROM sh21b
+WHERE tenant_id = 1 AND id BETWEEN 100 AND 110;
+SELECT sh21b_zonemap_scanned(
+    'SELECT * FROM sh21b WHERE tenant_id = 1 AND id = 123') <= 2
+    AS sh21b_composite_tight_eq;
+
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+
+DROP FUNCTION sh21b_zonemap_scanned(text);
+DROP TABLE sh21b;
+
+-- ================================================================
+-- SH23: Explicit partition parent maintenance/status helpers
+-- ================================================================
+CREATE TABLE sh23_concrete(id int PRIMARY KEY, val text) USING sorted_heap;
+INSERT INTO sh23_concrete SELECT g, repeat('c', 40) FROM generate_series(1, 200) g;
+SET client_min_messages = warning;
+SELECT count(*) AS sh23_concrete_compact_ok
+FROM sorted_heap_compact_partitions('sh23_concrete'::regclass)
+WHERE status = 'ok' AND leaf_relid = 'sh23_concrete'::regclass;
+RESET client_min_messages;
+SELECT count(*) AS sh23_concrete_status_rows,
+       bool_and(is_sorted_heap) AS sh23_concrete_is_sorted_heap
+FROM sorted_heap_partition_status('sh23_concrete'::regclass);
+DROP TABLE sh23_concrete;
+
+CREATE TABLE sh23_parent(tenant_id int, id int, val text,
+                         PRIMARY KEY (tenant_id, id))
+PARTITION BY RANGE (tenant_id);
+CREATE TABLE sh23_parent_1 PARTITION OF sh23_parent
+    FOR VALUES FROM (1) TO (2) USING sorted_heap;
+CREATE TABLE sh23_parent_2 PARTITION OF sh23_parent
+    FOR VALUES FROM (2) TO (3) USING sorted_heap;
+INSERT INTO sh23_parent
+SELECT tenant_id, id, repeat('p', 80)
+FROM generate_series(1, 2) tenant_id,
+     generate_series(1, 1000) id;
+
+CREATE FUNCTION sh23_plan_contains(query text, pattern text) RETURNS boolean AS $$
+DECLARE r record;
+BEGIN
+    FOR r IN EXECUTE 'EXPLAIN (COSTS OFF) ' || query LOOP
+        IF r."QUERY PLAN" LIKE '%' || pattern || '%' THEN RETURN true; END IF;
+    END LOOP;
+    RETURN false;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION sh23_plan_count(query text, pattern text) RETURNS int AS $$
+DECLARE
+    r record;
+    n int := 0;
+BEGIN
+    FOR r IN EXECUTE 'EXPLAIN (COSTS OFF) ' || query LOOP
+        IF r."QUERY PLAN" LIKE '%' || pattern || '%' THEN n := n + 1; END IF;
+    END LOOP;
+    RETURN n;
+END;
+$$ LANGUAGE plpgsql;
+
+-- SH23-1: status sees both concrete sorted_heap leaves
+SELECT count(*) AS sh23_status_rows,
+       bool_and(is_sorted_heap) AS sh23_all_sorted_heap,
+       bool_and(has_primary_key) AS sh23_all_have_pk
+FROM sorted_heap_partition_status('sh23_parent'::regclass);
+
+-- SH23-2: compact parent helper operates leaf-by-leaf
+SET client_min_messages = warning;
+SELECT count(*) AS sh23_compact_ok
+FROM sorted_heap_compact_partitions('sh23_parent'::regclass)
+WHERE status = 'ok' AND operation_name = 'compact';
+RESET client_min_messages;
+
+SELECT count(*) AS sh23_valid_sorted_leaves
+FROM sorted_heap_partition_status('sh23_parent'::regclass)
+WHERE is_sorted_heap AND zone_map_valid AND zone_map_sorted;
+SELECT count(*) AS sh23_parent_count
+FROM sh23_parent
+WHERE tenant_id = 1 AND id BETWEEN 10 AND 20;
+
+-- SH23-3: parent query reaches SortedHeapScan on the pruned leaf
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SELECT sh23_plan_contains(
+    'SELECT * FROM sh23_parent WHERE tenant_id = 1 AND id BETWEEN 10 AND 20',
+    'Custom Scan (SortedHeapScan)')
+    AS sh23_parent_uses_sorted_heap_scan;
+SELECT sh23_plan_count(
+    'SELECT * FROM sh23_parent WHERE tenant_id BETWEEN 1 AND 2 AND id BETWEEN 10 AND 20',
+    'Custom Scan (SortedHeapScan)') >= 2
+    AS sh23_parent_multi_leaf_sorted_heap_scan;
+
+SET plan_cache_mode = force_generic_plan;
+PREPARE sh23_parent_count_q(int, int, int) AS
+    SELECT count(*) FROM sh23_parent
+    WHERE tenant_id = $1 AND id BETWEEN $2 AND $3;
+SELECT sh23_plan_contains(
+    'EXECUTE sh23_parent_count_q(1, 10, 20)',
+    'runtime bounds')
+    AS sh23_parent_generic_runtime_bounds;
+EXECUTE sh23_parent_count_q(1, 10, 20);
+DEALLOCATE sh23_parent_count_q;
+RESET plan_cache_mode;
+
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+
+-- SH23-4: merge/rebuild wrappers use the same leaf traversal contract
+INSERT INTO sh23_parent VALUES (1, 2001, 'tail-1'), (2, 2001, 'tail-2');
+SET client_min_messages = warning;
+SELECT count(*) AS sh23_merge_ok
+FROM sorted_heap_merge_partitions('sh23_parent'::regclass)
+WHERE status = 'ok' AND operation_name = 'merge';
+SELECT count(*) AS sh23_rebuild_ok
+FROM sorted_heap_rebuild_zonemap_partitions('sh23_parent'::regclass)
+WHERE status = 'ok' AND operation_name = 'rebuild_zonemap';
+RESET client_min_messages;
+
+DROP FUNCTION sh23_plan_contains(text, text);
+DROP FUNCTION sh23_plan_count(text, text);
+DROP TABLE sh23_parent;
+
+-- SH23-5: unsupported leaves are visible and maintenance fails closed
+CREATE TABLE sh23_mixed(tenant_id int, id int,
+                        PRIMARY KEY (tenant_id, id))
+PARTITION BY RANGE (tenant_id);
+CREATE TABLE sh23_mixed_sh PARTITION OF sh23_mixed
+    FOR VALUES FROM (1) TO (2) USING sorted_heap;
+CREATE TABLE sh23_mixed_heap PARTITION OF sh23_mixed
+    FOR VALUES FROM (2) TO (3);
+
+SELECT array_agg(is_sorted_heap ORDER BY leaf_name) AS sh23_mixed_flags
+FROM sorted_heap_partition_status('sh23_mixed'::regclass);
+
+DO $$
+BEGIN
+    PERFORM *
+    FROM sorted_heap_compact_partitions('sh23_mixed'::regclass);
+    RAISE EXCEPTION 'expected sorted_heap_compact_partitions to fail';
+EXCEPTION WHEN OTHERS THEN
+    IF SQLERRM NOT LIKE 'unsupported partition leaf%' THEN
+        RAISE;
+    END IF;
+END;
+$$;
+
+SET client_min_messages = warning;
+SELECT count(*) AS sh23_mixed_skip_count
+FROM sorted_heap_compact_partitions('sh23_mixed'::regclass, false)
+WHERE status = 'skipped';
+RESET client_min_messages;
+
+DROP TABLE sh23_mixed;
+
+-- SH23-6: sorted_heap leaves without a primary key fail closed too
+CREATE TABLE sh23_nopk_parent(tenant_id int, id int)
+PARTITION BY RANGE (tenant_id);
+CREATE TABLE sh23_nopk_leaf PARTITION OF sh23_nopk_parent
+    FOR VALUES FROM (1) TO (2) USING sorted_heap;
+
+SELECT count(*) AS sh23_nopk_status_rows
+FROM sorted_heap_partition_status('sh23_nopk_parent'::regclass)
+WHERE is_sorted_heap AND NOT has_primary_key;
+
+DO $$
+BEGIN
+    PERFORM *
+    FROM sorted_heap_compact_partitions('sh23_nopk_parent'::regclass);
+    RAISE EXCEPTION 'expected sorted_heap_compact_partitions to fail';
+EXCEPTION WHEN OTHERS THEN
+    IF SQLERRM NOT LIKE 'unsupported sorted_heap partition leaf%primary key is required' THEN
+        RAISE;
+    END IF;
+END;
+$$;
+
+SELECT count(*) AS sh23_nopk_skip_count
+FROM sorted_heap_compact_partitions('sh23_nopk_parent'::regclass, false)
+WHERE status = 'skipped' AND message = 'primary key is required';
+
+DROP TABLE sh23_nopk_parent;
+
+-- SH23-7: empty partition parents have no concrete maintenance leaves
+CREATE TABLE sh23_empty_parent(id int, payload text)
+PARTITION BY RANGE (id);
+
+SELECT count(*) AS sh23_empty_status_rows
+FROM sorted_heap_partition_status('sh23_empty_parent'::regclass);
+
+SELECT count(*) AS sh23_empty_skip_count
+FROM sorted_heap_compact_partitions('sh23_empty_parent'::regclass, false);
+
+DROP TABLE sh23_empty_parent;
+
+-- SH23-8: nested partition trees recurse to concrete leaves only
+CREATE TABLE sh23_nested(tenant_id int, bucket int, id int,
+                         PRIMARY KEY (tenant_id, bucket, id))
+PARTITION BY RANGE (tenant_id);
+CREATE TABLE sh23_nested_t1 PARTITION OF sh23_nested
+    FOR VALUES FROM (1) TO (2)
+    PARTITION BY RANGE (bucket);
+CREATE TABLE sh23_nested_t1_b1 PARTITION OF sh23_nested_t1
+    FOR VALUES FROM (1) TO (2) USING sorted_heap;
+CREATE TABLE sh23_nested_t1_b2 PARTITION OF sh23_nested_t1
+    FOR VALUES FROM (2) TO (3) USING sorted_heap;
+INSERT INTO sh23_nested
+SELECT 1, bucket, id
+FROM generate_series(1, 2) bucket,
+     generate_series(1, 200) id;
+
+SELECT count(*) AS sh23_nested_status_rows,
+       bool_and(is_sorted_heap) AS sh23_nested_all_sorted_heap,
+       bool_and(leaf_name LIKE '%sh23_nested_t1_b%') AS sh23_nested_only_leaves
+FROM sorted_heap_partition_status('sh23_nested'::regclass);
+
+SET client_min_messages = warning;
+SELECT count(*) AS sh23_nested_compact_ok
+FROM sorted_heap_compact_partitions('sh23_nested'::regclass)
+WHERE status = 'ok';
+RESET client_min_messages;
+
+DROP TABLE sh23_nested;
+
 -- ====================================================================
 -- ANN regression tests: svec_ann_scan correctness, dimension check,
 -- ann_timing non-crash smoke

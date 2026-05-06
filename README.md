@@ -673,6 +673,7 @@ make test-release              # full extension release-candidate bundle
 make test-concurrent           # concurrent DML + online ops
 make test-toast                # TOAST integrity
 make test-alter-table          # ALTER TABLE DDL (36 checks)
+make test-partition-lock       # partition helper lock behavior
 make test-dump-restore         # pg_dump/restore lifecycle
 make test-graphrag-lifecycle   # GraphRAG upgrade + dump/restore lifecycle
 make test-graph-builder        # graph sidecar bootstrap + rebuild smoke
@@ -897,7 +898,11 @@ SET sorted_heap.ann_timing = on;                 -- timing breakdown in DEBUG1
 
 - [Quick Start](docs/quickstart.md)
 - [Vector Search](docs/vector-search.md) -- `sorted_hnsw`, IVF-PQ, sidecar HNSW
+- [Filtered ANN Contracts](docs/spec-filtered-ann.md) -- proposed safe modes for filtered vector retrieval
 - [Architecture](docs/architecture.md) -- zone maps, custom scan, compaction
+- [Composite-PK Pruning Spec](docs/spec-composite-pk-pruning.md) -- first-pass two-column pruning contract
+- [Huge-Table Compaction Operating Model](docs/spec-huge-table-compaction.md) -- rewrite/free-space contract
+- [Online Lossy-PK Maintenance Spec](docs/spec-online-lossy-pk.md) -- future online UUID/text PK contract
 - [SQL API](docs/api.md) -- full function reference
 - [Benchmarks](docs/benchmarks.md) -- latency, throughput, vector search
 - [GraphRAG 0.13 Plan](docs/graphrag-0.13-plan.md) -- stable target and hardening gates

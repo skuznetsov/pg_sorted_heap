@@ -1,0 +1,254 @@
+---
+layout: default
+title: Functional Gap Specs
+nav_order: 13
+---
+
+# Functional Gap Specs
+
+This document tracks the next functional gaps after the `0.13.0` release
+surface. It is intentionally contract-first: each gap should get a small spec,
+acceptance tests, and only then implementation.
+
+## Gap Inventory
+
+### G0. Composite-PK pruning quality
+
+Current state:
+
+- The zone map stores the first two PK columns.
+- Initial direct leaf probe on a compacted `(tenant_id, id)` sorted_heap table
+  produced `Custom Scan (SortedHeapScan)`, but scanned `308 of 310` blocks for
+  `tenant_id = 1 AND id BETWEEN 100 AND 110`.
+- The zone map entries contained second-column ranges, so this is not a
+  storage-layout absence. The likely gap is in the sorted-prefix range search:
+  it uses the first column as the main binary-search key and does not yet make
+  the lexicographic `(col1, col2)` bound tight enough.
+- Implemented first-pass fix: when column 1 is fixed by inclusive equality and
+  column 2 has a range/equality bound, the sorted-prefix candidate span is
+  refined with existing second-column zone-map overlap checks.
+- Regression `SH21B` now guards `tenant_id = 1 AND id BETWEEN 100 AND 110`
+  with a tight scanned-block threshold and verifies count correctness.
+- `docs/spec-composite-pk-pruning.md` documents the first-pass contract and
+  remaining lexicographic/tail follow-ups.
+
+Risk:
+
+- Partitioning and fact-shaped GraphRAG commonly use composite keys such as
+  `(tenant_id, id)` or `(entity_id, relation_id, target_id)`. If second-column
+  pruning is weak, we keep correctness but give back much of the locality win.
+
+Target direction:
+
+- Continue from the first-pass refinement toward true lexicographic binary
+  search for the sorted prefix path if planning-time refinement over a large
+  tenant span becomes measurable overhead.
+- Keep linear/tail pruning conservative, but make compacted prefix queries with
+  equality on column 1 and range/equality on column 2 map to tight block ranges.
+
+### G1. Declarative partitioning support
+
+Current state:
+
+- `sorted_heap` works as a concrete table access method on physical tables.
+- Each physical `sorted_heap` relation owns its own block-0 meta page, zone
+  map, sorted-prefix state, compact/merge lifecycle, and optional
+  `sorted_hnsw` indexes.
+- PostgreSQL declarative partitioned parents now have first-pass explicit
+  status and maintenance helpers:
+  `sorted_heap_partition_status(...)`,
+  `sorted_heap_compact_partitions(...)`,
+  `sorted_heap_merge_partitions(...)`, and
+  `sorted_heap_rebuild_zonemap_partitions(...)`.
+- Verified probe: sorted_heap leaves under a declarative partitioned parent can
+  be created and compacted, and a direct leaf query can use
+  `SortedHeapScan`.
+- First-pass planner fix: the same covered predicate shape issued through the
+  partitioned parent now reaches `SortedHeapScan` on the pruned leaf.
+- Regression `SH23` covers parent status, leaf-by-leaf compact, fail-closed
+  unsupported heap/no-PK leaf behavior, explicit skip mode, empty partition
+  parents, nested partition trees, and parent-query `SortedHeapScan` for
+  single-leaf and multi-leaf range-partition shapes, including a generic
+  prepared runtime-bound parent query.
+- GraphRAG routing already supports multiple concrete shard relations, but it
+  does not automatically dispatch across a PostgreSQL partitioned-table parent.
+
+Risk:
+
+- Treating partitioning as one broad feature would mix storage maintenance,
+  planner pruning, index fanout, and GraphRAG global merge semantics.
+
+Target direction:
+
+- Make partition support explicit and incremental:
+  1. leaf tables first: done;
+  2. parent-level maintenance helpers: first pass done;
+  3. parent/leaf observability: first pass done;
+  4. parent-query `SortedHeapScan` planner support: covered single-leaf and
+     multi-leaf range shapes plus generic prepared runtime-bound shape done;
+  5. optional GraphRAG/ANN parent dispatch later.
+
+### G2. Huge-table compaction operating model
+
+Current state:
+
+- `sorted_heap_compact(regclass)` is a rewrite-and-swap operation similar in
+  operational shape to `CLUSTER` or `VACUUM FULL`.
+- `sorted_heap_merge(regclass)` avoids re-sorting an already sorted prefix, but
+  still rewrites into a new relation.
+- Online compact/merge reduce blocking time, not temporary disk-space
+  requirements.
+- `docs/spec-huge-table-compaction.md` now documents the first-pass operating
+  model: concrete operations rewrite one relation; partition helpers bound the
+  rewrite unit to one leaf.
+
+Risk:
+
+- A user may expect compaction to be an in-place defragmentation operation with
+  no second-copy space requirement. That is not the current contract.
+
+Target direction:
+
+- For very large logical tables, keep partition-scoped compaction as the
+  default operational story.
+- Longer term: explore segment-level compaction inside a relation, but do not
+  promise this until crash-safety and index semantics are specified.
+
+### G3. Filtered ANN with `sorted_hnsw`
+
+Current state:
+
+- `sorted_hnsw` is intentionally narrow: base-relation
+  `ORDER BY embedding <=> query LIMIT k`.
+- It avoids planning for unbounded KNN and for extra base-table quals that can
+  under-return candidates.
+- GraphRAG wrappers handle some filtered retrieval patterns outside the generic
+  Index AM path.
+- `docs/spec-filtered-ann.md` now separates filtered retrieval into
+  pre-filter/materialize, ANN-overfetch/exact-rerank, and
+  partition/routing-aware global-merge modes.
+
+Risk:
+
+- Users will expect pgvector-like filtered ANN behavior from a normal-looking
+  index.
+
+Target direction:
+
+- Keep the transparent `sorted_hnsw` planner guard intact until helper-level
+  filtered contracts prove underfill handling and global merge semantics.
+- Implement helper-level modes from `docs/spec-filtered-ann.md` before
+  promoting any filtered ANN path into the planner.
+
+### G4. Parent-level observability
+
+Current state:
+
+- `sorted_heap_zonemap_stats(regclass)` reports one concrete relation.
+- `sorted_heap_partition_status(parent)` is the first row-returning
+  observability surface. It accepts a partitioned parent or a concrete
+  sorted_heap table and reports leaf AM, PK presence, zone-map validity,
+  sorted-prefix pages, zone-map entries, overflow pages, and relation size.
+- Scan stats are global/per-backend counters, not per partition.
+- GraphRAG stats are backend-local last-call stats.
+
+Risk:
+
+- On partitioned deployments, users still need deeper per-leaf runtime
+  observability: scan counters, GraphRAG counters, and expected index presence
+  are not yet exposed as parent-level row sets.
+
+Target direction:
+
+- Treat `sorted_heap_partition_status(...)` as the storage-state baseline.
+- Add separate row-returning parent observability for scan stats and vector /
+  GraphRAG index health when those contracts are specified.
+
+### G5. Online compact/merge restrictions for lossy PKs
+
+Current state:
+
+- Online compact/merge rejects UUID/text/varchar PKs because the replay key is
+  currently lossy `int64`.
+- `docs/spec-online-lossy-pk.md` documents the required future design:
+  pruning keys may stay lossy, but online replay identity must be lossless.
+
+Risk:
+
+- The offline path works, so the online limitation may surprise users.
+
+Target direction:
+
+- Replace the replay map key with a lossless Datum/composite key representation
+  or a serialized binary key, with full-key equality after hash lookup.
+- Keep current fail-closed behavior until then.
+
+### G6. `pg_dump` / `pg_restore` zone-map ergonomics
+
+Current state:
+
+- Data restores correctly.
+- Zone-map pruning needs compact/merge after restore.
+- Existing docs now call this out for concrete relations and partitioned
+  parents; HNSW sidecars still need rebuild because restored heap TIDs change.
+
+Risk:
+
+- Users may see correct but slower queries after restore and not understand why.
+
+Target direction:
+
+- Keep the explicit restore checklist in operator docs.
+- A future helper could find restored sorted_heap tables with invalid/missing
+  zone maps, but correctness does not depend on it.
+
+## Prioritization
+
+| Priority | Gap | Reason |
+|----------|-----|--------|
+| P0 | G0 composite-PK pruning quality | First-pass fix landed for fixed-col1/bounded-col2; tail and full lexicographic search remain follow-ups |
+| P0 | G1 declarative partitioning support | Directly affects huge-table operating model and interview/product story |
+| P0 | G2 huge-table compaction model | Needed to explain free-space requirements honestly |
+| P1 | G4 parent-level observability | Storage-state first pass landed; runtime/vector health remains |
+| P1 | G3 filtered ANN | Expected by vector-search users, but broader than storage |
+| P2 | G5 online lossy-PK support | Useful, but current fail-closed behavior is acceptable |
+| P2 | G6 restore ergonomics | Checklist documented; optional discovery helper remains |
+
+## Quadrumvirate Notes
+
+Cassandra:
+
+- Likely failure mode: collapsing partition support, GraphRAG routing, and ANN
+  fanout into one over-broad implementation.
+- Likely failure mode: making parent functions silently skip unsupported leaves,
+  hiding operational drift.
+- Likely failure mode: implementing parent maintenance while leaving
+  composite-key pruning weak, so partitioned tenant tables work operationally
+  but not fast enough.
+
+Daedalus:
+
+- Reframe from "support partitioned tables" to "define exact contracts for
+  leaf storage, parent maintenance, and cross-leaf query merge".
+
+Maieutic:
+
+- Refuted assumption: PostgreSQL planner will automatically produce the same
+  `SortedHeapScan` path through a partitioned parent that it produces on the
+  leaf directly. Probe result: direct leaf query used `SortedHeapScan`; parent
+  query did not.
+- Assumption: parent-level compact can be operationally useful even if it
+  locks one leaf at a time. Falsifier: lock behavior or transaction semantics
+  require a different procedure-style API.
+- Refuted then partially fixed assumption: current two-column zone map gives
+  tight pruning for `(tenant_id, id)` compacted tables. Probe result before the
+  fix: `id BETWEEN 100 AND 110` under `tenant_id = 1` scanned most leaf blocks.
+  `SH21B` now guards the fixed-col1/bounded-col2 path.
+
+Adversary:
+
+- Parent APIs must not accidentally operate on foreign partitions or
+  non-sorted_heap leaves without an explicit policy.
+- Parent APIs must report partial failure clearly.
+- Cross-leaf ANN/GraphRAG needs global top-k exact merge; local top-k concat is
+  not a sufficient correctness contract.

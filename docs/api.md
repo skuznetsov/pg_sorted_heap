@@ -45,6 +45,55 @@ Non-blocking variant of merge with the same three-phase approach as
 CALL sorted_heap_merge_online('events'::regclass);
 ```
 
+### Partition-scoped maintenance
+
+For declarative partitioned tables, use the explicit parent helpers instead of
+calling the concrete-table functions on the parent. They recurse to concrete
+leaves and operate one leaf at a time.
+
+```sql
+SELECT *
+FROM sorted_heap_partition_status('events_parent'::regclass);
+
+SELECT *
+FROM sorted_heap_compact_partitions('events_parent'::regclass);
+
+SELECT *
+FROM sorted_heap_merge_partitions('events_parent'::regclass);
+
+SELECT *
+FROM sorted_heap_rebuild_zonemap_partitions('events_parent'::regclass);
+```
+
+By default, maintenance helpers fail before doing work if any leaf is not a
+`sorted_heap` table or if a sorted_heap leaf has no primary key. Pass `false`
+as the second argument to explicitly skip unsupported leaves:
+
+```sql
+SELECT *
+FROM sorted_heap_compact_partitions('events_parent'::regclass, false);
+```
+
+Locking and disk-space model:
+
+- `sorted_heap_compact_partitions(...)` calls `sorted_heap_compact(...)` on each
+  leaf, so each processed leaf takes `AccessExclusiveLock` while it is
+  rewritten.
+- `sorted_heap_merge_partitions(...)` calls `sorted_heap_merge(...)` on each
+  leaf and has the same lock class.
+- The rewrite needs temporary disk headroom for the leaf being processed, not
+  for the whole logical parent at once.
+- These helpers are not atomic across all leaves. If a later leaf fails,
+  already processed leaves remain processed.
+- See [Huge-Table Compaction Operating Model](spec-huge-table-compaction) for
+  the detailed rewrite/free-space contract.
+
+Manual lock-behavior smoke:
+
+```bash
+make test-partition-lock
+```
+
 ---
 
 ## Zone map

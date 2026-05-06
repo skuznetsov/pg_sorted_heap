@@ -49,6 +49,7 @@ TEST_CONCURRENT_PORT ?= 65490
 TEST_CRASH_PORT ?= 65491
 TEST_TOAST_PORT ?= 65492
 TEST_ALTER_PORT ?= 65493
+TEST_PARTITION_LOCK_PORT ?= 65487
 TEST_GRAPHRAG_PORT ?= 65494
 TEST_DUMP_PORT ?= 65495
 TEST_GRAPHRAG_CRASH_PORT ?= 65498
@@ -505,6 +506,9 @@ test-toast:
 test-alter-table:
 	./scripts/test_alter_table.sh $(TMP_SELFTEST_ROOT) $(TEST_ALTER_PORT)
 
+test-partition-lock:
+	TMPDIR="$(TMP_SELFTEST_ROOT)" ./scripts/test_partition_lock_behavior.sh $(TEST_PARTITION_LOCK_PORT)
+
 test-dump-restore:
 	./scripts/test_dump_restore.sh $(TMP_SELFTEST_ROOT) $(TEST_DUMP_PORT)
 
@@ -523,6 +527,7 @@ test-release:
 	$(MAKE) test-dump-restore
 	$(MAKE) test-toast
 	$(MAKE) test-alter-table
+	$(MAKE) test-partition-lock
 	$(MAKE) test-crash-recovery
 	$(MAKE) test-concurrent
 	$(MAKE) test-hnsw-chunked-cache
@@ -793,6 +798,7 @@ help:
 	@echo "  make test-graphrag-concurrent TEST_GRAPHRAG_CONCURRENT_PORT=<port>"
 	@echo "  make test-toast TEST_TOAST_PORT=<port>"
 	@echo "  make test-alter-table TEST_ALTER_PORT=<port>"
+	@echo "  make test-partition-lock TEST_PARTITION_LOCK_PORT=<port>"
 	@echo "  make test-graphrag-lifecycle TEST_GRAPHRAG_PORT=<port>"
 	@echo "  make test-graphrag-release TMP_SELFTEST_ROOT=<abs_tmp_dir>"
 	@echo "  make test-release TMP_SELFTEST_ROOT=<abs_tmp_dir>"
