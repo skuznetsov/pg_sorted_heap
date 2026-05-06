@@ -35,6 +35,9 @@ Current state:
 - Regression `SH21B` now has a dedicated first-column-only range guard, so the
   first-pass composite refinement does not regress the original col1 pruning
   path.
+- Regression `SH21B-3` now guards generic prepared runtime composite bounds
+  under `force_generic_plan`, so executor-startup parameter resolution keeps the
+  same tight pruning shape as constant `(tenant_id, id)` predicates.
 - `docs/spec-composite-pk-pruning.md` documents the first-pass contract and
   remaining lexicographic follow-ups.
 

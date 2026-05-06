@@ -3893,7 +3893,32 @@ SELECT sh21b_zonemap_scanned(
  t
 (1 row)
 
--- SH21B-3: First-column-only range remains pruned and correct.
+-- SH21B-3: Generic prepared composite bounds keep the same tight pruning.
+SET plan_cache_mode = force_generic_plan;
+PREPARE sh21b_runtime(int, int, int) AS
+    SELECT * FROM sh21b WHERE tenant_id = $1 AND id BETWEEN $2 AND $3;
+PREPARE sh21b_runtime_count(int, int, int) AS
+    SELECT count(*) AS sh21b_runtime_count
+    FROM sh21b
+    WHERE tenant_id = $1 AND id BETWEEN $2 AND $3;
+SELECT sh21b_zonemap_scanned(
+    'EXECUTE sh21b_runtime(1, 100, 110)') <= 3
+    AS sh21b_runtime_composite_tight_range;
+ sh21b_runtime_composite_tight_range
+-------------------------------------
+ t
+(1 row)
+
+EXECUTE sh21b_runtime_count(1, 100, 110);
+ sh21b_runtime_count
+---------------------
+                  11
+(1 row)
+
+DEALLOCATE sh21b_runtime;
+DEALLOCATE sh21b_runtime_count;
+RESET plan_cache_mode;
+-- SH21B-4: First-column-only range remains pruned and correct.
 SELECT sh21b_zonemap_scanned(
     'SELECT * FROM sh21b WHERE tenant_id BETWEEN 2 AND 2') BETWEEN 1 AND 170
     AS sh21b_col1_range_pruned;
@@ -3910,7 +3935,7 @@ WHERE tenant_id BETWEEN 2 AND 2;
                   10000
 (1 row)
 
--- SH21B-4: Unsorted tail stays conservative for second-column predicates.
+-- SH21B-5: Unsorted tail stays conservative for second-column predicates.
 -- Insert tenant 1 rows after tenant 2's compacted prefix; this breaks global
 -- monotonicity while leaving the heap-backed executor quals authoritative.
 INSERT INTO sh21b

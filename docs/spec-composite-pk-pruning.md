@@ -61,6 +61,9 @@ For a compacted/sorted table with a two-column zone map:
   first-column range behavior.
 - `col1 IN (...) AND col2 ...` can remain conservative in the first pass unless
   an exact contract is specified.
+- Generic prepared queries with runtime bounds for `col1 = $1` and
+  `col2 BETWEEN $2 AND $3` should keep the same tight pruning once executor
+  startup resolves the parameters.
 
 Correctness rule:
 
@@ -147,6 +150,26 @@ Expected:
 Status: covered by `SH21B-3` for fixed-col1/bounded-col2 predicates. Existing
 tail regressions cover first-column behavior.
 
+### C5. Generic prepared composite bounds
+
+Run under `plan_cache_mode = force_generic_plan`:
+
+```text
+PREPARE q(int, int, int) AS
+SELECT * FROM tenant_events
+WHERE tenant_id = $1 AND id BETWEEN $2 AND $3;
+
+EXPLAIN (COSTS OFF) EXECUTE q(1, 100, 110);
+```
+
+Expected:
+
+- executor-startup runtime bound resolution preserves the composite bounds;
+- scanned blocks stay close to the constant-bound C1 shape;
+- result count is correct.
+
+Status: covered by `SH21B-3` regression.
+
 ## Implementation Sketch
 
 Data model:
@@ -186,6 +209,8 @@ Adversary checks:
 ## Definition of Done
 
 - C1-C2 regression tests are present in `sql/pg_sorted_heap.sql` as `SH21B`.
-- C4 tail correctness is present in `sql/pg_sorted_heap.sql` as `SH21B-3`.
+- C5 generic prepared runtime bounds are present in `sql/pg_sorted_heap.sql` as
+  `SH21B-3`.
+- C4 tail correctness is present in `sql/pg_sorted_heap.sql` as `SH21B-5`.
 - Existing single-column pruning tests pass in `pg_sorted_heap`.
 - Existing `sorted_hnsw` regression passes after the scan change.
