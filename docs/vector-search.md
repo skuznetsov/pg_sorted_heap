@@ -318,6 +318,9 @@ For future very-large tables, IVF-PQ / SQ-family revival is tracked as a
 benchmark-gated scale feature, not as a default replacement. See
 [Large-Vector Sublinear Search](spec-large-vector-sublinear).
 
+SIMD ADC optimization and pgvectorscale StreamingDiskANN comparison are tracked
+separately in [SIMD ADC And DiskANN Comparison](spec-simd-adc-diskann).
+
 ### 103K vectors, 2880-dim (Gutenberg corpus)
 
 Residual PQ (M=720, dsub=4), 256 IVF partitions.

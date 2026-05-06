@@ -120,3 +120,5 @@ At 100M rows, a point query reads **1 buffer** (vs 8 for btree, 519,906 for seq 
   page pruning, metadata-only answers, and future covering sidecars.
 - [Large-Vector Sublinear Search](spec-large-vector-sublinear) -- benchmark gate
   for IVF-PQ / SQ-family revival at 500K+ scale.
+- [SIMD ADC And DiskANN Comparison](spec-simd-adc-diskann) -- benchmark
+  contract for local ADC kernels and pgvectorscale StreamingDiskANN.

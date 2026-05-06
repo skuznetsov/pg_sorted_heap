@@ -738,3 +738,8 @@ Priority order after the native-partitioning hardening pass:
    `500K+` / `1M+` latency + recall + footprint evidence before promoting
    IVF-PQ, SQ8, or a FlashHadamard-derived SQ4 lane.
 8. SIMD-accelerated ADC lookup and pgvectorscale DiskANN comparison.
+   Resolved as two benchmark tracks in `docs/spec-simd-adc-diskann.md`: first
+   measure whether PQ/FlashHadamard ADC is the actual PostgreSQL hot path, keep
+   SIMD kernels behind scalar parity + platform guards, and compare
+   pgvectorscale StreamingDiskANN only with versioned settings, strict-order
+   behavior, recall, latency, footprint, and build cost on the same workload.

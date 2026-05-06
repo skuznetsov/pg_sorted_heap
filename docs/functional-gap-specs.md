@@ -251,6 +251,32 @@ Target direction:
 - Prefer SQ8 before SQ4 for productized candidate scanning unless a 4-bit
   FlashHadamard-derived path proves equal quality at lower footprint.
 
+### G9. SIMD ADC and pgvectorscale DiskANN comparison
+
+Current state:
+
+- PQ ADC has a scalar lookup path and a C-level `svec_ann_scan(...)` path that
+  avoids per-row fmgr overhead.
+- FlashHadamard has an experimental NEON int16 path and a kernel lab with AVX2
+  candidates; existing notes refute AVX2 int16 and keep AVX2 gather as
+  microbench-only.
+- pgvectorscale StreamingDiskANN is an external graph-index baseline with SBQ,
+  query rescoring, label filtering, and relaxed-order behavior.
+- `docs/spec-simd-adc-diskann.md` now separates local ADC kernel optimization
+  from product-level DiskANN benchmarking.
+
+Risk:
+
+- A microbench-only SIMD win can disappear in PostgreSQL executor overhead.
+- A DiskANN comparison can be misleading if it omits strict-order behavior,
+  query rescoring, build settings, or footprint.
+
+Target direction:
+
+- Add optional harness support for pgvectorscale when the extension is
+  installed; fail open when it is absent.
+- Only integrate SIMD kernels behind scalar parity gates and platform guards.
+
 ## Prioritization
 
 | Priority | Gap | Reason |
@@ -262,6 +288,7 @@ Target direction:
 | P1 | G3 filtered ANN | Expected by vector-search users, but broader than storage |
 | P2 | G7 zone-map-only / index-only-like fast paths | Spec boundary landed; real row-returning path requires a covering sidecar |
 | P2 | G8 large-vector sublinear search revival | Benchmark-gated; do not reopen refuted 103K pruning as a default |
+| P2 | G9 SIMD ADC and pgvectorscale DiskANN comparison | Benchmark-gated; external baseline needs versioned settings and strict-order note |
 | P2 | G5 online lossy-PK support | Useful, but current fail-closed behavior is acceptable |
 | P2 | G6 restore ergonomics | Checklist documented; optional discovery helper remains |
 
