@@ -2649,6 +2649,12 @@ WHERE tenant_id = 1 AND id BETWEEN 10 AND 20;
 -- SH23-3: parent query reaches SortedHeapScan on the pruned leaf
 SET enable_indexscan = off;
 SET enable_bitmapscan = off;
+SELECT sorted_heap_reset_stats();
+SELECT bool_and(total_scans = 0) AS sh23_scan_stats_initial_zero
+FROM sorted_heap_partition_scan_stats('sh23_parent'::regclass);
+SELECT count(*) AS sh23_parent_leaf1_count
+FROM sh23_parent
+WHERE tenant_id = 1 AND id BETWEEN 10 AND 20;
 SELECT sh23_plan_contains(
     'SELECT * FROM sh23_parent WHERE tenant_id = 1 AND id BETWEEN 10 AND 20',
     'Custom Scan (SortedHeapScan)')
@@ -2669,6 +2675,15 @@ SELECT sh23_plan_contains(
 EXECUTE sh23_parent_count_q(1, 10, 20);
 DEALLOCATE sh23_parent_count_q;
 RESET plan_cache_mode;
+
+SELECT count(*) AS sh23_scan_stats_leaf_rows,
+       bool_or(leaf_relid = 'sh23_parent_1'::regclass AND total_scans >= 1) AS sh23_scan_stats_leaf1_seen,
+       bool_or(leaf_relid = 'sh23_parent_2'::regclass) AS sh23_scan_stats_leaf2_seen,
+       bool_and(source = 'local') AS sh23_scan_stats_local
+FROM sorted_heap_partition_scan_stats('sh23_parent'::regclass);
+SELECT sorted_heap_reset_stats();
+SELECT bool_and(total_scans = 0) AS sh23_scan_stats_reset_zero
+FROM sorted_heap_partition_scan_stats('sh23_parent'::regclass);
 
 RESET enable_indexscan;
 RESET enable_bitmapscan;

@@ -165,6 +165,32 @@ RETURNS TABLE (
 AS '$libdir/pg_sorted_heap', 'sorted_heap_scan_stats_by_relation'
 LANGUAGE C STRICT;
 
+CREATE FUNCTION @extschema@.sorted_heap_partition_scan_stats(parent regclass)
+RETURNS TABLE (
+  parent_relid regclass,
+  leaf_relid regclass,
+  leaf_name text,
+  total_scans bigint,
+  blocks_scanned bigint,
+  blocks_pruned bigint,
+  source text
+)
+AS $$
+  SELECT
+    s.parent_relid,
+    s.leaf_relid,
+    s.leaf_name,
+    COALESCE(r.total_scans, 0)::bigint AS total_scans,
+    COALESCE(r.blocks_scanned, 0)::bigint AS blocks_scanned,
+    COALESCE(r.blocks_pruned, 0)::bigint AS blocks_pruned,
+    'local'::text AS source
+  FROM @extschema@.sorted_heap_partition_status(parent) AS s
+  LEFT JOIN @extschema@.sorted_heap_scan_stats_by_relation() AS r
+    ON r.relid = s.leaf_relid
+  WHERE s.is_sorted_heap IS TRUE
+  ORDER BY s.leaf_name;
+$$ LANGUAGE sql STABLE;
+
 CREATE FUNCTION @extschema@.sorted_heap_partition_maintenance(
   parent regclass,
   operation text,

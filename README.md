@@ -726,6 +726,7 @@ SELECT sorted_heap_rebuild_zonemap('t'); -- manual rebuild
 ```sql
 SELECT * FROM sorted_heap_scan_stats();  -- total_scans, blocks_scanned, blocks_pruned
 SELECT * FROM sorted_heap_scan_stats_by_relation(); -- backend-local relid counters
+SELECT * FROM sorted_heap_partition_scan_stats('parent'); -- local leaf rollup
 SELECT sorted_heap_reset_stats();        -- reset counters
 ```
 

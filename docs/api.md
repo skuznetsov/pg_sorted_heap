@@ -244,6 +244,21 @@ backend-local and reset by `sorted_heap_reset_stats()`. It is safe to join to
 `sorted_heap_partition_status(parent)` for same-backend diagnostics, but it is
 not cluster-wide telemetry.
 
+### `sorted_heap_partition_scan_stats(parent)`
+
+Returns backend-local scan statistics for sorted_heap leaves under a
+partitioned parent or concrete sorted_heap table:
+
+```sql
+SELECT *
+FROM sorted_heap_partition_scan_stats('events_parent'::regclass);
+```
+
+The helper joins `sorted_heap_partition_status(parent)` to
+`sorted_heap_scan_stats_by_relation()`. It returns one row per sorted_heap leaf,
+with zero counters for leaves that have not executed `SortedHeapScan` in the
+current backend. `source` is currently always `local`.
+
 ### `sorted_heap_reset_stats()`
 
 Resets the scan statistics counters.

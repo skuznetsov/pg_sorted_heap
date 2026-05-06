@@ -15,6 +15,8 @@ Current completion state:
 
 - Done: `sorted_heap_scan_stats_by_relation()` provides backend-local
   relation-aware `SortedHeapScan` counters.
+- Done: `sorted_heap_partition_scan_stats(parent)` rolls those local counters
+  up to sorted_heap leaves under a parent or concrete table.
 - Proposed: shared/cluster-wide relation-aware scan counters and per-shard
   GraphRAG route execution stats.
 
@@ -135,7 +137,8 @@ parent rows = relation-aware counters joined to actual leaves under parent
 ```
 
 No relation key means no parent rollup. The local relation key is now present;
-cluster-wide relation rollups still require a shared-memory design.
+the first parent rollup is implemented for same-backend diagnostics.
+Cluster-wide relation rollups still require a shared-memory design.
 
 ### O2. GraphRAG route execution stats
 
