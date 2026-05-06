@@ -758,7 +758,9 @@ Priority order after the native-partitioning hardening pass:
    same vectors/query/ground truth, without claiming PostgreSQL storage
    lifecycle integration. The harness also accepts local `.npy` / `.npz`
    vector inputs for offline smoke runs without downloading ANN-Benchmarks
-   files.
+   files. `make bench-ann-matrix-offline-smoke` now wraps the deterministic
+   offline matrix smoke for exact heap, `sorted_hnsw`, pgvector HNSW,
+   residual IVF-PQ, and FlashHadamard packed exhaustive.
 8. SIMD-accelerated ADC lookup and pgvectorscale DiskANN comparison.
    Resolved as two benchmark tracks in `docs/spec-simd-adc-diskann.md`: first
    measure whether PQ/FlashHadamard ADC is the actual PostgreSQL hot path, keep

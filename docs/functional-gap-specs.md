@@ -292,6 +292,9 @@ Current state:
 - The same harness accepts local `.npy` / `.npz` vector inputs so smoke tests
   can exercise the full matrix without downloading external ANN-Benchmarks
   files.
+- `make bench-ann-matrix-offline-smoke` wraps that local-input path and checks
+  exact heap, `sorted_hnsw`, pgvector HNSW, residual IVF-PQ, and FlashHadamard
+  packed exhaustive in one deterministic smoke run.
 
 Risk:
 

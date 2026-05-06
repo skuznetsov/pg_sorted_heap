@@ -78,6 +78,10 @@ BENCH_LARGE_VECTOR_PGV_EF_SEARCH ?= 64
 BENCH_LARGE_VECTOR_SHNSW_EF_SEARCH ?= 96
 BENCH_LARGE_VECTOR_DISKANN_QUERY_SEARCH_LIST_SIZE ?= 64
 BENCH_LARGE_VECTOR_DISKANN_QUERY_RESCORE ?= 50
+BENCH_ANN_MATRIX_ROWS ?= 320
+BENCH_ANN_MATRIX_QUERIES ?= 3
+BENCH_ANN_MATRIX_DIM ?= 8
+BENCH_ANN_MATRIX_K ?= 3
 BENCH_PORT ?= 65494
 BENCH_SCALES ?= 1000000,10000000
 VECTOR_BENCH_DSN ?= host=/tmp port=65432 dbname=bench_nomic
@@ -542,6 +546,9 @@ bench-partitioned-sorted-hnsw:
 bench-large-vector-synthetic:
 	bash ./scripts/bench_sorted_hnsw_vs_pgvector.sh $(TMP_SELFTEST_ROOT) $(BENCH_LARGE_VECTOR_PORT) $(BENCH_LARGE_VECTOR_ROWS) $(BENCH_LARGE_VECTOR_QUERIES) $(BENCH_LARGE_VECTOR_DIM) $(BENCH_LARGE_VECTOR_K) $(BENCH_LARGE_VECTOR_PGV_STORAGE) $(BENCH_LARGE_VECTOR_PGV_EF_SEARCH) $(BENCH_LARGE_VECTOR_SHNSW_EF_SEARCH) $(BENCH_LARGE_VECTOR_DISKANN_QUERY_SEARCH_LIST_SIZE) $(BENCH_LARGE_VECTOR_DISKANN_QUERY_RESCORE)
 
+bench-ann-matrix-offline-smoke:
+	bash ./scripts/bench_ann_matrix_offline_smoke.sh $(TMP_SELFTEST_ROOT) $(BENCH_ANN_MATRIX_ROWS) $(BENCH_ANN_MATRIX_QUERIES) $(BENCH_ANN_MATRIX_DIM) $(BENCH_ANN_MATRIX_K)
+
 test-graphrag-lifecycle:
 	./scripts/test_graph_rag_lifecycle.sh $(TMP_SELFTEST_ROOT) $(TEST_GRAPHRAG_PORT)
 
@@ -835,6 +842,7 @@ help:
 	@echo "  make test-graphrag-release TMP_SELFTEST_ROOT=<abs_tmp_dir>"
 	@echo "  make test-release TMP_SELFTEST_ROOT=<abs_tmp_dir>"
 	@echo "  make bench-large-vector-synthetic BENCH_LARGE_VECTOR_ROWS=<n> BENCH_LARGE_VECTOR_QUERIES=<n> BENCH_LARGE_VECTOR_DIM=<n>"
+	@echo "  make bench-ann-matrix-offline-smoke BENCH_ANN_MATRIX_ROWS=<n> BENCH_ANN_MATRIX_QUERIES=<n> BENCH_ANN_MATRIX_DIM=<n>"
 	@echo "  make test-graph-builder TEST_GRAPH_PORT=<port>"
 	@echo "  make build-graph-bench-nomic VECTOR_BENCH_DSN='<dsn>' VECTOR_GRAPH_TABLE=<graph_table> VECTOR_ENTRY_TABLE=<entry_table>"
 	@echo "  make build-hnsw-bench-nomic VECTOR_BENCH_DSN='<dsn>' HNSW_SOURCE_TABLE=<graph_table> HNSW_PREFIX=<prefix>"

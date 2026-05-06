@@ -192,7 +192,8 @@ Smoke shape:
 
 For offline smoke tests without downloading ANN-Benchmarks data, pass
 `--vectors /path/to/sample.npz` where the file contains `base` and `queries`
-2-D float arrays.
+2-D float arrays, or run `make bench-ann-matrix-offline-smoke` for the
+small deterministic matrix smoke.
 
 Expected:
 
