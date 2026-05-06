@@ -92,6 +92,21 @@ SELECT bool_and((row_data->>'bucket')::int = 2) AS part_selected_bucket_ok
 FROM sorted_hnsw_partition_search(
     'hnsw_part'::regclass, 'v', '[1,0,0,0]', 5, 5,
     ARRAY['hnsw_part_2'::regclass]);
+CREATE TABLE hnsw_part_not_leaf(id int PRIMARY KEY, v svec(4)) USING sorted_heap;
+DO $$
+BEGIN
+  PERFORM *
+  FROM sorted_hnsw_partition_search(
+      'hnsw_part'::regclass, 'v', '[1,0,0,0]', 5, 5,
+      ARRAY['hnsw_part_not_leaf'::regclass]);
+  RAISE EXCEPTION 'expected sorted_hnsw_partition_search to reject non-child selected leaf';
+EXCEPTION WHEN OTHERS THEN
+  IF SQLERRM NOT LIKE 'selected leaf % is not a leaf of partition parent %' THEN
+    RAISE;
+  END IF;
+END;
+$$;
+DROP TABLE hnsw_part_not_leaf;
 DROP INDEX hnsw_part_2_v_idx;
 DO $$
 BEGIN

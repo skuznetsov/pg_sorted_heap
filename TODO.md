@@ -499,7 +499,8 @@ relative throughput under sustained load, not absolute query latency.
   enforcement.
 - Selected sorted_heap leaves now must have a valid leaf-local `sorted_hnsw`
   index on the vector column. The helper fails closed instead of silently
-  falling back to exact sort.
+  falling back to exact sort. Explicit `leaf_relids` are also validated against
+  the requested parent instead of being silently ignored.
 - `sorted_heap_partition_maintenance_plan(parent, operation)` is a read-only
   dry-run helper for compact/merge/rebuild_zonemap. It reports all blockers,
   the expected concrete lock mode, relation size, and leaf-scoped temporary

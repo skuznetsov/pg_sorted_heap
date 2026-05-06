@@ -336,6 +336,7 @@ DECLARE
   vector_typname name;
   vector_attnum smallint;
   index_name text;
+  missing_leaf regclass;
 BEGIN
   IF top_k IS NULL OR top_k <= 0 THEN
     RAISE EXCEPTION 'top_k must be positive';
@@ -350,6 +351,21 @@ BEGIN
   IF local_limit > ef THEN
     RAISE EXCEPTION 'local_k (%) must be <= sorted_hnsw.ef_search (%)', local_limit, ef
       USING HINT = 'Increase sorted_hnsw.ef_search or lower local_k.';
+  END IF;
+
+  IF leaf_relids IS NOT NULL THEN
+    SELECT wanted.leaf_relid
+    INTO missing_leaf
+    FROM pg_catalog.unnest(leaf_relids) AS wanted(leaf_relid)
+    LEFT JOIN @extschema@.sorted_heap_partition_status(parent) AS s
+      ON s.leaf_relid = wanted.leaf_relid
+    WHERE s.leaf_relid IS NULL
+    LIMIT 1;
+
+    IF FOUND THEN
+      RAISE EXCEPTION 'selected leaf % is not a leaf of partition parent %',
+        missing_leaf, parent;
+    END IF;
   END IF;
 
   IF fail_on_unsupported THEN

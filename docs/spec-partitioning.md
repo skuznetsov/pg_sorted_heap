@@ -94,7 +94,8 @@ Current verified coverage:
 - Explicit `sorted_hnsw_partition_search(...)` supports route-first vector
   search over all leaves or a selected leaf set, with global exact rerank over
   local candidate pools. It requires a valid leaf-local `sorted_hnsw` index on
-  every selected sorted_heap leaf and fails closed if that contract is not met.
+  every selected sorted_heap leaf, verifies that explicit selected leaves
+  belong to the requested parent, and fails closed if that contract is not met.
 - Broader parent-query shapes still need expansion tests before we claim
   complete planner coverage.
 

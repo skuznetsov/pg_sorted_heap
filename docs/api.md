@@ -142,6 +142,8 @@ Contract:
 - each selected sorted_heap leaf must have a valid, ready, non-expression,
   non-partial leaf-local `sorted_hnsw` index on `vector_column`; the helper
   fails closed instead of silently falling back to exact sort;
+- every explicit `leaf_relids` entry must be a concrete leaf under `parent`;
+  wrong-parent relations are rejected instead of being ignored;
 - `leaf_relids` is optional. When omitted, all supported sorted_heap leaves
   under the parent participate.
 
