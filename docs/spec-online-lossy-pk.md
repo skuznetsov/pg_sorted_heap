@@ -6,7 +6,7 @@ nav_order: 18
 
 # Spec: Online Compact/Merge for Lossy PK Types
 
-Status: proposed
+Status: design-ready, implementation pending
 Risk tier: CAUTION
 Primary goal: define the requirements for supporting online compact/merge on
 UUID, text, and varchar primary keys without replay-key collisions.
@@ -64,7 +64,7 @@ For unsupported types, use offline `sorted_heap_compact(...)` or
 - Do not change zone-map encoding as part of this feature; pruning and replay
   identity are separate concerns.
 
-## Required Future Design
+## Required Design
 
 ### Lossless replay key
 
@@ -83,23 +83,83 @@ The replay hash table may use a hash digest for lookup speed, but equality must
 compare the full key. A digest collision must degrade to a small collision
 chain, not to wrong-row replay.
 
-### Log schema
+### Log schema v2
 
-A future log table should be versioned or shape-explicit. Candidate approaches:
+The next online log table should be shape-explicit. The log table is temporary
+to one online operation, so there is no long-lived on-disk compatibility
+problem, but the shape should still be self-describing enough for debugging.
 
-- typed columns per PK attribute for supported scalar cases;
-- binary serialized key plus typid/collation metadata;
-- composite Datum serialization with a strict memory-context and detoast
-  policy.
+Recommended v2 shape:
+
+```sql
+CREATE UNLOGGED TABLE _sh_compact_log_<relid> (
+    id bigserial,
+    action char(1) NOT NULL,
+    pk_typid oid NOT NULL,
+    pk_collation oid NOT NULL,
+    pk_key bytea NOT NULL
+);
+```
+
+`pk_key` is a lossless canonical byte representation for one primary-key
+attribute:
+
+- `int2/int4/int8`, `timestamp`, `timestamptz`, `date`: binary canonical
+  representation, preserving the current supported semantics.
+- `uuid`: raw 16 UUID bytes.
+- `text/varchar COLLATE "C"`: detoasted bytes without lossy truncation.
+- non-C text/varchar: still fail-closed until collation ordering/equality is
+  explicitly implemented and tested.
 
 The log schema must be safe across transaction boundaries while the online
 operation is running. It does not need to survive the operation after cleanup.
+
+The old `pk_val int8` log shape should not be kept as the internal default.
+Keeping two replay paths increases risk without a user-visible compatibility
+benefit, because online log tables are created and dropped inside one
+operation.
+
+### Key codec
+
+Extract replay identity into a small internal abstraction:
+
+```text
+SortedHeapReplayKey {
+  Oid typid;
+  Oid collation;
+  Size len;
+  uint8 bytes[len];
+}
+```
+
+Required operations:
+
+- encode a tuple key from trigger OLD/NEW rows;
+- encode a tuple key from copy-phase rows;
+- reconstruct a scan Datum for replay `I`/`U` lookup when the type is supported;
+- compare full key equality for hash-map collision chains;
+- hash bytes for lookup speed, never for identity.
+
+This abstraction must be separate from the zone-map key encoder. Zone maps may
+remain lossy for pruning; replay keys must be lossless.
 
 ### Replay lookup
 
 Replay must find rows in the replacement relation by full PK equality. For
 text/varchar, comparison must follow the same semantics used by the primary-key
 btree opclass/collation, not by the zone-map byte prefix.
+
+Replay has two lookup directions:
+
+- `D`/old half of PK-changing `U`: remove the copied row from the replacement
+  relation via the copy-phase full-key -> TID map.
+- `I`/new half of PK-changing `U`: scan the original relation's primary-key
+  index with a reconstructed Datum, then insert the current row version into
+  the replacement relation.
+
+The copy-phase map must not be keyed by `int64`. Use hash digest -> collision
+chain, and compare `(typid, collation, len, bytes)` before treating an entry as
+the target row.
 
 ### Crash and cleanup
 
@@ -167,11 +227,35 @@ Expected:
 Preferred order:
 
 1. Keep current fail-closed checks.
-2. Extract replay-key encoding into a small internal abstraction.
-3. Add lossless key equality and hashing for single-column UUID.
-4. Extend to text/varchar with C collation.
-5. Extend to composite keys only after single-column lossless replay is proven.
-6. Add crash/concurrent tests before broadening the supported type list.
+2. Replace the internal online log with v2 `pk_key bytea` even for already
+   supported scalar PKs, while preserving existing int/date/timestamp behavior.
+3. Extract replay-key encoding into a small internal abstraction.
+4. Add lossless key equality and hashing for single-column UUID.
+5. Add UUID collision regression with concurrent DML and online compact.
+6. Add UUID online merge regression.
+7. Extend to `text/varchar COLLATE "C"` with deliberate first-8-byte
+   collisions.
+8. Extend to composite keys only after single-column lossless replay is proven.
+9. Add crash/concurrent tests before broadening the supported type list.
+
+Do not enable UUID/text by merely removing the current fail-closed guard. The
+guard should move only after the v2 log path and collision tests are in place.
+
+## Pre-Mortem
+
+Likely breakages:
+
+- DML trigger logs a lossy or toasted pointer instead of durable bytes.
+- Replay hash map uses digest equality and silently corrupts colliding keys.
+- `I`/`U` replay reconstructs a Datum with the wrong type or collation.
+- Text support accidentally claims non-C collation safety.
+- Crash cleanup misses the new log-table shape.
+
+Fastest detection signals:
+
+- UUID/text first-8-byte collision tests under concurrent online compact/merge.
+- `make test-concurrent` for existing int/date/timestamp regressions.
+- crash-recovery smoke with replay-in-progress once UUID path is enabled.
 
 ## Quadrumvirate Notes
 

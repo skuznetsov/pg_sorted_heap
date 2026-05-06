@@ -722,7 +722,10 @@ Priority order after the native-partitioning hardening pass:
    free-byte checks remain external because PostgreSQL has no portable
    SQL-level filesystem free-space metric.
 5. Online compact/merge support for UUID/text PKs, which requires a log-format
-   redesign.
+   redesign. Spec is now design-ready in `docs/spec-online-lossy-pk.md`:
+   replace the online log with lossless `pk_key bytea`, split replay identity
+   from lossy zone-map keys, stage UUID first, then `text/varchar COLLATE "C"`,
+   and keep fail-closed guards until collision regressions pass.
 6. Index-only scan equivalent using zone map.
 7. IVF-PQ or SQ8/SQ4 revival for sub-linear scan on very large datasets.
 8. SIMD-accelerated ADC lookup and pgvectorscale DiskANN comparison.
