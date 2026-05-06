@@ -143,9 +143,8 @@ Expected:
 - unsorted tail remains conservatively scanned where needed;
 - no false negatives.
 
-Status: not yet directly covered for second-column predicates. Existing tail
-regressions covered first-column behavior; `SH21B-3` now directly covers the
-fixed-col1/bounded-col2 tail case.
+Status: covered by `SH21B-3` for fixed-col1/bounded-col2 predicates. Existing
+tail regressions cover first-column behavior.
 
 ## Implementation Sketch
 
