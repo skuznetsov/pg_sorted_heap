@@ -20,7 +20,8 @@ Current completion state:
   `shared_preload_libraries`.
 - Done: `sorted_heap_partition_scan_stats(parent)` rolls relation-aware
   counters up to sorted_heap leaves under a parent or concrete table.
-- Proposed: per-shard GraphRAG route execution stats.
+- Done: `sorted_heap_graph_route_last_stats()` provides backend-local
+  per-shard execution rows for the last segmented/routed GraphRAG call.
 
 ## Problem
 
@@ -153,17 +154,17 @@ shared memory is active.
 
 ### O2. GraphRAG route execution stats
 
-Add a route-call execution trace only if routed GraphRAG users need per-shard
-observability.
+Implemented first pass: routed/segmented GraphRAG records a backend-local
+last-call route trace.
 
-Candidate API:
+API:
 
 ```sql
 SELECT *
 FROM sorted_heap_graph_route_last_stats();
 ```
 
-Candidate columns:
+Columns:
 
 ```text
 call_id bigint
@@ -181,6 +182,17 @@ total_ms double precision
 
 This should remain backend-local unless a separate persistent telemetry
 contract is designed.
+
+Current behavior:
+
+- `sorted_heap_graph_rag_segmented(...)` starts a route trace, executes each
+  concrete shard through the existing GraphRAG helpers, and finishes by making
+  `sorted_heap_graph_rag_stats()` report the aggregate of the shard rows.
+- `sorted_heap_graph_route(...)` and lower-level routed wrappers inherit the
+  same trace because they delegate to the segmented merge path.
+- the trace is capped at 256 shard rows per backend-local last call; the row
+  cap avoids unbounded memory growth, while the aggregate
+  `sorted_heap_graph_rag_stats()` totals still include all executed shards.
 
 ### O3. Explain-only diagnostics
 
@@ -233,9 +245,14 @@ Expected:
 - selected shards with zero returned rows can still be represented if they did
   work.
 
+Status: covered in the `graph_rag` regression for a two-shard segmented
+multi-hop call. The test verifies two `source_rel` rows and sum equality for
+seed, expansion, rerank, and returned-row counters.
+
 ## Decision
 
 For `0.13`, parent-level observability is storage/index-health complete and
 scan-runtime complete for `SortedHeapScan`: relation-aware counters are local by
-default and cluster-wide when preloaded. GraphRAG runtime observability remains
-last-call aggregate telemetry until route stats carry source-rel identity.
+default and cluster-wide when preloaded. GraphRAG routed runtime observability
+now carries backend-local `source_rel` identity for the last segmented/routed
+call.

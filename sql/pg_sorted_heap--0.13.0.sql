@@ -2133,6 +2133,33 @@ RETURNS void
 AS '$libdir/pg_sorted_heap', 'sorted_heap_graph_rag_reset_stats'
 LANGUAGE C VOLATILE;
 
+CREATE FUNCTION @extschema@.sorted_heap_graph_route_stats_begin(api text)
+RETURNS bigint
+AS '$libdir/pg_sorted_heap', 'sorted_heap_graph_route_stats_begin'
+LANGUAGE C STABLE;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_route_stats_finish()
+RETURNS void
+AS '$libdir/pg_sorted_heap', 'sorted_heap_graph_route_stats_finish'
+LANGUAGE C STABLE;
+
+CREATE FUNCTION @extschema@.sorted_heap_graph_route_last_stats()
+RETURNS TABLE (
+  call_id bigint,
+  api text,
+  source_rel regclass,
+  seed_count bigint,
+  expanded_rows bigint,
+  reranked_rows bigint,
+  returned_rows bigint,
+  ann_ms float8,
+  expand_ms float8,
+  rerank_ms float8,
+  total_ms float8
+)
+AS '$libdir/pg_sorted_heap', 'sorted_heap_graph_route_last_stats'
+LANGUAGE C STABLE;
+
 CREATE FUNCTION @extschema@.sorted_heap_expand_ids(
   rel regclass,
   seed_ids int4[],
@@ -2544,14 +2571,21 @@ BEGIN
     RAISE EXCEPTION 'sorted_heap_graph_rag_segmented: rels must have length >= 1';
   END IF;
 
-  RETURN QUERY EXECUTE format(
-    'SELECT source_rel, entity_id, relation_id, target_id, payload, distance
-     FROM (%s) AS merged
-     ORDER BY distance, entity_id, relation_id, target_id, source_rel
-     LIMIT $4',
-    union_sql
-  )
-  USING query, relation_path, ann_k, top_k, score_mode, limit_rows;
+  PERFORM @extschema@.sorted_heap_graph_route_stats_begin('sorted_heap_graph_rag_segmented');
+  BEGIN
+    RETURN QUERY EXECUTE format(
+      'SELECT source_rel, entity_id, relation_id, target_id, payload, distance
+       FROM (%s) AS merged
+       ORDER BY distance, entity_id, relation_id, target_id, source_rel
+       LIMIT $4',
+      union_sql
+    )
+    USING query, relation_path, ann_k, top_k, score_mode, limit_rows;
+  EXCEPTION WHEN OTHERS THEN
+    PERFORM @extschema@.sorted_heap_graph_route_stats_finish();
+    RAISE;
+  END;
+  PERFORM @extschema@.sorted_heap_graph_route_stats_finish();
 END;
 $$ LANGUAGE plpgsql STABLE;
 

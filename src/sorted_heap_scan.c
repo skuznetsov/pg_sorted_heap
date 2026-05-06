@@ -227,8 +227,30 @@ typedef struct SortedHeapGraphRagStats
 	double		last_total_ms;
 } SortedHeapGraphRagStats;
 
+#define SH_GRAPH_ROUTE_MAX_STATS 256
+
+typedef struct SortedHeapGraphRouteStat
+{
+	uint64		call_id;
+	char		api[64];
+	Oid			source_rel;
+	int64		seed_count;
+	int64		expanded_rows;
+	int64		reranked_rows;
+	int64		returned_rows;
+	double		ann_ms;
+	double		expand_ms;
+	double		rerank_ms;
+	double		total_ms;
+} SortedHeapGraphRouteStat;
+
 static SortedHeapGraphRagStats sh_graph_rag_stats = {0};
 static int sh_graph_rag_obs_depth = 0;
+static SortedHeapGraphRouteStat sh_graph_route_stats[SH_GRAPH_ROUTE_MAX_STATS];
+static int sh_graph_route_stats_count = 0;
+static uint64 sh_graph_route_call_id = 0;
+static bool sh_graph_route_active = false;
+static SortedHeapGraphRagStats sh_graph_route_aggregate = {0};
 
 typedef struct SortedHeapLocalRelStats
 {
@@ -332,6 +354,7 @@ static void sorted_heap_graph_obs_add_expand(int64 expanded_rows, double expand_
 static void sorted_heap_graph_obs_add_rerank(int64 reranked_rows,
 											 int64 returned_rows,
 											 double rerank_ms);
+static void sorted_heap_graph_route_obs_capture(Oid source_rel);
 static void sorted_heap_update_local_rel_stats(Oid relid,
 											   BlockNumber scanned_blocks,
 											   BlockNumber pruned_blocks);
@@ -2711,6 +2734,9 @@ PG_FUNCTION_INFO_V1(sorted_heap_scan_stats);
 PG_FUNCTION_INFO_V1(sorted_heap_scan_stats_by_relation);
 PG_FUNCTION_INFO_V1(sorted_heap_graph_rag_stats);
 PG_FUNCTION_INFO_V1(sorted_heap_graph_rag_reset_stats);
+PG_FUNCTION_INFO_V1(sorted_heap_graph_route_stats_begin);
+PG_FUNCTION_INFO_V1(sorted_heap_graph_route_stats_finish);
+PG_FUNCTION_INFO_V1(sorted_heap_graph_route_last_stats);
 
 static void
 sorted_heap_update_local_rel_stats(Oid relid,
@@ -3025,7 +3051,82 @@ sorted_heap_graph_rag_reset_stats(PG_FUNCTION_ARGS)
 {
 	MemSet(&sh_graph_rag_stats, 0, sizeof(sh_graph_rag_stats));
 	sh_graph_rag_obs_depth = 0;
+	MemSet(&sh_graph_route_stats, 0, sizeof(sh_graph_route_stats));
+	MemSet(&sh_graph_route_aggregate, 0, sizeof(sh_graph_route_aggregate));
+	sh_graph_route_stats_count = 0;
+	sh_graph_route_call_id = 0;
+	sh_graph_route_active = false;
 	PG_RETURN_VOID();
+}
+
+Datum
+sorted_heap_graph_route_stats_begin(PG_FUNCTION_ARGS)
+{
+	char	   *api_name;
+	uint64		calls = sh_graph_rag_stats.calls + 1;
+
+	if (PG_ARGISNULL(0))
+		api_name = pstrdup("sorted_heap_graph_route");
+	else
+		api_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+	MemSet(&sh_graph_route_stats, 0, sizeof(sh_graph_route_stats));
+	MemSet(&sh_graph_route_aggregate, 0, sizeof(sh_graph_route_aggregate));
+	sh_graph_route_stats_count = 0;
+	sh_graph_route_call_id++;
+	sh_graph_route_active = true;
+
+	sh_graph_route_aggregate.calls = calls;
+	strlcpy(sh_graph_route_aggregate.last_api, api_name,
+			sizeof(sh_graph_route_aggregate.last_api));
+
+	pfree(api_name);
+	PG_RETURN_INT64((int64) sh_graph_route_call_id);
+}
+
+Datum
+sorted_heap_graph_route_stats_finish(PG_FUNCTION_ARGS)
+{
+	if (sh_graph_route_active)
+	{
+		sh_graph_rag_stats = sh_graph_route_aggregate;
+		sh_graph_route_active = false;
+	}
+
+	PG_RETURN_VOID();
+}
+
+Datum
+sorted_heap_graph_route_last_stats(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	for (int i = 0; i < sh_graph_route_stats_count; i++)
+	{
+		SortedHeapGraphRouteStat *s = &sh_graph_route_stats[i];
+		Datum		values[11];
+		bool		nulls[11] = {false, false, false, false, false,
+								 false, false, false, false, false, false};
+
+		values[0] = Int64GetDatum((int64) s->call_id);
+		values[1] = CStringGetTextDatum(s->api);
+		values[2] = ObjectIdGetDatum(s->source_rel);
+		values[3] = Int64GetDatum(s->seed_count);
+		values[4] = Int64GetDatum(s->expanded_rows);
+		values[5] = Int64GetDatum(s->reranked_rows);
+		values[6] = Int64GetDatum(s->returned_rows);
+		values[7] = Float8GetDatum(s->ann_ms);
+		values[8] = Float8GetDatum(s->expand_ms);
+		values[9] = Float8GetDatum(s->rerank_ms);
+		values[10] = Float8GetDatum(s->total_ms);
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+							 values, nulls);
+	}
+
+	PG_RETURN_NULL();
 }
 
 static bool
@@ -3079,6 +3180,48 @@ sorted_heap_graph_obs_add_rerank(int64 reranked_rows,
 	sh_graph_rag_stats.last_returned_rows += returned_rows;
 	sh_graph_rag_stats.last_rerank_ms += rerank_ms;
 	sh_graph_rag_stats.last_total_ms += rerank_ms;
+}
+
+static void
+sorted_heap_graph_route_obs_capture(Oid source_rel)
+{
+	SortedHeapGraphRouteStat *slot;
+
+	if (!sh_graph_route_active || !OidIsValid(source_rel))
+		return;
+
+	/*
+	 * Route wrappers execute one concrete GraphRAG helper per shard. Nested
+	 * helper calls contribute to the parent stats while obs_depth > 1; only the
+	 * outer concrete helper should publish a shard row.
+	 */
+	if (sh_graph_rag_obs_depth != 1)
+		return;
+
+	sh_graph_route_aggregate.last_seed_count += sh_graph_rag_stats.last_seed_count;
+	sh_graph_route_aggregate.last_expanded_rows += sh_graph_rag_stats.last_expanded_rows;
+	sh_graph_route_aggregate.last_reranked_rows += sh_graph_rag_stats.last_reranked_rows;
+	sh_graph_route_aggregate.last_returned_rows += sh_graph_rag_stats.last_returned_rows;
+	sh_graph_route_aggregate.last_ann_ms += sh_graph_rag_stats.last_ann_ms;
+	sh_graph_route_aggregate.last_expand_ms += sh_graph_rag_stats.last_expand_ms;
+	sh_graph_route_aggregate.last_rerank_ms += sh_graph_rag_stats.last_rerank_ms;
+	sh_graph_route_aggregate.last_total_ms += sh_graph_rag_stats.last_total_ms;
+
+	if (sh_graph_route_stats_count >= SH_GRAPH_ROUTE_MAX_STATS)
+		return;
+
+	slot = &sh_graph_route_stats[sh_graph_route_stats_count++];
+	slot->call_id = sh_graph_route_call_id;
+	strlcpy(slot->api, sh_graph_route_aggregate.last_api, sizeof(slot->api));
+	slot->source_rel = source_rel;
+	slot->seed_count = sh_graph_rag_stats.last_seed_count;
+	slot->expanded_rows = sh_graph_rag_stats.last_expanded_rows;
+	slot->reranked_rows = sh_graph_rag_stats.last_reranked_rows;
+	slot->returned_rows = sh_graph_rag_stats.last_returned_rows;
+	slot->ann_ms = sh_graph_rag_stats.last_ann_ms;
+	slot->expand_ms = sh_graph_rag_stats.last_expand_ms;
+	slot->rerank_ms = sh_graph_rag_stats.last_rerank_ms;
+	slot->total_ms = sh_graph_rag_stats.last_total_ms;
 }
 
 static int
@@ -4883,6 +5026,7 @@ done:
 	if (scan)
 		table_endscan(scan);
 	table_close(rel, AccessShareLock);
+	sorted_heap_graph_route_obs_capture(rel_oid);
 	sorted_heap_graph_obs_finish();
 
 	PG_RETURN_NULL();
@@ -5036,6 +5180,7 @@ sorted_heap_expand_rerank(PG_FUNCTION_ARGS)
 	if (seed_values)
 		pfree(seed_values);
 	table_close(rel, AccessShareLock);
+	sorted_heap_graph_route_obs_capture(rel_oid);
 	sorted_heap_graph_obs_finish();
 
 	PG_RETURN_NULL();
@@ -5188,6 +5333,7 @@ sorted_heap_expand_twohop_rerank(PG_FUNCTION_ARGS)
 		if (hop1_values)
 			pfree(hop1_values);
 		table_close(rel, AccessShareLock);
+		sorted_heap_graph_route_obs_capture(rel_oid);
 		sorted_heap_graph_obs_finish();
 		PG_RETURN_NULL();
 	}
@@ -5204,6 +5350,7 @@ sorted_heap_expand_twohop_rerank(PG_FUNCTION_ARGS)
 	if (hop1_values)
 		pfree(hop1_values);
 	table_close(rel, AccessShareLock);
+	sorted_heap_graph_route_obs_capture(rel_oid);
 	sorted_heap_graph_obs_finish();
 
 	PG_RETURN_NULL();
@@ -5358,6 +5505,7 @@ sorted_heap_expand_twohop_path_rerank(PG_FUNCTION_ARGS)
 		if (hop1_scores)
 			pfree(hop1_scores);
 		table_close(rel, AccessShareLock);
+		sorted_heap_graph_route_obs_capture(rel_oid);
 		sorted_heap_graph_obs_finish();
 		PG_RETURN_NULL();
 	}
@@ -5374,6 +5522,7 @@ sorted_heap_expand_twohop_path_rerank(PG_FUNCTION_ARGS)
 	if (hop1_scores)
 		pfree(hop1_scores);
 	table_close(rel, AccessShareLock);
+	sorted_heap_graph_route_obs_capture(rel_oid);
 	sorted_heap_graph_obs_finish();
 
 	PG_RETURN_NULL();
@@ -5556,6 +5705,7 @@ sorted_heap_expand_multihop_rerank(PG_FUNCTION_ARGS)
 			if (path_filters)
 				pfree(path_filters);
 			table_close(rel, AccessShareLock);
+			sorted_heap_graph_route_obs_capture(rel_oid);
 			sorted_heap_graph_obs_finish();
 			PG_RETURN_NULL();
 		}
@@ -5577,6 +5727,7 @@ sorted_heap_expand_multihop_rerank(PG_FUNCTION_ARGS)
 	if (path_filters)
 		pfree(path_filters);
 	table_close(rel, AccessShareLock);
+	sorted_heap_graph_route_obs_capture(rel_oid);
 	sorted_heap_graph_obs_finish();
 
 	PG_RETURN_NULL();
@@ -5758,6 +5909,7 @@ sorted_heap_expand_multihop_path_rerank(PG_FUNCTION_ARGS)
 			if (path_filters)
 				pfree(path_filters);
 			table_close(rel, AccessShareLock);
+			sorted_heap_graph_route_obs_capture(rel_oid);
 			sorted_heap_graph_obs_finish();
 			PG_RETURN_NULL();
 		}
@@ -5777,6 +5929,7 @@ sorted_heap_expand_multihop_path_rerank(PG_FUNCTION_ARGS)
 	if (path_filters)
 		pfree(path_filters);
 	table_close(rel, AccessShareLock);
+	sorted_heap_graph_route_obs_capture(rel_oid);
 	sorted_heap_graph_obs_finish();
 
 	PG_RETURN_NULL();
@@ -5936,6 +6089,7 @@ sorted_heap_graph_rag_scan(PG_FUNCTION_ARGS)
 	{
 		SPI_finish();
 		table_close(rel, AccessShareLock);
+		sorted_heap_graph_route_obs_capture(rel_oid);
 		sorted_heap_graph_obs_finish();
 		PG_RETURN_NULL();
 	}
@@ -5985,6 +6139,7 @@ sorted_heap_graph_rag_scan(PG_FUNCTION_ARGS)
 	SPI_freetuptable(SPI_tuptable);
 	SPI_finish();
 	table_close(rel, AccessShareLock);
+	sorted_heap_graph_route_obs_capture(rel_oid);
 	sorted_heap_graph_obs_finish();
 
 	PG_RETURN_NULL();
@@ -6151,6 +6306,7 @@ sorted_heap_graph_rag_twohop_scan(PG_FUNCTION_ARGS)
 	{
 		SPI_finish();
 		table_close(rel, AccessShareLock);
+		sorted_heap_graph_route_obs_capture(rel_oid);
 		sorted_heap_graph_obs_finish();
 		PG_RETURN_NULL();
 	}
@@ -6204,6 +6360,7 @@ sorted_heap_graph_rag_twohop_scan(PG_FUNCTION_ARGS)
 	SPI_freetuptable(SPI_tuptable);
 	SPI_finish();
 	table_close(rel, AccessShareLock);
+	sorted_heap_graph_route_obs_capture(rel_oid);
 	sorted_heap_graph_obs_finish();
 
 	PG_RETURN_NULL();
@@ -6366,6 +6523,7 @@ sorted_heap_graph_rag_twohop_path_scan(PG_FUNCTION_ARGS)
 	{
 		SPI_finish();
 		table_close(rel, AccessShareLock);
+		sorted_heap_graph_route_obs_capture(rel_oid);
 		sorted_heap_graph_obs_finish();
 		PG_RETURN_NULL();
 	}
@@ -6419,6 +6577,7 @@ sorted_heap_graph_rag_twohop_path_scan(PG_FUNCTION_ARGS)
 	SPI_freetuptable(SPI_tuptable);
 	SPI_finish();
 	table_close(rel, AccessShareLock);
+	sorted_heap_graph_route_obs_capture(rel_oid);
 	sorted_heap_graph_obs_finish();
 
 	PG_RETURN_NULL();
@@ -6564,6 +6723,7 @@ sorted_heap_graph_rag_multihop_scan(PG_FUNCTION_ARGS)
 	{
 		SPI_finish();
 		table_close(rel, AccessShareLock);
+		sorted_heap_graph_route_obs_capture(rel_oid);
 		sorted_heap_graph_obs_finish();
 		PG_RETURN_NULL();
 	}
@@ -6610,6 +6770,7 @@ sorted_heap_graph_rag_multihop_scan(PG_FUNCTION_ARGS)
 	SPI_freetuptable(SPI_tuptable);
 	SPI_finish();
 	table_close(rel, AccessShareLock);
+	sorted_heap_graph_route_obs_capture(rel_oid);
 	sorted_heap_graph_obs_finish();
 
 	PG_RETURN_NULL();
@@ -6755,6 +6916,7 @@ sorted_heap_graph_rag_multihop_path_scan(PG_FUNCTION_ARGS)
 	{
 		SPI_finish();
 		table_close(rel, AccessShareLock);
+		sorted_heap_graph_route_obs_capture(rel_oid);
 		sorted_heap_graph_obs_finish();
 		PG_RETURN_NULL();
 	}
@@ -6801,6 +6963,7 @@ sorted_heap_graph_rag_multihop_path_scan(PG_FUNCTION_ARGS)
 	SPI_freetuptable(SPI_tuptable);
 	SPI_finish();
 	table_close(rel, AccessShareLock);
+	sorted_heap_graph_route_obs_capture(rel_oid);
 	sorted_heap_graph_obs_finish();
 
 	PG_RETURN_NULL();

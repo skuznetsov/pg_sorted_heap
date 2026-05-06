@@ -1049,6 +1049,60 @@ COPY (
 ) TO STDOUT;
 
 COPY (
+  SELECT 'ok'
+  FROM (SELECT sorted_heap_graph_rag_reset_stats()) s
+) TO STDOUT;
+
+COPY (
+  SELECT count(*) AS segmented_stats_result_rows
+  FROM sorted_heap_graph_rag_segmented(
+    ARRAY['facts_chain_seg_a'::regclass, 'facts_chain_seg_b'::regclass],
+    '[-1,0,0,0]'::svec,
+    relation_path := ARRAY[1,2,3],
+    ann_k := 1,
+    top_k := 2,
+    score_mode := 'path',
+    limit_rows := 0
+  )
+) TO STDOUT;
+
+COPY (
+  SELECT call_id > 0 AS has_call_id,
+         api,
+         source_rel::text,
+         seed_count,
+         expanded_rows,
+         reranked_rows,
+         returned_rows,
+         (ann_ms >= 0.0)::int,
+         (expand_ms >= 0.0)::int,
+         (rerank_ms >= 0.0)::int,
+         (total_ms >= 0.0)::int
+  FROM sorted_heap_graph_route_last_stats()
+  ORDER BY source_rel::text
+) TO STDOUT;
+
+COPY (
+  WITH route_stats AS (
+    SELECT *
+    FROM sorted_heap_graph_route_last_stats()
+  ),
+  agg AS (
+    SELECT *
+    FROM sorted_heap_graph_rag_stats()
+  )
+  SELECT count(*) AS route_stat_rows,
+         count(DISTINCT source_rel) AS route_stat_sources,
+         (sum(route_stats.seed_count) = max(agg.seed_count))::int AS seed_sum_matches,
+         (sum(route_stats.expanded_rows) = max(agg.expanded_rows))::int AS expand_sum_matches,
+         (sum(route_stats.reranked_rows) = max(agg.reranked_rows))::int AS rerank_sum_matches,
+         (sum(route_stats.returned_rows) = max(agg.returned_rows))::int AS returned_sum_matches,
+         max(agg.api) AS aggregate_api
+  FROM route_stats
+  CROSS JOIN agg
+) TO STDOUT;
+
+COPY (
   WITH helper AS (
     SELECT entity_id, relation_id, target_id, payload, round(distance::numeric, 6) AS distance
     FROM sorted_heap_graph_rag_segmented(

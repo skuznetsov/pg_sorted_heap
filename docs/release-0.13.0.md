@@ -27,6 +27,7 @@ Stable in this release:
   - `sorted_heap_graph_unregister(...)`
   - `sorted_heap_graph_rag_stats()`
   - `sorted_heap_graph_rag_reset_stats()`
+  - `sorted_heap_graph_route_last_stats()`
 - Routed GraphRAG (multi-shard, the recommended app-facing flow):
   - `sorted_heap_graph_route(...)` — unified routed query dispatcher
   - `sorted_heap_graph_route_plan(...)` — routing introspection/explain
@@ -157,6 +158,7 @@ GraphRAG now exposes backend-local last-call stats through:
 
 - `sorted_heap_graph_rag_stats()`
 - `sorted_heap_graph_rag_reset_stats()`
+- `sorted_heap_graph_route_last_stats()` for segmented/routed per-shard rows
 
 The stats cover:
 
@@ -165,6 +167,10 @@ The stats cover:
 - reranked row count
 - returned row count
 - ANN / expand / rerank / total timing
+
+For segmented/routed calls, `sorted_heap_graph_route_last_stats()` identifies
+the concrete `source_rel` for each shard and the public aggregate stats row is
+the sum of those shard rows in the same backend.
 
 ## Benchmark snapshots
 

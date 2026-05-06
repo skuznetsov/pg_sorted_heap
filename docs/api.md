@@ -807,7 +807,8 @@ name. For example, a unified `sorted_heap_graph_rag(...)` call with
 `sorted_heap_graph_rag_twohop_path_scan`.
 
 These stats are backend-local and aggregate the last top-level GraphRAG call.
-They are not per-shard or per-partition telemetry.
+For segmented/routed calls, the aggregate row is the sum of the recorded shard
+rows from `sorted_heap_graph_route_last_stats()`.
 
 ```sql
 SELECT * FROM sorted_heap_graph_rag_stats();
@@ -819,6 +820,30 @@ Resets the backend-local GraphRAG stats counters.
 
 ```sql
 SELECT sorted_heap_graph_rag_reset_stats();
+```
+
+### `sorted_heap_graph_route_last_stats()`
+
+Returns backend-local per-shard stats for the last
+`sorted_heap_graph_rag_segmented(...)` or routed GraphRAG call.
+
+Returned fields:
+
+- `call_id`: backend-local route-trace id
+- `api`: route wrapper that started the trace
+- `source_rel`: concrete shard relation
+- `seed_count`, `expanded_rows`, `reranked_rows`, `returned_rows`: shard-local
+  stage counters
+- `ann_ms`, `expand_ms`, `rerank_ms`, `total_ms`: shard-local timing counters
+
+The row set is diagnostic last-call telemetry, not persistent accounting. It is
+cleared by `sorted_heap_graph_rag_reset_stats()`. The current implementation
+keeps at most 256 shard rows for the last call; aggregate
+`sorted_heap_graph_rag_stats()` totals still include all executed shards.
+
+```sql
+SELECT *
+FROM sorted_heap_graph_route_last_stats();
 ```
 
 ### `sorted_heap_graph_rag(rel, query, relation_path, ann_k, top_k, score_mode, limit_rows)`
@@ -880,6 +905,8 @@ Beta segmented GraphRAG wrapper.
 - each shard is queried via `sorted_heap_graph_rag(...)`
 - shard-local rows are merged globally by `(distance, entity_id, relation_id,
   target_id)`
+- the call records backend-local shard rows visible through
+  `sorted_heap_graph_route_last_stats()`
 - `limit_rows` keeps the same per-shard work-cap semantics as
   `sorted_heap_graph_rag(...)`; it does not replace `top_k` as the final merge
   limit

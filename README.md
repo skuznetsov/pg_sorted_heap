@@ -311,6 +311,17 @@ rows, and per-stage timing for ANN, expansion, rerank, and total time. The
 wrapper may report `sorted_heap_graph_rag_twohop_path_scan` or another
 underlying helper/wrapper path.
 
+Segmented/routed GraphRAG calls also record backend-local shard rows:
+
+```sql
+SELECT *
+FROM sorted_heap_graph_route_last_stats();
+```
+
+Those rows identify each concrete `source_rel` and sum back to the aggregate
+`sorted_heap_graph_rag_stats()` row for the same backend. They are last-call
+diagnostics, not persistent telemetry.
+
 For `0.13` hardening, the fact-graph path now also has dedicated lifecycle
 coverage for:
 
