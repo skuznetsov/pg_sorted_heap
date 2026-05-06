@@ -6,7 +6,7 @@ set -euo pipefail
 # ============================================================
 #
 # Verifies that sorted_heap tables survive dump/restore correctly:
-# data integrity, zone map rebuild, secondary indexes, TOAST.
+# data integrity, restore planning, zone map rebuild, secondary indexes, TOAST.
 #
 # Usage: ./scripts/test_dump_restore.sh [tmp_root] [port]
 
@@ -150,9 +150,27 @@ check "post_restore_index_query" "500" "$idx_result"
 # produce SortedHeapScan (will fall back to seqscan or use unverified zm).
 PSQL "$DB" -c "ANALYZE sh_dump"
 
+restore_plan_needs_compact=$(PSQL "$DB" -c "
+  SELECT needs_compact
+  FROM sorted_heap_restore_plan()
+  WHERE leaf_relid = 'sh_dump'::regclass")
+check "post_restore_plan_needs_compact" "t" "$restore_plan_needs_compact"
+
+restore_plan_action=$(PSQL "$DB" -c "
+  SELECT recommended_action
+  FROM sorted_heap_restore_plan()
+  WHERE leaf_relid = 'sh_dump'::regclass")
+check "post_restore_plan_action" "compact_or_merge" "$restore_plan_action"
+
 # --- Compact to restore zone map, then verify pruning ---
 PSQL "$DB" -c "SELECT sorted_heap_compact('sh_dump'::regclass)"
 PSQL "$DB" -c "ANALYZE sh_dump"
+
+post_compact_plan=$(PSQL "$DB" -c "
+  SELECT needs_compact
+  FROM sorted_heap_restore_plan('sh_dump'::regclass)
+  WHERE leaf_relid = 'sh_dump'::regclass")
+check "post_compact_plan_clean" "f" "$post_compact_plan"
 
 post_compact_pruning=$(PSQL "$DB" -c "
   SET enable_indexscan = off;

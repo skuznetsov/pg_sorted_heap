@@ -268,7 +268,7 @@ Observed signals:
 - `make pg-core-regression-smoke` ->
   `status=ok|installcheck_target=present|tap_prove=present|isolation_regress=missing`
 - `make policy-safety-selftest` -> all constituent selftests reported `status=ok`
-- `make test-dump-restore` -> `status=ok pass=10 fail=0 total=10`
+- `make test-dump-restore` -> `status=ok pass=13 fail=0 total=13`
 - `make test-toast` -> `status=ok pass=26 fail=0 total=26`
 - `make test-alter-table` -> `status=ok pass=36 fail=0 total=36`
 - `make test-crash-recovery` -> `status=ok pass=15 fail=0 total=15`

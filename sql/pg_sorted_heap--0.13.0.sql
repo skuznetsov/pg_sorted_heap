@@ -452,6 +452,77 @@ AS $$
   ORDER BY s.leaf_name;
 $$ LANGUAGE sql STABLE;
 
+CREATE FUNCTION @extschema@.sorted_heap_restore_plan(parent regclass DEFAULT NULL)
+RETURNS TABLE (
+  parent_relid regclass,
+  leaf_relid regclass,
+  leaf_name text,
+  zone_map_valid boolean,
+  zone_map_sorted boolean,
+  sorted_prefix_pages integer,
+  sorted_hnsw_indexes bigint,
+  needs_compact boolean,
+  post_restore_hnsw_rebuild_recommended boolean,
+  recommended_action text
+)
+AS $$
+  WITH roots AS (
+    SELECT c.oid::regclass AS root_relid
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_am a ON a.oid = c.relam
+    WHERE $1 IS NULL
+      AND c.relkind = 'r'
+      AND a.amname = 'sorted_heap'
+    UNION ALL
+    SELECT $1
+    WHERE $1 IS NOT NULL
+  ),
+  leaves AS (
+    SELECT DISTINCT ON (s.leaf_relid)
+      s.parent_relid,
+      s.leaf_relid,
+      s.leaf_name,
+      s.zone_map_valid,
+      s.zone_map_sorted,
+      s.sorted_prefix_pages
+    FROM roots r
+    CROSS JOIN LATERAL @extschema@.sorted_heap_partition_status(r.root_relid) AS s
+    WHERE s.is_sorted_heap IS TRUE
+    ORDER BY s.leaf_relid, s.leaf_name
+  ),
+  hnsw AS (
+    SELECT i.indrelid::regclass AS leaf_relid,
+           count(*)::bigint AS sorted_hnsw_indexes
+    FROM pg_catalog.pg_index i
+    JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+    JOIN pg_catalog.pg_am am ON am.oid = ic.relam
+    WHERE am.amname = 'sorted_hnsw'
+    GROUP BY i.indrelid
+  )
+  SELECT
+    l.parent_relid,
+    l.leaf_relid,
+    l.leaf_name,
+    l.zone_map_valid,
+    l.zone_map_sorted,
+    l.sorted_prefix_pages,
+    COALESCE(h.sorted_hnsw_indexes, 0)::bigint AS sorted_hnsw_indexes,
+    (l.zone_map_valid IS NOT TRUE) AS needs_compact,
+    (COALESCE(h.sorted_hnsw_indexes, 0) > 0) AS post_restore_hnsw_rebuild_recommended,
+    CASE
+      WHEN l.zone_map_valid IS NOT TRUE AND COALESCE(h.sorted_hnsw_indexes, 0) > 0
+        THEN 'compact_or_merge_and_rebuild_sorted_hnsw'
+      WHEN l.zone_map_valid IS NOT TRUE
+        THEN 'compact_or_merge'
+      WHEN COALESCE(h.sorted_hnsw_indexes, 0) > 0
+        THEN 'rebuild_sorted_hnsw_after_pg_restore'
+      ELSE 'none'
+    END AS recommended_action
+  FROM leaves l
+  LEFT JOIN hnsw h ON h.leaf_relid = l.leaf_relid
+  ORDER BY l.leaf_name;
+$$ LANGUAGE sql STABLE;
+
 CREATE FUNCTION @extschema@.sorted_heap_reset_stats()
 RETURNS void
 AS '$libdir/pg_sorted_heap', 'sorted_heap_reset_stats'

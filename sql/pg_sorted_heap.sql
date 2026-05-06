@@ -2624,7 +2624,14 @@ SELECT count(*) AS sh23_index_status_rows,
        bool_and(index_relid IS NOT NULL) AS sh23_all_indexed_leaves
 FROM sorted_heap_partition_index_status('sh23_parent'::regclass);
 
--- SH23-1B: dry-run maintenance plan is read-only and estimates leaf headroom
+-- SH23-1B: post-restore plan sees sorted_heap leaves and current maintenance state
+SELECT count(*) AS sh23_restore_plan_rows,
+       bool_and(needs_compact IS TRUE) AS sh23_restore_plan_needs_compact,
+       bool_and(sorted_hnsw_indexes = 0) AS sh23_restore_plan_no_hnsw,
+       bool_and(recommended_action = 'compact_or_merge') AS sh23_restore_plan_action
+FROM sorted_heap_restore_plan('sh23_parent'::regclass);
+
+-- SH23-1C: dry-run maintenance plan is read-only and estimates leaf headroom
 SELECT count(*) AS sh23_plan_would_run,
        bool_and(lock_mode = 'AccessExclusiveLock') AS sh23_plan_lock_mode,
        bool_and(tablespace_oid IS NOT NULL AND tablespace_name IS NOT NULL) AS sh23_plan_tablespace,

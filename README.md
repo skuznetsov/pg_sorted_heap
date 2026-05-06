@@ -719,6 +719,7 @@ CALL sorted_heap_merge_online('t');
 ```sql
 SELECT sorted_heap_zonemap_stats('t');   -- flags, entry count, ranges
 SELECT sorted_heap_rebuild_zonemap('t'); -- manual rebuild
+SELECT * FROM sorted_heap_restore_plan(); -- post-restore maintenance checklist
 ```
 
 ### Scan statistics

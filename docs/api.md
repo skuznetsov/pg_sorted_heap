@@ -259,6 +259,34 @@ The helper joins `sorted_heap_partition_status(parent)` to
 with zero counters for leaves that have not executed `SortedHeapScan` in the
 current backend. `source` is currently always `local`.
 
+### `sorted_heap_restore_plan(parent default NULL)`
+
+Returns a post-restore maintenance checklist for sorted_heap relations:
+
+```sql
+SELECT *
+FROM sorted_heap_restore_plan();
+
+SELECT *
+FROM sorted_heap_restore_plan('events_parent'::regclass);
+```
+
+When called without an argument, it scans all concrete sorted_heap relations in
+the database. With a concrete sorted_heap table or partitioned parent argument,
+it reports only that table or its sorted_heap leaves.
+
+Returned fields include:
+
+- `zone_map_valid`, `zone_map_sorted`, and `sorted_prefix_pages`
+- `sorted_hnsw_indexes`
+- `needs_compact`: true when compact/merge is needed to restore zone-map
+  pruning
+- `post_restore_hnsw_rebuild_recommended`: true when sorted_hnsw indexes exist;
+  after `pg_restore`, rebuild them because heap TIDs changed
+- `recommended_action`: `none`, `compact_or_merge`,
+  `rebuild_sorted_hnsw_after_pg_restore`, or
+  `compact_or_merge_and_rebuild_sorted_hnsw`
+
 ### `sorted_heap_reset_stats()`
 
 Resets the scan statistics counters.

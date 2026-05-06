@@ -206,6 +206,9 @@ Current state:
 - Zone-map pruning needs compact/merge after restore.
 - Existing docs now call this out for concrete relations and partitioned
   parents; HNSW sidecars still need rebuild because restored heap TIDs change.
+- `sorted_heap_restore_plan(parent default NULL)` now reports concrete
+  sorted_heap tables/leaves that need compact/merge after restore and flags
+  `sorted_hnsw` indexes that should be rebuilt after `pg_restore`.
 
 Risk:
 
@@ -214,8 +217,8 @@ Risk:
 Target direction:
 
 - Keep the explicit restore checklist in operator docs.
-- A future helper could find restored sorted_heap tables with invalid/missing
-  zone maps, but correctness does not depend on it.
+- Keep `sorted_heap_restore_plan(...)` read-only; correctness does not depend
+  on it, but it reduces post-restore operator guesswork.
 
 ### G7. Zone-map-only / index-only-like fast paths
 
@@ -305,7 +308,7 @@ Target direction:
 | P2 | G8 large-vector sublinear search revival | Benchmark-gated; do not reopen refuted 103K pruning as a default |
 | P2 | G9 SIMD ADC and pgvectorscale DiskANN comparison | Benchmark-gated; external baseline needs versioned settings and strict-order note |
 | P2 | G5 online lossy-PK support | Useful, but current fail-closed behavior is acceptable |
-| P2 | G6 restore ergonomics | Checklist documented; optional discovery helper remains |
+| P2 | G6 restore ergonomics | Checklist and read-only restore plan helper landed |
 
 ## Quadrumvirate Notes
 

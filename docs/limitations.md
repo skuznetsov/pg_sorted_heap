@@ -150,6 +150,10 @@ detailed rewrite/free-space contract.
 Post-restore checklist:
 
 ```sql
+-- Discover tables/leaves needing post-restore maintenance:
+SELECT *
+FROM sorted_heap_restore_plan();
+
 -- Concrete sorted_heap table:
 SELECT sorted_heap_compact('events'::regclass);
 
