@@ -184,6 +184,7 @@ extern Datum sorted_heap_merge_online(PG_FUNCTION_ARGS);
 extern BlockNumber sorted_heap_detect_sorted_prefix(SortedHeapRelInfo *info);
 extern void sorted_heap_bump_zm_generation(void);
 extern uint64 sorted_heap_read_zm_generation(void);
+extern Datum sorted_heap_scan_stats_by_relation(PG_FUNCTION_ARGS);
 extern void sorted_heap_zonemap_load(Relation rel, SortedHeapRelInfo *info);
 extern void sorted_heap_rebuild_zonemap_internal(Relation rel, Oid pk_typid,
 												 AttrNumber pk_attnum,

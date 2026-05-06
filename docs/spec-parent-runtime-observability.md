@@ -6,10 +6,17 @@ nav_order: 23
 
 # Spec: Parent Runtime Observability
 
-Status: proposed
+Status: partially implemented
 Risk tier: CAUTION
 Primary goal: define parent-level runtime observability without mislabeling
 global/backend-local counters as per-leaf partition telemetry.
+
+Current completion state:
+
+- Done: `sorted_heap_scan_stats_by_relation()` provides backend-local
+  relation-aware `SortedHeapScan` counters.
+- Proposed: shared/cluster-wide relation-aware scan counters and per-shard
+  GraphRAG route execution stats.
 
 ## Problem
 
@@ -90,7 +97,7 @@ Current semantics:
 
 Add relation-aware counters before adding parent rollups.
 
-Candidate API:
+Implemented first pass:
 
 ```sql
 SELECT *
@@ -108,6 +115,12 @@ blocks_pruned bigint
 source text
 ```
 
+Current limitation:
+
+- `source` is currently `local`; the function reports only the current backend.
+- `sorted_heap_reset_stats()` clears both aggregate and relation-aware local
+  counters.
+
 Parent rollup can then be a safe SQL helper:
 
 ```sql
@@ -121,7 +134,8 @@ Required invariant:
 parent rows = relation-aware counters joined to actual leaves under parent
 ```
 
-No relation key means no parent rollup.
+No relation key means no parent rollup. The local relation key is now present;
+cluster-wide relation rollups still require a shared-memory design.
 
 ### O2. GraphRAG route execution stats
 

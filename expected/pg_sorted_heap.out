@@ -1735,6 +1735,16 @@ SELECT sorted_heap_reset_stats();
  
 (1 row)
 
+SELECT
+    CASE WHEN NOT EXISTS (SELECT 1 FROM sorted_heap_scan_stats_by_relation())
+         THEN 'rel_scan_stats_reset_ok'
+         ELSE 'rel_scan_stats_reset_FAIL'
+    END AS sh6_rel_stats_reset_result;
+ sh6_rel_stats_reset_result 
+----------------------------
+ rel_scan_stats_reset_ok
+(1 row)
+
 -- Create a small table, compact it, run a pruned query to generate stats
 CREATE TABLE sh6_stats(id int PRIMARY KEY, v text) USING sorted_heap;
 INSERT INTO sh6_stats SELECT i, 'x' FROM generate_series(1, 1000) i;
@@ -1747,9 +1757,26 @@ HINT:  Schedule during maintenance windows. Concurrent reads and writes are bloc
 (1 row)
 
 ANALYZE sh6_stats;
+CREATE TABLE sh6_stats_b(id int PRIMARY KEY, v text) USING sorted_heap;
+INSERT INTO sh6_stats_b SELECT i, 'y' FROM generate_series(1, 1000) i;
+SELECT sorted_heap_compact('sh6_stats_b'::regclass);
+NOTICE:  sorted_heap_compact acquires AccessExclusiveLock
+HINT:  Schedule during maintenance windows. Concurrent reads and writes are blocked.
+ sorted_heap_compact 
+---------------------
+ 
+(1 row)
+
+ANALYZE sh6_stats_b;
 SET enable_indexscan = off;
 SET enable_bitmapscan = off;
 SELECT count(*) FROM sh6_stats WHERE id = 50;
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM sh6_stats_b WHERE id = 75;
  count 
 -------
      1
@@ -1767,7 +1794,57 @@ SELECT
  scan_stats_ok
 (1 row)
 
+SELECT
+    CASE WHEN count(*) = 1
+           AND bool_and(relid = 'sh6_stats'::regclass)
+           AND bool_and(relname = 'sh6_stats')
+           AND bool_and(total_scans >= 1)
+           AND bool_and(blocks_scanned >= 1)
+           AND bool_and(source = 'local')
+         THEN 'rel_scan_stats_ok'
+         ELSE 'rel_scan_stats_FAIL'
+    END AS sh6_rel_stats_result
+FROM sorted_heap_scan_stats_by_relation()
+WHERE relid = 'sh6_stats'::regclass;
+ sh6_rel_stats_result 
+----------------------
+ rel_scan_stats_ok
+(1 row)
+
+SELECT
+    CASE WHEN count(*) = 2
+           AND bool_and(relname IN ('sh6_stats', 'sh6_stats_b'))
+           AND bool_and(total_scans >= 1)
+           AND bool_and(blocks_scanned >= 1)
+           AND bool_and(source = 'local')
+         THEN 'rel_scan_stats_two_rel_ok'
+         ELSE 'rel_scan_stats_two_rel_FAIL'
+    END AS sh6_rel_stats_two_rel_result
+FROM sorted_heap_scan_stats_by_relation()
+WHERE relid IN ('sh6_stats'::regclass, 'sh6_stats_b'::regclass);
+ sh6_rel_stats_two_rel_result 
+------------------------------
+ rel_scan_stats_two_rel_ok
+(1 row)
+
+SELECT sorted_heap_reset_stats();
+ sorted_heap_reset_stats 
+-------------------------
+ 
+(1 row)
+
+SELECT
+    CASE WHEN NOT EXISTS (SELECT 1 FROM sorted_heap_scan_stats_by_relation())
+         THEN 'rel_scan_stats_clear_ok'
+         ELSE 'rel_scan_stats_clear_FAIL'
+    END AS sh6_rel_stats_clear_result;
+ sh6_rel_stats_clear_result 
+----------------------------
+ rel_scan_stats_clear_ok
+(1 row)
+
 DROP TABLE sh6_stats;
+DROP TABLE sh6_stats_b;
 -- ====================================================================
 -- SH7: Online compact (sorted_heap_compact_online)
 -- ====================================================================

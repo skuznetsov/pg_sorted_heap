@@ -158,7 +158,9 @@ Current state:
 - `sorted_heap_partition_index_status(parent)` now reports leaf index health:
   index AM, valid/ready/live flags, primary/unique flags, and convenience
   booleans for btree and `sorted_hnsw`.
-- Scan stats are global/per-backend counters, not per partition.
+- `sorted_heap_scan_stats_by_relation()` now reports backend-local
+  relation-aware scan counters for same-backend diagnostics.
+- Aggregate scan stats are global/per-backend counters, not per partition.
 - GraphRAG stats are backend-local last-call stats.
 
 Risk:
@@ -295,7 +297,7 @@ Target direction:
 | P0 | G0 composite-PK pruning quality | First-pass fix landed for fixed-col1/bounded-col2; tail correctness guarded; full lexicographic search remains follow-up |
 | P0 | G1 declarative partitioning support | Directly affects huge-table operating model and interview/product story |
 | P0 | G2 huge-table compaction model | Needed to explain free-space requirements honestly |
-| P1 | G4 parent-level observability | Storage and index-health first passes landed; runtime stats contract specified; relation/source-rel counters remain |
+| P1 | G4 parent-level observability | Storage, index-health, and local relation-aware scan counters landed; shared relation/source-rel counters remain |
 | P1 | G3 filtered ANN | Expected by vector-search users, but broader than storage |
 | P2 | G7 zone-map-only / index-only-like fast paths | Spec boundary landed; real row-returning path requires a covering sidecar |
 | P2 | G8 large-vector sublinear search revival | Benchmark-gated; do not reopen refuted 103K pruning as a default |

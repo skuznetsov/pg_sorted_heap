@@ -1163,14 +1163,24 @@ DROP TABLE sh6_explain;
 
 -- Test SH6-10: sorted_heap_scan_stats() with reset
 SELECT sorted_heap_reset_stats();
+SELECT
+    CASE WHEN NOT EXISTS (SELECT 1 FROM sorted_heap_scan_stats_by_relation())
+         THEN 'rel_scan_stats_reset_ok'
+         ELSE 'rel_scan_stats_reset_FAIL'
+    END AS sh6_rel_stats_reset_result;
 -- Create a small table, compact it, run a pruned query to generate stats
 CREATE TABLE sh6_stats(id int PRIMARY KEY, v text) USING sorted_heap;
 INSERT INTO sh6_stats SELECT i, 'x' FROM generate_series(1, 1000) i;
 SELECT sorted_heap_compact('sh6_stats'::regclass);
 ANALYZE sh6_stats;
+CREATE TABLE sh6_stats_b(id int PRIMARY KEY, v text) USING sorted_heap;
+INSERT INTO sh6_stats_b SELECT i, 'y' FROM generate_series(1, 1000) i;
+SELECT sorted_heap_compact('sh6_stats_b'::regclass);
+ANALYZE sh6_stats_b;
 SET enable_indexscan = off;
 SET enable_bitmapscan = off;
 SELECT count(*) FROM sh6_stats WHERE id = 50;
+SELECT count(*) FROM sh6_stats_b WHERE id = 75;
 RESET enable_indexscan;
 RESET enable_bitmapscan;
 SELECT
@@ -1178,7 +1188,37 @@ SELECT
          THEN 'scan_stats_ok'
          ELSE 'scan_stats_FAIL'
     END AS sh6_stats_result;
+SELECT
+    CASE WHEN count(*) = 1
+           AND bool_and(relid = 'sh6_stats'::regclass)
+           AND bool_and(relname = 'sh6_stats')
+           AND bool_and(total_scans >= 1)
+           AND bool_and(blocks_scanned >= 1)
+           AND bool_and(source = 'local')
+         THEN 'rel_scan_stats_ok'
+         ELSE 'rel_scan_stats_FAIL'
+    END AS sh6_rel_stats_result
+FROM sorted_heap_scan_stats_by_relation()
+WHERE relid = 'sh6_stats'::regclass;
+SELECT
+    CASE WHEN count(*) = 2
+           AND bool_and(relname IN ('sh6_stats', 'sh6_stats_b'))
+           AND bool_and(total_scans >= 1)
+           AND bool_and(blocks_scanned >= 1)
+           AND bool_and(source = 'local')
+         THEN 'rel_scan_stats_two_rel_ok'
+         ELSE 'rel_scan_stats_two_rel_FAIL'
+    END AS sh6_rel_stats_two_rel_result
+FROM sorted_heap_scan_stats_by_relation()
+WHERE relid IN ('sh6_stats'::regclass, 'sh6_stats_b'::regclass);
+SELECT sorted_heap_reset_stats();
+SELECT
+    CASE WHEN NOT EXISTS (SELECT 1 FROM sorted_heap_scan_stats_by_relation())
+         THEN 'rel_scan_stats_clear_ok'
+         ELSE 'rel_scan_stats_clear_FAIL'
+    END AS sh6_rel_stats_clear_result;
 DROP TABLE sh6_stats;
+DROP TABLE sh6_stats_b;
 
 -- ====================================================================
 -- SH7: Online compact (sorted_heap_compact_online)

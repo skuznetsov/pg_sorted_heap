@@ -220,6 +220,30 @@ These counters are not keyed by relation. For partitioned deployments, use
 runtime-observability contract is tracked in
 [Parent Runtime Observability](spec-parent-runtime-observability).
 
+### `sorted_heap_scan_stats_by_relation()`
+
+Returns backend-local scan statistics keyed by concrete relation:
+
+```sql
+SELECT *
+FROM sorted_heap_scan_stats_by_relation();
+```
+
+Returned fields:
+
+- `relid`: concrete relation that executed `SortedHeapScan`
+- `relname`: current relation name, or `NULL` if the relation was dropped after
+  the counter was recorded
+- `total_scans`: number of `SortedHeapScan` executions in this backend
+- `blocks_scanned`: heap blocks visited by those scans
+- `blocks_pruned`: heap blocks skipped by zone-map pruning
+- `source`: currently always `local`
+
+This is the first relation-aware runtime surface. It is intentionally
+backend-local and reset by `sorted_heap_reset_stats()`. It is safe to join to
+`sorted_heap_partition_status(parent)` for same-backend diagnostics, but it is
+not cluster-wide telemetry.
+
 ### `sorted_heap_reset_stats()`
 
 Resets the scan statistics counters.

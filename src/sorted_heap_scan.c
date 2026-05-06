@@ -42,7 +42,9 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/float.h"
+#include "utils/hsearch.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
@@ -228,6 +230,16 @@ typedef struct SortedHeapGraphRagStats
 static SortedHeapGraphRagStats sh_graph_rag_stats = {0};
 static int sh_graph_rag_obs_depth = 0;
 
+typedef struct SortedHeapLocalRelStats
+{
+	Oid			relid;				/* hash key */
+	uint64		total_scans;
+	uint64		blocks_scanned;
+	uint64		blocks_pruned;
+} SortedHeapLocalRelStats;
+
+static HTAB *sh_local_rel_stats = NULL;
+
 static int graph_rag_topk_cmp(const void *a, const void *b);
 static void graph_rag_topk_siftdown(GraphRagTopKEntry *heap, int n, int i);
 static void graph_rag_topk_siftup(GraphRagTopKEntry *heap, int i);
@@ -312,6 +324,9 @@ static void sorted_heap_graph_obs_add_expand(int64 expanded_rows, double expand_
 static void sorted_heap_graph_obs_add_rerank(int64 reranked_rows,
 											 int64 returned_rows,
 											 double rerank_ms);
+static void sorted_heap_update_local_rel_stats(Oid relid,
+											   BlockNumber scanned_blocks,
+											   BlockNumber pruned_blocks);
 static int sorted_heap_graph_count_int4_array(ArrayType *arr);
 static bool sorted_heap_exprs_need_deferred_runtime_resolve(List *exprs);
 static void sorted_heap_set_parallel_fallback_span(SortedHeapScanState *shstate);
@@ -2450,6 +2465,10 @@ sorted_heap_end_custom_scan(CustomScanState *node)
 	sh_local_scans++;
 	sh_local_blocks_scanned += shstate->scanned_blocks;
 	sh_local_blocks_pruned += shstate->pruned_blocks;
+	sorted_heap_update_local_rel_stats(
+		RelationGetRelid(node->ss.ss_currentRelation),
+		shstate->scanned_blocks,
+		shstate->pruned_blocks);
 
 	if (sh_shared_stats)
 	{
@@ -2661,8 +2680,50 @@ sorted_heap_explain_custom_scan(CustomScanState *node, List *ancestors,
  *  SQL-callable scan stats function
  * ---------------------------------------------------------------- */
 PG_FUNCTION_INFO_V1(sorted_heap_scan_stats);
+PG_FUNCTION_INFO_V1(sorted_heap_scan_stats_by_relation);
 PG_FUNCTION_INFO_V1(sorted_heap_graph_rag_stats);
 PG_FUNCTION_INFO_V1(sorted_heap_graph_rag_reset_stats);
+
+static void
+sorted_heap_update_local_rel_stats(Oid relid,
+								   BlockNumber scanned_blocks,
+								   BlockNumber pruned_blocks)
+{
+	SortedHeapLocalRelStats *entry;
+	HASHCTL		ctl;
+	bool		found;
+
+	if (!OidIsValid(relid))
+		return;
+
+	if (sh_local_rel_stats == NULL)
+	{
+		MemSet(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(SortedHeapLocalRelStats);
+		ctl.hcxt = TopMemoryContext;
+		sh_local_rel_stats = hash_create("sorted_heap local relation stats",
+										  32,
+										  &ctl,
+										  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+
+	entry = (SortedHeapLocalRelStats *) hash_search(sh_local_rel_stats,
+												   &relid,
+												   HASH_ENTER,
+												   &found);
+	if (!found)
+	{
+		entry->relid = relid;
+		entry->total_scans = 0;
+		entry->blocks_scanned = 0;
+		entry->blocks_pruned = 0;
+	}
+
+	entry->total_scans++;
+	entry->blocks_scanned += scanned_blocks;
+	entry->blocks_pruned += pruned_blocks;
+}
 
 Datum
 sorted_heap_scan_stats(PG_FUNCTION_ARGS)
@@ -2697,6 +2758,49 @@ sorted_heap_scan_stats(PG_FUNCTION_ARGS)
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+Datum
+sorted_heap_scan_stats_by_relation(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	HASH_SEQ_STATUS status;
+	SortedHeapLocalRelStats *entry;
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("sorted_heap_scan_stats_by_relation must be called in a set-returning context")));
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	if (sh_local_rel_stats == NULL)
+		PG_RETURN_NULL();
+
+	hash_seq_init(&status, sh_local_rel_stats);
+	while ((entry = (SortedHeapLocalRelStats *) hash_seq_search(&status)) != NULL)
+	{
+		Datum		values[6];
+		bool		nulls[6] = {false, false, false, false, false, false};
+		char	   *relname = get_rel_name(entry->relid);
+
+		values[0] = ObjectIdGetDatum(entry->relid);
+		if (relname)
+			values[1] = CStringGetTextDatum(relname);
+		else
+			nulls[1] = true;
+		values[2] = Int64GetDatum((int64) entry->total_scans);
+		values[3] = Int64GetDatum((int64) entry->blocks_scanned);
+		values[4] = Int64GetDatum((int64) entry->blocks_pruned);
+		values[5] = CStringGetTextDatum("local");
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+							 values, nulls);
+		if (relname)
+			pfree(relname);
+	}
+
+	PG_RETURN_NULL();
 }
 
 Datum
@@ -2749,6 +2853,11 @@ sorted_heap_reset_stats(PG_FUNCTION_ARGS)
 	sh_local_scans = 0;
 	sh_local_blocks_scanned = 0;
 	sh_local_blocks_pruned = 0;
+	if (sh_local_rel_stats)
+	{
+		hash_destroy(sh_local_rel_stats);
+		sh_local_rel_stats = NULL;
+	}
 
 	PG_RETURN_VOID();
 }

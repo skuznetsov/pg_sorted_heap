@@ -414,6 +414,18 @@ CREATE FUNCTION @extschema@.sorted_heap_scan_stats(
 AS '$libdir/pg_sorted_heap', 'sorted_heap_scan_stats'
 LANGUAGE C STRICT;
 
+CREATE FUNCTION @extschema@.sorted_heap_scan_stats_by_relation()
+RETURNS TABLE (
+  relid regclass,
+  relname text,
+  total_scans bigint,
+  blocks_scanned bigint,
+  blocks_pruned bigint,
+  source text
+)
+AS '$libdir/pg_sorted_heap', 'sorted_heap_scan_stats_by_relation'
+LANGUAGE C STRICT;
+
 CREATE FUNCTION @extschema@.sorted_heap_reset_stats()
 RETURNS void
 AS '$libdir/pg_sorted_heap', 'sorted_heap_reset_stats'
