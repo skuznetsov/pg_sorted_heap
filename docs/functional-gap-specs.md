@@ -172,9 +172,9 @@ Current state:
 
 Risk:
 
-- On partitioned deployments, users still need deeper per-leaf runtime
-  observability: scan counters and GraphRAG counters are not yet exposed as
-  parent-level row sets.
+- On partitioned deployments, `SortedHeapScan` counters now have parent leaf
+  rollups. GraphRAG route execution stats are still aggregate last-call
+  telemetry rather than per-source-rel execution rows.
 
 Target direction:
 
