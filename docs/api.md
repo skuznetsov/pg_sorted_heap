@@ -119,6 +119,9 @@ Contract:
   more true global winners than the local pool preserves;
 - `local_k` must be no larger than `sorted_hnsw.ef_search`, so each local scan
   remains inside the planner-integrated `sorted_hnsw` contract;
+- each selected sorted_heap leaf must have a valid, ready, non-expression,
+  non-partial leaf-local `sorted_hnsw` index on `vector_column`; the helper
+  fails closed instead of silently falling back to exact sort;
 - `leaf_relids` is optional. When omitted, all supported sorted_heap leaves
   under the parent participate.
 

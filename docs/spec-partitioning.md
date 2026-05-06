@@ -93,7 +93,8 @@ Current verified coverage:
   normal `Merge Append` over leaf `sorted_hnsw` ordered index scans.
 - Explicit `sorted_hnsw_partition_search(...)` supports route-first vector
   search over all leaves or a selected leaf set, with global exact rerank over
-  local candidate pools.
+  local candidate pools. It requires a valid leaf-local `sorted_hnsw` index on
+  every selected sorted_heap leaf and fails closed if that contract is not met.
 - Broader parent-query shapes still need expansion tests before we claim
   complete planner coverage.
 
@@ -352,8 +353,8 @@ Planner validation:
 
 1. Should parent helpers eventually collect all validation errors instead of
    reporting the first unsupported leaf?
-2. Should `sorted_hnsw` parent fanout be a separate API or left to PostgreSQL
-   partition pruning plus per-leaf indexes?
+2. Should `sorted_hnsw_partition_search(...)` eventually move from PL/pgSQL to
+   C to reduce route-first helper overhead on small partitions?
 3. Should GraphRAG parent fanout return a global exact top-k merge contract or
    require explicit routed-shard APIs only?
 

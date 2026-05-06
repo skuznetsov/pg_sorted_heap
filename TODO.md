@@ -497,6 +497,14 @@ relative throughput under sustained load, not absolute query latency.
 - Regression coverage now includes partitioned `svec` and `hsvec` leaves,
   selected-leaf routing, global result count, and `local_k <= ef_search`
   enforcement.
+- Selected sorted_heap leaves now must have a valid leaf-local `sorted_hnsw`
+  index on the vector column. The helper fails closed instead of silently
+  falling back to exact sort.
+- `scripts/bench_partitioned_sorted_hnsw.sh` benchmarks selected-leaf routing
+  versus parent filtered exact and all-leaf fanout. Local PostgreSQL 18 smoke
+  on 8 x 50K rows showed selected-leaf helper 4.901ms avg at 100% self-query
+  recall@10 versus 8.735ms parent filtered exact; small partitions may not
+  amortize PL/pgSQL helper overhead.
 
 ## Operational Notes
 
@@ -687,6 +695,8 @@ PQ approach directly addresses this by eliminating TOAST reads for filtering.
 - Extension upgrade SQL scripts for version transitions
 - pg_upgrade testing with two major PG versions
 - IVF-PQ: use SimHash or VQ partitioning + PQ codes for sub-linear scan on large datasets
+- C implementation of partitioned sorted_hnsw fanout if PL/pgSQL helper
+  overhead matters for small routed partitions
 - Scalar quantization (SQ8/SQ4) as lighter alternative to PQ for lower dimensions
 - SIMD-accelerated ADC lookup (NEON/AVX2 for distance table precomputation)
 - pgvectorscale DiskANN comparison (requires Rust/PGRX build)

@@ -161,6 +161,8 @@ Safety checks:
 - `local_k >= top_k`;
 - `local_k <= sorted_hnsw.ef_search`;
 - unsupported leaves fail closed by default;
+- selected sorted_heap leaves must have a valid leaf-local `sorted_hnsw` index
+  on the vector column, otherwise the helper fails instead of exact-sorting;
 - selected leaf routing is explicit via `leaf_relids`.
 
 ## Acceptance Tests
@@ -200,7 +202,10 @@ Current status:
 
 - Covered for partitioned `svec` and `hsvec` leaves in the `sorted_hnsw`
   regression. The helper routes selected leaves, unions local pools, globally
-  orders by exact distance, and rejects `local_k > sorted_hnsw.ef_search`.
+  orders by exact distance, rejects `local_k > sorted_hnsw.ef_search`, and
+  rejects selected leaves without a valid `sorted_hnsw` index.
+- `scripts/bench_partitioned_sorted_hnsw.sh` provides an operator benchmark for
+  selected-leaf routing versus parent filtered exact and all-leaf fanout.
 
 ### F4. Planner safety guard
 

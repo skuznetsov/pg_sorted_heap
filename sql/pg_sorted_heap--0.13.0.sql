@@ -553,6 +553,8 @@ DECLARE
   sep text := '';
   vector_type text;
   vector_typname name;
+  vector_attnum smallint;
+  index_name text;
 BEGIN
   IF top_k IS NULL OR top_k <= 0 THEN
     RAISE EXCEPTION 'top_k must be positive';
@@ -597,8 +599,8 @@ BEGIN
       AND s.has_primary_key IS TRUE
     ORDER BY s.leaf_name
   LOOP
-    SELECT a.atttypid::regtype::text, t.typname
-    INTO vector_type, vector_typname
+    SELECT a.atttypid::regtype::text, t.typname, a.attnum
+    INTO vector_type, vector_typname, vector_attnum
     FROM pg_catalog.pg_attribute a
     JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
     WHERE a.attrelid = rec.leaf_relid
@@ -613,6 +615,27 @@ BEGIN
     IF vector_typname NOT IN ('svec', 'hsvec') THEN
       RAISE EXCEPTION 'vector column %.% must be svec or hsvec, got %',
         rec.leaf_relid, vector_column, vector_type;
+    END IF;
+
+    SELECT idx.relname
+    INTO index_name
+    FROM pg_catalog.pg_index i
+    JOIN pg_catalog.pg_class idx ON idx.oid = i.indexrelid
+    JOIN pg_catalog.pg_am am ON am.oid = idx.relam
+    WHERE i.indrelid = rec.leaf_relid
+      AND am.amname = 'sorted_hnsw'
+      AND i.indisvalid
+      AND i.indisready
+      AND i.indnkeyatts = 1
+      AND i.indkey[0] = vector_attnum
+      AND i.indpred IS NULL
+      AND i.indexprs IS NULL
+    LIMIT 1;
+
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'partition leaf % must have a valid sorted_hnsw index on column %',
+        rec.leaf_relid, vector_column
+        USING HINT = 'Create a leaf-local sorted_hnsw index before calling sorted_hnsw_partition_search.';
     END IF;
 
     union_sql := union_sql || sep || pg_catalog.format(

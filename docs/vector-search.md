@@ -144,6 +144,18 @@ their candidate pools are unioned, and the final result is globally reranked by
 exact distance. Use this when tenant/time/segment routing maps to whole
 partitions instead of executor filters inside one leaf.
 
+Benchmark the route-first contract with:
+
+```bash
+make bench-partitioned-sorted-hnsw
+```
+
+On the local PostgreSQL 18 default run (`8 x 50K` rows, self-query top-10),
+selected-leaf routing measured `4.901 ms` average at `100.0%` recall@10 versus
+`8.735 ms` for the parent filtered exact query. The same run showed all-leaf
+fanout around `23-25 ms`. Small partitions may not amortize the PL/pgSQL helper
+overhead; use the benchmark script to find the crossover for a real corpus.
+
 ---
 
 ## Legacy/manual IVF-PQ quick start
@@ -341,6 +353,7 @@ Current repo-owned harnesses:
 - `python3 scripts/bench_gutenberg_local_dump.py --dump /tmp/cogniformerus_backup/cogniformerus_backup.dump --port 65473`
 - `REMOTE_PYTHON=/path/to/python SH_EF=32 EXTRA_ARGS='--sh-ef-construction 200' ./scripts/bench_gutenberg_aws.sh <aws-host> /path/to/repo /path/to/dump 65485`
 - `scripts/bench_sorted_hnsw_vs_pgvector.sh /tmp 65485 10000 20 384 10 vector 64 96`
+- `make bench-partitioned-sorted-hnsw`
 - `python3 scripts/bench_ann_real_dataset.py --dataset nytimes-256 --sample-size 10000 --queries 20 --k 10 --pgv-ef 64 --sh-ef 96 --zvec-ef 64 --qdrant-ef 64`
 - `python3 scripts/bench_qdrant_synthetic.py --rows 10000 --queries 20 --dim 384 --k 10 --ef 64`
 - `python3 scripts/bench_zvec_synthetic.py --rows 10000 --queries 20 --dim 384 --k 10 --ef 64`

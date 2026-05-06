@@ -57,6 +57,16 @@ TEST_GRAPHRAG_CONCURRENT_PORT ?= 65499
 TEST_GRAPHRAG_RELEASE_TMP ?= $(TMP_SELFTEST_ROOT)/pg_regress.codex.graphrag_release
 TEST_HNSW_CACHE_PORT ?= 65488
 TEST_GRAPH_PORT ?= 65489
+BENCH_PART_HNSW_PORT ?= 65492
+BENCH_PART_HNSW_PARTITIONS ?= 8
+BENCH_PART_HNSW_ROWS_PER_PARTITION ?= 50000
+BENCH_PART_HNSW_QUERIES ?= 4
+BENCH_PART_HNSW_DIM ?= 16
+BENCH_PART_HNSW_K ?= 10
+BENCH_PART_HNSW_LOCAL_K ?= 32
+BENCH_PART_HNSW_EF_SEARCH ?= 64
+BENCH_PART_HNSW_M ?= 16
+BENCH_PART_HNSW_EF_CONSTRUCTION ?= 64
 BENCH_PORT ?= 65494
 BENCH_SCALES ?= 1000000,10000000
 VECTOR_BENCH_DSN ?= host=/tmp port=65432 dbname=bench_nomic
@@ -512,6 +522,9 @@ test-partition-lock:
 test-dump-restore:
 	./scripts/test_dump_restore.sh $(TMP_SELFTEST_ROOT) $(TEST_DUMP_PORT)
 
+bench-partitioned-sorted-hnsw:
+	./scripts/bench_partitioned_sorted_hnsw.sh $(TMP_SELFTEST_ROOT) $(BENCH_PART_HNSW_PORT) $(BENCH_PART_HNSW_PARTITIONS) $(BENCH_PART_HNSW_ROWS_PER_PARTITION) $(BENCH_PART_HNSW_QUERIES) $(BENCH_PART_HNSW_DIM) $(BENCH_PART_HNSW_K) $(BENCH_PART_HNSW_LOCAL_K) $(BENCH_PART_HNSW_EF_SEARCH) $(BENCH_PART_HNSW_M) $(BENCH_PART_HNSW_EF_CONSTRUCTION)
+
 test-graphrag-lifecycle:
 	./scripts/test_graph_rag_lifecycle.sh $(TMP_SELFTEST_ROOT) $(TEST_GRAPHRAG_PORT)
 
@@ -799,6 +812,7 @@ help:
 	@echo "  make test-toast TEST_TOAST_PORT=<port>"
 	@echo "  make test-alter-table TEST_ALTER_PORT=<port>"
 	@echo "  make test-partition-lock TEST_PARTITION_LOCK_PORT=<port>"
+	@echo "  make bench-partitioned-sorted-hnsw BENCH_PART_HNSW_ROWS_PER_PARTITION=<n> BENCH_PART_HNSW_PARTITIONS=<n>"
 	@echo "  make test-graphrag-lifecycle TEST_GRAPHRAG_PORT=<port>"
 	@echo "  make test-graphrag-release TMP_SELFTEST_ROOT=<abs_tmp_dir>"
 	@echo "  make test-release TMP_SELFTEST_ROOT=<abs_tmp_dir>"
