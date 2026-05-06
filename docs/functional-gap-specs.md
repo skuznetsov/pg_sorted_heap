@@ -321,7 +321,7 @@ Target direction:
 
 | Priority | Gap | Reason |
 |----------|-----|--------|
-| P0 | G0 composite-PK pruning quality | First-pass fix landed for fixed-col1/bounded-col2; tail correctness guarded; full lexicographic search remains follow-up |
+| P0 | G0 composite-PK pruning quality | First-pass fixed-col1/bounded-col2 path landed; const, generic runtime, first-col-only, and tail correctness guarded; full lexicographic search remains benchmark-gated follow-up |
 | P0 | G1 declarative partitioning support | Directly affects huge-table operating model and interview/product story |
 | P0 | G2 huge-table compaction model | Needed to explain free-space requirements honestly |
 | P1 | G4 parent-level observability | Storage, index-health, local/shared scan rollups, and GraphRAG source-rel route stats landed; broader persistent telemetry remains out of scope |

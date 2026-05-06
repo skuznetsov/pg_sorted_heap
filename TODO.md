@@ -461,8 +461,9 @@ relative throughput under sustained load, not absolute query latency.
 - This keeps common `(tenant_id, id)` layouts from scanning an entire tenant
   prefix for narrow `id` ranges while preserving conservative behavior when
   the second column is not tracked.
-- SH21B regression covers bounded range and equality shapes and asserts both
-  correctness and tight zone-map block counts.
+- SH21B regression covers bounded range, equality, and generic prepared
+  runtime-bound shapes, and asserts both correctness and tight zone-map block
+  counts.
 
 ### Declarative Partitioning First Pass
 - Partition parent queries now allow `SortedHeapScan` paths on PostgreSQL
