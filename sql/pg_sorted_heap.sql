@@ -2533,6 +2533,9 @@ RESET client_min_messages;
 SELECT count(*) AS sh23_concrete_status_rows,
        bool_and(is_sorted_heap) AS sh23_concrete_is_sorted_heap
 FROM sorted_heap_partition_status('sh23_concrete'::regclass);
+SELECT count(*) AS sh23_concrete_index_rows,
+       bool_or(is_primary AND is_btree) AS sh23_concrete_pk_index_seen
+FROM sorted_heap_partition_index_status('sh23_concrete'::regclass);
 DROP TABLE sh23_concrete;
 
 CREATE TABLE sh23_parent(tenant_id int, id int, val text,
@@ -2574,6 +2577,12 @@ SELECT count(*) AS sh23_status_rows,
        bool_and(is_sorted_heap) AS sh23_all_sorted_heap,
        bool_and(has_primary_key) AS sh23_all_have_pk
 FROM sorted_heap_partition_status('sh23_parent'::regclass);
+
+-- SH23-1A: parent-level index observability sees leaf PK indexes
+SELECT count(*) AS sh23_index_status_rows,
+       bool_or(is_primary AND is_btree) AS sh23_pk_index_seen,
+       bool_and(index_relid IS NOT NULL) AS sh23_all_indexed_leaves
+FROM sorted_heap_partition_index_status('sh23_parent'::regclass);
 
 -- SH23-1B: dry-run maintenance plan is read-only and estimates leaf headroom
 SELECT count(*) AS sh23_plan_would_run,

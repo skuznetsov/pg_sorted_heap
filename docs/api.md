@@ -56,6 +56,9 @@ SELECT *
 FROM sorted_heap_partition_status('events_parent'::regclass);
 
 SELECT *
+FROM sorted_heap_partition_index_status('events_parent'::regclass);
+
+SELECT *
 FROM sorted_heap_compact_partitions('events_parent'::regclass);
 
 SELECT *
@@ -112,6 +115,12 @@ Locking and disk-space model:
   already processed leaves remain processed.
 - See [Huge-Table Compaction Operating Model](spec-huge-table-compaction) for
   the detailed rewrite/free-space contract.
+
+`sorted_heap_partition_index_status(parent)` returns one row per leaf index
+for a partitioned parent or concrete sorted_heap table. It reports the index AM,
+valid/ready/live flags, primary/unique flags, and convenience booleans for
+`sorted_hnsw` and btree indexes. Leaves without indexes are still represented
+with `NULL` index fields, so the output can be used as a health checklist.
 
 Manual lock-behavior smoke:
 

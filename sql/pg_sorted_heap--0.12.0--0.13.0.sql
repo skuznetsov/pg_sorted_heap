@@ -115,6 +115,44 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql STABLE;
 
+CREATE FUNCTION @extschema@.sorted_heap_partition_index_status(parent regclass)
+RETURNS TABLE (
+  parent_relid regclass,
+  leaf_relid regclass,
+  leaf_name text,
+  index_relid regclass,
+  index_name text,
+  index_am name,
+  is_valid boolean,
+  is_ready boolean,
+  is_live boolean,
+  is_primary boolean,
+  is_unique boolean,
+  is_sorted_hnsw boolean,
+  is_btree boolean
+)
+AS $$
+  SELECT
+    s.parent_relid,
+    s.leaf_relid,
+    s.leaf_name,
+    i.indexrelid::regclass AS index_relid,
+    i.indexrelid::text AS index_name,
+    am.amname AS index_am,
+    i.indisvalid AS is_valid,
+    i.indisready AS is_ready,
+    i.indislive AS is_live,
+    i.indisprimary AS is_primary,
+    i.indisunique AS is_unique,
+    COALESCE(am.amname = 'sorted_hnsw', false) AS is_sorted_hnsw,
+    COALESCE(am.amname = 'btree', false) AS is_btree
+  FROM @extschema@.sorted_heap_partition_status(parent) AS s
+  LEFT JOIN pg_catalog.pg_index i ON i.indrelid = s.leaf_relid
+  LEFT JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+  LEFT JOIN pg_catalog.pg_am am ON am.oid = ic.relam
+  ORDER BY s.leaf_name, i.indexrelid::text NULLS LAST;
+$$ LANGUAGE sql STABLE;
+
 CREATE FUNCTION @extschema@.sorted_heap_partition_maintenance(
   parent regclass,
   operation text,
