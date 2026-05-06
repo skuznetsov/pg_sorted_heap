@@ -151,10 +151,11 @@ make bench-partitioned-sorted-hnsw
 ```
 
 On the local PostgreSQL 18 default run (`8 x 50K` rows, self-query top-10),
-selected-leaf routing measured `4.901 ms` average at `100.0%` recall@10 versus
-`8.735 ms` for the parent filtered exact query. The same run showed all-leaf
-fanout around `23-25 ms`. Small partitions may not amortize the PL/pgSQL helper
-overhead; use the benchmark script to find the crossover for a real corpus.
+selected-leaf routing measured `5.359 ms` average at `100.0%` recall@10 versus
+`8.849 ms` for the parent filtered exact query. The same run showed all-leaf
+fanout around `23-25 ms`. The script now also reports `direct_leaf_index`:
+`2.942 ms` on the same run, which quantifies the current PL/pgSQL wrapper
+overhead and is the main signal for a future C fanout helper.
 
 ---
 

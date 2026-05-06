@@ -8,9 +8,10 @@ set -euo pipefail
 # Builds a synthetic partitioned sorted_heap table with one sorted_hnsw index per
 # leaf, then compares:
 #   1. selected-leaf route-first helper
-#   2. parent filtered exact query
-#   3. all-leaf helper fanout
-#   4. parent Merge Append over leaf sorted_hnsw indexes
+#   2. direct selected leaf sorted_hnsw query
+#   3. parent filtered exact query
+#   4. all-leaf helper fanout
+#   5. parent Merge Append over leaf sorted_hnsw indexes
 #
 # Usage:
 #   ./scripts/bench_partitioned_sorted_hnsw.sh [tmp_root] [port] [partitions] [rows_per_partition] [queries] [dim] [k] [local_k] [ef_search] [hnsw_m] [ef_construction]
@@ -226,6 +227,17 @@ BEGIN
     ) INTO ids;
     SELECT count(*) INTO hit_count FROM unnest(ids) AS got(id) WHERE got.id = ANY(gt);
     INSERT INTO bench_runs VALUES ('helper_selected', q.qid,
+      EXTRACT(EPOCH FROM clock_timestamp() - t0) * 1000.0,
+      hit_count::double precision / $K);
+
+    t0 := clock_timestamp();
+    EXECUTE format(
+      'SELECT ARRAY(SELECT bucket::text || '':'' || id::text FROM %s ORDER BY v <=> \$1::svec(%s) LIMIT %s)',
+      q.leaf_relid, $DIM, $K)
+    USING q.qtext
+    INTO ids;
+    SELECT count(*) INTO hit_count FROM unnest(ids) AS got(id) WHERE got.id = ANY(gt);
+    INSERT INTO bench_runs VALUES ('direct_leaf_index', q.qid,
       EXTRACT(EPOCH FROM clock_timestamp() - t0) * 1000.0,
       hit_count::double precision / $K);
 
