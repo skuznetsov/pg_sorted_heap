@@ -248,6 +248,7 @@ BEGIN
 END
 \$warm_shnsw\$;
 
+SELECT sorted_hnsw_reset_stats();
 DO \$run_shnsw\$
 DECLARE
   q record;
@@ -478,6 +479,8 @@ SELECT format(
 )
 FROM bench_notes
 ORDER BY method, status, detail;
+
+SELECT format('sorted_hnsw_scan_stats|%s', sorted_hnsw_scan_stats());
 
 SELECT format(
   'index_sizes|sorted_hnsw=%s|pgvector_hnsw=%s|pgvectorscale_diskann=%s|bench_sh_total=%s|bench_pgv_total=%s|bench_diskann_total=%s',

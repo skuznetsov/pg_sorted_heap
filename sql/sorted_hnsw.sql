@@ -34,6 +34,8 @@ SELECT pg_relation_size('hnsw_test_idx') > 0 AS hnsw_index_exists;
 SET enable_seqscan = off;
 SET sorted_hnsw.ef_search = 32;
 
+DO $$ BEGIN PERFORM sorted_hnsw_reset_stats(); END $$;
+
 CREATE FUNCTION hnsw_plan_contains(query text, pattern text) RETURNS boolean AS $$
 DECLARE
   r record;
@@ -50,6 +52,11 @@ $$ LANGUAGE plpgsql;
 SELECT count(*) AS hnsw_result_count FROM (
   SELECT id FROM hnsw_test ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec LIMIT 5
 ) x;
+
+COPY (
+  SELECT sorted_hnsw_scan_stats() LIKE
+         'calls=% l0_searches=% topup_searches=% exact_fallbacks=% exact_fallback_wins=% last={ef=%,nodes=%,l0_candidates=%,initial_results=%,topup_ef=%,topup_candidates=%,topup_results=%,fallback_results=%,final_results=%,exact_fallback=%}' AS hnsw_scan_stats_shape
+) TO STDOUT;
 
 -- Self-query
 SELECT round(min(v <=> (SELECT v FROM hnsw_test WHERE id = 1))::numeric, 6) AS self_dist FROM (

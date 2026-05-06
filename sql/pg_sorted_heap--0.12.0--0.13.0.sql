@@ -2845,3 +2845,19 @@ $$ LANGUAGE plpgsql STABLE;
 
 COMMENT ON FUNCTION @extschema@.sorted_heap_graph_route_plan(text, text, int8, text, text, int4, text[], text, text[])
 IS 'Explain which routing path sorted_heap_graph_route would take for the given parameters. Returns the resolution path, resolved profile/policy/default, effective filter knobs, and the candidate shard list. Uses the same resolution order as sorted_heap_graph_route.';
+
+CREATE FUNCTION @extschema@.sorted_hnsw_scan_stats()
+RETURNS text
+AS '$libdir/pg_sorted_heap', 'sorted_hnsw_scan_stats'
+LANGUAGE C STRICT;
+
+COMMENT ON FUNCTION @extschema@.sorted_hnsw_scan_stats()
+IS 'Return backend-local sorted_hnsw scan diagnostics, including top-up and exact fallback counters.';
+
+CREATE FUNCTION @extschema@.sorted_hnsw_reset_stats()
+RETURNS void
+AS '$libdir/pg_sorted_heap', 'sorted_hnsw_reset_stats'
+LANGUAGE C STRICT;
+
+COMMENT ON FUNCTION @extschema@.sorted_hnsw_reset_stats()
+IS 'Reset backend-local sorted_hnsw scan diagnostics.';

@@ -559,6 +559,29 @@ graph privately.
 SET sorted_hnsw.shared_cache = on;
 ```
 
+### `sorted_hnsw_scan_stats()`
+
+Backend-local scan diagnostics for planner-integrated `sorted_hnsw` ordered
+index scans. Use this while tuning or benchmarking to distinguish normal ANN
+latency from the fail-closed exact heap fallback used when ANN/top-up rerank
+underfills the configured `sorted_hnsw.ef_search` budget.
+
+```sql
+SELECT sorted_hnsw_reset_stats();
+
+SELECT id
+FROM items
+ORDER BY embedding <=> '[0.1,0.2,0.3,...]'::svec
+LIMIT 10;
+
+SELECT sorted_hnsw_scan_stats();
+```
+
+The text output includes cumulative `calls`, `l0_searches`,
+`topup_searches`, `exact_fallbacks`, and last-scan fields such as `ef`,
+`nodes`, `l0_candidates`, `initial_results`, `topup_results`,
+`fallback_results`, `final_results`, and `exact_fallback`.
+
 ### `sorted_heap.ann_timing`
 
 | Property | Value |

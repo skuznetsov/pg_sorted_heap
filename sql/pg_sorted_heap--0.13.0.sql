@@ -3811,6 +3811,22 @@ RETURNS index_am_handler
 AS '$libdir/pg_sorted_heap', 'sorted_hnsw_handler'
 LANGUAGE C STRICT;
 
+CREATE FUNCTION @extschema@.sorted_hnsw_scan_stats()
+RETURNS text
+AS '$libdir/pg_sorted_heap', 'sorted_hnsw_scan_stats'
+LANGUAGE C STRICT;
+
+COMMENT ON FUNCTION @extschema@.sorted_hnsw_scan_stats()
+IS 'Return backend-local sorted_hnsw scan diagnostics, including top-up and exact fallback counters.';
+
+CREATE FUNCTION @extschema@.sorted_hnsw_reset_stats()
+RETURNS void
+AS '$libdir/pg_sorted_heap', 'sorted_hnsw_reset_stats'
+LANGUAGE C STRICT;
+
+COMMENT ON FUNCTION @extschema@.sorted_hnsw_reset_stats()
+IS 'Reset backend-local sorted_hnsw scan diagnostics.';
+
 -- Register the access method
 CREATE ACCESS METHOD sorted_hnsw TYPE INDEX
 HANDLER @extschema@.sorted_hnsw_handler;

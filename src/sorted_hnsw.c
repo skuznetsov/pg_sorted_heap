@@ -26,6 +26,7 @@
 #include "utils/rel.h"
 #include "utils/float.h"
 #include "utils/selfuncs.h"
+#include "utils/builtins.h"
 #include "optimizer/optimizer.h"
 #include "common/pg_prng.h"
 #include "storage/smgr.h"
@@ -41,6 +42,7 @@
 #include <arm_neon.h>
 #endif
 
+#include <inttypes.h>
 #include "hsvec.h"
 #include "svec.h"
 
@@ -276,6 +278,27 @@ bool	sorted_hnsw_shared_cache = true;
 
 static relopt_kind shnsw_relopt_kind = 0;
 
+typedef struct ShnswScanStats
+{
+	uint64		calls;
+	uint64		l0_searches;
+	uint64		topup_searches;
+	uint64		exact_fallbacks;
+	uint64		exact_fallback_wins;
+	int			last_ef;
+	int			last_nodes;
+	int			last_l0_candidates;
+	int			last_initial_results;
+	int			last_topup_ef;
+	int			last_topup_candidates;
+	int			last_topup_results;
+	int			last_fallback_results;
+	int			last_final_results;
+	bool		last_exact_fallback;
+} ShnswScanStats;
+
+static ShnswScanStats shnsw_scan_stats;
+
 #define SHNSW_SHARED_CACHE_TRANCHE "sorted_hnsw"
 #define SHNSW_SHARED_CACHE_PAYLOAD_BYTES (64 * 1024 * 1024)
 
@@ -495,6 +518,8 @@ shnsw_sq8_buffer_bytes(int n_nodes, int dim)
  * ================================================================ */
 
 PG_FUNCTION_INFO_V1(sorted_hnsw_handler);
+PG_FUNCTION_INFO_V1(sorted_hnsw_scan_stats);
+PG_FUNCTION_INFO_V1(sorted_hnsw_reset_stats);
 Datum
 sorted_hnsw_handler(PG_FUNCTION_ARGS)
 {
@@ -548,6 +573,41 @@ sorted_hnsw_handler(PG_FUNCTION_ARGS)
 	amroutine->amparallelrescan = NULL;
 
 	PG_RETURN_POINTER(amroutine);
+}
+
+Datum
+sorted_hnsw_scan_stats(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf(
+		"calls=%" PRIu64 " l0_searches=%" PRIu64
+		" topup_searches=%" PRIu64
+		" exact_fallbacks=%" PRIu64
+		" exact_fallback_wins=%" PRIu64
+		" last={ef=%d,nodes=%d,l0_candidates=%d,initial_results=%d,"
+		"topup_ef=%d,topup_candidates=%d,topup_results=%d,"
+		"fallback_results=%d,final_results=%d,exact_fallback=%s}",
+		shnsw_scan_stats.calls,
+		shnsw_scan_stats.l0_searches,
+		shnsw_scan_stats.topup_searches,
+		shnsw_scan_stats.exact_fallbacks,
+		shnsw_scan_stats.exact_fallback_wins,
+		shnsw_scan_stats.last_ef,
+		shnsw_scan_stats.last_nodes,
+		shnsw_scan_stats.last_l0_candidates,
+		shnsw_scan_stats.last_initial_results,
+		shnsw_scan_stats.last_topup_ef,
+		shnsw_scan_stats.last_topup_candidates,
+		shnsw_scan_stats.last_topup_results,
+		shnsw_scan_stats.last_fallback_results,
+		shnsw_scan_stats.last_final_results,
+		shnsw_scan_stats.last_exact_fallback ? "true" : "false")));
+}
+
+Datum
+sorted_hnsw_reset_stats(PG_FUNCTION_ARGS)
+{
+	MemSet(&shnsw_scan_stats, 0, sizeof(shnsw_scan_stats));
+	PG_RETURN_VOID();
 }
 
 /* ================================================================
@@ -3782,6 +3842,17 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 
 		ef = Min(Max(sorted_hnsw_ef_search, 1), cache->n_nodes);
 		ep_nid = cache->entry_nid;
+		shnsw_scan_stats.calls++;
+		shnsw_scan_stats.last_ef = ef;
+		shnsw_scan_stats.last_nodes = cache->n_nodes;
+		shnsw_scan_stats.last_l0_candidates = 0;
+		shnsw_scan_stats.last_initial_results = 0;
+		shnsw_scan_stats.last_topup_ef = 0;
+		shnsw_scan_stats.last_topup_candidates = 0;
+		shnsw_scan_stats.last_topup_results = 0;
+		shnsw_scan_stats.last_fallback_results = 0;
+		shnsw_scan_stats.last_final_results = 0;
+		shnsw_scan_stats.last_exact_fallback = false;
 
 		/* Navigate upper levels (ef=1, greedy) */
 		for (level = cache->max_level; level >= 1; level--)
@@ -3805,6 +3876,8 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 		candidates = palloc(sizeof(ScanCandidate) * ef);
 		n_cand = shnsw_search_level(index, cache, so->query, ep_nid,
 									ef, 0, candidates, ef);
+		shnsw_scan_stats.l0_searches++;
+		shnsw_scan_stats.last_l0_candidates = n_cand;
 
 		elog(DEBUG1, "sorted_hnsw scan: L0 search found %d candidates", n_cand);
 
@@ -3813,6 +3886,7 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 											so->query_dim,
 											candidates, n_cand,
 											results, Max(ef, 1));
+		shnsw_scan_stats.last_initial_results = n_results;
 
 		/*
 		 * Writable tables can leave dead heap tuples behind the graph. If the
@@ -3834,6 +3908,9 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 				topup_n_cand = shnsw_search_level(index, cache, so->query, ep_nid,
 												 topup_ef, 0,
 												 topup_candidates, topup_ef);
+				shnsw_scan_stats.topup_searches++;
+				shnsw_scan_stats.last_topup_ef = topup_ef;
+				shnsw_scan_stats.last_topup_candidates = topup_n_cand;
 
 				topup_results = palloc(sizeof(ScanResult) * topup_ef);
 				topup_n_results = shnsw_rerank_candidates(index, cache,
@@ -3843,6 +3920,7 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 														  topup_n_cand,
 														  topup_results,
 														  topup_ef);
+				shnsw_scan_stats.last_topup_results = topup_n_results;
 
 				if (topup_n_results > n_results)
 				{
@@ -3872,16 +3950,21 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 														   so->query_dim,
 														   fallback_results,
 														   Max(ef, 1));
+			shnsw_scan_stats.exact_fallbacks++;
+			shnsw_scan_stats.last_exact_fallback = true;
+			shnsw_scan_stats.last_fallback_results = fallback_n_results;
 			if (fallback_n_results > n_results)
 			{
 				pfree(results);
 				results = fallback_results;
 				n_results = fallback_n_results;
+				shnsw_scan_stats.exact_fallback_wins++;
 			}
 			else
 				pfree(fallback_results);
 		}
 
+		shnsw_scan_stats.last_final_results = n_results;
 		elog(DEBUG1, "sorted_hnsw scan: reranked %d results", n_results);
 
 		/* Sort by exact distance */
