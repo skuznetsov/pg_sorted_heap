@@ -266,6 +266,15 @@ SELECT * FROM sorted_heap_graph_route_plan(
 parameters. See `docs/api.md` for the full resolution order and operator
 recipe.
 
+For partitioned or tenant-sharded fact tables, GraphRAG fanout is explicit:
+register concrete leaves/shards, inspect them with
+`sorted_heap_graph_route_plan(...)`, then query through
+`sorted_heap_graph_route(...)` or `sorted_heap_graph_rag_segmented(...)`.
+`sorted_heap_graph_rag(...)` remains a concrete-relation API; it is not a
+transparent declarative-parent graph scan. The routed merge is global over the
+selected shard-local result sets, so app code gets one ordered top-k result
+with `source_rel` preserved.
+
 The lower-level routing building blocks (`_routed`, `_routed_exact`,
 `_routed_policy`, `_routed_profile`, `_routed_default`, `_segmented`,
 expand/rerank helpers, scan wrappers, catalog/config/resolve functions)

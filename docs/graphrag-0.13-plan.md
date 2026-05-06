@@ -70,6 +70,9 @@ These remain beta even after the new syntax lands:
   - `sorted_heap_graph_route(...)` — single query entry point
   - `sorted_heap_graph_route_plan(...)` — routing introspection
   - routing setup helpers (exact-key, range, policy, profile, default)
+  - partitioned-parent fanout is explicit: register concrete leaves/shards,
+    inspect the route plan, and merge selected shard-local results globally;
+    do not treat a declarative partition parent as an implicit GraphRAG relation
 - lower-level helper zoo:
   - `sorted_heap_expand_ids(...)`
   - `sorted_heap_expand_rerank(...)`

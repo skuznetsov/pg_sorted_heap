@@ -769,6 +769,25 @@ fact-shaped GraphRAG. It is useful when routing/pruning already exists in the
 application or in metadata tables, and you want to move shard fanout/merge out
 of benchmark code and into SQL.
 
+Partitioned-parent contract:
+
+- `sorted_heap_graph_rag(...)` is a concrete-relation API. Do not use a
+  declarative partition parent as an implicit global graph.
+- For partitioned or tenant-sharded facts, register each concrete leaf/shard
+  with `sorted_heap_graph_register(...)` and call
+  `sorted_heap_graph_route(...)` or `sorted_heap_graph_rag_segmented(...)`
+  over the selected leaves.
+- Fanout is explicit. `sorted_heap_graph_route_plan(...)` shows the concrete
+  shard list before execution.
+- The merge step is global over the routed shard-local result sets:
+  `global_top_k = top_k(sort(union(shard_local_top_k)))`. It is not local
+  top-k concatenation.
+- `fanout_limit` narrows the selected shard list before GraphRAG execution. If
+  correctness requires every possibly relevant shard, keep `fanout_limit := 0`
+  or use a profile that includes all required shards.
+- ANN seed retrieval, `ann_k`, and `limit_rows` remain per-shard work bounds;
+  they do not become a transparent cross-partition planner path.
+
 ```sql
 SELECT source_rel, entity_id, relation_id, target_id, payload, distance
 FROM sorted_heap_graph_rag_segmented(
@@ -1194,6 +1213,9 @@ Important constraints:
 - defaults never override explicit call-site routing knobs
 - this wrapper reuses the existing routed GraphRAG paths; it does not define
   a new GraphRAG scoring model
+- this is the recommended parent/shard fanout API for GraphRAG; declarative
+  partition parents should be resolved to concrete leaves first rather than
+  passed as implicit global GraphRAG relations
 
 ```sql
 SELECT source_rel, entity_id, relation_id, target_id, payload, distance

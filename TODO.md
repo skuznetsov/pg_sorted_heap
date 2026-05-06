@@ -704,7 +704,12 @@ Priority order after the native-partitioning hardening pass:
    `2.942ms` vs SQL helper `5.359ms`, so a C helper is justified if routed
    small-leaf latency becomes important.
 2. Specify GraphRAG parent fanout: decide whether it is a global exact top-k
-   merge over routed leaves or an explicit routed-shard-only API.
+   merge over routed leaves or an explicit routed-shard-only API. Resolved:
+   GraphRAG parent fanout stays explicit in `0.13`; callers register concrete
+   leaves/shards, inspect `sorted_heap_graph_route_plan(...)`, and use
+   `sorted_heap_graph_route(...)` or `sorted_heap_graph_rag_segmented(...)`.
+   The merge is global over selected shard-local result sets, not transparent
+   declarative-parent execution.
 3. Add attach/detach/default-partition lifecycle regression for dynamic
    partition-tree operations.
 4. Refine `sorted_heap_partition_maintenance_plan(...)` with tablespace/free
