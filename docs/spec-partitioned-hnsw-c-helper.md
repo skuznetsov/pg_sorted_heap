@@ -21,6 +21,8 @@ ANN contract for declarative partitions:
 - run local ANN on selected leaves with `local_k`;
 - union candidate pools;
 - globally rerank by exact distance and return final `top_k`.
+- optionally replace an underfilled ANN pool with an exact rerank over the
+  same selected leaves when `exact_fallback := true`.
 
 The current implementation is PL/pgSQL that builds one dynamic `UNION ALL`
 query across selected leaves. This is simple and safe, but route-first latency
@@ -61,11 +63,14 @@ The C helper should preserve the SQL-level behavior:
 
 - same function name or a private C implementation under the same SQL wrapper;
 - same arguments: `parent`, `vector_column`, `query`, `top_k`, `local_k`,
-  `leaf_relids`, `fail_on_unsupported`;
+  `leaf_relids`, `fail_on_unsupported`, `exact_fallback`;
 - same returned columns: `leaf_relid`, `leaf_name`, `distance`, `row_data`;
 - same validation failures for wrong-parent leaves, unsupported leaves,
   missing vector columns, unsupported vector types, missing leaf-local HNSW
   indexes, `local_k < top_k`, and `local_k > sorted_hnsw.ef_search`;
+- same opt-in fallback behavior: default ANN-only semantics, and
+  `exact_fallback := true` executes an exact selected-leaf rerank only when the
+  ANN candidate pool underfills `top_k`;
 - deterministic global ordering by exact distance, with a stable tie-breaker if
   required by regression output.
 
@@ -112,6 +117,7 @@ Run the existing `sorted_hnsw` regression cases for:
 - wrong-parent selected leaf rejection;
 - selected leaf without HNSW index rejection;
 - `local_k > sorted_hnsw.ef_search` rejection;
+- default no-fallback underfill behavior and `exact_fallback := true`;
 - `svec` and `hsvec` partitioned leaves.
 
 Expected: identical rows or intentionally updated stable ordering with the
@@ -125,6 +131,11 @@ Expected: the helper returns all global winners from that leaf. A local top-k
 concatenation implementation must fail this test.
 
 ### C3. Benchmark gate
+
+The benchmark must include both default and fallback-enabled helper rows if the
+candidate changes fallback orchestration. Report the fallback row separately
+because exact fallback is an operator-selected correctness/coverage trade-off,
+not the default latency path.
 
 Run:
 
