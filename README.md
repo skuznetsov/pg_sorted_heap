@@ -345,9 +345,9 @@ The local M-series tuning run found a slightly different frontier, but the new
 path-aware helper transferred cleanly to AWS at both `5K` and `10K` chains.
 The full tuning history, reasoning, external-engine caveats, and larger-scale
 results live in
-[docs/design-graphrag.md](/Users/sergey/Projects/C/clustered_pg/docs/design-graphrag.md).
+[docs/design-graphrag.md](docs/design-graphrag.md).
 The current `0.13` release target and hardening gates live in
-[docs/graphrag-0.13-plan.md](/Users/sergey/Projects/C/clustered_pg/docs/graphrag-0.13-plan.md).
+[docs/graphrag-0.13-plan.md](docs/graphrag-0.13-plan.md).
 
 There is now also a **real code-corpus** GraphRAG benchmark using the actual
 `cogniformerus` source tree plus the real CrossFile prompts from
@@ -367,9 +367,9 @@ The key correction is that the code-aware path needed exact prompt-symbol
 rescue (`HierarchicalMemory`, `TwoStageAnswerer`, `DialogueNLU`, etc.) in the
 summary seed stage; the generic path did not. The repeated-build and AWS
 results are documented in
-[docs/design-graphrag.md](/Users/sergey/Projects/C/clustered_pg/docs/design-graphrag.md)
+[docs/design-graphrag.md](docs/design-graphrag.md)
 and summarized in
-[docs/benchmarks.md](/Users/sergey/Projects/C/clustered_pg/docs/benchmarks.md).
+[docs/benchmarks.md](docs/benchmarks.md).
 
 A larger in-repo transfer gate now also exists on the full
 `cogniformerus` repository (`183` Crystal files instead of the smaller
@@ -518,7 +518,7 @@ SELECT WHERE pk op const -> planner hook -> extract bounds
 
 ## Performance
 
-Use [docs/benchmarks.md](/Users/sergey/Projects/C/clustered_pg/docs/benchmarks.md)
+Use [docs/benchmarks.md](docs/benchmarks.md)
 for the full benchmark matrix and methodology. The summary below keeps only the
 current representative rows and avoids older narrow-range comparisons that no
 longer reflect the release story cleanly.
@@ -909,6 +909,7 @@ SET sorted_heap.ann_timing = on;                 -- timing breakdown in DEBUG1
 - [Vector Search](docs/vector-search.md) -- `sorted_hnsw`, IVF-PQ, sidecar HNSW
 - [Filtered ANN Contracts](docs/spec-filtered-ann.md) -- proposed safe modes for filtered vector retrieval
 - [Zone-Map-Only Fast Paths](docs/spec-zone-map-only-fast-paths.md) -- why current zone maps are page pruning, not true index-only scans
+- [Large-Vector Sublinear Search](docs/spec-large-vector-sublinear.md) -- benchmark-gated IVF-PQ / SQ-family revival
 - [Architecture](docs/architecture.md) -- zone maps, custom scan, compaction
 - [Composite-PK Pruning Spec](docs/spec-composite-pk-pruning.md) -- first-pass two-column pruning contract
 - [Huge-Table Compaction Operating Model](docs/spec-huge-table-compaction.md) -- rewrite/free-space contract

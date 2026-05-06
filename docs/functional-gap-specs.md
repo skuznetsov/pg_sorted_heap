@@ -226,6 +226,31 @@ Target direction:
 - If needed later, choose explicitly between metadata-only fast paths and a
   covering value-bearing sidecar / Index AM contract.
 
+### G8. Large-vector sublinear search revival
+
+Current state:
+
+- `sorted_hnsw` is the stable planner-integrated vector default.
+- IVF-PQ remains available as a legacy/manual `svec_ann_scan(...)` path.
+- FlashHadamard is a documented experimental packed exhaustive lane.
+- Existing FlashHadamard notes refute IVF/pruning as the next default win at
+  `103K x 2880D`, but do not refute sublinear routing at `500K+` / `1M+`.
+- `docs/spec-large-vector-sublinear.md` now defines the benchmark gate for any
+  IVF-PQ, SQ8, or SQ4 revival.
+
+Risk:
+
+- Promoting IVF-PQ or SQ4 without a scale gate would weaken the product story:
+  it would add complexity while competing with stronger current defaults on the
+  validated `103K` operating point.
+
+Target direction:
+
+- Keep IVF-PQ as explicit/manual until a large-scale harness proves a winning
+  region against `sorted_hnsw` and FlashHadamard.
+- Prefer SQ8 before SQ4 for productized candidate scanning unless a 4-bit
+  FlashHadamard-derived path proves equal quality at lower footprint.
+
 ## Prioritization
 
 | Priority | Gap | Reason |
@@ -236,6 +261,7 @@ Target direction:
 | P1 | G4 parent-level observability | Storage-state first pass landed; runtime/vector health remains |
 | P1 | G3 filtered ANN | Expected by vector-search users, but broader than storage |
 | P2 | G7 zone-map-only / index-only-like fast paths | Spec boundary landed; real row-returning path requires a covering sidecar |
+| P2 | G8 large-vector sublinear search revival | Benchmark-gated; do not reopen refuted 103K pruning as a default |
 | P2 | G5 online lossy-PK support | Useful, but current fail-closed behavior is acceptable |
 | P2 | G6 restore ergonomics | Checklist documented; optional discovery helper remains |
 

@@ -314,6 +314,10 @@ legacy/manual ANN paths. Use the `sorted_hnsw` rows as the release default;
 use the IVF-PQ and sidecar rows only when you explicitly want those manual
 trade-offs.
 
+For future very-large tables, IVF-PQ / SQ-family revival is tracked as a
+benchmark-gated scale feature, not as a default replacement. See
+[Large-Vector Sublinear Search](spec-large-vector-sublinear).
+
 ### 103K vectors, 2880-dim (Gutenberg corpus)
 
 Residual PQ (M=720, dsub=4), 256 IVF partitions.

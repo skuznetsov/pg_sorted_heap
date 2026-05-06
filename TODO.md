@@ -732,4 +732,9 @@ Priority order after the native-partitioning hardening pass:
    visible rows like PostgreSQL `Index Only Scan` without a covering
    value-bearing sidecar. See `docs/spec-zone-map-only-fast-paths.md`.
 7. IVF-PQ or SQ8/SQ4 revival for sub-linear scan on very large datasets.
+   Resolved as a benchmark-gated large-scale track in
+   `docs/spec-large-vector-sublinear.md`: keep IVF-PQ legacy/manual at `0.13`,
+   do not reopen the refuted `103K` pruning branch as a default, and require
+   `500K+` / `1M+` latency + recall + footprint evidence before promoting
+   IVF-PQ, SQ8, or a FlashHadamard-derived SQ4 lane.
 8. SIMD-accelerated ADC lookup and pgvectorscale DiskANN comparison.
