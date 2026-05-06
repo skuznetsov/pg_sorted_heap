@@ -144,7 +144,8 @@ Expected:
 - no false negatives.
 
 Status: not yet directly covered for second-column predicates. Existing tail
-regressions cover first-column behavior.
+regressions covered first-column behavior; `SH21B-3` now directly covers the
+fixed-col1/bounded-col2 tail case.
 
 ## Implementation Sketch
 
@@ -183,7 +184,6 @@ Adversary checks:
 ## Definition of Done
 
 - C1-C2 regression tests are present in `sql/pg_sorted_heap.sql` as `SH21B`.
+- C4 tail correctness is present in `sql/pg_sorted_heap.sql` as `SH21B-3`.
 - Existing single-column pruning tests pass in `pg_sorted_heap`.
 - Existing `sorted_hnsw` regression passes after the scan change.
-- Remaining follow-up: add direct C4 coverage for sorted-prefix + unsorted-tail
-  second-column predicates.

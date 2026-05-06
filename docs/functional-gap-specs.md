@@ -29,8 +29,11 @@ Current state:
   refined with existing second-column zone-map overlap checks.
 - Regression `SH21B` now guards `tenant_id = 1 AND id BETWEEN 100 AND 110`
   with a tight scanned-block threshold and verifies count correctness.
+- Regression `SH21B-3` now guards that an unsorted tail remains conservative
+  for fixed-column-1 and bounded-column-2 predicates, preserving correctness
+  after tail inserts.
 - `docs/spec-composite-pk-pruning.md` documents the first-pass contract and
-  remaining lexicographic/tail follow-ups.
+  remaining lexicographic follow-ups.
 
 Risk:
 
@@ -281,7 +284,7 @@ Target direction:
 
 | Priority | Gap | Reason |
 |----------|-----|--------|
-| P0 | G0 composite-PK pruning quality | First-pass fix landed for fixed-col1/bounded-col2; tail and full lexicographic search remain follow-ups |
+| P0 | G0 composite-PK pruning quality | First-pass fix landed for fixed-col1/bounded-col2; tail correctness guarded; full lexicographic search remains follow-up |
 | P0 | G1 declarative partitioning support | Directly affects huge-table operating model and interview/product story |
 | P0 | G2 huge-table compaction model | Needed to explain free-space requirements honestly |
 | P1 | G4 parent-level observability | Storage-state first pass landed; runtime/vector health remains |

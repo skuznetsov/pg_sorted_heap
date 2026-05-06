@@ -2492,6 +2492,28 @@ SELECT sh21b_zonemap_scanned(
     'SELECT * FROM sh21b WHERE tenant_id = 1 AND id = 123') <= 2
     AS sh21b_composite_tight_eq;
 
+-- SH21B-3: Unsorted tail stays conservative for second-column predicates.
+-- Insert tenant 1 rows after tenant 2's compacted prefix; this breaks global
+-- monotonicity while leaving the heap-backed executor quals authoritative.
+INSERT INTO sh21b
+SELECT 1, id, repeat('tail', 20)
+FROM generate_series(20001, 20100) id;
+
+SELECT CASE WHEN sorted_heap_zonemap_stats('sh21b'::regclass)
+                 LIKE '%flags=valid%'
+              AND sorted_heap_zonemap_stats('sh21b'::regclass)
+                 NOT LIKE '%flags=valid,sorted%'
+         THEN 'sh21b_valid_not_sorted_ok'
+         ELSE 'sh21b_FAIL: ' || sorted_heap_zonemap_stats('sh21b'::regclass)
+    END AS sh21b_tail_zm_state;
+
+SELECT sh21b_zonemap_scanned(
+    'SELECT * FROM sh21b WHERE tenant_id = 1 AND id BETWEEN 20010 AND 20020') >= 1
+    AS sh21b_tail_uses_sorted_heap_scan;
+SELECT count(*) AS sh21b_tail_second_col_count
+FROM sh21b
+WHERE tenant_id = 1 AND id BETWEEN 20010 AND 20020;
+
 RESET enable_indexscan;
 RESET enable_bitmapscan;
 
