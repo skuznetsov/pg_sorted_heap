@@ -79,6 +79,30 @@ SELECT count(*) AS dead_topup_count FROM (
 DROP TABLE hnsw_dead;
 SET sorted_hnsw.ef_search = 32;
 
+-- Dead-heavy churn after VACUUM: stale graph entry points must not make a
+-- live table look empty. This models app-level reindexing that deletes old
+-- chunks and inserts fresh chunks without rebuilding the ANN index.
+CREATE TABLE hnsw_dead_churn (id serial PRIMARY KEY, v svec(4));
+INSERT INTO hnsw_dead_churn (v)
+SELECT format('[1,%s,0,0]', round((i / 1000.0)::numeric, 3))::svec
+FROM generate_series(1, 200) AS i;
+SET client_min_messages = warning;
+CREATE INDEX hnsw_dead_churn_idx ON hnsw_dead_churn USING sorted_hnsw (v) WITH (m = 2, ef_construction = 8);
+SET client_min_messages = notice;
+DELETE FROM hnsw_dead_churn;
+VACUUM hnsw_dead_churn;
+INSERT INTO hnsw_dead_churn (v)
+SELECT format('[1,%s,0,0]', round((i / 1000.0)::numeric, 3))::svec
+FROM generate_series(1, 5) AS i;
+SET sorted_hnsw.ef_search = 4;
+COPY (
+  SELECT count(*) = 4 AS dead_churn_fallback_ok FROM (
+    SELECT id FROM hnsw_dead_churn ORDER BY v <=> '[1,0,0,0]'::svec LIMIT 4
+  ) x
+) TO STDOUT;
+DROP TABLE hnsw_dead_churn;
+SET sorted_hnsw.ef_search = 32;
+
 -- DELETE + VACUUM
 DELETE FROM hnsw_test WHERE id BETWEEN 1 AND 5;
 VACUUM hnsw_test;

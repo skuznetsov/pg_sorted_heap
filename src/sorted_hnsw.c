@@ -3510,6 +3510,114 @@ shnsw_rerank_candidates(Relation index, const ShnswScanCache *cache,
 	return n_results;
 }
 
+/*
+ * Correctness fallback for dead-heavy graphs.
+ *
+ * sorted_hnsw keeps deleted graph nodes as tombstones until REINDEX. Under
+ * heavy DELETE+INSERT churn, graph navigation can spend the whole ANN beam in
+ * nodes whose heap TIDs are no longer visible to the active snapshot. In that
+ * case returning an underfilled ordered scan is worse than falling back to an
+ * exact heap pass: the planner only allows this AM for bounded LIMIT <=
+ * ef_search scans, so max_results stays small while correctness is preserved.
+ */
+static int
+shnsw_exact_heap_fallback(Relation index, const float *query, int query_dim,
+						  ScanResult *results, int max_results)
+{
+	Relation	heap;
+	Snapshot	snap;
+	TableScanDesc scan;
+	TupleTableSlot *slot;
+	ShnswVectorKind vector_kind;
+	double		query_norm = 0.0;
+	int			dim;
+	int			i;
+	int			n_results = 0;
+
+	vector_kind = shnsw_index_vector_kind(index, &dim);
+	if (query_dim != dim)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("sorted_hnsw query dimension %d does not match index dimension %d",
+						query_dim, dim)));
+
+	for (i = 0; i < dim; i++)
+		query_norm += (double) query[i] * (double) query[i];
+
+	if (max_results <= 0)
+		return 0;
+
+	heap = table_open(index->rd_index->indrelid, AccessShareLock);
+	snap = GetActiveSnapshot();
+	scan = table_beginscan(heap, snap, 0, NULL);
+	slot = table_slot_create(heap, NULL);
+
+	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+	{
+		bool		isnull;
+		Datum		val;
+		ScanResult	candidate;
+
+		CHECK_FOR_INTERRUPTS();
+
+		val = slot_getattr(slot, index->rd_index->indkey.values[0], &isnull);
+		if (isnull)
+		{
+			ExecClearTuple(slot);
+			continue;
+		}
+
+		if (vector_kind == SHNSW_VECTOR_SVEC)
+		{
+			Svec   *sv = DatumGetSvecP(val);
+
+			candidate.exact_dist =
+				shnsw_cosine_distance_query_svec_prenorm(query, dim,
+														 query_norm, sv);
+			if (sv != (Svec *) DatumGetPointer(val))
+				pfree(sv);
+		}
+		else if (vector_kind == SHNSW_VECTOR_HSVEC)
+		{
+			Hsvec  *hv = (Hsvec *) PG_DETOAST_DATUM(val);
+
+			candidate.exact_dist =
+				shnsw_cosine_distance_query_hsvec_prenorm(query, dim,
+														  query_norm, hv);
+			if (hv != (Hsvec *) DatumGetPointer(val))
+				pfree(hv);
+		}
+		else
+			elog(ERROR, "unsupported sorted_hnsw vector kind %d",
+				 (int) vector_kind);
+
+		ItemPointerCopy(&slot->tts_tid, &candidate.tid);
+
+		if (n_results < max_results)
+		{
+			results[n_results++] = candidate;
+			if (n_results == max_results)
+				qsort(results, n_results, sizeof(ScanResult), cmp_result_asc);
+		}
+		else if (cmp_result_asc(&candidate, &results[n_results - 1]) < 0)
+		{
+			results[n_results - 1] = candidate;
+			qsort(results, n_results, sizeof(ScanResult), cmp_result_asc);
+		}
+
+		ExecClearTuple(slot);
+	}
+
+	if (n_results > 1)
+		qsort(results, n_results, sizeof(ScanResult), cmp_result_asc);
+
+	ExecDropSingleTupleTableSlot(slot);
+	table_endscan(scan);
+	table_close(heap, AccessShareLock);
+
+	return n_results;
+}
+
 /* ================================================================
  * Scan callbacks
  * ================================================================ */
@@ -3747,6 +3855,31 @@ shnsw_gettuple(IndexScanDesc scan, ScanDirection direction)
 
 				pfree(topup_candidates);
 			}
+		}
+
+		if (n_results < Min(ef, cache->n_nodes))
+		{
+			ScanResult	   *fallback_results;
+			int				fallback_n_results;
+
+			elog(DEBUG1,
+				 "sorted_hnsw scan: ANN rerank underfilled (%d/%d); using exact heap fallback",
+				 n_results, Min(ef, cache->n_nodes));
+
+			fallback_results = palloc(sizeof(ScanResult) * Max(ef, 1));
+			fallback_n_results = shnsw_exact_heap_fallback(index,
+														   so->query,
+														   so->query_dim,
+														   fallback_results,
+														   Max(ef, 1));
+			if (fallback_n_results > n_results)
+			{
+				pfree(results);
+				results = fallback_results;
+				n_results = fallback_n_results;
+			}
+			else
+				pfree(fallback_results);
 		}
 
 		elog(DEBUG1, "sorted_hnsw scan: reranked %d results", n_results);
