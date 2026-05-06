@@ -34,6 +34,19 @@ SELECT pg_relation_size('hnsw_test_idx') > 0 AS hnsw_index_exists;
 SET enable_seqscan = off;
 SET sorted_hnsw.ef_search = 32;
 
+CREATE FUNCTION hnsw_plan_contains(query text, pattern text) RETURNS boolean AS $$
+DECLARE
+  r record;
+BEGIN
+  FOR r IN EXECUTE 'EXPLAIN (COSTS OFF) ' || query LOOP
+    IF r."QUERY PLAN" LIKE '%' || pattern || '%' THEN
+      RETURN true;
+    END IF;
+  END LOOP;
+  RETURN false;
+END;
+$$ LANGUAGE plpgsql;
+
 SELECT count(*) AS hnsw_result_count FROM (
   SELECT id FROM hnsw_test ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec LIMIT 5
 ) x;
@@ -56,6 +69,15 @@ EXPLAIN (COSTS OFF)
 SELECT id FROM hnsw_test ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec LIMIT 40;
 EXPLAIN (COSTS OFF)
 SELECT id FROM hnsw_test WHERE id > 10 ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec LIMIT 5;
+SELECT NOT hnsw_plan_contains(
+  'SELECT id FROM hnsw_test ORDER BY v <=> ''[0.8,0.6,0.9,0.1]''::svec',
+  'hnsw_test_idx') AS hnsw_guard_unbounded_no_index;
+SELECT NOT hnsw_plan_contains(
+  'SELECT id FROM hnsw_test ORDER BY v <=> ''[0.8,0.6,0.9,0.1]''::svec LIMIT 40',
+  'hnsw_test_idx') AS hnsw_guard_limit_gt_ef_no_index;
+SELECT NOT hnsw_plan_contains(
+  'SELECT id FROM hnsw_test WHERE id > 10 ORDER BY v <=> ''[0.8,0.6,0.9,0.1]''::svec LIMIT 5',
+  'hnsw_test_idx') AS hnsw_guard_filter_no_index;
 SET enable_seqscan = off;
 
 -- Partition-aware helper: route selected leaves, run local sorted_hnsw KNN,
@@ -297,6 +319,7 @@ SELECT id FROM hnsw_half ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::hsvec LIMIT 5;
 
 RESET enable_seqscan;
 RESET sorted_hnsw.ef_search;
+DROP FUNCTION hnsw_plan_contains(text, text);
 DROP TABLE hnsw_half;
 DROP TABLE hnsw_empty;
 DROP TABLE hnsw_test;

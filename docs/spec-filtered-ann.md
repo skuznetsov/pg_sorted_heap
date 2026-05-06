@@ -231,6 +231,12 @@ Expected:
 - if a future planner path supports this shape, EXPLAIN must expose the
   filtered-ANN mode and underfill/fallback behavior.
 
+Current status:
+
+- Covered by `sorted_hnsw` regression. The guard asserts that the
+  planner-integrated `sorted_hnsw` index path is not selected for unbounded KNN,
+  `LIMIT > sorted_hnsw.ef_search`, or a base-table filtered KNN query.
+
 ## Implementation Direction
 
 Preferred order:

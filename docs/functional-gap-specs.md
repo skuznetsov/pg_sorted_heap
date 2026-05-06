@@ -134,6 +134,8 @@ Current state:
 - `docs/spec-filtered-ann.md` now separates filtered retrieval into
   pre-filter/materialize, ANN-overfetch/exact-rerank, and
   partition/routing-aware global-merge modes.
+- `sorted_hnsw` regression now has explicit planner-safety guards for
+  unbounded KNN, `LIMIT > sorted_hnsw.ef_search`, and filtered KNN shapes.
 
 Risk:
 
