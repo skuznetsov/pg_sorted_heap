@@ -133,6 +133,23 @@ SELECT requested_top_k, effective_local_k, selected_leaves,
 FROM sorted_hnsw_partition_search_status(
     'hnsw_part'::regclass, 'v', '[1,0,0,0]', 5, 5,
     ARRAY['hnsw_part_3'::regclass]);
+COPY (
+  SELECT requested_top_k, effective_local_k, selected_leaves,
+         returned_rows, underfilled, fallback
+  FROM sorted_hnsw_partition_search_status(
+      'hnsw_part'::regclass, 'v', '[1,0,0,0]', 5, 5,
+      ARRAY['hnsw_part_3'::regclass],
+      true,
+      true)
+) TO STDOUT;
+COPY (
+  SELECT count(*) AS part_exact_fallback_count
+  FROM sorted_hnsw_partition_search(
+      'hnsw_part'::regclass, 'v', '[1,0,0,0]', 5, 5,
+      ARRAY['hnsw_part_3'::regclass],
+      true,
+      true)
+) TO STDOUT;
 CREATE TABLE hnsw_part_not_leaf(id int PRIMARY KEY, v svec(4)) USING sorted_heap;
 DO $$
 BEGIN

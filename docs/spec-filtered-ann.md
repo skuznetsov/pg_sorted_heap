@@ -19,8 +19,10 @@ Current completion state:
   global exact rerank.
 - Done: routed-search underfill diagnostics via
   `sorted_hnsw_partition_search_status(...)`.
+- Done: explicit selected-leaf exact fallback for routed-search underfill via
+  `exact_fallback := true`.
 - Proposed: F2 overfetch/exact filtered rerank with explicit underfill metadata
-  and fallback reporting.
+  and fallback reporting for arbitrary non-shard filters.
 - Non-goal for now: transparent arbitrary `WHERE ... ORDER BY embedding <=> q`
   planner support.
 
@@ -121,7 +123,7 @@ Required metadata:
 - `top_k`: final result budget;
 - `matched_after_filter`: number of candidates surviving the filter;
 - `underfilled`: whether final rows `< top_k`;
-- optional fallback marker: `none | larger_ann | exact_filtered`.
+- optional fallback marker: `none | underfilled_no_fallback | exact_filtered`.
 
 This should be a helper/function contract before it is a transparent planner
 path, because callers need to see when the filtered result is approximate or
@@ -177,8 +179,10 @@ FROM sorted_hnsw_partition_search_status(...);
 ```
 
 This reports `returned_rows`, `underfilled`, and `fallback` for the same routed
-search contract. It is intentionally diagnostic and does not silently fall back
-to exact search.
+search contract. By default it is diagnostic and does not silently fall back to
+exact search. If the caller explicitly sets `exact_fallback := true`, an
+underfilled ANN candidate pool is replaced with an exact rerank over the same
+selected leaves and `fallback` reports `exact_filtered`.
 
 Safety checks:
 
@@ -231,7 +235,8 @@ Current status:
   rejects selected leaves without a valid `sorted_hnsw` index or without a
   parent-child relationship to the requested parent.
 - The same regression covers `sorted_hnsw_partition_search_status(...)` for a
-  complete selected-leaf result and an underfilled selected-leaf result.
+  complete selected-leaf result, an underfilled selected-leaf result, and the
+  explicit `exact_fallback := true` marker path.
 - `scripts/bench_partitioned_sorted_hnsw.sh` provides an operator benchmark for
   selected-leaf routing versus parent filtered exact and all-leaf fanout.
 

@@ -20,6 +20,7 @@ Stable in this release:
 - Partition-aware `sorted_hnsw` helpers:
   - `sorted_hnsw_partition_search(...)`
   - `sorted_hnsw_partition_search_status(...)`
+  - explicit `exact_fallback := true` for selected-leaf underfill
 - Fact-shaped GraphRAG (single-table):
   - `sorted_heap_graph_rag(...)`
   - `sorted_heap_graph_register(...)`

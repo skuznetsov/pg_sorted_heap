@@ -277,7 +277,9 @@ with `source_rel` preserved.
 
 For partition-aware vector search, `sorted_hnsw_partition_search_status(...)`
 reports `returned_rows`, `underfilled`, and the explicit fallback marker for
-the same routed `sorted_hnsw_partition_search(...)` contract.
+the same routed `sorted_hnsw_partition_search(...)` contract. Passing
+`exact_fallback := true` keeps the default ANN path first, but fills ANN
+underfill with an exact rerank over the same selected leaves.
 
 The lower-level routing building blocks (`_routed`, `_routed_exact`,
 `_routed_policy`, `_routed_profile`, `_routed_default`, `_segmented`,

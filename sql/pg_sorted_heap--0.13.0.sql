@@ -760,7 +760,8 @@ CREATE FUNCTION @extschema@.sorted_hnsw_partition_search(
   top_k integer,
   local_k integer DEFAULT NULL,
   leaf_relids regclass[] DEFAULT NULL,
-  fail_on_unsupported boolean DEFAULT true
+  fail_on_unsupported boolean DEFAULT true,
+  exact_fallback boolean DEFAULT false
 ) RETURNS TABLE (
   leaf_relid regclass,
   leaf_name text,
@@ -779,6 +780,7 @@ DECLARE
   vector_attnum smallint;
   index_name text;
   missing_leaf regclass;
+  exact_sql text := '';
 BEGIN
   IF top_k IS NULL OR top_k <= 0 THEN
     RAISE EXCEPTION 'top_k must be positive';
@@ -892,6 +894,17 @@ BEGIN
       rec.leaf_relid,
       vector_column,
       vector_type);
+    exact_sql := exact_sql || sep || pg_catalog.format(
+      '(SELECT %L::regclass AS leaf_relid,
+               %L::text AS leaf_name,
+               (t.%I <=> $1::%s)::double precision AS distance,
+               pg_catalog.to_jsonb(t) AS row_data
+        FROM %s AS t)',
+      rec.leaf_relid::text,
+      rec.leaf_name,
+      vector_column,
+      vector_type,
+      rec.leaf_relid);
     sep := ' UNION ALL ';
   END LOOP;
 
@@ -899,12 +912,44 @@ BEGIN
     RETURN;
   END IF;
 
-  RETURN QUERY EXECUTE
-    'SELECT leaf_relid, leaf_name, distance, row_data
-     FROM (' || union_sql || ') AS candidates
-     ORDER BY distance
-     LIMIT $3'
-    USING query, local_limit, top_k;
+  IF exact_fallback THEN
+    RETURN QUERY EXECUTE
+      'WITH ann_candidates AS (
+         SELECT leaf_relid, leaf_name, distance, row_data
+         FROM (' || union_sql || ') AS candidates
+         ORDER BY distance
+         LIMIT $3
+       ),
+       ann_count AS (
+         SELECT count(*)::integer AS n FROM ann_candidates
+       ),
+       exact_candidates AS (
+         SELECT leaf_relid, leaf_name, distance, row_data
+         FROM (' || exact_sql || ') AS exact_pool
+         ORDER BY distance
+         LIMIT $3
+       )
+       SELECT leaf_relid, leaf_name, distance, row_data
+       FROM (
+         SELECT *
+         FROM ann_candidates
+         WHERE (SELECT n FROM ann_count) >= $3
+         UNION ALL
+         SELECT *
+         FROM exact_candidates
+         WHERE (SELECT n FROM ann_count) < $3
+       ) AS final
+       ORDER BY distance
+       LIMIT $3'
+      USING query, local_limit, top_k;
+  ELSE
+    RETURN QUERY EXECUTE
+      'SELECT leaf_relid, leaf_name, distance, row_data
+       FROM (' || union_sql || ') AS candidates
+       ORDER BY distance
+       LIMIT $3'
+      USING query, local_limit, top_k;
+  END IF;
 END;
 $$ LANGUAGE plpgsql STABLE;
 
@@ -915,7 +960,8 @@ CREATE FUNCTION @extschema@.sorted_hnsw_partition_search_status(
   top_k integer,
   local_k integer DEFAULT NULL,
   leaf_relids regclass[] DEFAULT NULL,
-  fail_on_unsupported boolean DEFAULT true
+  fail_on_unsupported boolean DEFAULT true,
+  exact_fallback boolean DEFAULT false
 ) RETURNS TABLE (
   requested_top_k integer,
   effective_local_k integer,
@@ -928,6 +974,7 @@ AS $$
 DECLARE
   local_limit integer;
   selected_count integer;
+  ann_returned_count integer;
   returned_count integer;
 BEGIN
   IF top_k IS NULL OR top_k <= 0 THEN
@@ -937,10 +984,20 @@ BEGIN
   local_limit := COALESCE(local_k, top_k);
 
   SELECT count(*)::integer
-  INTO returned_count
+  INTO ann_returned_count
   FROM @extschema@.sorted_hnsw_partition_search(
     parent, vector_column, query, top_k, local_limit, leaf_relids,
-    fail_on_unsupported);
+    fail_on_unsupported, false);
+
+  IF exact_fallback AND ann_returned_count < top_k THEN
+    SELECT count(*)::integer
+    INTO returned_count
+    FROM @extschema@.sorted_hnsw_partition_search(
+      parent, vector_column, query, top_k, local_limit, leaf_relids,
+      fail_on_unsupported, true);
+  ELSE
+    returned_count := ann_returned_count;
+  END IF;
 
   SELECT count(*)::integer
   INTO selected_count
@@ -955,15 +1012,17 @@ BEGIN
          selected_count,
          returned_count,
          returned_count < top_k,
-         CASE WHEN returned_count < top_k
+         CASE WHEN ann_returned_count < top_k AND exact_fallback
+              THEN 'exact_filtered'
+              WHEN ann_returned_count < top_k
               THEN 'underfilled_no_fallback'
               ELSE 'none'
          END;
 END;
 $$ LANGUAGE plpgsql STABLE;
 
-COMMENT ON FUNCTION @extschema@.sorted_hnsw_partition_search_status(regclass, name, text, integer, integer, regclass[], boolean)
-IS 'Diagnostic status for sorted_hnsw_partition_search(...). Reports requested/effective budgets, selected leaves, returned row count, underfill state, and fallback marker without changing the row-returning search API.';
+COMMENT ON FUNCTION @extschema@.sorted_hnsw_partition_search_status(regclass, name, text, integer, integer, regclass[], boolean, boolean)
+IS 'Diagnostic status for sorted_hnsw_partition_search(...). Reports requested/effective budgets, selected leaves, returned row count, underfill state, and fallback marker. exact_fallback=true fills ANN underfill with an exact selected-leaf rerank.';
 
 CREATE PROCEDURE @extschema@.sorted_heap_merge_online(regclass)
 AS '$libdir/pg_sorted_heap', 'sorted_heap_merge_online'

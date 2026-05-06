@@ -187,10 +187,16 @@ Returned fields:
 - `selected_leaves`: supported sorted_heap leaves participating in the call
 - `returned_rows`: rows returned by the routed search
 - `underfilled`: true when `returned_rows < requested_top_k`
-- `fallback`: `none` or `underfilled_no_fallback`
+- `fallback`: `none`, `underfilled_no_fallback`, or `exact_filtered` when
+  `exact_fallback := true` was requested and the ANN candidate pool underfilled
+  before the exact selected-leaf pass
 
-The status helper is diagnostic. It does not change the row-returning search
-API and it does not silently fall back to exact search.
+By default, the status helper is diagnostic and does not change the row-returning
+search API. If callers explicitly pass `exact_fallback := true` to
+`sorted_hnsw_partition_search(...)` or
+`sorted_hnsw_partition_search_status(...)`, an underfilled ANN candidate pool is
+replaced with an exact rerank over the same selected leaves. This fallback is
+bounded by shard selection, not by arbitrary base-table `WHERE` clauses.
 
 ---
 

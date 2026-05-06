@@ -138,6 +138,9 @@ Current state:
   unbounded KNN, `LIMIT > sorted_hnsw.ef_search`, and filtered KNN shapes.
 - `sorted_hnsw_partition_search_status(...)` now exposes underfill metadata for
   routed partition search without changing the row-returning API.
+- `sorted_hnsw_partition_search(..., exact_fallback := true)` now lets callers
+  explicitly replace an underfilled selected-leaf ANN pool with exact rerank
+  over the same selected leaves.
 
 Risk:
 
@@ -150,6 +153,8 @@ Target direction:
   filtered contracts prove underfill handling and global merge semantics.
 - Implement helper-level modes from `docs/spec-filtered-ann.md` before
   promoting any filtered ANN path into the planner.
+- Treat exact fallback as an explicit selected-leaf helper mode, not a generic
+  `WHERE`-qual planner mode.
 - Treat a C implementation of `sorted_hnsw_partition_search(...)` as a
   benchmark-gated follow-up, not as a correctness requirement for filtered ANN.
   See `docs/spec-partitioned-hnsw-c-helper.md`.
