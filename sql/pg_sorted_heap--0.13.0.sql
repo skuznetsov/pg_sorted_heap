@@ -530,6 +530,67 @@ AS $$
   FROM @extschema@.sorted_heap_partition_maintenance($1, 'rebuild_zonemap', $2);
 $$ LANGUAGE SQL;
 
+CREATE FUNCTION @extschema@.sorted_heap_partition_maintenance_plan(
+  parent regclass,
+  operation text DEFAULT 'compact'
+) RETURNS TABLE (
+  parent_relid regclass,
+  leaf_relid regclass,
+  leaf_name text,
+  operation_name text,
+  status text,
+  message text,
+  lock_mode text,
+  relation_size_bytes bigint,
+  estimated_temp_bytes bigint
+)
+AS $$
+DECLARE
+  rec record;
+BEGIN
+  IF operation NOT IN ('compact', 'merge', 'rebuild_zonemap') THEN
+    RAISE EXCEPTION 'unsupported sorted_heap partition maintenance operation: %', operation;
+  END IF;
+
+  FOR rec IN
+    SELECT s.*
+    FROM @extschema@.sorted_heap_partition_status(parent) AS s
+    ORDER BY s.leaf_name
+  LOOP
+    parent_relid := rec.parent_relid;
+    leaf_relid := rec.leaf_relid;
+    leaf_name := rec.leaf_name;
+    operation_name := operation;
+    relation_size_bytes := rec.relation_size_bytes;
+    lock_mode := 'AccessExclusiveLock';
+
+    IF rec.is_sorted_heap IS NOT TRUE THEN
+      status := 'blocked';
+      message := 'unsupported access method: ' || COALESCE(rec.am_name::text, rec.relkind::text);
+      estimated_temp_bytes := NULL;
+      RETURN NEXT;
+      CONTINUE;
+    END IF;
+
+    IF rec.has_primary_key IS NOT TRUE THEN
+      status := 'blocked';
+      message := 'primary key is required';
+      estimated_temp_bytes := NULL;
+      RETURN NEXT;
+      CONTINUE;
+    END IF;
+
+    status := 'would_run';
+    message := NULL;
+    estimated_temp_bytes := CASE
+      WHEN operation IN ('compact', 'merge') THEN rec.relation_size_bytes
+      ELSE 0
+    END;
+    RETURN NEXT;
+  END LOOP;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
 CREATE FUNCTION @extschema@.sorted_hnsw_partition_search(
   parent regclass,
   vector_column name,

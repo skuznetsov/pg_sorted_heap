@@ -65,6 +65,26 @@ SELECT *
 FROM sorted_heap_rebuild_zonemap_partitions('events_parent'::regclass);
 ```
 
+Before running a maintenance operation on a large partition tree, use the
+read-only plan helper:
+
+```sql
+SELECT *
+FROM sorted_heap_partition_maintenance_plan(
+    'events_parent'::regclass,
+    operation := 'compact');
+```
+
+The plan returns one row per concrete leaf with:
+
+- `status = 'would_run'` for supported sorted_heap leaves with a primary key;
+- `status = 'blocked'` for unsupported leaves or sorted_heap leaves without a
+  primary key;
+- `lock_mode`, currently `AccessExclusiveLock` for the concrete operation;
+- `relation_size_bytes` and `estimated_temp_bytes`. For `compact` and `merge`,
+  the temp estimate is the current leaf size; for `rebuild_zonemap`, heap
+  rewrite temp is `0`.
+
 By default, maintenance helpers fail before doing work if any leaf is not a
 `sorted_heap` table or if a sorted_heap leaf has no primary key. Pass `false`
 as the second argument to explicitly skip unsupported leaves:

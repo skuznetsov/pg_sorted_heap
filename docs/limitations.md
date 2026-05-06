@@ -115,6 +115,11 @@ requirements from "whole logical table" to "current leaf rewrite", but an
 individual leaf still needs rewrite headroom. If a later leaf fails, earlier
 leaves are not rolled back by the helper.
 
+Use `sorted_heap_partition_maintenance_plan(parent, operation)` before large
+runs to list all blockers and estimate the current leaf rewrite headroom. The
+estimate is intentionally conservative and relation-size based; it does not
+replace tablespace/free-space monitoring.
+
 The manual smoke `make test-partition-lock` verifies the expected lock
 behavior with two sessions and `lock_timeout`.
 

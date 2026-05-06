@@ -500,6 +500,10 @@ relative throughput under sustained load, not absolute query latency.
 - Selected sorted_heap leaves now must have a valid leaf-local `sorted_hnsw`
   index on the vector column. The helper fails closed instead of silently
   falling back to exact sort.
+- `sorted_heap_partition_maintenance_plan(parent, operation)` is a read-only
+  dry-run helper for compact/merge/rebuild_zonemap. It reports all blockers,
+  the expected concrete lock mode, relation size, and leaf-scoped temporary
+  rewrite estimate before mutating helpers are run.
 - `scripts/bench_partitioned_sorted_hnsw.sh` benchmarks selected-leaf routing
   versus parent filtered exact and all-leaf fanout. Local PostgreSQL 18 smoke
   on 8 x 50K rows showed selected-leaf helper 4.901ms avg at 100% self-query

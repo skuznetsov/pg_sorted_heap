@@ -83,8 +83,12 @@ Recommended flow:
 2. Bulk load or ingest into leaves.
 3. Run `sorted_heap_compact_partitions(...)` or
    `sorted_heap_merge_partitions(...)` during maintenance windows.
-4. Inspect state with `sorted_heap_partition_status(parent)`.
-5. For live systems, prefer online concrete operations on the hot leaf when
+4. Before the run, inspect
+   `sorted_heap_partition_maintenance_plan(parent, 'compact')` or
+   `sorted_heap_partition_maintenance_plan(parent, 'merge')` to see all
+   blockers and the per-leaf rewrite headroom estimate.
+5. Inspect state with `sorted_heap_partition_status(parent)`.
+6. For live systems, prefer online concrete operations on the hot leaf when
    blocking time matters more than total runtime.
 
 ## Sizing Heuristic
@@ -138,7 +142,8 @@ Future tests:
 
 - benchmark partitioned maintenance over multiple differently sized leaves;
 - verify failure reporting when one later leaf cannot acquire lock;
-- add an optional dry-run/estimate helper if operator demand justifies it.
+- refine the dry-run estimate with free-space / tablespace data if operator
+  demand justifies it.
 
 ## Quadrumvirate Notes
 

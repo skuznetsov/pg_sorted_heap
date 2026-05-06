@@ -2553,6 +2553,13 @@ SELECT count(*) AS sh23_status_rows,
        bool_and(has_primary_key) AS sh23_all_have_pk
 FROM sorted_heap_partition_status('sh23_parent'::regclass);
 
+-- SH23-1B: dry-run maintenance plan is read-only and estimates leaf headroom
+SELECT count(*) AS sh23_plan_would_run,
+       bool_and(lock_mode = 'AccessExclusiveLock') AS sh23_plan_lock_mode,
+       bool_and(estimated_temp_bytes > 0) AS sh23_plan_temp_estimate
+FROM sorted_heap_partition_maintenance_plan('sh23_parent'::regclass, 'compact')
+WHERE status = 'would_run';
+
 -- SH23-2: compact parent helper operates leaf-by-leaf
 SET client_min_messages = warning;
 SELECT count(*) AS sh23_compact_ok
@@ -2605,6 +2612,22 @@ FROM sorted_heap_rebuild_zonemap_partitions('sh23_parent'::regclass)
 WHERE status = 'ok' AND operation_name = 'rebuild_zonemap';
 RESET client_min_messages;
 
+SELECT bool_and(estimated_temp_bytes = 0) AS sh23_rebuild_plan_no_heap_temp
+FROM sorted_heap_partition_maintenance_plan('sh23_parent'::regclass, 'rebuild_zonemap')
+WHERE status = 'would_run';
+
+DO $$
+BEGIN
+    PERFORM *
+    FROM sorted_heap_partition_maintenance_plan('sh23_parent'::regclass, 'bad_op');
+    RAISE EXCEPTION 'expected sorted_heap_partition_maintenance_plan to fail';
+EXCEPTION WHEN OTHERS THEN
+    IF SQLERRM NOT LIKE 'unsupported sorted_heap partition maintenance operation:%' THEN
+        RAISE;
+    END IF;
+END;
+$$;
+
 DROP FUNCTION sh23_plan_contains(text, text);
 DROP FUNCTION sh23_plan_count(text, text);
 DROP TABLE sh23_parent;
@@ -2620,6 +2643,11 @@ CREATE TABLE sh23_mixed_heap PARTITION OF sh23_mixed
 
 SELECT array_agg(is_sorted_heap ORDER BY leaf_name) AS sh23_mixed_flags
 FROM sorted_heap_partition_status('sh23_mixed'::regclass);
+
+SELECT count(*) AS sh23_mixed_plan_blocked
+FROM sorted_heap_partition_maintenance_plan('sh23_mixed'::regclass, 'compact')
+WHERE status = 'blocked'
+  AND message LIKE 'unsupported access method:%';
 
 DO $$
 BEGIN
@@ -2651,6 +2679,10 @@ SELECT count(*) AS sh23_nopk_status_rows
 FROM sorted_heap_partition_status('sh23_nopk_parent'::regclass)
 WHERE is_sorted_heap AND NOT has_primary_key;
 
+SELECT count(*) AS sh23_nopk_plan_blocked
+FROM sorted_heap_partition_maintenance_plan('sh23_nopk_parent'::regclass)
+WHERE status = 'blocked' AND message = 'primary key is required';
+
 DO $$
 BEGIN
     PERFORM *
@@ -2668,6 +2700,21 @@ FROM sorted_heap_compact_partitions('sh23_nopk_parent'::regclass, false)
 WHERE status = 'skipped' AND message = 'primary key is required';
 
 DROP TABLE sh23_nopk_parent;
+
+-- SH23-6B: dry-run plan reports all blockers instead of only first failure
+CREATE TABLE sh23_plan_blockers(tenant_id int, id int)
+PARTITION BY RANGE (tenant_id);
+CREATE TABLE sh23_plan_blockers_sh PARTITION OF sh23_plan_blockers
+    FOR VALUES FROM (1) TO (2) USING sorted_heap;
+CREATE TABLE sh23_plan_blockers_heap PARTITION OF sh23_plan_blockers
+    FOR VALUES FROM (2) TO (3);
+
+SELECT count(*) AS sh23_plan_all_blockers,
+       array_agg(message ORDER BY leaf_name) AS sh23_plan_blocker_messages
+FROM sorted_heap_partition_maintenance_plan('sh23_plan_blockers'::regclass)
+WHERE status = 'blocked';
+
+DROP TABLE sh23_plan_blockers;
 
 -- SH23-7: empty partition parents have no concrete maintenance leaves
 CREATE TABLE sh23_empty_parent(id int, payload text)

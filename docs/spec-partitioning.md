@@ -111,6 +111,8 @@ sorted_heap_merge_partitions(parent regclass, fail_on_unsupported boolean defaul
   -> setof partition maintenance rows
 sorted_heap_rebuild_zonemap_partitions(parent regclass, fail_on_unsupported boolean default true)
   -> setof partition maintenance rows
+sorted_heap_partition_maintenance_plan(parent regclass, operation text default 'compact')
+  -> setof partition maintenance plan rows
 ```
 
 Result columns:
@@ -123,6 +125,20 @@ operation_name text
 status text
 message text
 elapsed_ms double precision
+```
+
+Plan result columns:
+
+```text
+parent_relid oid
+leaf_relid oid
+leaf_name text
+operation_name text
+status text                  -- would_run | blocked
+message text
+lock_mode text
+relation_size_bytes bigint
+estimated_temp_bytes bigint
 ```
 
 Default behavior:
@@ -341,6 +357,9 @@ Planner validation:
 
 - Parent helpers are `FUNCTION`s returning rows, because callers need a
   machine-readable per-leaf result stream.
+- `sorted_heap_partition_maintenance_plan(...)` is read-only and reports all
+  blockers instead of stopping at the first unsupported leaf. It is the
+  operator-facing dry-run path for lock/headroom review.
 - Helpers preflight unsupported leaves by default and fail before work starts.
   Explicit `fail_on_unsupported=false` returns `skipped` rows for unsupported
   leaves.
@@ -352,7 +371,8 @@ Planner validation:
 ## Remaining Open Questions
 
 1. Should parent helpers eventually collect all validation errors instead of
-   reporting the first unsupported leaf?
+   reporting the first unsupported leaf? The dry-run plan now collects all
+   blockers; mutating helpers still fail fast to avoid partial work.
 2. Should `sorted_hnsw_partition_search(...)` eventually move from PL/pgSQL to
    C to reduce route-first helper overhead on small partitions?
 3. Should GraphRAG parent fanout return a global exact top-k merge contract or
