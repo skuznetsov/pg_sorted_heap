@@ -501,6 +501,11 @@ relative throughput under sustained load, not absolute query latency.
   index on the vector column. The helper fails closed instead of silently
   falling back to exact sort. Explicit `leaf_relids` are also validated against
   the requested parent instead of being silently ignored.
+- `sorted_hnsw_partition_search(..., exact_fallback := true)` is now an
+  explicit selected-leaf underfill mode: default behavior stays ANN-only, while
+  opt-in fallback replaces an underfilled ANN pool with an exact rerank over
+  the same selected leaves. `sorted_hnsw_partition_search_status(...)` reports
+  `underfilled_no_fallback` versus `exact_filtered`.
 - `sorted_heap_partition_maintenance_plan(parent, operation)` is a read-only
   dry-run helper for compact/merge/rebuild_zonemap. It reports all blockers,
   the expected concrete lock mode, relation size, and leaf-scoped temporary
@@ -702,7 +707,9 @@ Priority order after the native-partitioning hardening pass:
    `docs/spec-partitioned-hnsw-c-helper.md`: local 8 x 50K self-query top-10
    measured direct leaf `2.942ms` vs SQL helper `5.359ms`, so a C helper is
    justified only if routed small-leaf latency becomes a product target and
-   the candidate clears parity plus promotion gates.
+   the candidate clears parity plus promotion gates. The gate now includes the
+   `exact_fallback` argument and requires fallback-enabled benchmark rows to be
+   reported separately from the default ANN-only latency path.
 2. Specify GraphRAG parent fanout: decide whether it is a global exact top-k
    merge over routed leaves or an explicit routed-shard-only API. Resolved:
    GraphRAG parent fanout stays explicit in `0.13`; callers register concrete
