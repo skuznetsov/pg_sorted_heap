@@ -173,7 +173,10 @@ Expected:
    sampling. Baseline entry point: `make bench-large-vector-synthetic`, which
    reuses the existing exact/sorted_hnsw/pgvector/optional-DiskANN harness.
 3. Compare three candidates on the same harness: `sorted_hnsw`, IVF-PQ
-   residual, and FlashHadamard packed exhaustive.
+   residual, and FlashHadamard packed exhaustive. Baseline flag:
+   `scripts/bench_ann_real_dataset.py --enable-flashhadamard`. This is an
+   offline packed-storage comparator; it does not claim PostgreSQL storage
+   lifecycle integration.
 4. Only after a winning region is identified, design a product API or planner
    integration. Until then, keep IVF-PQ as legacy/manual.
 
@@ -185,7 +188,7 @@ Run the real-dataset harness on a small sample with IVF-PQ enabled.
 
 Smoke shape:
 
-`python3 scripts/bench_ann_real_dataset.py --sample-size 1000 --queries 5 --skip-zvec --skip-qdrant --enable-ivfpq --ivfpq-nlist 32 --ivfpq-nprobe 4`
+`python3 scripts/bench_ann_real_dataset.py --sample-size 1000 --queries 5 --skip-zvec --skip-qdrant --enable-ivfpq --ivfpq-nlist 32 --ivfpq-nprobe 4 --enable-flashhadamard`
 
 Expected:
 
@@ -194,6 +197,8 @@ Expected:
 - compact completes;
 - `svec_ann_scan(...)` returns `k` rows per query;
 - exact ground truth comparison is reported.
+- FlashHadamard reports p50/p95/average latency, hit@1, recall@K, encode time,
+  bytes/vector, metadata, and packed scorer backend when enabled.
 
 ### L2. Recall/latency matrix is apples-to-apples
 

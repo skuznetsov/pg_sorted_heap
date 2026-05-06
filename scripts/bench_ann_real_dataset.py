@@ -12,12 +12,14 @@ the same vectors and queries.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import io
 import os
 import shutil
 import socket
 import statistics
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -49,6 +51,9 @@ DATASETS = {
         "dim": 100,
     },
 }
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+TURBOQUANT_BENCH_PATH = REPO_ROOT / "scripts" / "bench_turboquant_retrieval.py"
 
 
 def median_ms(values: list[float]) -> float:
@@ -115,6 +120,16 @@ def pick_port() -> int:
         return int(s.getsockname()[1])
 
 
+def load_turboquant_bench_module():
+    spec = importlib.util.spec_from_file_location("bench_turboquant_retrieval", TURBOQUANT_BENCH_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load {TURBOQUANT_BENCH_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def choose_pq_m(dim: int, requested: int) -> int:
     if requested > 0:
         if dim % requested != 0:
@@ -141,6 +156,19 @@ class IvfPqResult:
 
 
 @dataclass
+class FlashHadamardResult:
+    p50: float
+    p95: float
+    avg: float
+    hit1: float
+    recall: float
+    encode_ms: float
+    bytes_per_vec: float
+    metadata_kb: float
+    aux: str
+
+
+@dataclass
 class PgRunResult:
     exact_p50: float
     exact_avg: float
@@ -156,6 +184,7 @@ class PgRunResult:
     sh_total_size: str
     pgv_total_size: str
     ivfpq: IvfPqResult | None = None
+    flashhadamard: FlashHadamardResult | None = None
 
 
 def run_pg_benchmark(
@@ -173,6 +202,9 @@ def run_pg_benchmark(
     ivfpq_rerank_topk: int = 200,
     ivfpq_train_iter: int = 10,
     ivfpq_max_train: int = 10000,
+    enable_flashhadamard: bool = False,
+    flashhadamard_group_size: int = 16,
+    seed: int = 42,
 ) -> PgRunResult:
     dim = vectors.shape[1]
     tmp = Path(tempfile.mkdtemp(prefix="ann_real_pg_", dir="/tmp"))
@@ -196,6 +228,8 @@ def run_pg_benchmark(
             raise ValueError("ivfpq_train_iter must be positive")
         if ivfpq_max_train < 256:
             raise ValueError("ivfpq_max_train must be at least 256")
+    if enable_flashhadamard and flashhadamard_group_size <= 0:
+        raise ValueError("flashhadamard_group_size must be positive")
 
     try:
         subprocess.run(
@@ -419,6 +453,45 @@ def run_pg_benchmark(
                     ),
                 )
 
+            flash_result: FlashHadamardResult | None = None
+            if enable_flashhadamard:
+                bench = load_turboquant_bench_module()
+                base_norm = bench.normalize_rows(vectors.astype(np.float32, copy=False))
+                query_norm = bench.normalize_rows(queries.astype(np.float32, copy=False))
+                method = bench.TurboQuantBlock32PackedTopKMethod(
+                    4,
+                    seed,
+                    group_size=flashhadamard_group_size,
+                )
+
+                t0 = time.perf_counter()
+                method.fit(base_norm)
+                encode_ms = (time.perf_counter() - t0) * 1000.0
+
+                fh_ms: list[float] = []
+                fh_hit1_parts: list[float] = []
+                fh_recall_parts: list[float] = []
+                for qi, query in enumerate(query_norm):
+                    t0 = time.perf_counter()
+                    found = method.search(query, k)
+                    fh_ms.append((time.perf_counter() - t0) * 1000.0)
+                    found_ids = (found + 1).astype(np.int64).tolist()
+                    gt = exact_ids[qi]
+                    fh_hit1_parts.append(100.0 if found_ids and gt and found_ids[0] == gt[0] else 0.0)
+                    fh_recall_parts.append(recall_at_k(found_ids, gt, k))
+
+                flash_result = FlashHadamardResult(
+                    p50=median_ms(fh_ms),
+                    p95=p95_ms(fh_ms),
+                    avg=avg_ms(fh_ms),
+                    hit1=avg_ms(fh_hit1_parts),
+                    recall=avg_ms(fh_recall_parts),
+                    encode_ms=encode_ms,
+                    bytes_per_vec=method.bytes_per_vec(),
+                    metadata_kb=method.metadata_bytes() / 1024.0,
+                    aux=f"group_size={flashhadamard_group_size}|bits=4|backend={bench.packed_adc_backend_name()}",
+                )
+
             cur.execute(
                 """
                 SELECT
@@ -445,6 +518,7 @@ def run_pg_benchmark(
                 sh_total_size=sh_total_size,
                 pgv_total_size=pgv_total_size,
                 ivfpq=ivfpq_result,
+                flashhadamard=flash_result,
             )
         finally:
             cur.close()
@@ -619,6 +693,8 @@ def main() -> int:
     ap.add_argument("--ivfpq-rerank-topk", type=int, default=200)
     ap.add_argument("--ivfpq-train-iter", type=int, default=10)
     ap.add_argument("--ivfpq-max-train", type=int, default=10000)
+    ap.add_argument("--enable-flashhadamard", action="store_true")
+    ap.add_argument("--flashhadamard-group-size", type=int, default=16)
     ap.add_argument("--zvec-ef", type=int, default=64)
     ap.add_argument("--qdrant-ef", type=int, default=64)
     ap.add_argument("--skip-zvec", action="store_true")
@@ -643,6 +719,9 @@ def main() -> int:
             f"ivfpq_cfg:   nlist={args.ivfpq_nlist} nprobe={args.ivfpq_nprobe} "
             f"m={args.ivfpq_m or 'auto'} rerank_topk={args.ivfpq_rerank_topk}"
         )
+    print(f"flashh:     {'on' if args.enable_flashhadamard else 'off'}")
+    if args.enable_flashhadamard:
+        print(f"flashh_cfg: group_size={args.flashhadamard_group_size} bits=4")
     print(f"zvec_ef:     {args.zvec_ef}")
     print(f"qdrant_ef:   {args.qdrant_ef}")
     print()
@@ -663,6 +742,9 @@ def main() -> int:
         ivfpq_rerank_topk=args.ivfpq_rerank_topk,
         ivfpq_train_iter=args.ivfpq_train_iter,
         ivfpq_max_train=args.ivfpq_max_train,
+        enable_flashhadamard=args.enable_flashhadamard,
+        flashhadamard_group_size=args.flashhadamard_group_size,
+        seed=args.seed,
     )
     print_result("exact_heap", pg.exact_p50, pg.exact_avg, 100.0, args.k)
     print_result("sorted_hnsw", pg.sorted_p50, pg.sorted_avg, pg.sorted_recall, args.k, extra=f"index={pg.sh_index_size}")
@@ -689,6 +771,20 @@ def main() -> int:
                 f"{pg.ivfpq.aux}|p95_ms={pg.ivfpq.p95:.3f}|train_ms={pg.ivfpq.train_ms:.1f}"
                 f"|build_ms={pg.ivfpq.build_ms:.1f}|compact_ms={pg.ivfpq.compact_ms:.1f}"
                 f"|table={pg.ivfpq.table_size}|codebooks={pg.ivfpq.codebook_size}"
+            ),
+        )
+    if pg.flashhadamard is not None:
+        print_result(
+            f"flashhadamard{args.flashhadamard_group_size}_packed",
+            pg.flashhadamard.p50,
+            pg.flashhadamard.avg,
+            pg.flashhadamard.recall,
+            args.k,
+            extra=(
+                f"{pg.flashhadamard.aux}|p95_ms={pg.flashhadamard.p95:.3f}"
+                f"|hit1={pg.flashhadamard.hit1:.1f}|encode_ms={pg.flashhadamard.encode_ms:.1f}"
+                f"|bytes_per_vec={pg.flashhadamard.bytes_per_vec:.1f}"
+                f"|metadata_kb={pg.flashhadamard.metadata_kb:.1f}"
             ),
         )
 

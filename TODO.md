@@ -752,7 +752,11 @@ Priority order after the native-partitioning hardening pass:
    evidence runs. Real-dataset runs can now add the opt-in residual IVF-PQ row
    with `scripts/bench_ann_real_dataset.py --enable-ivfpq`; it stays off by
    default because training, generated-code insertion, compaction, and query
-   latency must be reported separately.
+   latency must be reported separately. The same harness can add the opt-in
+   offline FlashHadamard packed exhaustive comparator with
+   `--enable-flashhadamard`; this provides quality/footprint context on the
+   same vectors/query/ground truth, without claiming PostgreSQL storage
+   lifecycle integration.
 8. SIMD-accelerated ADC lookup and pgvectorscale DiskANN comparison.
    Resolved as two benchmark tracks in `docs/spec-simd-adc-diskann.md`: first
    measure whether PQ/FlashHadamard ADC is the actual PostgreSQL hot path, keep

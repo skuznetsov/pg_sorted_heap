@@ -285,6 +285,10 @@ Current state:
 - `scripts/bench_ann_real_dataset.py --enable-ivfpq` adds an opt-in residual
   IVF-PQ row for real-corpus runs. It remains off by default because training,
   generated-code insertion, and compaction are part of the measured cost.
+- `scripts/bench_ann_real_dataset.py --enable-flashhadamard` adds an opt-in
+  offline FlashHadamard packed exhaustive row on the same vectors, queries, and
+  exact PostgreSQL ground truth. It is a comparator, not PostgreSQL storage
+  lifecycle integration.
 
 Risk:
 
@@ -300,6 +304,8 @@ Target direction:
   optional DiskANN baselines before adding IVF-PQ or FlashHadamard rows.
 - Use the real-dataset `--enable-ivfpq` row to gate any claim that residual
   IVF-PQ has a winning region; do not infer it from synthetic data alone.
+- Use the real-dataset `--enable-flashhadamard` row as the packed exhaustive
+  quality/footprint comparator before promoting any sublinear lane.
 - Prefer SQ8 before SQ4 for productized candidate scanning unless a 4-bit
   FlashHadamard-derived path proves equal quality at lower footprint.
 
