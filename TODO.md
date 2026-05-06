@@ -756,7 +756,9 @@ Priority order after the native-partitioning hardening pass:
    offline FlashHadamard packed exhaustive comparator with
    `--enable-flashhadamard`; this provides quality/footprint context on the
    same vectors/query/ground truth, without claiming PostgreSQL storage
-   lifecycle integration.
+   lifecycle integration. The harness also accepts local `.npy` / `.npz`
+   vector inputs for offline smoke runs without downloading ANN-Benchmarks
+   files.
 8. SIMD-accelerated ADC lookup and pgvectorscale DiskANN comparison.
    Resolved as two benchmark tracks in `docs/spec-simd-adc-diskann.md`: first
    measure whether PQ/FlashHadamard ADC is the actual PostgreSQL hot path, keep

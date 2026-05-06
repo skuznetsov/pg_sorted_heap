@@ -104,6 +104,31 @@ def load_sample(dataset_name: str, sample_size: int, query_count: int, seed: int
     return train[train_idx], test[query_idx]
 
 
+def load_vector_files(vectors_path: Path, queries_path: Path | None) -> tuple[np.ndarray, np.ndarray]:
+    if vectors_path.suffix == ".npz":
+        blob = np.load(vectors_path)
+        if "base" not in blob:
+            raise ValueError(f"{vectors_path} must contain a 'base' array")
+        base = np.asarray(blob["base"], dtype=np.float32)
+        if queries_path is None:
+            if "queries" not in blob:
+                raise ValueError(f"{vectors_path} must contain a 'queries' array when --query-vectors is not set")
+            queries = np.asarray(blob["queries"], dtype=np.float32)
+        else:
+            queries = np.asarray(np.load(queries_path), dtype=np.float32)
+    else:
+        base = np.asarray(np.load(vectors_path), dtype=np.float32)
+        if queries_path is None:
+            raise ValueError("--query-vectors is required for .npy base input")
+        queries = np.asarray(np.load(queries_path), dtype=np.float32)
+
+    if base.ndim != 2 or queries.ndim != 2:
+        raise ValueError("base and query vectors must be 2-D arrays")
+    if base.shape[1] != queries.shape[1]:
+        raise ValueError(f"dimension mismatch: base={base.shape[1]} query={queries.shape[1]}")
+    return base, queries
+
+
 def recall_at_k(found_ids: list[int], gt_ids: list[int], k: int) -> float:
     if k <= 0:
         return 0.0
@@ -677,7 +702,10 @@ def print_result(method: str, p50: float, avg: float, recall: float, k: int, ext
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default="nytimes-256", choices=sorted(DATASETS))
+    src = ap.add_mutually_exclusive_group()
+    src.add_argument("--dataset", choices=sorted(DATASETS), help="ANN-Benchmarks dataset name (default: nytimes-256)")
+    src.add_argument("--vectors", type=Path, help="Base vectors (.npy or .npz with key 'base')")
+    ap.add_argument("--query-vectors", type=Path, help="Query vectors (.npy); optional for .npz with key 'queries'")
     ap.add_argument("--sample-size", type=int, default=10000)
     ap.add_argument("--queries", type=int, default=20)
     ap.add_argument("--k", type=int, default=10)
@@ -701,13 +729,20 @@ def main() -> int:
     ap.add_argument("--skip-qdrant", action="store_true")
     args = ap.parse_args()
 
-    vectors, queries = load_sample(args.dataset, args.sample_size, args.queries, args.seed, Path(args.cache_dir))
+    if args.vectors is not None:
+        vectors, queries = load_vector_files(args.vectors, args.query_vectors)
+        source = str(args.vectors)
+    else:
+        dataset = args.dataset or "nytimes-256"
+        vectors, queries = load_sample(dataset, args.sample_size, args.queries, args.seed, Path(args.cache_dir))
+        source = dataset
+
     print("============================================================")
     print("real-dataset ANN benchmark")
     print("============================================================")
-    print(f"dataset:     {args.dataset}")
-    print(f"sample_size: {args.sample_size}")
-    print(f"queries:     {args.queries}")
+    print(f"source:      {source}")
+    print(f"base_rows:   {vectors.shape[0]}")
+    print(f"queries:     {queries.shape[0]}")
     print(f"dim:         {vectors.shape[1]}")
     print(f"k:           {args.k}")
     print(f"pgv_storage: {args.pgv_storage}")

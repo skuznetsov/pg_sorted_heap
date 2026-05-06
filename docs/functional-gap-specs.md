@@ -289,6 +289,9 @@ Current state:
   offline FlashHadamard packed exhaustive row on the same vectors, queries, and
   exact PostgreSQL ground truth. It is a comparator, not PostgreSQL storage
   lifecycle integration.
+- The same harness accepts local `.npy` / `.npz` vector inputs so smoke tests
+  can exercise the full matrix without downloading external ANN-Benchmarks
+  files.
 
 Risk:
 

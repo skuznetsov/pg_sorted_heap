@@ -190,6 +190,10 @@ Smoke shape:
 
 `python3 scripts/bench_ann_real_dataset.py --sample-size 1000 --queries 5 --skip-zvec --skip-qdrant --enable-ivfpq --ivfpq-nlist 32 --ivfpq-nprobe 4 --enable-flashhadamard`
 
+For offline smoke tests without downloading ANN-Benchmarks data, pass
+`--vectors /path/to/sample.npz` where the file contains `base` and `queries`
+2-D float arrays.
+
 Expected:
 
 - codebooks train;
