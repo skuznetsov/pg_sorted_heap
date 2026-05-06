@@ -711,7 +711,10 @@ Priority order after the native-partitioning hardening pass:
    The merge is global over selected shard-local result sets, not transparent
    declarative-parent execution.
 3. Add attach/detach/default-partition lifecycle regression for dynamic
-   partition-tree operations.
+   partition-tree operations. Covered by SH23-9: default partition detach/attach,
+   standalone range partition attach/detach, status traversal refresh, detached
+   sorted_heap standalone status, and compact helper traversal across the
+   dynamic leaf set.
 4. Refine `sorted_heap_partition_maintenance_plan(...)` with tablespace/free
    space data if relation-size headroom is too coarse for operators.
 5. Online compact/merge support for UUID/text PKs, which requires a log-format

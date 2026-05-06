@@ -2757,6 +2757,55 @@ RESET client_min_messages;
 
 DROP TABLE sh23_nested;
 
+-- SH23-9: attach/detach/default partition lifecycle updates leaf traversal
+CREATE TABLE sh23_lifecycle(tenant_id int, id int, val text,
+                            PRIMARY KEY (tenant_id, id))
+PARTITION BY RANGE (tenant_id);
+CREATE TABLE sh23_lifecycle_1 PARTITION OF sh23_lifecycle
+    FOR VALUES FROM (1) TO (2) USING sorted_heap;
+CREATE TABLE sh23_lifecycle_default PARTITION OF sh23_lifecycle
+    DEFAULT USING sorted_heap;
+INSERT INTO sh23_lifecycle VALUES (1, 1, 'one'), (9, 1, 'default');
+
+SELECT count(*) AS sh23_lifecycle_initial_leaves,
+       bool_and(is_sorted_heap) AS sh23_lifecycle_initial_sorted
+FROM sorted_heap_partition_status('sh23_lifecycle'::regclass);
+
+ALTER TABLE sh23_lifecycle DETACH PARTITION sh23_lifecycle_default;
+
+SELECT count(*) AS sh23_lifecycle_after_default_detach,
+       bool_and(leaf_name <> 'sh23_lifecycle_default') AS sh23_lifecycle_default_absent
+FROM sorted_heap_partition_status('sh23_lifecycle'::regclass);
+
+ALTER TABLE sh23_lifecycle ATTACH PARTITION sh23_lifecycle_default DEFAULT;
+
+CREATE TABLE sh23_lifecycle_2 (LIKE sh23_lifecycle INCLUDING ALL) USING sorted_heap;
+ALTER TABLE sh23_lifecycle ATTACH PARTITION sh23_lifecycle_2
+    FOR VALUES FROM (2) TO (3);
+INSERT INTO sh23_lifecycle VALUES (2, 1, 'two');
+
+SELECT count(*) AS sh23_lifecycle_after_attach,
+       bool_and(is_sorted_heap AND has_primary_key) AS sh23_lifecycle_attach_supported
+FROM sorted_heap_partition_status('sh23_lifecycle'::regclass);
+
+SET client_min_messages = warning;
+SELECT count(*) AS sh23_lifecycle_compact_ok
+FROM sorted_heap_compact_partitions('sh23_lifecycle'::regclass)
+WHERE status = 'ok';
+RESET client_min_messages;
+
+ALTER TABLE sh23_lifecycle DETACH PARTITION sh23_lifecycle_2;
+
+SELECT count(*) AS sh23_lifecycle_after_range_detach
+FROM sorted_heap_partition_status('sh23_lifecycle'::regclass);
+
+SELECT count(*) AS sh23_lifecycle_detached_standalone
+FROM sorted_heap_partition_status('sh23_lifecycle_2'::regclass)
+WHERE is_sorted_heap AND has_primary_key;
+
+DROP TABLE sh23_lifecycle;
+DROP TABLE sh23_lifecycle_2;
+
 -- ====================================================================
 -- ANN regression tests: svec_ann_scan correctness, dimension check,
 -- ann_timing non-crash smoke
