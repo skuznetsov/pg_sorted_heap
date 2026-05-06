@@ -1728,7 +1728,11 @@ BEGIN
     CALL sorted_heap_compact_online('sh13_uuid'::regclass);
     RAISE NOTICE 'sh13_online_compact_uuid_FAIL';
 EXCEPTION WHEN feature_not_supported THEN
-    RAISE NOTICE 'sh13_online_compact_uuid_blocked_ok';
+    IF SQLERRM = 'online compact is not supported for uuid primary keys' THEN
+        RAISE NOTICE 'sh13_online_compact_uuid_blocked_ok';
+    ELSE
+        RAISE;
+    END IF;
 END;
 $$;
 
@@ -1737,7 +1741,11 @@ BEGIN
     CALL sorted_heap_compact_online('sh13_text'::regclass);
     RAISE NOTICE 'sh13_online_compact_text_FAIL';
 EXCEPTION WHEN feature_not_supported THEN
-    RAISE NOTICE 'sh13_online_compact_text_blocked_ok';
+    IF SQLERRM = 'online compact is not supported for text primary keys' THEN
+        RAISE NOTICE 'sh13_online_compact_text_blocked_ok';
+    ELSE
+        RAISE;
+    END IF;
 END;
 $$;
 
@@ -1747,7 +1755,11 @@ BEGIN
     CALL sorted_heap_merge_online('sh13_uuid'::regclass);
     RAISE NOTICE 'sh13_online_merge_uuid_FAIL';
 EXCEPTION WHEN feature_not_supported THEN
-    RAISE NOTICE 'sh13_online_merge_uuid_blocked_ok';
+    IF SQLERRM = 'online merge is not supported for uuid primary keys' THEN
+        RAISE NOTICE 'sh13_online_merge_uuid_blocked_ok';
+    ELSE
+        RAISE;
+    END IF;
 END;
 $$;
 
@@ -1773,7 +1785,11 @@ BEGIN
     CALL sorted_heap_compact_online('sh13_varchar'::regclass);
     RAISE NOTICE 'sh13_online_compact_varchar_FAIL';
 EXCEPTION WHEN feature_not_supported THEN
-    RAISE NOTICE 'sh13_online_compact_varchar_blocked_ok';
+    IF SQLERRM = 'online compact is not supported for character varying primary keys' THEN
+        RAISE NOTICE 'sh13_online_compact_varchar_blocked_ok';
+    ELSE
+        RAISE;
+    END IF;
 END;
 $$;
 
@@ -1782,7 +1798,11 @@ BEGIN
     CALL sorted_heap_merge_online('sh13_text'::regclass);
     RAISE NOTICE 'sh13_online_merge_text_FAIL';
 EXCEPTION WHEN feature_not_supported THEN
-    RAISE NOTICE 'sh13_online_merge_text_blocked_ok';
+    IF SQLERRM = 'online merge is not supported for text primary keys' THEN
+        RAISE NOTICE 'sh13_online_merge_text_blocked_ok';
+    ELSE
+        RAISE;
+    END IF;
 END;
 $$;
 
@@ -1791,7 +1811,11 @@ BEGIN
     CALL sorted_heap_merge_online('sh13_varchar'::regclass);
     RAISE NOTICE 'sh13_online_merge_varchar_FAIL';
 EXCEPTION WHEN feature_not_supported THEN
-    RAISE NOTICE 'sh13_online_merge_varchar_blocked_ok';
+    IF SQLERRM = 'online merge is not supported for character varying primary keys' THEN
+        RAISE NOTICE 'sh13_online_merge_varchar_blocked_ok';
+    ELSE
+        RAISE;
+    END IF;
 END;
 $$;
 
@@ -2576,10 +2600,27 @@ PREPARE sh21b_runtime_count(int, int, int) AS
     SELECT count(*) AS sh21b_runtime_count
     FROM sh21b
     WHERE tenant_id = $1 AND id BETWEEN $2 AND $3;
-SELECT sh21b_zonemap_scanned(
-    'EXECUTE sh21b_runtime(1, 100, 110)') <= 3
-    AS sh21b_runtime_composite_tight_range;
-EXECUTE sh21b_runtime_count(1, 100, 110);
+DO $$
+DECLARE
+    scanned_ok boolean;
+    n int;
+BEGIN
+    SELECT sh21b_zonemap_scanned(
+        'EXECUTE sh21b_runtime(1, 100, 110)') <= 3
+    INTO scanned_ok;
+    IF NOT scanned_ok THEN
+        RAISE EXCEPTION 'sh21b_runtime_composite_tight_range_FAIL';
+    END IF;
+
+    EXECUTE 'EXECUTE sh21b_runtime_count(1, 100, 110)' INTO n;
+    IF n != 11 THEN
+        RAISE EXCEPTION 'sh21b_runtime_count_FAIL: %', n;
+    END IF;
+
+    RAISE NOTICE 'sh21b_runtime_composite_tight_range_ok';
+    RAISE NOTICE 'sh21b_runtime_count_ok';
+END;
+$$;
 DEALLOCATE sh21b_runtime;
 DEALLOCATE sh21b_runtime_count;
 RESET plan_cache_mode;

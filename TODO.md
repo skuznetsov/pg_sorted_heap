@@ -330,7 +330,8 @@ relative throughput under sustained load, not absolute query latency.
 - Collation check uses `C_COLLATION_OID` from `pg_collation_d.h`
   (avoids ICU header dependency from `pg_locale.h`)
 - SH13 test suite: UUID zone map + scan pruning, text/C zone map +
-  scan pruning, online compact/merge blocked, varchar zone map
+  scan pruning, online compact/merge blocked with concrete operation/type
+  messages, varchar zone map
 
 ### Phase 13 — Production Hardening: Unlimited Zone Map, Autovacuum Integration
 

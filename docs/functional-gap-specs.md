@@ -206,7 +206,8 @@ Current state:
 - Online compact/merge rejects UUID/text/varchar PKs because the replay key is
   currently lossy `int64`.
 - SH13 regression covers the fail-closed online compact/merge behavior for
-  UUID, text, and varchar PKs.
+  UUID, text, and varchar PKs, including the concrete operation/type rejection
+  message.
 - `docs/spec-online-lossy-pk.md` documents the required future design:
   pruning keys may stay lossy, but online replay identity must be lossless.
 

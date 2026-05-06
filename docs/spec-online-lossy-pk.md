@@ -33,7 +33,10 @@ Online compact/merge currently use:
 If two distinct UUID/text/varchar primary keys collapse to the same `int64`,
 online replay can delete or update the wrong row. The current implementation
 therefore rejects those primary-key types, and SH13 regression covers
-fail-closed online compact/merge behavior for UUID, text, and varchar.
+fail-closed online compact/merge behavior for UUID, text, and varchar. The
+regression asserts both SQLSTATE `feature_not_supported` and the concrete
+operation/type error message, so an unrelated feature-not-supported error does
+not accidentally satisfy the guard.
 
 ## Current Contract
 
