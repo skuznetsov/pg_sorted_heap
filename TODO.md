@@ -698,11 +698,11 @@ PQ approach directly addresses this by eliminating TOAST reads for filtering.
 Priority order after the native-partitioning hardening pass:
 
 1. Benchmark whether `sorted_hnsw_partition_search(...)` should move from
-   PL/pgSQL to C. Current large-leaf route-first results are good, but small
-   partitions can expose helper overhead. The benchmark harness now includes
-   `direct_leaf_index`; local 8 x 50K self-query top-10 measured direct leaf
-   `2.942ms` vs SQL helper `5.359ms`, so a C helper is justified if routed
-   small-leaf latency becomes important.
+   PL/pgSQL to C. Resolved as a benchmark-gated follow-up in
+   `docs/spec-partitioned-hnsw-c-helper.md`: local 8 x 50K self-query top-10
+   measured direct leaf `2.942ms` vs SQL helper `5.359ms`, so a C helper is
+   justified only if routed small-leaf latency becomes a product target and
+   the candidate clears parity plus promotion gates.
 2. Specify GraphRAG parent fanout: decide whether it is a global exact top-k
    merge over routed leaves or an explicit routed-shard-only API. Resolved:
    GraphRAG parent fanout stays explicit in `0.13`; callers register concrete

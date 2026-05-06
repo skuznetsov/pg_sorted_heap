@@ -155,7 +155,9 @@ selected-leaf routing measured `5.359 ms` average at `100.0%` recall@10 versus
 `8.849 ms` for the parent filtered exact query. The same run showed all-leaf
 fanout around `23-25 ms`. The script now also reports `direct_leaf_index`:
 `2.942 ms` on the same run, which quantifies the current PL/pgSQL wrapper
-overhead and is the main signal for a future C fanout helper.
+overhead and is the main signal for a future C fanout helper. The promotion
+criteria for that work are tracked in
+[Partitioned HNSW C Helper Gate](spec-partitioned-hnsw-c-helper).
 
 ---
 

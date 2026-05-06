@@ -398,7 +398,8 @@ Resolved in first-pass hardening:
 Still open for the next phase:
 
 1. Should `sorted_hnsw_partition_search(...)` move from PL/pgSQL to C to reduce
-   route-first helper overhead on small partitions?
+   route-first helper overhead on small partitions? This is now gated by
+   [Partitioned HNSW C Helper Gate](spec-partitioned-hnsw-c-helper).
 2. Should a future transparent parent-dispatched GraphRAG/ANN planner path ever
    exist, or should parent fanout remain helper/API-level only? The `0.13`
    contract intentionally chooses helper/API-level routing.

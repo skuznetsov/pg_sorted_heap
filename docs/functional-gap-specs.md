@@ -142,6 +142,9 @@ Target direction:
   filtered contracts prove underfill handling and global merge semantics.
 - Implement helper-level modes from `docs/spec-filtered-ann.md` before
   promoting any filtered ANN path into the planner.
+- Treat a C implementation of `sorted_hnsw_partition_search(...)` as a
+  benchmark-gated follow-up, not as a correctness requirement for filtered ANN.
+  See `docs/spec-partitioned-hnsw-c-helper.md`.
 
 ### G4. Parent-level observability
 
