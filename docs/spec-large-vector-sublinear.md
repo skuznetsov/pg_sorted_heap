@@ -165,8 +165,9 @@ Expected:
 ## Implementation Plan
 
 1. Extend the real-dataset benchmark harness with an opt-in IVF-PQ residual
-   row. It should report training time, compact time, code size, p50/p95,
-   recall@10, and rerank settings.
+   row. Baseline flag: `scripts/bench_ann_real_dataset.py --enable-ivfpq`.
+   The row reports training time, table build time, compact time, codebook
+   footprint, p50/p95/average latency, recall@K, and rerank settings.
 2. Add a larger synthetic scale harness that can generate `500K` and `1M`
    vectors without external downloads, with deterministic query and exact GT
    sampling. Baseline entry point: `make bench-large-vector-synthetic`, which
@@ -181,6 +182,10 @@ Expected:
 ### L1. IVF-PQ harness row is reproducible
 
 Run the real-dataset harness on a small sample with IVF-PQ enabled.
+
+Smoke shape:
+
+`python3 scripts/bench_ann_real_dataset.py --sample-size 1000 --queries 5 --skip-zvec --skip-qdrant --enable-ivfpq --ivfpq-nlist 32 --ivfpq-nprobe 4`
 
 Expected:
 

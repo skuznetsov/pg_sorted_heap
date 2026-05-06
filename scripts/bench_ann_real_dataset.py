@@ -59,6 +59,14 @@ def avg_ms(values: list[float]) -> float:
     return statistics.fmean(values) if values else 0.0
 
 
+def p95_ms(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, int(round(0.95 * (len(ordered) - 1))))
+    return ordered[idx]
+
+
 def ensure_download(url: str, dst: Path) -> Path:
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists() and dst.stat().st_size > 0:
@@ -107,6 +115,31 @@ def pick_port() -> int:
         return int(s.getsockname()[1])
 
 
+def choose_pq_m(dim: int, requested: int) -> int:
+    if requested > 0:
+        if dim % requested != 0:
+            raise ValueError(f"dim={dim} must be divisible by ivfpq_m={requested}")
+        return requested
+    for candidate in (16, 12, 10, 8, 4, 2, 1):
+        if candidate <= dim and dim % candidate == 0:
+            return candidate
+    return 1
+
+
+@dataclass
+class IvfPqResult:
+    p50: float
+    p95: float
+    avg: float
+    recall: float
+    train_ms: float
+    build_ms: float
+    compact_ms: float
+    table_size: str
+    codebook_size: str
+    aux: str
+
+
 @dataclass
 class PgRunResult:
     exact_p50: float
@@ -122,6 +155,7 @@ class PgRunResult:
     pgv_index_size: str
     sh_total_size: str
     pgv_total_size: str
+    ivfpq: IvfPqResult | None = None
 
 
 def run_pg_benchmark(
@@ -132,11 +166,36 @@ def run_pg_benchmark(
     pgv_storage: str,
     pgv_ef: int,
     sh_ef: int,
+    enable_ivfpq: bool = False,
+    ivfpq_nlist: int = 256,
+    ivfpq_nprobe: int = 16,
+    ivfpq_m: int = 0,
+    ivfpq_rerank_topk: int = 200,
+    ivfpq_train_iter: int = 10,
+    ivfpq_max_train: int = 10000,
 ) -> PgRunResult:
     dim = vectors.shape[1]
     tmp = Path(tempfile.mkdtemp(prefix="ann_real_pg_", dir="/tmp"))
     pg_bindir = subprocess.check_output(["pg_config", "--bindir"], text=True).strip()
     port = pick_port()
+    resolved_ivfpq_m = choose_pq_m(dim, ivfpq_m) if enable_ivfpq else 0
+    if enable_ivfpq:
+        if ivfpq_nlist <= 0:
+            raise ValueError("ivfpq_nlist must be positive")
+        if ivfpq_nprobe <= 0:
+            raise ValueError("ivfpq_nprobe must be positive")
+        if ivfpq_nprobe > ivfpq_nlist:
+            raise ValueError("ivfpq_nprobe must be <= ivfpq_nlist")
+        if ivfpq_nlist > vectors.shape[0]:
+            raise ValueError(f"ivfpq_nlist={ivfpq_nlist} exceeds sample size {vectors.shape[0]}")
+        if ivfpq_rerank_topk < 0:
+            raise ValueError("ivfpq_rerank_topk must be non-negative")
+        if 0 < ivfpq_rerank_topk < k:
+            raise ValueError("ivfpq_rerank_topk must be zero or >= k")
+        if ivfpq_train_iter <= 0:
+            raise ValueError("ivfpq_train_iter must be positive")
+        if ivfpq_max_train < 256:
+            raise ValueError("ivfpq_max_train must be at least 256")
 
     try:
         subprocess.run(
@@ -258,6 +317,108 @@ def run_pg_benchmark(
                 pgv_ms.append((time.perf_counter() - t0) * 1000.0)
                 pgv_recall_parts.append(recall_at_k(ids, exact_ids[qid - 1], k))
 
+            ivfpq_result: IvfPqResult | None = None
+            if enable_ivfpq:
+                t0 = time.perf_counter()
+                cur.execute(
+                    "SELECT svec_ivf_train(%s, %s, %s, %s)",
+                    ("SELECT v FROM bench_sh", ivfpq_nlist, ivfpq_train_iter, ivfpq_max_train),
+                )
+                ivf_cb_id = int(cur.fetchone()[0])
+                cur.execute(
+                    "SELECT svec_pq_train_residual(%s, %s, %s, %s, %s)",
+                    ("SELECT v FROM bench_sh", resolved_ivfpq_m, ivf_cb_id, ivfpq_train_iter, ivfpq_max_train),
+                )
+                pq_cb_id = int(cur.fetchone()[0])
+                train_ms = (time.perf_counter() - t0) * 1000.0
+
+                t0 = time.perf_counter()
+                cur.execute(
+                    f"""
+                    CREATE TABLE bench_ivfpq(
+                      id text,
+                      partition_id int2 GENERATED ALWAYS AS (
+                        svec_ivf_assign(embedding, {ivf_cb_id})
+                      ) STORED,
+                      embedding svec({dim}),
+                      pq_code bytea GENERATED ALWAYS AS (
+                        svec_pq_encode_residual(
+                          embedding,
+                          svec_ivf_assign(embedding, {ivf_cb_id}),
+                          {pq_cb_id},
+                          {ivf_cb_id}
+                        )
+                      ) STORED,
+                      PRIMARY KEY(partition_id, id)
+                    ) USING sorted_heap
+                    """
+                )
+                cur.execute("INSERT INTO bench_ivfpq(id, embedding) SELECT id::text, v FROM bench_sh")
+                build_ms = (time.perf_counter() - t0) * 1000.0
+
+                t0 = time.perf_counter()
+                cur.execute("SELECT sorted_heap_compact('bench_ivfpq'::regclass)")
+                compact_ms = (time.perf_counter() - t0) * 1000.0
+
+                ivfpq_ms: list[float] = []
+                ivfpq_recall_parts: list[float] = []
+                for qid, lit in query_rows:
+                    cur.execute(
+                        """
+                        SELECT id
+                        FROM svec_ann_scan(
+                          'bench_ivfpq'::regclass, %s::svec, %s, %s, %s, %s, %s,
+                          'pq_code', '', 0
+                        )
+                        """,
+                        (lit, ivfpq_nprobe, k, ivfpq_rerank_topk, pq_cb_id, ivf_cb_id),
+                    )
+                    t0 = time.perf_counter()
+                    cur.execute(
+                        """
+                        SELECT id
+                        FROM svec_ann_scan(
+                          'bench_ivfpq'::regclass, %s::svec, %s, %s, %s, %s, %s,
+                          'pq_code', '', 0
+                        )
+                        """,
+                        (lit, ivfpq_nprobe, k, ivfpq_rerank_topk, pq_cb_id, ivf_cb_id),
+                    )
+                    ids = [int(row[0]) for row in cur.fetchall()]
+                    ivfpq_ms.append((time.perf_counter() - t0) * 1000.0)
+                    ivfpq_recall_parts.append(recall_at_k(ids, exact_ids[qid - 1], k))
+
+                cur.execute(
+                    """
+                    SELECT
+                      pg_size_pretty(pg_total_relation_size('bench_ivfpq'::regclass)),
+                      pg_size_pretty(COALESCE((
+                        SELECT sum(pg_total_relation_size(c.oid))::bigint
+                        FROM pg_class c
+                        WHERE c.relname IN (
+                          '_ivf_meta', '_ivf_centroids',
+                          '_pq_codebook_meta', '_pq_codebooks'
+                        )
+                      ), 0))
+                    """
+                )
+                ivfpq_table_size, ivfpq_codebook_size = cur.fetchone()
+                ivfpq_result = IvfPqResult(
+                    p50=median_ms(ivfpq_ms),
+                    p95=p95_ms(ivfpq_ms),
+                    avg=avg_ms(ivfpq_ms),
+                    recall=avg_ms(ivfpq_recall_parts),
+                    train_ms=train_ms,
+                    build_ms=build_ms,
+                    compact_ms=compact_ms,
+                    table_size=ivfpq_table_size,
+                    codebook_size=ivfpq_codebook_size,
+                    aux=(
+                        f"nlist={ivfpq_nlist}|nprobe={ivfpq_nprobe}|m={resolved_ivfpq_m}"
+                        f"|rerank_topk={ivfpq_rerank_topk}"
+                    ),
+                )
+
             cur.execute(
                 """
                 SELECT
@@ -283,6 +444,7 @@ def run_pg_benchmark(
                 pgv_index_size=pgv_index_size,
                 sh_total_size=sh_total_size,
                 pgv_total_size=pgv_total_size,
+                ivfpq=ivfpq_result,
             )
         finally:
             cur.close()
@@ -450,6 +612,13 @@ def main() -> int:
     ap.add_argument("--pgv-storage", default="vector", choices=["vector", "halfvec"])
     ap.add_argument("--pgv-ef", type=int, default=64)
     ap.add_argument("--sh-ef", type=int, default=96)
+    ap.add_argument("--enable-ivfpq", action="store_true")
+    ap.add_argument("--ivfpq-nlist", type=int, default=256)
+    ap.add_argument("--ivfpq-nprobe", type=int, default=16)
+    ap.add_argument("--ivfpq-m", type=int, default=0, help="PQ subvector count; 0 chooses a divisor of dim")
+    ap.add_argument("--ivfpq-rerank-topk", type=int, default=200)
+    ap.add_argument("--ivfpq-train-iter", type=int, default=10)
+    ap.add_argument("--ivfpq-max-train", type=int, default=10000)
     ap.add_argument("--zvec-ef", type=int, default=64)
     ap.add_argument("--qdrant-ef", type=int, default=64)
     ap.add_argument("--skip-zvec", action="store_true")
@@ -468,12 +637,33 @@ def main() -> int:
     print(f"pgv_storage: {args.pgv_storage}")
     print(f"pgv_ef:      {args.pgv_ef}")
     print(f"sh_ef:       {args.sh_ef}")
+    print(f"ivfpq:       {'on' if args.enable_ivfpq else 'off'}")
+    if args.enable_ivfpq:
+        print(
+            f"ivfpq_cfg:   nlist={args.ivfpq_nlist} nprobe={args.ivfpq_nprobe} "
+            f"m={args.ivfpq_m or 'auto'} rerank_topk={args.ivfpq_rerank_topk}"
+        )
     print(f"zvec_ef:     {args.zvec_ef}")
     print(f"qdrant_ef:   {args.qdrant_ef}")
     print()
 
     root_dir = Path(__file__).resolve().parent.parent
-    pg = run_pg_benchmark(root_dir, vectors, queries, args.k, args.pgv_storage, args.pgv_ef, args.sh_ef)
+    pg = run_pg_benchmark(
+        root_dir,
+        vectors,
+        queries,
+        args.k,
+        args.pgv_storage,
+        args.pgv_ef,
+        args.sh_ef,
+        enable_ivfpq=args.enable_ivfpq,
+        ivfpq_nlist=args.ivfpq_nlist,
+        ivfpq_nprobe=args.ivfpq_nprobe,
+        ivfpq_m=args.ivfpq_m,
+        ivfpq_rerank_topk=args.ivfpq_rerank_topk,
+        ivfpq_train_iter=args.ivfpq_train_iter,
+        ivfpq_max_train=args.ivfpq_max_train,
+    )
     print_result("exact_heap", pg.exact_p50, pg.exact_avg, 100.0, args.k)
     print_result("sorted_hnsw", pg.sorted_p50, pg.sorted_avg, pg.sorted_recall, args.k, extra=f"index={pg.sh_index_size}")
     print_result(
@@ -488,6 +678,19 @@ def main() -> int:
         f"pg_sizes|sorted_hnsw_index={pg.sh_index_size}|pgvector_index={pg.pgv_index_size}"
         f"|bench_sh_total={pg.sh_total_size}|bench_pgv_total={pg.pgv_total_size}"
     )
+    if pg.ivfpq is not None:
+        print_result(
+            "ivfpq_residual",
+            pg.ivfpq.p50,
+            pg.ivfpq.avg,
+            pg.ivfpq.recall,
+            args.k,
+            extra=(
+                f"{pg.ivfpq.aux}|p95_ms={pg.ivfpq.p95:.3f}|train_ms={pg.ivfpq.train_ms:.1f}"
+                f"|build_ms={pg.ivfpq.build_ms:.1f}|compact_ms={pg.ivfpq.compact_ms:.1f}"
+                f"|table={pg.ivfpq.table_size}|codebooks={pg.ivfpq.codebook_size}"
+            ),
+        )
 
     if not args.skip_zvec:
         zres = run_zvec_benchmark(vectors, queries, pg.exact_ids, args.k, args.zvec_ef)

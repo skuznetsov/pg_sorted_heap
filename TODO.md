@@ -749,7 +749,10 @@ Priority order after the native-partitioning hardening pass:
    point is now `make bench-large-vector-synthetic`; use smoke defaults for
    CI/local checks and override `BENCH_LARGE_VECTOR_ROWS`,
    `BENCH_LARGE_VECTOR_QUERIES`, and `BENCH_LARGE_VECTOR_DIM` for `500K+`
-   evidence runs.
+   evidence runs. Real-dataset runs can now add the opt-in residual IVF-PQ row
+   with `scripts/bench_ann_real_dataset.py --enable-ivfpq`; it stays off by
+   default because training, generated-code insertion, compaction, and query
+   latency must be reported separately.
 8. SIMD-accelerated ADC lookup and pgvectorscale DiskANN comparison.
    Resolved as two benchmark tracks in `docs/spec-simd-adc-diskann.md`: first
    measure whether PQ/FlashHadamard ADC is the actual PostgreSQL hot path, keep

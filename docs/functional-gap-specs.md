@@ -282,6 +282,9 @@ Current state:
   baseline entry point. Its defaults are smoke-sized; large-scale runs override
   `BENCH_LARGE_VECTOR_ROWS`, `BENCH_LARGE_VECTOR_QUERIES`, and
   `BENCH_LARGE_VECTOR_DIM`.
+- `scripts/bench_ann_real_dataset.py --enable-ivfpq` adds an opt-in residual
+  IVF-PQ row for real-corpus runs. It remains off by default because training,
+  generated-code insertion, and compaction are part of the measured cost.
 
 Risk:
 
@@ -295,6 +298,8 @@ Target direction:
   region against `sorted_hnsw` and FlashHadamard.
 - Use the synthetic harness first to establish exact/sorted_hnsw/pgvector and
   optional DiskANN baselines before adding IVF-PQ or FlashHadamard rows.
+- Use the real-dataset `--enable-ivfpq` row to gate any claim that residual
+  IVF-PQ has a winning region; do not infer it from synthetic data alone.
 - Prefer SQ8 before SQ4 for productized candidate scanning unless a 4-bit
   FlashHadamard-derived path proves equal quality at lower footprint.
 
