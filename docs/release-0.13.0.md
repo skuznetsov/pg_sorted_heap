@@ -17,6 +17,9 @@ Stable in this release:
 
 - `sorted_heap` table AM
 - `sorted_hnsw` Index AM for `svec` and `hsvec`
+- Partition-aware `sorted_hnsw` helpers:
+  - `sorted_hnsw_partition_search(...)`
+  - `sorted_hnsw_partition_search_status(...)`
 - Fact-shaped GraphRAG (single-table):
   - `sorted_heap_graph_rag(...)`
   - `sorted_heap_graph_register(...)`

@@ -275,6 +275,10 @@ transparent declarative-parent graph scan. The routed merge is global over the
 selected shard-local result sets, so app code gets one ordered top-k result
 with `source_rel` preserved.
 
+For partition-aware vector search, `sorted_hnsw_partition_search_status(...)`
+reports `returned_rows`, `underfilled`, and the explicit fallback marker for
+the same routed `sorted_hnsw_partition_search(...)` contract.
+
 The lower-level routing building blocks (`_routed`, `_routed_exact`,
 `_routed_policy`, `_routed_profile`, `_routed_default`, `_segmented`,
 expand/rerank helpers, scan wrappers, catalog/config/resolve functions)

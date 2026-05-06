@@ -17,6 +17,8 @@ Current completion state:
   `sorted_hnsw_partition_search(...)`, including explicit selected-leaf
   validation, leaf-local index validation, local ANN candidate pools, and
   global exact rerank.
+- Done: routed-search underfill diagnostics via
+  `sorted_hnsw_partition_search_status(...)`.
 - Proposed: F2 overfetch/exact filtered rerank with explicit underfill metadata
   and fallback reporting.
 - Non-goal for now: transparent arbitrary `WHERE ... ORDER BY embedding <=> q`
@@ -167,6 +169,17 @@ filters can still underfill bounded ANN scans. Instead, callers route first to
 whole eligible leaves, run local `sorted_hnsw` scans, and receive a globally
 reranked result over the union of local candidate pools.
 
+Implemented diagnostic helper:
+
+```sql
+SELECT *
+FROM sorted_hnsw_partition_search_status(...);
+```
+
+This reports `returned_rows`, `underfilled`, and `fallback` for the same routed
+search contract. It is intentionally diagnostic and does not silently fall back
+to exact search.
+
 Safety checks:
 
 - `local_k >= top_k`;
@@ -217,6 +230,8 @@ Current status:
   orders by exact distance, rejects `local_k > sorted_hnsw.ef_search`, and
   rejects selected leaves without a valid `sorted_hnsw` index or without a
   parent-child relationship to the requested parent.
+- The same regression covers `sorted_hnsw_partition_search_status(...)` for a
+  complete selected-leaf result and an underfilled selected-leaf result.
 - `scripts/bench_partitioned_sorted_hnsw.sh` provides an operator benchmark for
   selected-leaf routing versus parent filtered exact and all-leaf fanout.
 

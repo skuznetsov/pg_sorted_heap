@@ -136,6 +136,8 @@ Current state:
   partition/routing-aware global-merge modes.
 - `sorted_hnsw` regression now has explicit planner-safety guards for
   unbounded KNN, `LIMIT > sorted_hnsw.ef_search`, and filtered KNN shapes.
+- `sorted_hnsw_partition_search_status(...)` now exposes underfill metadata for
+  routed partition search without changing the row-returning API.
 
 Risk:
 

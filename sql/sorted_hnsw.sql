@@ -114,6 +114,25 @@ SELECT bool_and((row_data->>'bucket')::int = 2) AS part_selected_bucket_ok
 FROM sorted_hnsw_partition_search(
     'hnsw_part'::regclass, 'v', '[1,0,0,0]', 5, 5,
     ARRAY['hnsw_part_2'::regclass]);
+SELECT requested_top_k, effective_local_k, selected_leaves,
+       returned_rows, underfilled, fallback
+FROM sorted_hnsw_partition_search_status(
+    'hnsw_part'::regclass, 'v', '[1,0,0,0]', 5, 5,
+    ARRAY['hnsw_part_2'::regclass]);
+CREATE TABLE hnsw_part_3 PARTITION OF hnsw_part
+    FOR VALUES FROM (3) TO (4) USING sorted_heap;
+INSERT INTO hnsw_part
+SELECT 3, g, format('[1,%s,0,0]', round((g / 10000.0)::numeric, 4))::svec, 'c'
+FROM generate_series(1, 2) g;
+SELECT sorted_heap_compact('hnsw_part_3'::regclass);
+SET client_min_messages = warning;
+CREATE INDEX hnsw_part_3_v_idx ON hnsw_part_3 USING sorted_hnsw (v) WITH (m = 8, ef_construction = 32);
+SET client_min_messages = notice;
+SELECT requested_top_k, effective_local_k, selected_leaves,
+       returned_rows, underfilled, fallback
+FROM sorted_hnsw_partition_search_status(
+    'hnsw_part'::regclass, 'v', '[1,0,0,0]', 5, 5,
+    ARRAY['hnsw_part_3'::regclass]);
 CREATE TABLE hnsw_part_not_leaf(id int PRIMARY KEY, v svec(4)) USING sorted_heap;
 DO $$
 BEGIN

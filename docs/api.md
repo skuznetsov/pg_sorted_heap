@@ -166,6 +166,32 @@ column (`svec` or `hsvec`). The result is intentionally generic:
 `row_data jsonb` carries the source row because partitioned parents can have
 arbitrary table shapes.
 
+Use `sorted_hnsw_partition_search_status(...)` when the caller needs explicit
+underfill metadata for the same routed search contract:
+
+```sql
+SELECT *
+FROM sorted_hnsw_partition_search_status(
+    'documents_parent'::regclass,
+    'embedding',
+    '[0.1,0.2,0.3,...]',
+    top_k := 10,
+    local_k := 32,
+    leaf_relids := ARRAY['documents_2026_05'::regclass]);
+```
+
+Returned fields:
+
+- `requested_top_k`: requested final result count
+- `effective_local_k`: per-leaf candidate budget after applying the default
+- `selected_leaves`: supported sorted_heap leaves participating in the call
+- `returned_rows`: rows returned by the routed search
+- `underfilled`: true when `returned_rows < requested_top_k`
+- `fallback`: `none` or `underfilled_no_fallback`
+
+The status helper is diagnostic. It does not change the row-returning search
+API and it does not silently fall back to exact search.
+
 ---
 
 ## Zone map

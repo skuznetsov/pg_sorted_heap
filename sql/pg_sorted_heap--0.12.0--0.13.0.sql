@@ -628,6 +628,63 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql STABLE;
 
+CREATE FUNCTION @extschema@.sorted_hnsw_partition_search_status(
+  parent regclass,
+  vector_column name,
+  query text,
+  top_k integer,
+  local_k integer DEFAULT NULL,
+  leaf_relids regclass[] DEFAULT NULL,
+  fail_on_unsupported boolean DEFAULT true
+) RETURNS TABLE (
+  requested_top_k integer,
+  effective_local_k integer,
+  selected_leaves integer,
+  returned_rows integer,
+  underfilled boolean,
+  fallback text
+)
+AS $$
+DECLARE
+  local_limit integer;
+  selected_count integer;
+  returned_count integer;
+BEGIN
+  IF top_k IS NULL OR top_k <= 0 THEN
+    RAISE EXCEPTION 'top_k must be positive';
+  END IF;
+
+  local_limit := COALESCE(local_k, top_k);
+
+  SELECT count(*)::integer
+  INTO returned_count
+  FROM @extschema@.sorted_hnsw_partition_search(
+    parent, vector_column, query, top_k, local_limit, leaf_relids,
+    fail_on_unsupported);
+
+  SELECT count(*)::integer
+  INTO selected_count
+  FROM @extschema@.sorted_heap_partition_status(parent) AS s
+  WHERE (leaf_relids IS NULL OR s.leaf_relid = ANY(leaf_relids))
+    AND s.is_sorted_heap IS TRUE
+    AND s.has_primary_key IS TRUE;
+
+  RETURN QUERY
+  SELECT top_k,
+         local_limit,
+         selected_count,
+         returned_count,
+         returned_count < top_k,
+         CASE WHEN returned_count < top_k
+              THEN 'underfilled_no_fallback'
+              ELSE 'none'
+         END;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION @extschema@.sorted_hnsw_partition_search_status(regclass, name, text, integer, integer, regclass[], boolean)
+IS 'Diagnostic status for sorted_hnsw_partition_search(...). Reports requested/effective budgets, selected leaves, returned row count, underfill state, and fallback marker without changing the row-returning search API.';
+
 CREATE TABLE @extschema@.sorted_heap_graph_registry (
   relid regclass PRIMARY KEY,
   entity_column name NOT NULL,
