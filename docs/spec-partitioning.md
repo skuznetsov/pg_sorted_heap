@@ -372,6 +372,11 @@ Planner validation:
   up front. This keeps temporary disk-space requirements leaf-scoped.
 - Parent-query `SortedHeapScan` is handled in the generic planner hook by
   accepting simple partition-member relations.
+- GraphRAG parent fanout stays explicit for `0.13`: callers register concrete
+  leaves/shards, inspect the route plan, and call the routed GraphRAG APIs.
+  The routed wrappers perform a global merge over selected shard-local result
+  sets; they do not treat a declarative partition parent as an implicit
+  GraphRAG relation.
 
 ## Remaining Open Questions
 
@@ -382,21 +387,21 @@ Resolved in first-pass hardening:
 - Route-first HNSW safety: explicit `leaf_relids` are validated against the
   requested parent, and every selected sorted_heap leaf must have a valid
   leaf-local `sorted_hnsw` index.
+- Tablespace identity: maintenance-plan rows include portable tablespace OID,
+  name, and location fields. Actual free-byte checks stay external because
+  PostgreSQL has no portable SQL-level filesystem free-space metric.
+- Attach/detach/default-partition lifecycle: SH23-9 covers default partition
+  detach/attach, standalone range partition attach/detach, status traversal
+  refresh, detached sorted_heap standalone status, and helper traversal across
+  the dynamic leaf set.
 
 Still open for the next phase:
 
 1. Should `sorted_hnsw_partition_search(...)` move from PL/pgSQL to C to reduce
    route-first helper overhead on small partitions?
-2. Should GraphRAG parent fanout return a global exact top-k merge contract or
-   require explicit routed-shard APIs only?
-3. Should partition maintenance plans include tablespace/free-space data, or is
-   relation-size headroom enough for the stable SQL contract?
-   Resolved for `0.13`: include portable tablespace identity in the SQL plan;
-   keep actual free-byte checks in OS/platform monitoring because PostgreSQL
-   does not expose a portable SQL-level free-space metric.
-4. Should attach/detach/default-partition lifecycle get a dedicated regression
-   block, beyond the current nested/mixed/empty partition coverage?
-   Resolved by SH23-9.
+2. Should a future transparent parent-dispatched GraphRAG/ANN planner path ever
+   exist, or should parent fanout remain helper/API-level only? The `0.13`
+   contract intentionally chooses helper/API-level routing.
 
 ## Definition of Done
 
@@ -416,5 +421,8 @@ Current completion state:
   compatibility, nested partition traversal, covered parent-query
   `SortedHeapScan` for single-leaf, multi-leaf range, and generic prepared
   runtime-bound shapes, lock/free-space documentation, optional lock-wait
-  smoke, upgrade-path SQL.
-- Open: parent-dispatched GraphRAG/ANN fanout remains a separate future spec.
+  smoke, upgrade-path SQL, route-first partitioned HNSW helper, and explicit
+  routed GraphRAG parent/shard fanout policy.
+- Open: optional C implementation for the partitioned HNSW helper, plus any
+  future transparent parent-dispatched GraphRAG/ANN planner path as a separate
+  spec.

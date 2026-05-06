@@ -6,10 +6,21 @@ nav_order: 17
 
 # Spec: Filtered ANN Contracts
 
-Status: proposed
+Status: partially implemented
 Risk tier: CAUTION
 Primary goal: define safe filtered vector-search contracts without weakening
 the current `sorted_hnsw` ordered-scan guarantee.
+
+Current completion state:
+
+- Done: F3 route-first partition/routing-aware helper via
+  `sorted_hnsw_partition_search(...)`, including explicit selected-leaf
+  validation, leaf-local index validation, local ANN candidate pools, and
+  global exact rerank.
+- Proposed: F2 overfetch/exact filtered rerank with explicit underfill metadata
+  and fallback reporting.
+- Non-goal for now: transparent arbitrary `WHERE ... ORDER BY embedding <=> q`
+  planner support.
 
 ## Problem
 

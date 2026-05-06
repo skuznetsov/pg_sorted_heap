@@ -135,8 +135,8 @@ Current ordered-scan contract:
 
 For filtered retrieval or expansion workflows, materialize/filter first or use
 the GraphRAG helper API instead of expecting the ordered index scan to serve as
-a general filtered ANN primitive. The future filtered-ANN contract is tracked
-in [Filtered ANN Contracts](spec-filtered-ann).
+a general filtered ANN primitive. The remaining filtered-ANN contracts are
+tracked in [Filtered ANN Contracts](spec-filtered-ann).
 
 For declarative partitioned tables, `sorted_hnsw_partition_search(...)` provides
 an explicit route-first helper. Selected leaves run local `sorted_hnsw` scans,
