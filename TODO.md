@@ -711,7 +711,9 @@ Priority order after the native-partitioning hardening pass:
    justified only if routed small-leaf latency becomes a product target and
    the candidate clears parity plus promotion gates. The gate now includes the
    `exact_fallback` argument and requires fallback-enabled benchmark rows to be
-   reported separately from the default ANN-only latency path.
+   reported separately from the default ANN-only latency path; the benchmark
+   now emits selected/all-leaf default and exact-fallback helper rows with
+   average, p50, p95, and recall.
 2. Specify GraphRAG parent fanout: decide whether it is a global exact top-k
    merge over routed leaves or an explicit routed-shard-only API. Resolved:
    GraphRAG parent fanout stays explicit in `0.13`; callers register concrete

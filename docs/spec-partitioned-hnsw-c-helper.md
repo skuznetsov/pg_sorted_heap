@@ -137,6 +137,15 @@ candidate changes fallback orchestration. Report the fallback row separately
 because exact fallback is an operator-selected correctness/coverage trade-off,
 not the default latency path.
 
+The current SQL benchmark reports:
+
+- `helper_selected` and `helper_selected_exact_fallback`;
+- `helper_all_leaves` and `helper_all_leaves_exact_fallback`;
+- `direct_leaf_index`;
+- `parent_filtered_exact`;
+- `parent_all_merge_append`;
+- average, p50, p95, and recall@K for each method.
+
 Run:
 
 ```bash

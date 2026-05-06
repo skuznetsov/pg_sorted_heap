@@ -231,6 +231,18 @@ BEGIN
       hit_count::double precision / $K);
 
     t0 := clock_timestamp();
+    SELECT ARRAY(
+      SELECT (row_data->>'bucket') || ':' || (row_data->>'id')
+      FROM sorted_hnsw_partition_search(
+        'bench_part'::regclass, 'v', q.qtext, $K, $LOCAL_K, ARRAY[q.leaf_relid],
+        true, true)
+    ) INTO ids;
+    SELECT count(*) INTO hit_count FROM unnest(ids) AS got(id) WHERE got.id = ANY(gt);
+    INSERT INTO bench_runs VALUES ('helper_selected_exact_fallback', q.qid,
+      EXTRACT(EPOCH FROM clock_timestamp() - t0) * 1000.0,
+      hit_count::double precision / $K);
+
+    t0 := clock_timestamp();
     EXECUTE format(
       'SELECT ARRAY(SELECT bucket::text || '':'' || id::text FROM %s ORDER BY v <=> \$1::svec(%s) LIMIT %s)',
       q.leaf_relid, $DIM, $K)
@@ -266,6 +278,18 @@ BEGIN
       hit_count::double precision / $K);
 
     t0 := clock_timestamp();
+    SELECT ARRAY(
+      SELECT (row_data->>'bucket') || ':' || (row_data->>'id')
+      FROM sorted_hnsw_partition_search(
+        'bench_part'::regclass, 'v', q.qtext, $K, $LOCAL_K, NULL,
+        true, true)
+    ) INTO ids;
+    SELECT count(*) INTO hit_count FROM unnest(ids) AS got(id) WHERE got.id = ANY(gt);
+    INSERT INTO bench_runs VALUES ('helper_all_leaves_exact_fallback', q.qid,
+      EXTRACT(EPOCH FROM clock_timestamp() - t0) * 1000.0,
+      hit_count::double precision / $K);
+
+    t0 := clock_timestamp();
     EXECUTE format(
       'SELECT ARRAY(SELECT bucket::text || '':'' || id::text FROM bench_part ORDER BY v <=> \$1::svec(%s) LIMIT %s)',
       $DIM, $K)
@@ -282,6 +306,7 @@ END
 SELECT method,
        round(avg(ms)::numeric, 3) AS avg_ms,
        round(percentile_cont(0.5) WITHIN GROUP (ORDER BY ms)::numeric, 3) AS p50_ms,
+       round(percentile_cont(0.95) WITHIN GROUP (ORDER BY ms)::numeric, 3) AS p95_ms,
        round(avg(recall)::numeric, 4) AS recall_at_k
 FROM bench_runs
 GROUP BY method
