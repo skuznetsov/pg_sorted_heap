@@ -137,6 +137,32 @@ global_top_k = exact_top_k(union(local_candidate_pools))
 Local top-k concatenation is insufficient because a dense shard can contribute
 more than `k_per_shard` globally relevant rows.
 
+Implemented first-pass helper:
+
+```sql
+SELECT *
+FROM sorted_hnsw_partition_search(
+    'items_parent'::regclass,
+    'embedding',
+    '[0.1,0.2,0.3,...]',
+    top_k := 10,
+    local_k := 32,
+    leaf_relids := ARRAY['items_tenant_42'::regclass]);
+```
+
+This helper keeps the planner guard intact. It does not make arbitrary
+`WHERE ... ORDER BY embedding <=> query LIMIT k` transparent, because executor
+filters can still underfill bounded ANN scans. Instead, callers route first to
+whole eligible leaves, run local `sorted_hnsw` scans, and receive a globally
+reranked result over the union of local candidate pools.
+
+Safety checks:
+
+- `local_k >= top_k`;
+- `local_k <= sorted_hnsw.ef_search`;
+- unsupported leaves fail closed by default;
+- selected leaf routing is explicit via `leaf_relids`.
+
 ## Acceptance Tests
 
 ### F1. Pre-filter materialization correctness
@@ -169,6 +195,12 @@ Expected:
 - local candidate pools are unioned;
 - exact global rerank returns all true top-k rows from the dense shard;
 - test fails if implementation concatenates fixed local top-k slices.
+
+Current status:
+
+- Covered for partitioned `svec` and `hsvec` leaves in the `sorted_hnsw`
+  regression. The helper routes selected leaves, unions local pools, globally
+  orders by exact distance, and rejects `local_k > sorted_hnsw.ef_search`.
 
 ### F4. Planner safety guard
 

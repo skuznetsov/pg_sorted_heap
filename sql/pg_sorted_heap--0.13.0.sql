@@ -530,6 +530,122 @@ AS $$
   FROM @extschema@.sorted_heap_partition_maintenance($1, 'rebuild_zonemap', $2);
 $$ LANGUAGE SQL;
 
+CREATE FUNCTION @extschema@.sorted_hnsw_partition_search(
+  parent regclass,
+  vector_column name,
+  query text,
+  top_k integer,
+  local_k integer DEFAULT NULL,
+  leaf_relids regclass[] DEFAULT NULL,
+  fail_on_unsupported boolean DEFAULT true
+) RETURNS TABLE (
+  leaf_relid regclass,
+  leaf_name text,
+  distance double precision,
+  row_data jsonb
+)
+AS $$
+DECLARE
+  rec record;
+  local_limit integer;
+  ef integer;
+  union_sql text := '';
+  sep text := '';
+  vector_type text;
+  vector_typname name;
+BEGIN
+  IF top_k IS NULL OR top_k <= 0 THEN
+    RAISE EXCEPTION 'top_k must be positive';
+  END IF;
+
+  local_limit := COALESCE(local_k, top_k);
+  IF local_limit < top_k THEN
+    RAISE EXCEPTION 'local_k must be >= top_k for global partition merge';
+  END IF;
+
+  ef := current_setting('sorted_hnsw.ef_search')::integer;
+  IF local_limit > ef THEN
+    RAISE EXCEPTION 'local_k (%) must be <= sorted_hnsw.ef_search (%)', local_limit, ef
+      USING HINT = 'Increase sorted_hnsw.ef_search or lower local_k.';
+  END IF;
+
+  IF fail_on_unsupported THEN
+    SELECT s.*
+    INTO rec
+    FROM @extschema@.sorted_heap_partition_status(parent) AS s
+    WHERE (leaf_relids IS NULL OR s.leaf_relid = ANY(leaf_relids))
+      AND (s.is_sorted_heap IS NOT TRUE OR s.has_primary_key IS NOT TRUE)
+    LIMIT 1;
+
+    IF FOUND THEN
+      IF rec.is_sorted_heap IS NOT TRUE THEN
+        RAISE EXCEPTION 'unsupported partition leaf %: access method is %',
+          rec.leaf_relid,
+          COALESCE(rec.am_name::text, rec.relkind::text);
+      ELSE
+        RAISE EXCEPTION 'unsupported sorted_heap partition leaf %: primary key is required',
+          rec.leaf_relid;
+      END IF;
+    END IF;
+  END IF;
+
+  FOR rec IN
+    SELECT s.*
+    FROM @extschema@.sorted_heap_partition_status(parent) AS s
+    WHERE (leaf_relids IS NULL OR s.leaf_relid = ANY(leaf_relids))
+      AND s.is_sorted_heap IS TRUE
+      AND s.has_primary_key IS TRUE
+    ORDER BY s.leaf_name
+  LOOP
+    SELECT a.atttypid::regtype::text, t.typname
+    INTO vector_type, vector_typname
+    FROM pg_catalog.pg_attribute a
+    JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+    WHERE a.attrelid = rec.leaf_relid
+      AND a.attname = vector_column
+      AND NOT a.attisdropped;
+
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'vector column % does not exist on partition leaf %',
+        vector_column, rec.leaf_relid;
+    END IF;
+
+    IF vector_typname NOT IN ('svec', 'hsvec') THEN
+      RAISE EXCEPTION 'vector column %.% must be svec or hsvec, got %',
+        rec.leaf_relid, vector_column, vector_type;
+    END IF;
+
+    union_sql := union_sql || sep || pg_catalog.format(
+      '(SELECT %L::regclass AS leaf_relid,
+               %L::text AS leaf_name,
+               (t.%I <=> $1::%s)::double precision AS distance,
+               pg_catalog.to_jsonb(t) AS row_data
+        FROM %s AS t
+        ORDER BY t.%I <=> $1::%s
+        LIMIT $2)',
+      rec.leaf_relid::text,
+      rec.leaf_name,
+      vector_column,
+      vector_type,
+      rec.leaf_relid,
+      vector_column,
+      vector_type);
+    sep := ' UNION ALL ';
+  END LOOP;
+
+  IF union_sql = '' THEN
+    RETURN;
+  END IF;
+
+  RETURN QUERY EXECUTE
+    'SELECT leaf_relid, leaf_name, distance, row_data
+     FROM (' || union_sql || ') AS candidates
+     ORDER BY distance
+     LIMIT $3'
+    USING query, local_limit, top_k;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
 CREATE PROCEDURE @extschema@.sorted_heap_merge_online(regclass)
 AS '$libdir/pg_sorted_heap', 'sorted_heap_merge_online'
 LANGUAGE C;

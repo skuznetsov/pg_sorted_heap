@@ -49,7 +49,8 @@ The first partitioning pass will not:
 
 - implement a global in-place compactor;
 - compact multiple leaves atomically as one logical operation;
-- automatically dispatch `sorted_hnsw` KNN across all partitions;
+- transparently dispatch arbitrary filtered `sorted_hnsw` KNN through normal
+  `WHERE` clauses;
 - automatically dispatch GraphRAG across a partitioned parent;
 - introduce a global cross-partition HNSW index;
 - silently support foreign partitions.
@@ -88,6 +89,11 @@ Current verified coverage:
 
 - Direct leaf queries use `SortedHeapScan`.
 - Covered parent query shape now uses `SortedHeapScan` after partition pruning.
+- Pure parent-level `ORDER BY embedding <=> query LIMIT k` can use PostgreSQL's
+  normal `Merge Append` over leaf `sorted_hnsw` ordered index scans.
+- Explicit `sorted_hnsw_partition_search(...)` supports route-first vector
+  search over all leaves or a selected leaf set, with global exact rerank over
+  local candidate pools.
 - Broader parent-query shapes still need expansion tests before we claim
   complete planner coverage.
 

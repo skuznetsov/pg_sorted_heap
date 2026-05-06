@@ -94,6 +94,39 @@ Manual lock-behavior smoke:
 make test-partition-lock
 ```
 
+### Partition-aware vector search
+
+Use `sorted_hnsw_partition_search(...)` when vector search should run across a
+partitioned parent or an explicit subset of leaves:
+
+```sql
+SELECT leaf_relid, distance, row_data
+FROM sorted_hnsw_partition_search(
+    'documents_parent'::regclass,
+    'embedding',
+    '[0.1,0.2,0.3,...]',
+    top_k := 10,
+    local_k := 32,
+    leaf_relids := ARRAY['documents_2026_05'::regclass]);
+```
+
+Contract:
+
+- each selected leaf runs local `ORDER BY embedding <=> query LIMIT local_k`;
+- the helper unions local candidate pools and globally reranks by exact
+  distance;
+- `local_k` must be at least `top_k`, otherwise a dense leaf could contribute
+  more true global winners than the local pool preserves;
+- `local_k` must be no larger than `sorted_hnsw.ef_search`, so each local scan
+  remains inside the planner-integrated `sorted_hnsw` contract;
+- `leaf_relids` is optional. When omitted, all supported sorted_heap leaves
+  under the parent participate.
+
+The query argument is text and is cast to the actual vector type of each leaf
+column (`svec` or `hsvec`). The result is intentionally generic:
+`row_data jsonb` carries the source row because partitioned parents can have
+arbitrary table shapes.
+
 ---
 
 ## Zone map

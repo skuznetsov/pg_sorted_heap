@@ -58,6 +58,74 @@ EXPLAIN (COSTS OFF)
 SELECT id FROM hnsw_test WHERE id > 10 ORDER BY v <=> '[0.8,0.6,0.9,0.1]'::svec LIMIT 5;
 SET enable_seqscan = off;
 
+-- Partition-aware helper: route selected leaves, run local sorted_hnsw KNN,
+-- then exact-rerank the global candidate pool.
+SET client_min_messages = warning;
+CREATE TABLE hnsw_part(bucket int, id int, v svec(4), payload text,
+                       PRIMARY KEY(bucket, id))
+PARTITION BY RANGE(bucket);
+CREATE TABLE hnsw_part_1 PARTITION OF hnsw_part
+    FOR VALUES FROM (1) TO (2) USING sorted_heap;
+CREATE TABLE hnsw_part_2 PARTITION OF hnsw_part
+    FOR VALUES FROM (2) TO (3) USING sorted_heap;
+INSERT INTO hnsw_part
+SELECT 1, g, format('[1,%s,0,0]', round((g / 10000.0)::numeric, 4))::svec, 'a'
+FROM generate_series(1, 40) g;
+INSERT INTO hnsw_part
+SELECT 2, g, format('[0,1,%s,0]', round((g / 10000.0)::numeric, 4))::svec, 'b'
+FROM generate_series(1, 40) g;
+SELECT count(*) AS part_compact_ok
+FROM sorted_heap_compact_partitions('hnsw_part'::regclass)
+WHERE status = 'ok';
+CREATE INDEX hnsw_part_1_v_idx ON hnsw_part_1 USING sorted_hnsw (v) WITH (m = 8, ef_construction = 32);
+CREATE INDEX hnsw_part_2_v_idx ON hnsw_part_2 USING sorted_hnsw (v) WITH (m = 8, ef_construction = 32);
+ANALYZE hnsw_part;
+SET client_min_messages = notice;
+SET sorted_hnsw.ef_search = 8;
+SELECT count(*) AS part_search_count
+FROM sorted_hnsw_partition_search('hnsw_part'::regclass, 'v', '[1,0,0,0]', 5);
+SELECT array_agg(DISTINCT leaf_name ORDER BY leaf_name) AS part_selected_leaf
+FROM sorted_hnsw_partition_search(
+    'hnsw_part'::regclass, 'v', '[1,0,0,0]', 5, 5,
+    ARRAY['hnsw_part_2'::regclass]);
+SELECT bool_and((row_data->>'bucket')::int = 2) AS part_selected_bucket_ok
+FROM sorted_hnsw_partition_search(
+    'hnsw_part'::regclass, 'v', '[1,0,0,0]', 5, 5,
+    ARRAY['hnsw_part_2'::regclass]);
+DO $$
+BEGIN
+  PERFORM *
+  FROM sorted_hnsw_partition_search('hnsw_part'::regclass, 'v', '[1,0,0,0]', 5, 9);
+  RAISE EXCEPTION 'expected sorted_hnsw_partition_search to reject local_k > ef_search';
+EXCEPTION WHEN OTHERS THEN
+  IF SQLERRM NOT LIKE 'local_k (%) must be <= sorted_hnsw.ef_search (%)' THEN
+    RAISE;
+  END IF;
+END;
+$$;
+DROP TABLE hnsw_part;
+SET sorted_hnsw.ef_search = 32;
+
+SET client_min_messages = warning;
+CREATE TABLE hnsw_part_half(bucket int, id int, v hsvec(4),
+                            PRIMARY KEY(bucket, id))
+PARTITION BY RANGE(bucket);
+CREATE TABLE hnsw_part_half_1 PARTITION OF hnsw_part_half
+    FOR VALUES FROM (1) TO (2) USING sorted_heap;
+INSERT INTO hnsw_part_half
+SELECT 1, g, format('[1,%s,0,0]', round((g / 10000.0)::numeric, 4))::hsvec
+FROM generate_series(1, 20) g;
+SELECT count(*) AS part_hsvec_compact_ok
+FROM sorted_heap_compact_partitions('hnsw_part_half'::regclass)
+WHERE status = 'ok';
+CREATE INDEX hnsw_part_half_1_v_idx ON hnsw_part_half_1 USING sorted_hnsw (v hsvec_cosine_ops) WITH (m = 8, ef_construction = 32);
+SET client_min_messages = notice;
+SET sorted_hnsw.ef_search = 8;
+SELECT count(*) AS part_hsvec_count
+FROM sorted_hnsw_partition_search('hnsw_part_half'::regclass, 'v', '[1,0,0,0]', 3);
+DROP TABLE hnsw_part_half;
+SET sorted_hnsw.ef_search = 32;
+
 -- Dead heap tuples before VACUUM: top-up must still fill LIMIT K
 CREATE TABLE hnsw_dead (id int PRIMARY KEY, v svec(4));
 INSERT INTO hnsw_dead

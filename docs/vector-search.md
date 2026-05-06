@@ -138,6 +138,12 @@ the GraphRAG helper API instead of expecting the ordered index scan to serve as
 a general filtered ANN primitive. The future filtered-ANN contract is tracked
 in [Filtered ANN Contracts](spec-filtered-ann).
 
+For declarative partitioned tables, `sorted_hnsw_partition_search(...)` provides
+an explicit route-first helper. Selected leaves run local `sorted_hnsw` scans,
+their candidate pools are unioned, and the final result is globally reranked by
+exact distance. Use this when tenant/time/segment routing maps to whole
+partitions instead of executor filters inside one leaf.
+
 ---
 
 ## Legacy/manual IVF-PQ quick start

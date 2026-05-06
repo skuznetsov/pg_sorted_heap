@@ -485,6 +485,19 @@ relative throughput under sustained load, not absolute query latency.
 - `scripts/test_partition_lock_behavior.sh` manually verifies two-session
   leaf-lock behavior with `lock_timeout`.
 
+### Partition-Aware Vector Search
+- Pure `ORDER BY embedding <=> query LIMIT k` through a partitioned parent can
+  use PostgreSQL `Merge Append` over leaf `sorted_hnsw` ordered index scans.
+- For routed or tenant/time/segment-scoped search, use
+  `sorted_hnsw_partition_search(parent, vector_column, query, top_k, local_k,
+  leaf_relids)` to run local leaf KNN, union local pools, and globally rerank by
+  exact distance.
+- The helper keeps transparent filtered ANN disabled: real executor filters can
+  still underfill bounded ANN scans. Route to whole eligible leaves first.
+- Regression coverage now includes partitioned `svec` and `hsvec` leaves,
+  selected-leaf routing, global result count, and `local_k <= ef_search`
+  enforcement.
+
 ## Operational Notes
 
 ### pg_dump / pg_restore
