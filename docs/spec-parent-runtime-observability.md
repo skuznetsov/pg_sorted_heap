@@ -15,10 +15,12 @@ Current completion state:
 
 - Done: `sorted_heap_scan_stats_by_relation()` provides backend-local
   relation-aware `SortedHeapScan` counters.
-- Done: `sorted_heap_partition_scan_stats(parent)` rolls those local counters
-  up to sorted_heap leaves under a parent or concrete table.
-- Proposed: shared/cluster-wide relation-aware scan counters and per-shard
-  GraphRAG route execution stats.
+- Done: `sorted_heap_scan_stats_by_relation()` also provides cluster-wide
+  relation-aware counters when `pg_sorted_heap` is loaded through
+  `shared_preload_libraries`.
+- Done: `sorted_heap_partition_scan_stats(parent)` rolls relation-aware
+  counters up to sorted_heap leaves under a parent or concrete table.
+- Proposed: per-shard GraphRAG route execution stats.
 
 ## Problem
 
@@ -117,11 +119,19 @@ blocks_pruned bigint
 source text
 ```
 
-Current limitation:
+Current behavior:
 
-- `source` is currently `local`; the function reports only the current backend.
+- `source = 'local'` when the extension is not preloaded; the function reports
+  only the current backend.
+- `source = 'shared'` when the extension is loaded through
+  `shared_preload_libraries`; the function reports cluster-wide relation-aware
+  counters from shared memory.
 - `sorted_heap_reset_stats()` clears both aggregate and relation-aware local
-  counters.
+  counters, and clears shared relation-aware counters when shared memory is
+  active.
+- shared relation-aware counters track up to 4,096 concrete relations per reset
+  window; aggregate scan counters remain complete if that fixed relation table
+  is exhausted.
 
 Parent rollup can then be a safe SQL helper:
 
@@ -138,7 +148,8 @@ parent rows = relation-aware counters joined to actual leaves under parent
 
 No relation key means no parent rollup. The local relation key is now present;
 the first parent rollup is implemented for same-backend diagnostics.
-Cluster-wide relation rollups still require a shared-memory design.
+Cluster-wide relation rollups use the shared relation-aware counters when
+shared memory is active.
 
 ### O2. GraphRAG route execution stats
 
@@ -206,6 +217,10 @@ Expected:
 - docs state the reset/window behavior clearly;
 - tests do not assume cross-backend visibility when source is local.
 
+Status: covered by `test-shared-scan-stats`, which starts an ephemeral cluster
+with `shared_preload_libraries = 'pg_sorted_heap'`, runs scans from separate
+backends, verifies shared relation attribution, and verifies reset.
+
 ### R3. GraphRAG route stats attribution
 
 Run a routed GraphRAG call over multiple selected shards.
@@ -220,8 +235,7 @@ Expected:
 
 ## Decision
 
-For `0.13`, parent-level observability is storage/index-health complete enough
-for operations. Runtime parent observability should not be implemented until
-scan stats carry relation identity or GraphRAG route stats carry source-rel
-identity. Until then, use existing runtime stats only with their documented
-global/backend-local scope.
+For `0.13`, parent-level observability is storage/index-health complete and
+scan-runtime complete for `SortedHeapScan`: relation-aware counters are local by
+default and cluster-wide when preloaded. GraphRAG runtime observability remains
+last-call aggregate telemetry until route stats carry source-rel identity.

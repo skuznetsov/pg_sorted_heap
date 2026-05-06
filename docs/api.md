@@ -222,7 +222,7 @@ runtime-observability contract is tracked in
 
 ### `sorted_heap_scan_stats_by_relation()`
 
-Returns backend-local scan statistics keyed by concrete relation:
+Returns scan statistics keyed by concrete relation:
 
 ```sql
 SELECT *
@@ -234,20 +234,24 @@ Returned fields:
 - `relid`: concrete relation that executed `SortedHeapScan`
 - `relname`: current relation name, or `NULL` if the relation was dropped after
   the counter was recorded
-- `total_scans`: number of `SortedHeapScan` executions in this backend
+- `total_scans`: number of `SortedHeapScan` executions for this relation
 - `blocks_scanned`: heap blocks visited by those scans
 - `blocks_pruned`: heap blocks skipped by zone-map pruning
-- `source`: currently always `local`
+- `source`: `shared` when `pg_sorted_heap` is loaded through
+  `shared_preload_libraries`, otherwise `local`
 
-This is the first relation-aware runtime surface. It is intentionally
-backend-local and reset by `sorted_heap_reset_stats()`. It is safe to join to
-`sorted_heap_partition_status(parent)` for same-backend diagnostics, but it is
-not cluster-wide telemetry.
+This is the first relation-aware runtime surface. Without preload it is
+backend-local and useful for same-backend diagnostics. With
+`shared_preload_libraries = 'pg_sorted_heap'`, it is cluster-wide shared
+telemetry. In both modes it is reset by `sorted_heap_reset_stats()`.
+The shared relation table tracks up to 4,096 concrete relations per reset
+window; aggregate `sorted_heap_scan_stats()` counters continue to count all
+scans even if that relation table is exhausted.
 
 ### `sorted_heap_partition_scan_stats(parent)`
 
-Returns backend-local scan statistics for sorted_heap leaves under a
-partitioned parent or concrete sorted_heap table:
+Returns scan statistics for sorted_heap leaves under a partitioned parent or
+concrete sorted_heap table:
 
 ```sql
 SELECT *
@@ -257,7 +261,8 @@ FROM sorted_heap_partition_scan_stats('events_parent'::regclass);
 The helper joins `sorted_heap_partition_status(parent)` to
 `sorted_heap_scan_stats_by_relation()`. It returns one row per sorted_heap leaf,
 with zero counters for leaves that have not executed `SortedHeapScan` in the
-current backend. `source` is currently always `local`.
+current stats window. `source` follows `sorted_heap_scan_stats_by_relation()`:
+`shared` with preload, otherwise `local`.
 
 ### `sorted_heap_restore_plan(parent default NULL)`
 

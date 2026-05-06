@@ -726,8 +726,8 @@ SELECT * FROM sorted_heap_restore_plan(); -- post-restore maintenance checklist
 
 ```sql
 SELECT * FROM sorted_heap_scan_stats();  -- total_scans, blocks_scanned, blocks_pruned
-SELECT * FROM sorted_heap_scan_stats_by_relation(); -- backend-local relid counters
-SELECT * FROM sorted_heap_partition_scan_stats('parent'); -- local leaf rollup
+SELECT * FROM sorted_heap_scan_stats_by_relation(); -- relid counters, shared when preloaded
+SELECT * FROM sorted_heap_partition_scan_stats('parent'); -- leaf rollup
 SELECT sorted_heap_reset_stats();        -- reset counters
 ```
 

@@ -52,6 +52,7 @@ TEST_ALTER_PORT ?= 65493
 TEST_PARTITION_LOCK_PORT ?= 65487
 TEST_GRAPHRAG_PORT ?= 65494
 TEST_DUMP_PORT ?= 65495
+TEST_SHARED_STATS_PORT ?= 65486
 TEST_GRAPHRAG_CRASH_PORT ?= 65498
 TEST_GRAPHRAG_CONCURRENT_PORT ?= 65499
 TEST_GRAPHRAG_RELEASE_TMP ?= $(TMP_SELFTEST_ROOT)/pg_regress.codex.graphrag_release
@@ -522,6 +523,9 @@ test-partition-lock:
 test-dump-restore:
 	./scripts/test_dump_restore.sh $(TMP_SELFTEST_ROOT) $(TEST_DUMP_PORT)
 
+test-shared-scan-stats:
+	./scripts/test_shared_relation_scan_stats.sh $(TMP_SELFTEST_ROOT) $(TEST_SHARED_STATS_PORT)
+
 bench-partitioned-sorted-hnsw:
 	./scripts/bench_partitioned_sorted_hnsw.sh $(TMP_SELFTEST_ROOT) $(BENCH_PART_HNSW_PORT) $(BENCH_PART_HNSW_PARTITIONS) $(BENCH_PART_HNSW_ROWS_PER_PARTITION) $(BENCH_PART_HNSW_QUERIES) $(BENCH_PART_HNSW_DIM) $(BENCH_PART_HNSW_K) $(BENCH_PART_HNSW_LOCAL_K) $(BENCH_PART_HNSW_EF_SEARCH) $(BENCH_PART_HNSW_M) $(BENCH_PART_HNSW_EF_CONSTRUCTION)
 
@@ -814,6 +818,7 @@ help:
 	@echo "  make test-partition-lock TEST_PARTITION_LOCK_PORT=<port>"
 	@echo "  make bench-partitioned-sorted-hnsw BENCH_PART_HNSW_ROWS_PER_PARTITION=<n> BENCH_PART_HNSW_PARTITIONS=<n>"
 	@echo "  make test-graphrag-lifecycle TEST_GRAPHRAG_PORT=<port>"
+	@echo "  make test-shared-scan-stats TEST_SHARED_STATS_PORT=<port>"
 	@echo "  make test-graphrag-release TMP_SELFTEST_ROOT=<abs_tmp_dir>"
 	@echo "  make test-release TMP_SELFTEST_ROOT=<abs_tmp_dir>"
 	@echo "  make test-graph-builder TEST_GRAPH_PORT=<port>"

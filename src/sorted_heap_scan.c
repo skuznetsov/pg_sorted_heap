@@ -240,6 +240,14 @@ typedef struct SortedHeapLocalRelStats
 
 static HTAB *sh_local_rel_stats = NULL;
 
+typedef struct SortedHeapRelStatsSnapshot
+{
+	Oid			relid;
+	uint64		total_scans;
+	uint64		blocks_scanned;
+	uint64		blocks_pruned;
+} SortedHeapRelStatsSnapshot;
+
 static int graph_rag_topk_cmp(const void *a, const void *b);
 static void graph_rag_topk_siftdown(GraphRagTopKEntry *heap, int n, int i);
 static void graph_rag_topk_siftup(GraphRagTopKEntry *heap, int i);
@@ -327,6 +335,11 @@ static void sorted_heap_graph_obs_add_rerank(int64 reranked_rows,
 static void sorted_heap_update_local_rel_stats(Oid relid,
 											   BlockNumber scanned_blocks,
 											   BlockNumber pruned_blocks);
+static void sorted_heap_update_shared_rel_stats(Oid relid,
+												BlockNumber scanned_blocks,
+												BlockNumber pruned_blocks);
+static SortedHeapRelStatsSnapshot *sorted_heap_snapshot_shared_rel_stats(uint32 *count_out);
+static void sorted_heap_reset_shared_rel_stats(void);
 static int sorted_heap_graph_count_int4_array(ArrayType *arr);
 static bool sorted_heap_exprs_need_deferred_runtime_resolve(List *exprs);
 static void sorted_heap_set_parallel_fallback_span(SortedHeapScanState *shstate);
@@ -424,6 +437,7 @@ static void
 sorted_heap_shmem_startup(void)
 {
 	bool		found;
+	uint32		i;
 
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
@@ -437,6 +451,15 @@ sorted_heap_shmem_startup(void)
 		pg_atomic_init_u64(&sh_shared_stats->blocks_scanned, 0);
 		pg_atomic_init_u64(&sh_shared_stats->blocks_pruned, 0);
 		pg_atomic_init_u64(&sh_shared_stats->zm_generation, 1);
+		SpinLockInit(&sh_shared_stats->rel_stats_lock);
+		sh_shared_stats->rel_stats_count = 0;
+		for (i = 0; i < SORTED_HEAP_SHARED_REL_STATS_MAX; i++)
+		{
+			sh_shared_stats->rel_stats[i].relid = InvalidOid;
+			pg_atomic_init_u64(&sh_shared_stats->rel_stats[i].total_scans, 0);
+			pg_atomic_init_u64(&sh_shared_stats->rel_stats[i].blocks_scanned, 0);
+			pg_atomic_init_u64(&sh_shared_stats->rel_stats[i].blocks_pruned, 0);
+		}
 	}
 }
 
@@ -2472,11 +2495,16 @@ sorted_heap_end_custom_scan(CustomScanState *node)
 
 	if (sh_shared_stats)
 	{
+		Oid		relid = RelationGetRelid(node->ss.ss_currentRelation);
+
 		pg_atomic_fetch_add_u64(&sh_shared_stats->total_scans, 1);
 		pg_atomic_fetch_add_u64(&sh_shared_stats->blocks_scanned,
 								shstate->scanned_blocks);
 		pg_atomic_fetch_add_u64(&sh_shared_stats->blocks_pruned,
 								shstate->pruned_blocks);
+		sorted_heap_update_shared_rel_stats(relid,
+											shstate->scanned_blocks,
+											shstate->pruned_blocks);
 	}
 
 	if (shstate->heap_scan)
@@ -2725,6 +2753,103 @@ sorted_heap_update_local_rel_stats(Oid relid,
 	entry->blocks_pruned += pruned_blocks;
 }
 
+static void
+sorted_heap_update_shared_rel_stats(Oid relid,
+									BlockNumber scanned_blocks,
+									BlockNumber pruned_blocks)
+{
+	SortedHeapSharedRelStats *entry = NULL;
+	uint32		i;
+
+	if (!sh_shared_stats || !OidIsValid(relid))
+		return;
+
+	SpinLockAcquire(&sh_shared_stats->rel_stats_lock);
+	for (i = 0; i < sh_shared_stats->rel_stats_count; i++)
+	{
+		if (sh_shared_stats->rel_stats[i].relid == relid)
+		{
+			entry = &sh_shared_stats->rel_stats[i];
+			break;
+		}
+	}
+	if (entry == NULL &&
+		sh_shared_stats->rel_stats_count < SORTED_HEAP_SHARED_REL_STATS_MAX)
+	{
+		entry = &sh_shared_stats->rel_stats[sh_shared_stats->rel_stats_count++];
+		entry->relid = relid;
+		pg_atomic_init_u64(&entry->total_scans, 0);
+		pg_atomic_init_u64(&entry->blocks_scanned, 0);
+		pg_atomic_init_u64(&entry->blocks_pruned, 0);
+	}
+	if (entry != NULL)
+	{
+		pg_atomic_fetch_add_u64(&entry->total_scans, 1);
+		pg_atomic_fetch_add_u64(&entry->blocks_scanned, scanned_blocks);
+		pg_atomic_fetch_add_u64(&entry->blocks_pruned, pruned_blocks);
+	}
+	SpinLockRelease(&sh_shared_stats->rel_stats_lock);
+}
+
+static SortedHeapRelStatsSnapshot *
+sorted_heap_snapshot_shared_rel_stats(uint32 *count_out)
+{
+	SortedHeapRelStatsSnapshot *snapshot = NULL;
+	uint32		count;
+	uint32		i;
+
+	*count_out = 0;
+	if (!sh_shared_stats)
+		return NULL;
+
+	snapshot = palloc(sizeof(SortedHeapRelStatsSnapshot) *
+					  SORTED_HEAP_SHARED_REL_STATS_MAX);
+	SpinLockAcquire(&sh_shared_stats->rel_stats_lock);
+	count = sh_shared_stats->rel_stats_count;
+	for (i = 0; i < count; i++)
+	{
+		SortedHeapSharedRelStats *entry = &sh_shared_stats->rel_stats[i];
+
+		snapshot[i].relid = entry->relid;
+		snapshot[i].total_scans =
+			pg_atomic_read_u64(&entry->total_scans);
+		snapshot[i].blocks_scanned =
+			pg_atomic_read_u64(&entry->blocks_scanned);
+		snapshot[i].blocks_pruned =
+			pg_atomic_read_u64(&entry->blocks_pruned);
+	}
+	SpinLockRelease(&sh_shared_stats->rel_stats_lock);
+
+	if (count == 0)
+	{
+		pfree(snapshot);
+		return NULL;
+	}
+
+	*count_out = count;
+	return snapshot;
+}
+
+static void
+sorted_heap_reset_shared_rel_stats(void)
+{
+	uint32		i;
+
+	if (!sh_shared_stats)
+		return;
+
+	SpinLockAcquire(&sh_shared_stats->rel_stats_lock);
+	for (i = 0; i < sh_shared_stats->rel_stats_count; i++)
+	{
+		sh_shared_stats->rel_stats[i].relid = InvalidOid;
+		pg_atomic_write_u64(&sh_shared_stats->rel_stats[i].total_scans, 0);
+		pg_atomic_write_u64(&sh_shared_stats->rel_stats[i].blocks_scanned, 0);
+		pg_atomic_write_u64(&sh_shared_stats->rel_stats[i].blocks_pruned, 0);
+	}
+	sh_shared_stats->rel_stats_count = 0;
+	SpinLockRelease(&sh_shared_stats->rel_stats_lock);
+}
+
 Datum
 sorted_heap_scan_stats(PG_FUNCTION_ARGS)
 {
@@ -2766,6 +2891,9 @@ sorted_heap_scan_stats_by_relation(PG_FUNCTION_ARGS)
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	HASH_SEQ_STATUS status;
 	SortedHeapLocalRelStats *entry;
+	SortedHeapRelStatsSnapshot *shared_snapshot = NULL;
+	uint32		shared_count = 0;
+	uint32		i;
 
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
 		ereport(ERROR,
@@ -2773,6 +2901,35 @@ sorted_heap_scan_stats_by_relation(PG_FUNCTION_ARGS)
 				 errmsg("sorted_heap_scan_stats_by_relation must be called in a set-returning context")));
 
 	InitMaterializedSRF(fcinfo, 0);
+
+	if (sh_shared_stats)
+	{
+		shared_snapshot = sorted_heap_snapshot_shared_rel_stats(&shared_count);
+		for (i = 0; i < shared_count; i++)
+		{
+			Datum		values[6];
+			bool		nulls[6] = {false, false, false, false, false, false};
+			char	   *relname = get_rel_name(shared_snapshot[i].relid);
+
+			values[0] = ObjectIdGetDatum(shared_snapshot[i].relid);
+			if (relname)
+				values[1] = CStringGetTextDatum(relname);
+			else
+				nulls[1] = true;
+			values[2] = Int64GetDatum((int64) shared_snapshot[i].total_scans);
+			values[3] = Int64GetDatum((int64) shared_snapshot[i].blocks_scanned);
+			values[4] = Int64GetDatum((int64) shared_snapshot[i].blocks_pruned);
+			values[5] = CStringGetTextDatum("shared");
+
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+								 values, nulls);
+			if (relname)
+				pfree(relname);
+		}
+		if (shared_snapshot)
+			pfree(shared_snapshot);
+		PG_RETURN_NULL();
+	}
 
 	if (sh_local_rel_stats == NULL)
 		PG_RETURN_NULL();
@@ -2848,6 +3005,7 @@ sorted_heap_reset_stats(PG_FUNCTION_ARGS)
 		pg_atomic_write_u64(&sh_shared_stats->total_scans, 0);
 		pg_atomic_write_u64(&sh_shared_stats->blocks_scanned, 0);
 		pg_atomic_write_u64(&sh_shared_stats->blocks_pruned, 0);
+		sorted_heap_reset_shared_rel_stats();
 	}
 
 	sh_local_scans = 0;

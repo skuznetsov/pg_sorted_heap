@@ -7,6 +7,7 @@
 #include "access/tableam.h"
 #include "port/atomics.h"
 #include "storage/block.h"
+#include "storage/spin.h"
 
 #define SORTED_HEAP_MAGIC		0x534F5254	/* 'SORT' */
 #define SORTED_HEAP_VERSION		7
@@ -192,12 +193,25 @@ extern void sorted_heap_rebuild_zonemap_internal(Relation rel, Oid pk_typid,
 												 AttrNumber pk_attnum2);
 
 /* Shared memory stats (cluster-wide when loaded via shared_preload_libraries) */
+#define SORTED_HEAP_SHARED_REL_STATS_MAX 4096
+
+typedef struct SortedHeapSharedRelStats
+{
+	Oid				relid;
+	pg_atomic_uint64 total_scans;
+	pg_atomic_uint64 blocks_scanned;
+	pg_atomic_uint64 blocks_pruned;
+} SortedHeapSharedRelStats;
+
 typedef struct SortedHeapSharedStats
 {
 	pg_atomic_uint64 total_scans;
 	pg_atomic_uint64 blocks_scanned;
 	pg_atomic_uint64 blocks_pruned;
 	pg_atomic_uint64 zm_generation;		/* bumped on any zone map mutation */
+	slock_t		rel_stats_lock;
+	uint32		rel_stats_count;
+	SortedHeapSharedRelStats rel_stats[SORTED_HEAP_SHARED_REL_STATS_MAX];
 } SortedHeapSharedStats;
 
 /* GUC variables */

@@ -163,9 +163,10 @@ Current state:
   index AM, valid/ready/live flags, primary/unique flags, and convenience
   booleans for btree and `sorted_hnsw`.
 - `sorted_heap_scan_stats_by_relation()` now reports backend-local
-  relation-aware scan counters for same-backend diagnostics.
-- `sorted_heap_partition_scan_stats(parent)` now rolls those local counters up
-  to sorted_heap leaves under a partitioned parent or concrete table.
+  relation-aware scan counters for same-backend diagnostics, and shared
+  relation-aware counters when the extension is preloaded.
+- `sorted_heap_partition_scan_stats(parent)` now rolls those counters up to
+  sorted_heap leaves under a partitioned parent or concrete table.
 - Aggregate scan stats are global/per-backend counters, not per partition.
 - GraphRAG stats are backend-local last-call stats.
 
