@@ -908,6 +908,7 @@ SET sorted_heap.ann_timing = on;                 -- timing breakdown in DEBUG1
 - [Quick Start](docs/quickstart.md)
 - [Vector Search](docs/vector-search.md) -- `sorted_hnsw`, IVF-PQ, sidecar HNSW
 - [Filtered ANN Contracts](docs/spec-filtered-ann.md) -- proposed safe modes for filtered vector retrieval
+- [Zone-Map-Only Fast Paths](docs/spec-zone-map-only-fast-paths.md) -- why current zone maps are page pruning, not true index-only scans
 - [Architecture](docs/architecture.md) -- zone maps, custom scan, compaction
 - [Composite-PK Pruning Spec](docs/spec-composite-pk-pruning.md) -- first-pass two-column pruning contract
 - [Huge-Table Compaction Operating Model](docs/spec-huge-table-compaction.md) -- rewrite/free-space contract

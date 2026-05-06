@@ -76,6 +76,16 @@ non-contiguous distributions (e.g., after many random inserts without
 compaction), the scan reads intervening pages but skips tuple processing
 on pages outside the bounds.
 
+## Zone maps are not index-only scans
+
+Zone maps store page-level min/max metadata. They let `SortedHeapScan` skip
+heap pages, but they do not store row values or tuple identities and cannot
+return rows without fetching heap tuples. Any future heap-fetch-avoiding path
+needs either a metadata-only proof contract or a covering value-bearing sidecar.
+
+See [Zone-Map-Only Fast Paths](spec-zone-map-only-fast-paths) for the design
+boundary.
+
 ---
 
 ## `sorted_hnsw` ordered-scan contract

@@ -202,6 +202,30 @@ Target direction:
 - A future helper could find restored sorted_heap tables with invalid/missing
   zone maps, but correctness does not depend on it.
 
+### G7. Zone-map-only / index-only-like fast paths
+
+Current state:
+
+- `SortedHeapScan` uses zone maps to choose heap block ranges, then returns
+  heap tuples via the normal table scan path.
+- Zone maps store page-level min/max for the first two PK columns. They do not
+  store tuple values, TIDs, or MVCC visibility information.
+- `docs/spec-zone-map-only-fast-paths.md` now defines the boundary: current
+  zone maps can skip pages or prove empty overlap, but cannot implement a true
+  PostgreSQL `Index Only Scan`.
+
+Risk:
+
+- Calling this "index-only" overstates the feature and invites an unsafe
+  implementation that bypasses heap visibility or returns rows from lossy page
+  metadata.
+
+Target direction:
+
+- Keep `0.13` as heap-backed `SortedHeapScan`.
+- If needed later, choose explicitly between metadata-only fast paths and a
+  covering value-bearing sidecar / Index AM contract.
+
 ## Prioritization
 
 | Priority | Gap | Reason |
@@ -211,6 +235,7 @@ Target direction:
 | P0 | G2 huge-table compaction model | Needed to explain free-space requirements honestly |
 | P1 | G4 parent-level observability | Storage-state first pass landed; runtime/vector health remains |
 | P1 | G3 filtered ANN | Expected by vector-search users, but broader than storage |
+| P2 | G7 zone-map-only / index-only-like fast paths | Spec boundary landed; real row-returning path requires a covering sidecar |
 | P2 | G5 online lossy-PK support | Useful, but current fail-closed behavior is acceptable |
 | P2 | G6 restore ergonomics | Checklist documented; optional discovery helper remains |
 

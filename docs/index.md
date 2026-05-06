@@ -116,3 +116,5 @@ At 100M rows, a point query reads **1 buffer** (vs 8 for btree, 519,906 for seq 
   retrieval.
 - [Online Lossy-PK Maintenance](spec-online-lossy-pk) -- future lossless
   replay-key contract for UUID/text online maintenance.
+- [Zone-Map-Only Fast Paths](spec-zone-map-only-fast-paths) -- boundary between
+  page pruning, metadata-only answers, and future covering sidecars.

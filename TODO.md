@@ -726,6 +726,10 @@ Priority order after the native-partitioning hardening pass:
    replace the online log with lossless `pk_key bytea`, split replay identity
    from lossy zone-map keys, stage UUID first, then `text/varchar COLLATE "C"`,
    and keep fail-closed guards until collision regressions pass.
-6. Index-only scan equivalent using zone map.
+6. Index-only scan equivalent using zone map. Resolved as a contract boundary
+   rather than a `0.13` implementation: page-level zone maps can skip heap
+   blocks and can support future metadata-only proofs, but they cannot return
+   visible rows like PostgreSQL `Index Only Scan` without a covering
+   value-bearing sidecar. See `docs/spec-zone-map-only-fast-paths.md`.
 7. IVF-PQ or SQ8/SQ4 revival for sub-linear scan on very large datasets.
 8. SIMD-accelerated ADC lookup and pgvectorscale DiskANN comparison.
