@@ -141,6 +141,10 @@ Benchmark requirements:
 - fixed query set and exact heap ground truth;
 - cold-build and warm-query metrics;
 - footprint reported from PostgreSQL relation sizes and sidecar files.
+- synthetic baseline runs should start from `make bench-large-vector-synthetic`;
+  its defaults are intentionally small for smoke checks, while `500K` / `1M`
+  runs are selected by overriding `BENCH_LARGE_VECTOR_ROWS`,
+  `BENCH_LARGE_VECTOR_QUERIES`, and `BENCH_LARGE_VECTOR_DIM`.
 
 Promotion condition:
 
@@ -165,7 +169,8 @@ Expected:
    recall@10, and rerank settings.
 2. Add a larger synthetic scale harness that can generate `500K` and `1M`
    vectors without external downloads, with deterministic query and exact GT
-   sampling.
+   sampling. Baseline entry point: `make bench-large-vector-synthetic`, which
+   reuses the existing exact/sorted_hnsw/pgvector/optional-DiskANN harness.
 3. Compare three candidates on the same harness: `sorted_hnsw`, IVF-PQ
    residual, and FlashHadamard packed exhaustive.
 4. Only after a winning region is identified, design a product API or planner

@@ -278,6 +278,10 @@ Current state:
   `103K x 2880D`, but do not refute sublinear routing at `500K+` / `1M+`.
 - `docs/spec-large-vector-sublinear.md` now defines the benchmark gate for any
   IVF-PQ, SQ8, or SQ4 revival.
+- `make bench-large-vector-synthetic` now provides the reproducible synthetic
+  baseline entry point. Its defaults are smoke-sized; large-scale runs override
+  `BENCH_LARGE_VECTOR_ROWS`, `BENCH_LARGE_VECTOR_QUERIES`, and
+  `BENCH_LARGE_VECTOR_DIM`.
 
 Risk:
 
@@ -289,6 +293,8 @@ Target direction:
 
 - Keep IVF-PQ as explicit/manual until a large-scale harness proves a winning
   region against `sorted_hnsw` and FlashHadamard.
+- Use the synthetic harness first to establish exact/sorted_hnsw/pgvector and
+  optional DiskANN baselines before adding IVF-PQ or FlashHadamard rows.
 - Prefer SQ8 before SQ4 for productized candidate scanning unless a 4-bit
   FlashHadamard-derived path proves equal quality at lower footprint.
 

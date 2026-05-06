@@ -745,7 +745,11 @@ Priority order after the native-partitioning hardening pass:
    `docs/spec-large-vector-sublinear.md`: keep IVF-PQ legacy/manual at `0.13`,
    do not reopen the refuted `103K` pruning branch as a default, and require
    `500K+` / `1M+` latency + recall + footprint evidence before promoting
-   IVF-PQ, SQ8, or a FlashHadamard-derived SQ4 lane.
+   IVF-PQ, SQ8, or a FlashHadamard-derived SQ4 lane. Synthetic baseline entry
+   point is now `make bench-large-vector-synthetic`; use smoke defaults for
+   CI/local checks and override `BENCH_LARGE_VECTOR_ROWS`,
+   `BENCH_LARGE_VECTOR_QUERIES`, and `BENCH_LARGE_VECTOR_DIM` for `500K+`
+   evidence runs.
 8. SIMD-accelerated ADC lookup and pgvectorscale DiskANN comparison.
    Resolved as two benchmark tracks in `docs/spec-simd-adc-diskann.md`: first
    measure whether PQ/FlashHadamard ADC is the actual PostgreSQL hot path, keep
