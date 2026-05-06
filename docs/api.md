@@ -213,6 +213,13 @@ SELECT * FROM sorted_heap_scan_stats();
          142 |           284  |        276012 | shmem
 ```
 
+These counters are not keyed by relation. For partitioned deployments, use
+`sorted_heap_partition_status(...)` and
+`sorted_heap_partition_index_status(...)` for per-leaf state; do not interpret
+`sorted_heap_scan_stats()` as parent-level runtime telemetry. The future
+runtime-observability contract is tracked in
+[Parent Runtime Observability](spec-parent-runtime-observability).
+
 ### `sorted_heap_reset_stats()`
 
 Resets the scan statistics counters.
@@ -700,6 +707,9 @@ Returned fields:
 name. For example, a unified `sorted_heap_graph_rag(...)` call with
 `relation_path := ARRAY[1, 2], score_mode := 'path'` will report
 `sorted_heap_graph_rag_twohop_path_scan`.
+
+These stats are backend-local and aggregate the last top-level GraphRAG call.
+They are not per-shard or per-partition telemetry.
 
 ```sql
 SELECT * FROM sorted_heap_graph_rag_stats();

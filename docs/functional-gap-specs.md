@@ -171,8 +171,9 @@ Target direction:
 
 - Treat `sorted_heap_partition_status(...)` as the storage-state baseline.
 - Treat `sorted_heap_partition_index_status(...)` as the index-health baseline.
-- Add separate row-returning parent observability for scan stats and GraphRAG
-  runtime stats when those contracts are specified.
+- Add separate row-returning parent observability only after scan stats carry
+  relation identity or GraphRAG route stats carry source-rel identity. See
+  `docs/spec-parent-runtime-observability.md`.
 
 ### G5. Online compact/merge restrictions for lossy PKs
 
