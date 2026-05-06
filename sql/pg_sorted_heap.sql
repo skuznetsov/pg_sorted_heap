@@ -1722,7 +1722,7 @@ RESET enable_indexscan;
 RESET enable_bitmapscan;
 RESET max_parallel_workers_per_gather;
 
--- SH13-5: Online compact on UUID PK → error
+-- SH13-5: Online compact on UUID/text/varchar PKs → error
 DO $$
 BEGIN
     CALL sorted_heap_compact_online('sh13_uuid'::regclass);
@@ -1732,7 +1732,16 @@ EXCEPTION WHEN feature_not_supported THEN
 END;
 $$;
 
--- SH13-6: Online merge on UUID PK → error
+DO $$
+BEGIN
+    CALL sorted_heap_compact_online('sh13_text'::regclass);
+    RAISE NOTICE 'sh13_online_compact_text_FAIL';
+EXCEPTION WHEN feature_not_supported THEN
+    RAISE NOTICE 'sh13_online_compact_text_blocked_ok';
+END;
+$$;
+
+-- SH13-6: Online merge on UUID/text/varchar PKs → error
 DO $$
 BEGIN
     CALL sorted_heap_merge_online('sh13_uuid'::regclass);
@@ -1758,6 +1767,33 @@ SELECT CASE WHEN sorted_heap_zonemap_stats('sh13_varchar'::regclass)
          THEN 'sh13_varchar_zm_valid'
          ELSE 'sh13_varchar_zm_FAIL'
     END AS sh13_7_result;
+
+DO $$
+BEGIN
+    CALL sorted_heap_compact_online('sh13_varchar'::regclass);
+    RAISE NOTICE 'sh13_online_compact_varchar_FAIL';
+EXCEPTION WHEN feature_not_supported THEN
+    RAISE NOTICE 'sh13_online_compact_varchar_blocked_ok';
+END;
+$$;
+
+DO $$
+BEGIN
+    CALL sorted_heap_merge_online('sh13_text'::regclass);
+    RAISE NOTICE 'sh13_online_merge_text_FAIL';
+EXCEPTION WHEN feature_not_supported THEN
+    RAISE NOTICE 'sh13_online_merge_text_blocked_ok';
+END;
+$$;
+
+DO $$
+BEGIN
+    CALL sorted_heap_merge_online('sh13_varchar'::regclass);
+    RAISE NOTICE 'sh13_online_merge_varchar_FAIL';
+EXCEPTION WHEN feature_not_supported THEN
+    RAISE NOTICE 'sh13_online_merge_varchar_blocked_ok';
+END;
+$$;
 
 DROP TABLE sh13_varchar;
 DROP TABLE sh13_text;
