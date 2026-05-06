@@ -2568,7 +2568,15 @@ SELECT sh21b_zonemap_scanned(
     'SELECT * FROM sh21b WHERE tenant_id = 1 AND id = 123') <= 2
     AS sh21b_composite_tight_eq;
 
--- SH21B-3: Unsorted tail stays conservative for second-column predicates.
+-- SH21B-3: First-column-only range remains pruned and correct.
+SELECT sh21b_zonemap_scanned(
+    'SELECT * FROM sh21b WHERE tenant_id BETWEEN 2 AND 2') BETWEEN 1 AND 170
+    AS sh21b_col1_range_pruned;
+SELECT count(*) AS sh21b_col1_range_count
+FROM sh21b
+WHERE tenant_id BETWEEN 2 AND 2;
+
+-- SH21B-4: Unsorted tail stays conservative for second-column predicates.
 -- Insert tenant 1 rows after tenant 2's compacted prefix; this breaks global
 -- monotonicity while leaving the heap-backed executor quals authoritative.
 INSERT INTO sh21b

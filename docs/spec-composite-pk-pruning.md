@@ -130,8 +130,9 @@ Expected:
 
 - existing first-column pruning behavior remains correct.
 
-Status: indirectly covered by existing single-column and multi-range
-regressions; no dedicated C3 assertion yet.
+Status: covered by `SH21B` regression. The guard verifies that
+`tenant_id BETWEEN 2 AND 2` remains zone-map pruned and returns the expected
+10,000 rows without using a second-column predicate.
 
 ### C4. Unsorted tail remains conservative
 
@@ -170,7 +171,9 @@ Sorted-prefix search:
   - emit contiguous matching ranges.
 - Future optimization:
   - replace the linear refinement inside one column-1 span with true
-    lexicographic binary search when the page metadata proves it is safe.
+    lexicographic binary search only if page metadata can prove endpoint
+    ordering. The current second-column zone-map fields are page-global
+    min/max values, not `(col1, col2)` lower/upper endpoint pairs.
 
 Adversary checks:
 

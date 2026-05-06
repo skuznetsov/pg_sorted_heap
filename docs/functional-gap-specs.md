@@ -32,6 +32,9 @@ Current state:
 - Regression `SH21B-3` now guards that an unsorted tail remains conservative
   for fixed-column-1 and bounded-column-2 predicates, preserving correctness
   after tail inserts.
+- Regression `SH21B` now has a dedicated first-column-only range guard, so the
+  first-pass composite refinement does not regress the original col1 pruning
+  path.
 - `docs/spec-composite-pk-pruning.md` documents the first-pass contract and
   remaining lexicographic follow-ups.
 
@@ -44,8 +47,9 @@ Risk:
 Target direction:
 
 - Continue from the first-pass refinement toward true lexicographic binary
-  search for the sorted prefix path if planning-time refinement over a large
-  tenant span becomes measurable overhead.
+  search for the sorted prefix path only if planning-time refinement over a
+  large tenant span becomes measurable overhead and the zone-map metadata can
+  prove lexicographic endpoint ordering.
 - Keep linear/tail pruning conservative, but make compacted prefix queries with
   equality on column 1 and range/equality on column 2 map to tight block ranges.
 
