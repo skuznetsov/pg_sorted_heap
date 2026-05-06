@@ -45,6 +45,7 @@ cleanup() {
 trap cleanup EXIT
 
 VECTORS_NPZ="$TMP_DIR/vectors.npz"
+OUTPUT_LOG="$TMP_DIR/output.log"
 "$PYTHON_BIN" - "$VECTORS_NPZ" "$ROWS" "$QUERIES" "$DIM" <<'PY'
 import sys
 import numpy as np
@@ -70,4 +71,23 @@ PY
   --ivfpq-train-iter 2 \
   --ivfpq-max-train 256 \
   --enable-flashhadamard \
-  --flashhadamard-group-size 4
+  --flashhadamard-group-size 4 \
+  | tee "$OUTPUT_LOG"
+
+required_patterns=(
+  '^exact_heap\|'
+  '^sorted_hnsw\|'
+  '^pgvector_hnsw_vector\|'
+  '^pg_sizes\|'
+  '^ivfpq_residual\|'
+  '^flashhadamard4_packed\|'
+)
+
+for pattern in "${required_patterns[@]}"; do
+  if ! grep -Eq "$pattern" "$OUTPUT_LOG"; then
+    echo "missing expected benchmark row matching: $pattern" >&2
+    exit 1
+  fi
+done
+
+echo "ann_matrix_offline_smoke: all expected benchmark rows present"
