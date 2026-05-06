@@ -117,8 +117,10 @@ leaves are not rolled back by the helper.
 
 Use `sorted_heap_partition_maintenance_plan(parent, operation)` before large
 runs to list all blockers and estimate the current leaf rewrite headroom. The
-estimate is intentionally conservative and relation-size based; it does not
-replace tablespace/free-space monitoring.
+estimate is intentionally conservative and relation-size based. The plan also
+reports each leaf tablespace so operators can connect the estimate to external
+tablespace/free-space monitoring; PostgreSQL does not provide a portable
+SQL-level free-byte metric.
 
 The manual smoke `make test-partition-lock` verifies the expected lock
 behavior with two sessions and `lock_timeout`.

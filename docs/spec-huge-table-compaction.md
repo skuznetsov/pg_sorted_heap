@@ -86,7 +86,8 @@ Recommended flow:
 4. Before the run, inspect
    `sorted_heap_partition_maintenance_plan(parent, 'compact')` or
    `sorted_heap_partition_maintenance_plan(parent, 'merge')` to see all
-   blockers and the per-leaf rewrite headroom estimate.
+   blockers, the per-leaf rewrite headroom estimate, and the tablespace that
+   should be checked by external free-space monitoring.
 5. Inspect state with `sorted_heap_partition_status(parent)`.
 6. For live systems, prefer online concrete operations on the hot leaf when
    blocking time matters more than total runtime.
@@ -142,10 +143,10 @@ Future tests:
 
 - benchmark partitioned maintenance over multiple differently sized leaves;
 - verify failure reporting when one later leaf cannot acquire lock;
-- refine the dry-run estimate with free-space / tablespace data if operator
-  demand justifies it.
-- add attach/detach/default-partition lifecycle regression if users start
-  managing sorted_heap partition trees dynamically.
+- continue validating the dry-run estimate against operator feedback; the SQL
+  plan now reports tablespace identity, while actual free bytes remain an
+  external filesystem/platform metric.
+- attach/detach/default-partition lifecycle regression is covered by SH23-9.
 
 ## Quadrumvirate Notes
 

@@ -81,6 +81,8 @@ The plan returns one row per concrete leaf with:
 - `status = 'blocked'` for unsupported leaves or sorted_heap leaves without a
   primary key;
 - `lock_mode`, currently `AccessExclusiveLock` for the concrete operation;
+- `tablespace_oid`, `tablespace_name`, and `tablespace_location`, so operators
+  can join the rewrite estimate to their tablespace or filesystem monitoring;
 - `relation_size_bytes` and `estimated_temp_bytes`. For `compact` and `merge`,
   the temp estimate is the current leaf size; for `rebuild_zonemap`, heap
   rewrite temp is `0`.
@@ -103,6 +105,9 @@ Locking and disk-space model:
   leaf and has the same lock class.
 - The rewrite needs temporary disk headroom for the leaf being processed, not
   for the whole logical parent at once.
+- PostgreSQL does not expose a portable SQL-level free-space metric; use the
+  reported tablespace fields with OS or platform monitoring when checking
+  available bytes.
 - These helpers are not atomic across all leaves. If a later leaf fails,
   already processed leaves remain processed.
 - See [Huge-Table Compaction Operating Model](spec-huge-table-compaction) for

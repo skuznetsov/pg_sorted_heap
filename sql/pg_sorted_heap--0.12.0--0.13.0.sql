@@ -261,6 +261,9 @@ CREATE FUNCTION @extschema@.sorted_heap_partition_maintenance_plan(
   status text,
   message text,
   lock_mode text,
+  tablespace_oid oid,
+  tablespace_name name,
+  tablespace_location text,
   relation_size_bytes bigint,
   estimated_temp_bytes bigint
 )
@@ -283,6 +286,18 @@ BEGIN
     operation_name := operation;
     relation_size_bytes := rec.relation_size_bytes;
     lock_mode := 'AccessExclusiveLock';
+    SELECT ts.oid,
+           ts.spcname,
+           pg_catalog.pg_tablespace_location(ts.oid)
+    INTO tablespace_oid,
+         tablespace_name,
+         tablespace_location
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_database d
+      ON d.datname = pg_catalog.current_database()
+    JOIN pg_catalog.pg_tablespace ts
+      ON ts.oid = COALESCE(NULLIF(c.reltablespace, 0), d.dattablespace)
+    WHERE c.oid = rec.leaf_relid;
 
     IF rec.is_sorted_heap IS NOT TRUE THEN
       status := 'blocked';

@@ -716,7 +716,11 @@ Priority order after the native-partitioning hardening pass:
    sorted_heap standalone status, and compact helper traversal across the
    dynamic leaf set.
 4. Refine `sorted_heap_partition_maintenance_plan(...)` with tablespace/free
-   space data if relation-size headroom is too coarse for operators.
+   space data if relation-size headroom is too coarse for operators. Resolved
+   for `0.13`: plan rows include portable tablespace identity
+   (`tablespace_oid`, `tablespace_name`, `tablespace_location`); actual
+   free-byte checks remain external because PostgreSQL has no portable
+   SQL-level filesystem free-space metric.
 5. Online compact/merge support for UUID/text PKs, which requires a log-format
    redesign.
 6. Index-only scan equivalent using zone map.

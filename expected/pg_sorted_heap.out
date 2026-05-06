@@ -3852,12 +3852,13 @@ FROM sorted_heap_partition_status('sh23_parent'::regclass);
 -- SH23-1B: dry-run maintenance plan is read-only and estimates leaf headroom
 SELECT count(*) AS sh23_plan_would_run,
        bool_and(lock_mode = 'AccessExclusiveLock') AS sh23_plan_lock_mode,
+       bool_and(tablespace_oid IS NOT NULL AND tablespace_name IS NOT NULL) AS sh23_plan_tablespace,
        bool_and(estimated_temp_bytes > 0) AS sh23_plan_temp_estimate
 FROM sorted_heap_partition_maintenance_plan('sh23_parent'::regclass, 'compact')
 WHERE status = 'would_run';
- sh23_plan_would_run | sh23_plan_lock_mode | sh23_plan_temp_estimate 
----------------------+---------------------+-------------------------
-                   2 | t                   | t
+ sh23_plan_would_run | sh23_plan_lock_mode | sh23_plan_tablespace | sh23_plan_temp_estimate 
+---------------------+---------------------+----------------------+-------------------------
+                   2 | t                   | t                    | t
 (1 row)
 
 -- SH23-2: compact parent helper operates leaf-by-leaf

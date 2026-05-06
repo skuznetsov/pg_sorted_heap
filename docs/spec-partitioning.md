@@ -138,6 +138,9 @@ operation_name text
 status text                  -- would_run | blocked
 message text
 lock_mode text
+tablespace_oid oid
+tablespace_name name
+tablespace_location text
 relation_size_bytes bigint
 estimated_temp_bytes bigint
 ```
@@ -360,7 +363,8 @@ Planner validation:
   machine-readable per-leaf result stream.
 - `sorted_heap_partition_maintenance_plan(...)` is read-only and reports all
   blockers instead of stopping at the first unsupported leaf. It is the
-  operator-facing dry-run path for lock/headroom review.
+  operator-facing dry-run path for lock/headroom review, including portable
+  tablespace identity for external free-space monitoring.
 - Helpers preflight unsupported leaves by default and fail before work starts.
   Explicit `fail_on_unsupported=false` returns `skipped` rows for unsupported
   leaves.
@@ -387,8 +391,12 @@ Still open for the next phase:
    require explicit routed-shard APIs only?
 3. Should partition maintenance plans include tablespace/free-space data, or is
    relation-size headroom enough for the stable SQL contract?
+   Resolved for `0.13`: include portable tablespace identity in the SQL plan;
+   keep actual free-byte checks in OS/platform monitoring because PostgreSQL
+   does not expose a portable SQL-level free-space metric.
 4. Should attach/detach/default-partition lifecycle get a dedicated regression
    block, beyond the current nested/mixed/empty partition coverage?
+   Resolved by SH23-9.
 
 ## Definition of Done
 
