@@ -305,6 +305,9 @@ Current state:
   query rescoring, label filtering, and relaxed-order behavior.
 - `docs/spec-simd-adc-diskann.md` now separates local ADC kernel optimization
   from product-level DiskANN benchmarking.
+- `scripts/bench_sorted_hnsw_vs_pgvector.sh` now reports strict-order mode and
+  optional pgvectorscale DiskANN rows. If `vectorscale` is absent, it emits a
+  skip note and keeps the local benchmark runnable.
 
 Risk:
 
@@ -314,8 +317,8 @@ Risk:
 
 Target direction:
 
-- Add optional harness support for pgvectorscale when the extension is
-  installed; fail open when it is absent.
+- Use the optional pgvectorscale harness row for apples-to-apples DiskANN
+  comparisons when the extension is installed.
 - Only integrate SIMD kernels behind scalar parity gates and platform guards.
 
 ## Prioritization

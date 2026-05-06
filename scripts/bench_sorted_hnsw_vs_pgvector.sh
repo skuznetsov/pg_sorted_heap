@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ============================================================
-# sorted_hnsw vs exact heap vs pgvector HNSW
+# sorted_hnsw vs exact heap vs pgvector HNSW vs optional pgvectorscale DiskANN
 # ============================================================
 #
 # Local reproducible benchmark on a temp PostgreSQL instance.
@@ -10,12 +10,14 @@ set -euo pipefail
 #   1. exact heap baseline on svec (ground truth)
 #   2. sorted_hnsw ordered index scan on svec
 #   3. pgvector HNSW on vector or halfvec
+#   4. pgvectorscale DiskANN when the vectorscale extension is installed
 #
 # Usage:
-#   ./scripts/bench_sorted_hnsw_vs_pgvector.sh [tmp_root] [port] [rows] [queries] [dim] [k] [pgv_storage] [pgv_ef_search] [shnsw_ef_search]
+#   ./scripts/bench_sorted_hnsw_vs_pgvector.sh [tmp_root] [port] [rows] [queries] [dim] [k] [pgv_storage] [pgv_ef_search] [shnsw_ef_search] [diskann_query_search_list_size] [diskann_query_rescore]
 #
 # Output:
-#   - method table with p50 / avg / recall@K
+#   - method table with p50 / avg / recall@K / strict-order mode
+#   - optional benchmark notes for skipped external baselines
 #   - index size summary
 
 TMP_ROOT="${1:-${TMPDIR:-/tmp}}"
@@ -27,12 +29,14 @@ K="${6:-10}"
 PGV_STORAGE="${7:-vector}"
 PGV_EF_SEARCH="${8:-64}"
 SHNSW_EF_SEARCH="${9:-96}"
+DISKANN_QUERY_SEARCH_LIST_SIZE="${10:-$PGV_EF_SEARCH}"
+DISKANN_QUERY_RESCORE="${11:-50}"
 
 if [[ "$TMP_ROOT" != /* ]]; then
   echo "tmp_root must be absolute: $TMP_ROOT" >&2
   exit 2
 fi
-for val_name in PORT ROWS QUERIES DIM K PGV_EF_SEARCH SHNSW_EF_SEARCH; do
+for val_name in PORT ROWS QUERIES DIM K PGV_EF_SEARCH SHNSW_EF_SEARCH DISKANN_QUERY_SEARCH_LIST_SIZE DISKANN_QUERY_RESCORE; do
   val="${!val_name}"
   if ! [[ "$val" =~ ^[0-9]+$ ]] || [ "$val" -le 0 ]; then
     echo "$val_name must be a positive integer" >&2
@@ -77,7 +81,7 @@ PSQL() {
 }
 
 echo "============================================================"
-echo "sorted_hnsw vs exact heap vs pgvector HNSW"
+echo "sorted_hnsw vs exact heap vs pgvector HNSW vs optional pgvectorscale DiskANN"
 echo "============================================================"
 echo "rows:    $ROWS"
 echo "queries: $QUERIES"
@@ -86,6 +90,8 @@ echo "k:       $K"
 echo "pgv:     $PGV_STORAGE"
 echo "pgv ef:  $PGV_EF_SEARCH"
 echo "sh ef:   $SHNSW_EF_SEARCH"
+echo "diskann query_search_list_size: $DISKANN_QUERY_SEARCH_LIST_SIZE"
+echo "diskann query_rescore:          $DISKANN_QUERY_RESCORE"
 echo "port:    $PORT"
 echo
 
@@ -185,6 +191,8 @@ SET jit = off;
 CREATE TEMP TABLE bench_exact(qid int, ms double precision, ids int[]);
 CREATE TEMP TABLE bench_shnsw(qid int, ms double precision, ids int[]);
 CREATE TEMP TABLE bench_pgv_run(qid int, ms double precision, ids int[]);
+CREATE TEMP TABLE bench_diskann_run(qid int, ms double precision, ids int[]);
+CREATE TEMP TABLE bench_notes(method text, status text, detail text);
 
 SET enable_seqscan = on;
 SET enable_indexscan = off;
@@ -295,9 +303,109 @@ BEGIN
 END
 \$run_pgv\$;
 
+DO \$diskann_optional\$
+DECLARE
+  q record;
+  t0 timestamptz;
+  ids int[];
+  has_vectorscale boolean;
+  has_diskann boolean;
+BEGIN
+  IF '$PGV_STORAGE' != 'vector' THEN
+    INSERT INTO bench_notes
+    VALUES ('pgvectorscale_diskann', 'skipped',
+            'requires pgv_storage=vector in this harness');
+    RETURN;
+  END IF;
+
+  SELECT EXISTS (
+    SELECT 1
+    FROM pg_available_extensions
+    WHERE name = 'vectorscale'
+  ) INTO has_vectorscale;
+
+  IF NOT has_vectorscale THEN
+    INSERT INTO bench_notes
+    VALUES ('pgvectorscale_diskann', 'skipped',
+            'vectorscale extension is not installed');
+    RETURN;
+  END IF;
+
+  EXECUTE 'CREATE EXTENSION IF NOT EXISTS vectorscale';
+
+  SELECT EXISTS (
+    SELECT 1
+    FROM pg_am
+    WHERE amname = 'diskann'
+  ) INTO has_diskann;
+
+  IF NOT has_diskann THEN
+    INSERT INTO bench_notes
+    VALUES ('pgvectorscale_diskann', 'skipped',
+            'vectorscale extension did not register diskann access method');
+    RETURN;
+  END IF;
+
+  EXECUTE 'CREATE TABLE bench_diskann(id int PRIMARY KEY, v vector($DIM))';
+  EXECUTE 'INSERT INTO bench_diskann SELECT id, v::text::vector($DIM) FROM bench_sh';
+  EXECUTE 'CREATE INDEX bench_diskann_idx ON bench_diskann USING diskann (v vector_cosine_ops)';
+  EXECUTE 'ANALYZE bench_diskann';
+
+  PERFORM set_config('diskann.query_search_list_size',
+                     '$DISKANN_QUERY_SEARCH_LIST_SIZE',
+                     false);
+  PERFORM set_config('diskann.query_rescore',
+                     '$DISKANN_QUERY_RESCORE',
+                     false);
+
+  INSERT INTO bench_notes
+  VALUES (
+    'pgvectorscale_diskann',
+    'enabled',
+    format(
+      'strict_order=materialized_exact_reorder|query_search_list_size=%s|query_rescore=%s',
+      current_setting('diskann.query_search_list_size', true),
+      current_setting('diskann.query_rescore', true)
+    )
+  );
+
+  PERFORM set_config('enable_seqscan', 'off', false);
+
+  FOR q IN SELECT * FROM bench_queries ORDER BY qid LOOP
+    PERFORM id
+    FROM bench_diskann
+    ORDER BY v <=> q.q_h
+    LIMIT $K;
+  END LOOP;
+
+  FOR q IN SELECT * FROM bench_queries ORDER BY qid LOOP
+    t0 := clock_timestamp();
+    WITH relaxed AS MATERIALIZED (
+      SELECT id, v <=> q.q_h AS distance
+      FROM bench_diskann
+      ORDER BY v <=> q.q_h
+      LIMIT $K
+    )
+    SELECT ARRAY(
+      SELECT id
+      FROM relaxed
+      ORDER BY distance
+      LIMIT $K
+    ) INTO ids;
+
+    INSERT INTO bench_diskann_run(qid, ms, ids)
+    VALUES (q.qid, EXTRACT(EPOCH FROM clock_timestamp() - t0) * 1000.0, ids);
+  END LOOP;
+EXCEPTION WHEN OTHERS THEN
+  INSERT INTO bench_notes
+  VALUES ('pgvectorscale_diskann', 'skipped', SQLERRM);
+END
+\$diskann_optional\$;
+
 WITH metrics AS (
   SELECT
     'exact_heap'::text AS method,
+    'full_exact'::text AS strict_order,
     percentile_disc(0.5) WITHIN GROUP (ORDER BY ms) AS p50_ms,
     avg(ms) AS avg_ms,
     100.0::numeric AS recall_at_k
@@ -305,6 +413,7 @@ WITH metrics AS (
   UNION ALL
   SELECT
     'sorted_hnsw',
+    'index_order',
     percentile_disc(0.5) WITHIN GROUP (ORDER BY r.ms),
     avg(r.ms),
     avg((
@@ -317,6 +426,7 @@ WITH metrics AS (
   UNION ALL
   SELECT
     '$PGV_METHOD',
+    'index_order',
     percentile_disc(0.5) WITHIN GROUP (ORDER BY r.ms),
     avg(r.ms),
     avg((
@@ -326,10 +436,25 @@ WITH metrics AS (
     ) / $K::numeric) * 100.0
   FROM bench_pgv_run r
   JOIN bench_gt g USING (qid)
+  UNION ALL
+  SELECT
+    'pgvectorscale_diskann',
+    'materialized_exact_reorder',
+    percentile_disc(0.5) WITHIN GROUP (ORDER BY r.ms),
+    avg(r.ms),
+    avg((
+      SELECT count(*)::numeric
+      FROM unnest(r.ids) x
+      WHERE x = ANY(g.ids)
+    ) / $K::numeric) * 100.0
+  FROM bench_diskann_run r
+  JOIN bench_gt g USING (qid)
+  HAVING count(*) > 0
 )
 SELECT format(
-  '%s|p50_ms=%s|avg_ms=%s|recall_at_%s=%s',
+  '%s|strict_order=%s|p50_ms=%s|avg_ms=%s|recall_at_%s=%s',
   method,
+  strict_order,
   to_char(p50_ms, 'FM999999990.000'),
   to_char(avg_ms, 'FM999999990.000'),
   $K,
@@ -341,14 +466,26 @@ ORDER BY
     WHEN 'exact_heap' THEN 1
     WHEN 'sorted_hnsw' THEN 2
     WHEN '$PGV_METHOD' THEN 3
+    WHEN 'pgvectorscale_diskann' THEN 4
     ELSE 99
   END;
 
 SELECT format(
-  'index_sizes|sorted_hnsw=%s|pgvector_hnsw=%s|bench_sh_total=%s|bench_pgv_total=%s',
+  'benchmark_note|method=%s|status=%s|detail=%s',
+  method,
+  status,
+  detail
+)
+FROM bench_notes
+ORDER BY method, status, detail;
+
+SELECT format(
+  'index_sizes|sorted_hnsw=%s|pgvector_hnsw=%s|pgvectorscale_diskann=%s|bench_sh_total=%s|bench_pgv_total=%s|bench_diskann_total=%s',
   pg_size_pretty(pg_relation_size('bench_sh_idx'::regclass)),
   pg_size_pretty(pg_relation_size('bench_pgv_idx'::regclass)),
+  COALESCE(pg_size_pretty(pg_relation_size(to_regclass('bench_diskann_idx'))), 'skipped'),
   pg_size_pretty(pg_total_relation_size('bench_sh'::regclass)),
-  pg_size_pretty(pg_total_relation_size('bench_pgv'::regclass))
+  pg_size_pretty(pg_total_relation_size('bench_pgv'::regclass)),
+  COALESCE(pg_size_pretty(pg_total_relation_size(to_regclass('bench_diskann'))), 'skipped')
 );
 SQL

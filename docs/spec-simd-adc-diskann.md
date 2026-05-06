@@ -72,6 +72,23 @@ index baseline that should be compared at the product level.
 
 Upstream source: <https://github.com/timescale/pgvectorscale>
 
+## Current Harness Status
+
+`scripts/bench_sorted_hnsw_vs_pgvector.sh` now includes an optional
+`pgvectorscale_diskann` row:
+
+- if the `vectorscale` extension is unavailable, the script emits a
+  `benchmark_note|method=pgvectorscale_diskann|status=skipped|...` line and
+  still reports the exact, `sorted_hnsw`, and pgvector rows;
+- the DiskANN row currently requires `pgv_storage=vector`; `halfvec` runs emit
+  an explicit skip note;
+- if `vectorscale` is available and registers the `diskann` access method, the
+  script creates a `diskann` index on the same synthetic vector corpus;
+- DiskANN result timing is reported with
+  `strict_order=materialized_exact_reorder`;
+- the index-size line includes `pgvectorscale_diskann` and
+  `bench_diskann_total`, or `skipped` when the optional extension is absent.
+
 ## Track A: SIMD ADC Optimization
 
 ### A1. PQ ADC

@@ -752,3 +752,5 @@ Priority order after the native-partitioning hardening pass:
    SIMD kernels behind scalar parity + platform guards, and compare
    pgvectorscale StreamingDiskANN only with versioned settings, strict-order
    behavior, recall, latency, footprint, and build cost on the same workload.
+   `scripts/bench_sorted_hnsw_vs_pgvector.sh` now includes an optional
+   fail-open `pgvectorscale_diskann` row for that comparison.
