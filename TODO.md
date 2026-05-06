@@ -695,13 +695,19 @@ PQ approach directly addresses this by eliminating TOAST reads for filtering.
 
 ## Possible Future Work
 
-- Index-only scan equivalent using zone map
-- Online compact/merge support for UUID/text PKs (requires log format redesign)
-- Extension upgrade SQL scripts for version transitions
-- pg_upgrade testing with two major PG versions
-- IVF-PQ: use SimHash or VQ partitioning + PQ codes for sub-linear scan on large datasets
-- C implementation of partitioned sorted_hnsw fanout if PL/pgSQL helper
-  overhead matters for small routed partitions
-- Scalar quantization (SQ8/SQ4) as lighter alternative to PQ for lower dimensions
-- SIMD-accelerated ADC lookup (NEON/AVX2 for distance table precomputation)
-- pgvectorscale DiskANN comparison (requires Rust/PGRX build)
+Priority order after the native-partitioning hardening pass:
+
+1. Benchmark whether `sorted_hnsw_partition_search(...)` should move from
+   PL/pgSQL to C. Current large-leaf route-first results are good, but small
+   partitions can expose helper overhead.
+2. Specify GraphRAG parent fanout: decide whether it is a global exact top-k
+   merge over routed leaves or an explicit routed-shard-only API.
+3. Add attach/detach/default-partition lifecycle regression for dynamic
+   partition-tree operations.
+4. Refine `sorted_heap_partition_maintenance_plan(...)` with tablespace/free
+   space data if relation-size headroom is too coarse for operators.
+5. Online compact/merge support for UUID/text PKs, which requires a log-format
+   redesign.
+6. Index-only scan equivalent using zone map.
+7. IVF-PQ or SQ8/SQ4 revival for sub-linear scan on very large datasets.
+8. SIMD-accelerated ADC lookup and pgvectorscale DiskANN comparison.

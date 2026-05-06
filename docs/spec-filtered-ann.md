@@ -225,10 +225,16 @@ Expected:
 Preferred order:
 
 1. Keep the current planner guard intact.
-2. Add helper-level F2 with explicit result metadata.
-3. Reuse routed GraphRAG metadata for F3 where filters are actually routing
+2. Treat F3 partition/route-aware search as the first implemented helper-level
+   contract: explicit leaf routing, local ANN, global exact rerank, fail-closed
+   leaf/index validation.
+3. Add helper-level F2 with explicit result metadata only if users need
+   filtered retrieval that does not map cleanly to whole leaves.
+4. Reuse routed GraphRAG metadata for F3 where filters are actually routing
    predicates.
-4. Only after helper contracts are tested, consider a transparent planner path
+5. Benchmark whether the current PL/pgSQL F3 helper should be moved to C before
+   adding more filtered-ANN API surface.
+6. Only after helper contracts are tested, consider a transparent planner path
    for a narrow class of safe filters.
 
 ## Quadrumvirate Notes

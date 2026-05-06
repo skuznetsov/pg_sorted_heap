@@ -371,13 +371,24 @@ Planner validation:
 
 ## Remaining Open Questions
 
-1. Should parent helpers eventually collect all validation errors instead of
-   reporting the first unsupported leaf? The dry-run plan now collects all
-   blockers; mutating helpers still fail fast to avoid partial work.
-2. Should `sorted_hnsw_partition_search(...)` eventually move from PL/pgSQL to
-   C to reduce route-first helper overhead on small partitions?
-3. Should GraphRAG parent fanout return a global exact top-k merge contract or
+Resolved in first-pass hardening:
+
+- Parent maintenance validation: the dry-run plan now collects all blockers;
+  mutating helpers still fail fast to avoid partial work.
+- Route-first HNSW safety: explicit `leaf_relids` are validated against the
+  requested parent, and every selected sorted_heap leaf must have a valid
+  leaf-local `sorted_hnsw` index.
+
+Still open for the next phase:
+
+1. Should `sorted_hnsw_partition_search(...)` move from PL/pgSQL to C to reduce
+   route-first helper overhead on small partitions?
+2. Should GraphRAG parent fanout return a global exact top-k merge contract or
    require explicit routed-shard APIs only?
+3. Should partition maintenance plans include tablespace/free-space data, or is
+   relation-size headroom enough for the stable SQL contract?
+4. Should attach/detach/default-partition lifecycle get a dedicated regression
+   block, beyond the current nested/mixed/empty partition coverage?
 
 ## Definition of Done
 

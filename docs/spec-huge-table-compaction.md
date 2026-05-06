@@ -144,6 +144,8 @@ Future tests:
 - verify failure reporting when one later leaf cannot acquire lock;
 - refine the dry-run estimate with free-space / tablespace data if operator
   demand justifies it.
+- add attach/detach/default-partition lifecycle regression if users start
+  managing sorted_heap partition trees dynamically.
 
 ## Quadrumvirate Notes
 
