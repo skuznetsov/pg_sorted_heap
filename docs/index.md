@@ -101,8 +101,12 @@ At 100M rows, a point query reads **1 buffer** (vs 8 for btree, 519,906 for seq 
   pruning, `sorted_hnsw` Index AM for `svec` and `hsvec`, and the narrow
   fact-shaped GraphRAG API.
 - **Beta:** Lower-level GraphRAG helpers/wrappers, code-corpus reference
-  contracts, and the FlashHadamard experimental retrieval lane.
+  contracts, and partition-aware helper contracts.
+- **Experimental:** FlashHadamard and TurboQuant research/benchmark lanes.
 - **Legacy/manual:** IVF-PQ and sidecar HNSW paths.
+
+See the [Stability Matrix](stability-matrix) for the full stable, beta,
+experimental, and legacy/manual boundary.
 
 ## Contract specs
 

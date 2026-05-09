@@ -52,6 +52,9 @@ plus planner-integrated HNSW search.
 - Lower-level GraphRAG expand/rerank helpers and scan wrappers
 - Code-corpus and snippet-oriented GraphRAG contracts that currently live
   in benchmark/reference logic
+
+### Experimental
+
 - FlashHadamard experimental retrieval path:
   - SQL surface in `sql/flashhadamard_experimental.sql`
   - current canonical point: exhaustive parallel engine scan on the
@@ -926,6 +929,8 @@ SET sorted_heap.ann_timing = on;                 -- timing breakdown in DEBUG1
 ## Documentation
 
 - [Quick Start](docs/quickstart.md)
+- [Stability Matrix](docs/stability-matrix.md) -- stable, beta, experimental,
+  and legacy/manual surface boundaries
 - [Vector Search](docs/vector-search.md) -- `sorted_hnsw`, IVF-PQ, sidecar HNSW
 - [Filtered ANN Contracts](docs/spec-filtered-ann.md) -- proposed safe modes for filtered vector retrieval
 - [Zone-Map-Only Fast Paths](docs/spec-zone-map-only-fast-paths.md) -- why current zone maps are page pruning, not true index-only scans
