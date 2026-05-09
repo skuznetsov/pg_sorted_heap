@@ -5,11 +5,8 @@
 .github/** export-ignore
 .ruff_cache/** export-ignore
 
-CLAUDE_*.md export-ignore
 TODO.md export-ignore
 docs/announcement-0.13.0.md export-ignore
-docs/turboquant-consumer-plan.md export-ignore
 scripts/bench_hnsw_pg.py export-ignore
-scripts/build_hnsw_graph.py export-ignore
 scripts/ingest_gutenberg_gptoss_sh.py export-ignore
 scripts/sim_hierarchical_graph.py export-ignore
