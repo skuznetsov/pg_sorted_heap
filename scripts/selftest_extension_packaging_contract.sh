@@ -47,11 +47,17 @@ provides = meta.get("provides", {})
 if "pg_sorted_heap" not in provides:
     raise SystemExit("META.json missing provides.pg_sorted_heap")
 
+expected_release_sql = f"sql/pg_sorted_heap--{version}.sql"
 for provide_name, provide in provides.items():
     if provide.get("version") != version:
         raise SystemExit(
             f"META.json provides.{provide_name}.version mismatch: "
             f"{provide.get('version')} != {version}"
+        )
+    if provide_name == "pg_sorted_heap" and provide.get("file") != expected_release_sql:
+        raise SystemExit(
+            "META.json provides.pg_sorted_heap.file mismatch: "
+            f"expected {expected_release_sql}, got {provide.get('file')}"
         )
     for key in ("file", "docfile"):
         path = provide.get(key)
