@@ -6,8 +6,10 @@ find the right category without relying on filename memory.
 
 ## Release gates
 
-These scripts are part of the product-quality safety net and are composed by
-`make test-release`.
+These scripts are the main script-backed pieces of the product-quality safety
+net. `make test-release` also runs Makefile-level gates such as
+`policy-safety-selftest` and GraphRAG `installcheck`, so treat the Makefile as
+the source of truth for exact release composition.
 
 - `run_pg_core_regression_smoke.sh`
 - `test_dump_restore.sh`
@@ -21,6 +23,11 @@ These scripts are part of the product-quality safety net and are composed by
 - `test_graph_rag_lifecycle.sh`
 - `test_graph_rag_crash_recovery.sh`
 - `test_graph_rag_concurrent.sh`
+
+Related Makefile-level release gates:
+
+- `policy-safety-selftest`
+- GraphRAG `installcheck REGRESS='pg_sorted_heap sorted_hnsw graph_rag'`
 
 ## Product benchmarks
 
