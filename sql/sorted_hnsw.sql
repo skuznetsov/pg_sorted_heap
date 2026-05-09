@@ -121,6 +121,12 @@ SELECT bool_and((row_data->>'bucket')::int = 2) AS part_selected_bucket_ok
 FROM sorted_hnsw_partition_search(
     'hnsw_part'::regclass, 'v', '[1,0,0,0]', 5, 5,
     ARRAY['hnsw_part_2'::regclass]);
+COPY (
+SELECT count(*)
+FROM sorted_hnsw_partition_search(
+    'hnsw_part'::regclass, 'v', '[1,0,0,0]', 5, 5,
+    ARRAY[]::regclass[])
+) TO STDOUT;
 SELECT requested_top_k, effective_local_k, selected_leaves,
        returned_rows, underfilled, fallback
 FROM sorted_hnsw_partition_search_status(

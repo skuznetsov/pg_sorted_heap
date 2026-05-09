@@ -6,7 +6,7 @@ nav_order: 15
 
 # Spec: Declarative Partitioning Support
 
-Status: partially implemented
+Status: implemented first pass
 Risk tier: CAUTION
 Primary goal: make `sorted_heap` operationally useful for very large logical
 tables by supporting partition-scoped maintenance and observability.
@@ -93,11 +93,14 @@ Current verified coverage:
   normal `Merge Append` over leaf `sorted_hnsw` ordered index scans.
 - Explicit `sorted_hnsw_partition_search(...)` supports route-first vector
   search over all leaves or a selected leaf set, with global exact rerank over
-  local candidate pools. It requires a valid leaf-local `sorted_hnsw` index on
-  every selected sorted_heap leaf, verifies that explicit selected leaves
+  local candidate pools. It now executes the per-leaf search through the
+  `sorted_hnsw` Index AM in C, requires a valid leaf-local `sorted_hnsw` index
+  on every selected sorted_heap leaf, verifies that explicit selected leaves
   belong to the requested parent, and fails closed if that contract is not met.
-- Broader parent-query shapes still need expansion tests before we claim
-  complete planner coverage.
+- Covered parent query shapes now include equality, range, `IN`, literal
+  `ANY(array)`, and generic prepared runtime-bound predicates.
+- Arbitrary transparent parent-dispatched ANN/GraphRAG planner support is not
+  part of the first-pass contract.
 
 ### Parent maintenance
 
@@ -224,11 +227,12 @@ Current status:
 
 - Covered by `SH23-3` regression for a range-partitioned parent with
   sorted_heap leaves, partition key equality, and primary-key range predicate.
-- Also covered for a multi-leaf parent query with a partition-key range that
-  reaches both leaves and produces at least two `SortedHeapScan` child plans.
-- Generic prepared parent query is covered with `plan_cache_mode =
-  force_generic_plan`; the plan uses runtime bounds and the execution returns
-  the expected count.
+- Also covered for multi-leaf parent queries with partition-key range, `IN`,
+  and literal `ANY(array)` predicates that reach both leaves and produce at
+  least two `SortedHeapScan` child plans.
+- Generic prepared parent queries are covered with `plan_cache_mode =
+  force_generic_plan` for equality and `ANY($1)` predicates; the plans use
+  runtime bounds and execution returns the expected counts.
 
 ### P2. Parent status reports all leaves
 
@@ -424,6 +428,5 @@ Current completion state:
   runtime-bound shapes, lock/free-space documentation, optional lock-wait
   smoke, upgrade-path SQL, route-first partitioned HNSW helper, and explicit
   routed GraphRAG parent/shard fanout policy.
-- Open: optional C implementation for the partitioned HNSW helper, plus any
-  future transparent parent-dispatched GraphRAG/ANN planner path as a separate
-  spec.
+- Open: any future transparent parent-dispatched GraphRAG/ANN planner path as
+  a separate spec.

@@ -201,6 +201,13 @@ FROM sorted_hnsw_partition_search(
  t
 (1 row)
 
+COPY (
+SELECT count(*)
+FROM sorted_hnsw_partition_search(
+    'hnsw_part'::regclass, 'v', '[1,0,0,0]', 5, 5,
+    ARRAY[]::regclass[])
+) TO STDOUT;
+0
 SELECT requested_top_k, effective_local_k, selected_leaves,
        returned_rows, underfilled, fallback
 FROM sorted_hnsw_partition_search_status(

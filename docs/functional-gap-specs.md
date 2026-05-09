@@ -144,6 +144,9 @@ Current state:
 - `sorted_hnsw_partition_search(..., exact_fallback := true)` now lets callers
   explicitly replace an underfilled selected-leaf ANN pool with exact rerank
   over the same selected leaves.
+- `sorted_hnsw_partition_search(...)` now uses a C SRF over the leaf-local
+  `sorted_hnsw` Index AM rather than PL/pgSQL dynamic fanout, preserving the
+  public SQL contract while removing selected-leaf orchestration overhead.
 
 Risk:
 
@@ -158,9 +161,10 @@ Target direction:
   promoting any filtered ANN path into the planner.
 - Treat exact fallback as an explicit selected-leaf helper mode, not a generic
   `WHERE`-qual planner mode.
-- Treat a C implementation of `sorted_hnsw_partition_search(...)` as a
-  benchmark-gated follow-up, not as a correctness requirement for filtered ANN.
-  See `docs/spec-partitioned-hnsw-c-helper.md`.
+- Keep transparent filtered ANN planner support gated behind explicit
+  underfill/global-merge semantics. The C partition helper closes the
+  route-first helper overhead gap, but it does not by itself make arbitrary
+  `WHERE`-qualified KNN safe.
 
 ### G4. Parent-level observability
 

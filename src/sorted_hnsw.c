@@ -12,9 +12,13 @@
 #include "access/reloptions.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "catalog/pg_inherits.h"
+#include "catalog/pg_am.h"
+#include "catalog/pg_type_d.h"
 #include "catalog/index.h"
 #include "catalog/pg_type.h"
 #include "commands/vacuum.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "optimizer/cost.h"
@@ -22,11 +26,14 @@
 #include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
+#include "utils/jsonb.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/float.h"
 #include "utils/selfuncs.h"
 #include "utils/builtins.h"
+#include "utils/array.h"
 #include "optimizer/optimizer.h"
 #include "common/pg_prng.h"
 #include "storage/smgr.h"
@@ -520,6 +527,7 @@ shnsw_sq8_buffer_bytes(int n_nodes, int dim)
 PG_FUNCTION_INFO_V1(sorted_hnsw_handler);
 PG_FUNCTION_INFO_V1(sorted_hnsw_scan_stats);
 PG_FUNCTION_INFO_V1(sorted_hnsw_reset_stats);
+PG_FUNCTION_INFO_V1(sorted_hnsw_partition_search);
 Datum
 sorted_hnsw_handler(PG_FUNCTION_ARGS)
 {
@@ -3676,6 +3684,611 @@ shnsw_exact_heap_fallback(Relation index, const float *query, int query_dim,
 	table_close(heap, AccessShareLock);
 
 	return n_results;
+}
+
+typedef struct ShnswPartitionLeaf
+{
+	Oid			leaf_oid;
+	char	   *leaf_name;
+	bool		is_sorted_heap;
+	bool		has_primary_key;
+	char	   *am_name;
+	AttrNumber	vector_attno;
+	Oid			vector_typid;
+	int32		vector_typmod;
+	Oid			index_oid;
+} ShnswPartitionLeaf;
+
+typedef struct ShnswPartitionResult
+{
+	Oid			leaf_oid;
+	char	   *leaf_name;
+	float8		distance;
+	Datum		row_data;
+	ItemPointerData tid;
+} ShnswPartitionResult;
+
+static char *
+shnsw_am_name(Oid amoid)
+{
+	HeapTuple	tup;
+	Form_pg_am	amform;
+	char	   *name;
+
+	if (!OidIsValid(amoid))
+		return NULL;
+
+	tup = SearchSysCache1(AMOID, ObjectIdGetDatum(amoid));
+	if (!HeapTupleIsValid(tup))
+		return NULL;
+
+	amform = (Form_pg_am) GETSTRUCT(tup);
+	name = pstrdup(NameStr(amform->amname));
+	ReleaseSysCache(tup);
+
+	return name;
+}
+
+static char *
+shnsw_regclass_name(Oid relid)
+{
+	Oid			typoutput;
+	bool		typisvarlena;
+
+	getTypeOutputInfo(REGCLASSOID, &typoutput, &typisvarlena);
+	return OidOutputFunctionCall(typoutput, ObjectIdGetDatum(relid));
+}
+
+static bool
+shnsw_oid_in_list(Oid oid, const Oid *oids, int count)
+{
+	int			i;
+
+	for (i = 0; i < count; i++)
+	{
+		if (oids[i] == oid)
+			return true;
+	}
+	return false;
+}
+
+static Datum
+shnsw_slot_to_jsonb(Relation rel, TupleTableSlot *slot)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	Datum	   *args;
+	bool	   *nulls;
+	Oid		   *types;
+	int			nargs = 0;
+	int			i;
+
+	args = palloc0(sizeof(Datum) * desc->natts * 2);
+	nulls = palloc0(sizeof(bool) * desc->natts * 2);
+	types = palloc0(sizeof(Oid) * desc->natts * 2);
+
+	slot_getallattrs(slot);
+
+	for (i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+		bool		isnull;
+
+		if (att->attisdropped)
+			continue;
+
+		args[nargs] = CStringGetTextDatum(NameStr(att->attname));
+		nulls[nargs] = false;
+		types[nargs] = TEXTOID;
+		nargs++;
+
+		args[nargs] = slot_getattr(slot, att->attnum, &isnull);
+		nulls[nargs] = isnull;
+		types[nargs] = att->atttypid;
+		nargs++;
+	}
+
+	return jsonb_build_object_worker(nargs, args, nulls, types, false, false);
+}
+
+static void
+shnsw_partition_result_append(ShnswPartitionResult **results, int *n_results,
+							  int *cap_results, Oid leaf_oid,
+							  const char *leaf_name, float8 distance,
+							  ItemPointer tid, Datum row_data)
+{
+	if (*n_results >= *cap_results)
+	{
+		*cap_results = (*cap_results == 0) ? 16 : (*cap_results * 2);
+		if (*results == NULL)
+			*results = palloc(sizeof(ShnswPartitionResult) * (*cap_results));
+		else
+			*results = repalloc(*results,
+								 sizeof(ShnswPartitionResult) * (*cap_results));
+	}
+
+	(*results)[*n_results].leaf_oid = leaf_oid;
+	(*results)[*n_results].leaf_name = pstrdup(leaf_name);
+	(*results)[*n_results].distance = distance;
+	(*results)[*n_results].row_data = row_data;
+	if (tid)
+		ItemPointerCopy(tid, &(*results)[*n_results].tid);
+	else
+		ItemPointerSetInvalid(&(*results)[*n_results].tid);
+	(*n_results)++;
+}
+
+static int
+shnsw_partition_result_cmp(const void *a, const void *b)
+{
+	const ShnswPartitionResult *ra = (const ShnswPartitionResult *) a;
+	const ShnswPartitionResult *rb = (const ShnswPartitionResult *) b;
+
+	if (ra->distance < rb->distance)
+		return -1;
+	if (ra->distance > rb->distance)
+		return 1;
+
+	if (ra->leaf_oid < rb->leaf_oid)
+		return -1;
+	if (ra->leaf_oid > rb->leaf_oid)
+		return 1;
+
+	if (ItemPointerGetBlockNumber(&ra->tid) < ItemPointerGetBlockNumber(&rb->tid))
+		return -1;
+	if (ItemPointerGetBlockNumber(&ra->tid) > ItemPointerGetBlockNumber(&rb->tid))
+		return 1;
+	if (ItemPointerGetOffsetNumber(&ra->tid) < ItemPointerGetOffsetNumber(&rb->tid))
+		return -1;
+	if (ItemPointerGetOffsetNumber(&ra->tid) > ItemPointerGetOffsetNumber(&rb->tid))
+		return 1;
+	return 0;
+}
+
+static int
+shnsw_partition_leaf_cmp(const void *a, const void *b)
+{
+	const ShnswPartitionLeaf *la = (const ShnswPartitionLeaf *) a;
+	const ShnswPartitionLeaf *lb = (const ShnswPartitionLeaf *) b;
+
+	return strcmp(la->leaf_name, lb->leaf_name);
+}
+
+static Oid *
+shnsw_partition_parse_selected(ArrayType *arr, int *nselected)
+{
+	Datum	   *datums;
+	bool	   *nulls;
+	int			nelems;
+	Oid		   *selected;
+	int			i;
+	int			n = 0;
+
+	deconstruct_array(arr, REGCLASSOID, sizeof(Oid), true, TYPALIGN_INT,
+					  &datums, &nulls, &nelems);
+	selected = palloc0(sizeof(Oid) * Max(nelems, 1));
+	for (i = 0; i < nelems; i++)
+	{
+		Oid			relid;
+
+		if (nulls[i])
+			continue;
+		relid = DatumGetObjectId(datums[i]);
+		if (!shnsw_oid_in_list(relid, selected, n))
+			selected[n++] = relid;
+	}
+	*nselected = n;
+	return selected;
+}
+
+static void
+shnsw_partition_find_hnsw_index(ShnswPartitionLeaf *leaf)
+{
+	Relation	rel;
+	List	   *index_oids;
+	ListCell   *lc;
+
+	rel = table_open(leaf->leaf_oid, AccessShareLock);
+	index_oids = RelationGetIndexList(rel);
+
+	foreach(lc, index_oids)
+	{
+		Oid			idxoid = lfirst_oid(lc);
+		Relation	idx;
+		char	   *amname;
+
+		idx = index_open(idxoid, AccessShareLock);
+		amname = shnsw_am_name(idx->rd_rel->relam);
+		if (amname != NULL &&
+			strcmp(amname, "sorted_hnsw") == 0 &&
+			idx->rd_index->indisvalid &&
+			idx->rd_index->indisready &&
+			idx->rd_index->indnkeyatts == 1 &&
+			idx->rd_index->indkey.values[0] == leaf->vector_attno &&
+			heap_attisnull(idx->rd_indextuple, Anum_pg_index_indpred, NULL) &&
+			heap_attisnull(idx->rd_indextuple, Anum_pg_index_indexprs, NULL))
+		{
+			leaf->index_oid = idxoid;
+			index_close(idx, AccessShareLock);
+			break;
+		}
+		index_close(idx, AccessShareLock);
+	}
+
+	list_free(index_oids);
+	table_close(rel, AccessShareLock);
+}
+
+static Datum
+shnsw_partition_input_query(const char *query, Oid typid, int32 typmod)
+{
+	Oid			typinput;
+	Oid			typioparam;
+
+	getTypeInputInfo(typid, &typinput, &typioparam);
+	return OidInputFunctionCall(typinput, (char *) query, typioparam, typmod);
+}
+
+static void
+shnsw_partition_collect_index_results(ShnswPartitionLeaf *leaf,
+									  const char *query,
+									  int local_limit,
+									  ShnswPartitionResult **results,
+									  int *n_results,
+									  int *cap_results)
+{
+	Relation	heap;
+	Relation	index;
+	Snapshot	snapshot;
+	TupleTableSlot *slot;
+	IndexScanDesc iscan;
+	ScanKeyData	orderby;
+	Datum		query_datum;
+	int			n_leaf = 0;
+
+	heap = table_open(leaf->leaf_oid, AccessShareLock);
+	index = index_open(leaf->index_oid, AccessShareLock);
+	snapshot = GetActiveSnapshot();
+	slot = table_slot_create(heap, NULL);
+	query_datum = shnsw_partition_input_query(query, leaf->vector_typid,
+											  leaf->vector_typmod);
+
+#if PG_VERSION_NUM < 180000
+	iscan = index_beginscan(heap, index, snapshot, 0, 1);
+#else
+	iscan = index_beginscan(heap, index, snapshot, NULL, 0, 1);
+#endif
+
+	memset(&orderby, 0, sizeof(orderby));
+	orderby.sk_attno = 1;
+	orderby.sk_strategy = InvalidStrategy;
+	orderby.sk_subtype = leaf->vector_typid;
+	orderby.sk_collation = InvalidOid;
+	orderby.sk_argument = query_datum;
+
+	index_rescan(iscan, NULL, 0, &orderby, 1);
+
+	while (n_leaf < local_limit &&
+		   index_getnext_slot(iscan, ForwardScanDirection, slot))
+	{
+		float8		distance;
+		Datum		row_data;
+
+		if (iscan->xs_orderbynulls == NULL || iscan->xs_orderbynulls[0])
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("sorted_hnsw index scan did not return distance")));
+
+		distance = DatumGetFloat8(iscan->xs_orderbyvals[0]);
+		row_data = shnsw_slot_to_jsonb(heap, slot);
+		shnsw_partition_result_append(results, n_results, cap_results,
+									  leaf->leaf_oid, leaf->leaf_name,
+									  distance, &slot->tts_tid, row_data);
+		n_leaf++;
+		ExecClearTuple(slot);
+	}
+
+	index_endscan(iscan);
+	ExecDropSingleTupleTableSlot(slot);
+	index_close(index, AccessShareLock);
+	table_close(heap, AccessShareLock);
+}
+
+static void
+shnsw_partition_collect_exact_results(ShnswPartitionLeaf *leaf,
+									  const char *query,
+									  int top_k,
+									  ShnswPartitionResult **results,
+									  int *n_results,
+									  int *cap_results)
+{
+	Relation	heap;
+	Relation	index;
+	Snapshot	snapshot;
+	TupleTableSlot *slot;
+	ScanResult *scan_results;
+	int			dim;
+	ShnswVectorKind kind;
+	Datum		query_datum;
+	float	   *query_f32;
+	int			n_exact;
+	int			i;
+
+	heap = table_open(leaf->leaf_oid, AccessShareLock);
+	index = index_open(leaf->index_oid, AccessShareLock);
+	snapshot = GetActiveSnapshot();
+	slot = table_slot_create(heap, NULL);
+
+	kind = shnsw_index_vector_kind(index, &dim);
+	query_datum = shnsw_partition_input_query(query, leaf->vector_typid,
+											  leaf->vector_typmod);
+	query_f32 = palloc(sizeof(float) * dim);
+	shnsw_copy_datum_to_float4(query_datum, kind, dim, query_f32);
+
+	scan_results = palloc0(sizeof(ScanResult) * Max(top_k, 1));
+	n_exact = shnsw_exact_heap_fallback(index, query_f32, dim,
+										scan_results, top_k);
+
+	for (i = 0; i < n_exact; i++)
+	{
+		if (table_tuple_fetch_row_version(heap, &scan_results[i].tid,
+										  snapshot, slot))
+		{
+			Datum		row_data = shnsw_slot_to_jsonb(heap, slot);
+
+			shnsw_partition_result_append(results, n_results, cap_results,
+										  leaf->leaf_oid, leaf->leaf_name,
+										  scan_results[i].exact_dist,
+										  &scan_results[i].tid, row_data);
+			ExecClearTuple(slot);
+		}
+	}
+
+	pfree(scan_results);
+	pfree(query_f32);
+	ExecDropSingleTupleTableSlot(slot);
+	index_close(index, AccessShareLock);
+	table_close(heap, AccessShareLock);
+}
+
+Datum
+sorted_hnsw_partition_search(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Oid			parent = PG_GETARG_OID(0);
+	char	   *vector_column = NameStr(*PG_GETARG_NAME(1));
+	char	   *query = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	int32		top_k = PG_GETARG_INT32(3);
+	int32		local_limit;
+	Oid		   *selected = NULL;
+	int			nselected = 0;
+	bool		selected_provided = !PG_ARGISNULL(5);
+	bool		fail_on_unsupported = PG_GETARG_BOOL(6);
+	bool		exact_fallback = PG_GETARG_BOOL(7);
+	Relation	parent_rel;
+	List	   *relids = NIL;
+	ListCell   *lc;
+	ShnswPartitionLeaf *leaves = NULL;
+	int			nleaves = 0;
+	int			capleaves = 0;
+	ShnswPartitionResult *results = NULL;
+	int			n_results = 0;
+	int			cap_results = 0;
+	int			i;
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("sorted_hnsw_partition_search must be called in a set-returning context")));
+
+	if (top_k <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("top_k must be positive")));
+
+	local_limit = PG_ARGISNULL(4) ? top_k : PG_GETARG_INT32(4);
+	if (local_limit < top_k)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("local_k must be >= top_k for global partition merge")));
+	if (local_limit > sorted_hnsw_ef_search)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("local_k (%d) must be <= sorted_hnsw.ef_search (%d)",
+						local_limit, sorted_hnsw_ef_search),
+				 errhint("Increase sorted_hnsw.ef_search or lower local_k.")));
+
+	if (selected_provided)
+		selected = shnsw_partition_parse_selected(PG_GETARG_ARRAYTYPE_P(5),
+												  &nselected);
+
+	parent_rel = table_open(parent, AccessShareLock);
+	if (parent_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		relids = find_all_inheritors(parent, AccessShareLock, NULL);
+	else if (parent_rel->rd_rel->relkind == RELKIND_RELATION &&
+			 parent_rel->rd_tableam == &sorted_heap_am_routine)
+		relids = list_make1_oid(parent);
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("%s is neither a partitioned table nor a sorted_heap table",
+						shnsw_regclass_name(parent))));
+	table_close(parent_rel, AccessShareLock);
+
+	foreach(lc, relids)
+	{
+		Oid			relid = lfirst_oid(lc);
+		Relation	rel;
+		ShnswPartitionLeaf *leaf;
+		AttrNumber	attno;
+
+		rel = table_open(relid, AccessShareLock);
+		if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		{
+			table_close(rel, AccessShareLock);
+			continue;
+		}
+
+		if (selected_provided && !shnsw_oid_in_list(relid, selected, nselected))
+		{
+			table_close(rel, AccessShareLock);
+			continue;
+		}
+
+		if (nleaves >= capleaves)
+		{
+			capleaves = (capleaves == 0) ? 8 : capleaves * 2;
+			if (leaves == NULL)
+				leaves = palloc(sizeof(ShnswPartitionLeaf) * capleaves);
+			else
+				leaves = repalloc(leaves,
+								  sizeof(ShnswPartitionLeaf) * capleaves);
+		}
+		leaf = &leaves[nleaves++];
+		memset(leaf, 0, sizeof(*leaf));
+		leaf->leaf_oid = relid;
+		leaf->leaf_name = shnsw_regclass_name(relid);
+		leaf->is_sorted_heap = (rel->rd_tableam == &sorted_heap_am_routine);
+		leaf->am_name = leaf->is_sorted_heap ? pstrdup("sorted_heap") :
+			(rel->rd_rel->relam != InvalidOid ? shnsw_am_name(rel->rd_rel->relam) :
+			 pstrdup(rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE ? "foreign" : "unknown"));
+		if (!rel->rd_indexvalid)
+			RelationGetIndexList(rel);
+		leaf->has_primary_key = OidIsValid(rel->rd_pkindex);
+
+		attno = get_attnum(relid, vector_column);
+		if (attno != InvalidAttrNumber)
+		{
+			Form_pg_attribute att = TupleDescAttr(RelationGetDescr(rel), attno - 1);
+
+			leaf->vector_attno = attno;
+			leaf->vector_typid = att->atttypid;
+			leaf->vector_typmod = att->atttypmod;
+		}
+
+		table_close(rel, AccessShareLock);
+	}
+
+	if (selected_provided)
+	{
+		for (i = 0; i < nselected; i++)
+		{
+			bool		found = false;
+			int			j;
+
+			for (j = 0; j < nleaves; j++)
+			{
+				if (leaves[j].leaf_oid == selected[i])
+				{
+					found = true;
+					break;
+				}
+			}
+			if (!found)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("selected leaf %s is not a leaf of partition parent %s",
+								shnsw_regclass_name(selected[i]),
+								shnsw_regclass_name(parent))));
+		}
+	}
+
+	if (nleaves > 1)
+		qsort(leaves, nleaves, sizeof(ShnswPartitionLeaf),
+			  shnsw_partition_leaf_cmp);
+
+	for (i = 0; i < nleaves; i++)
+	{
+		ShnswPartitionLeaf *leaf = &leaves[i];
+		ShnswVectorKind kind;
+
+		if (!leaf->is_sorted_heap || !leaf->has_primary_key)
+		{
+			if (fail_on_unsupported)
+			{
+				if (!leaf->is_sorted_heap)
+					ereport(ERROR,
+							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+							 errmsg("unsupported partition leaf %s: access method is %s",
+									leaf->leaf_name,
+									leaf->am_name ? leaf->am_name : "unknown")));
+				else
+					ereport(ERROR,
+							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+							 errmsg("unsupported sorted_heap partition leaf %s: primary key is required",
+									leaf->leaf_name)));
+			}
+			continue;
+		}
+
+		if (leaf->vector_attno == InvalidAttrNumber)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_COLUMN),
+					 errmsg("vector column %s does not exist on partition leaf %s",
+							vector_column, leaf->leaf_name)));
+
+		kind = shnsw_vector_kind(leaf->vector_typid);
+		if (kind == SHNSW_VECTOR_UNSUPPORTED)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("vector column %s.%s must be svec or hsvec, got %s",
+							leaf->leaf_name, vector_column,
+							format_type_be(leaf->vector_typid))));
+
+		shnsw_partition_find_hnsw_index(leaf);
+		if (!OidIsValid(leaf->index_oid))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("partition leaf %s must have a valid sorted_hnsw index on column %s",
+							leaf->leaf_name, vector_column),
+					 errhint("Create a leaf-local sorted_hnsw index before calling sorted_hnsw_partition_search.")));
+	}
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	for (i = 0; i < nleaves; i++)
+	{
+		if (!leaves[i].is_sorted_heap || !leaves[i].has_primary_key ||
+			!OidIsValid(leaves[i].index_oid))
+			continue;
+		shnsw_partition_collect_index_results(&leaves[i], query, local_limit,
+											  &results, &n_results,
+											  &cap_results);
+	}
+
+	if (exact_fallback && n_results < top_k)
+	{
+		results = NULL;
+		n_results = 0;
+		cap_results = 0;
+		for (i = 0; i < nleaves; i++)
+		{
+			if (!leaves[i].is_sorted_heap || !leaves[i].has_primary_key ||
+				!OidIsValid(leaves[i].index_oid))
+				continue;
+			shnsw_partition_collect_exact_results(&leaves[i], query, top_k,
+												  &results, &n_results,
+												  &cap_results);
+		}
+	}
+
+	if (n_results > 1)
+		qsort(results, n_results, sizeof(ShnswPartitionResult),
+			  shnsw_partition_result_cmp);
+
+	for (i = 0; i < n_results && i < top_k; i++)
+	{
+		Datum		values[4];
+		bool		nulls[4] = {false, false, false, false};
+
+		values[0] = ObjectIdGetDatum(results[i].leaf_oid);
+		values[1] = CStringGetTextDatum(results[i].leaf_name);
+		values[2] = Float8GetDatum(results[i].distance);
+		values[3] = results[i].row_data;
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+							 values, nulls);
+	}
+
+	PG_RETURN_NULL();
 }
 
 /* ================================================================

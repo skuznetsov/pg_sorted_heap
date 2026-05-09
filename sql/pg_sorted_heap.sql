@@ -2771,6 +2771,16 @@ SELECT sh23_plan_count(
     'SELECT * FROM sh23_parent WHERE tenant_id BETWEEN 1 AND 2 AND id BETWEEN 10 AND 20',
     'Custom Scan (SortedHeapScan)') >= 2
     AS sh23_parent_multi_leaf_sorted_heap_scan;
+COPY (
+SELECT sh23_plan_count(
+    'SELECT * FROM sh23_parent WHERE tenant_id IN (1, 2) AND id BETWEEN 10 AND 20',
+    'Custom Scan (SortedHeapScan)') >= 2
+) TO STDOUT;
+COPY (
+SELECT sh23_plan_count(
+    'SELECT * FROM sh23_parent WHERE tenant_id = ANY (ARRAY[1, 2]) AND id BETWEEN 10 AND 20',
+    'Custom Scan (SortedHeapScan)') >= 2
+) TO STDOUT;
 
 SET plan_cache_mode = force_generic_plan;
 PREPARE sh23_parent_count_q(int, int, int) AS
@@ -2782,6 +2792,26 @@ SELECT sh23_plan_contains(
     AS sh23_parent_generic_runtime_bounds;
 EXECUTE sh23_parent_count_q(1, 10, 20);
 DEALLOCATE sh23_parent_count_q;
+PREPARE sh23_parent_any_count_q(int[], int, int) AS
+    SELECT count(*) FROM sh23_parent
+    WHERE tenant_id = ANY ($1) AND id BETWEEN $2 AND $3;
+COPY (
+SELECT sh23_plan_contains(
+    'EXECUTE sh23_parent_any_count_q(ARRAY[1,2], 10, 20)',
+    'runtime bounds')
+) TO STDOUT;
+DO $$
+DECLARE
+    n int;
+BEGIN
+    EXECUTE 'EXECUTE sh23_parent_any_count_q(ARRAY[1,2], 10, 20)' INTO n;
+    IF n != 22 THEN
+        RAISE EXCEPTION 'sh23_parent_generic_any_count_FAIL: %', n;
+    END IF;
+    RAISE NOTICE 'sh23_parent_generic_any_count_ok';
+END;
+$$;
+DEALLOCATE sh23_parent_any_count_q;
 RESET plan_cache_mode;
 
 SELECT count(*) AS sh23_scan_stats_leaf_rows,

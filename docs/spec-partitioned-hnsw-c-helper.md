@@ -6,10 +6,11 @@ nav_order: 22
 
 # Spec: Partitioned HNSW C Helper Gate
 
-Status: proposed
+Status: implemented
 Risk tier: CAUTION
-Primary goal: decide when `sorted_hnsw_partition_search(...)` should move from
-PL/pgSQL orchestration to a C implementation without changing the SQL contract.
+Primary goal: keep `sorted_hnsw_partition_search(...)` on the same SQL
+contract while executing the per-leaf route-first search through the
+`sorted_hnsw` Index AM instead of PL/pgSQL dynamic fanout.
 
 ## Problem
 
@@ -24,13 +25,14 @@ ANN contract for declarative partitions:
 - optionally replace an underfilled ANN pool with an exact rerank over the
   same selected leaves when `exact_fallback := true`.
 
-The current implementation is PL/pgSQL that builds one dynamic `UNION ALL`
-query across selected leaves. This is simple and safe, but route-first latency
-on small partitions can expose orchestration overhead.
+The original implementation was PL/pgSQL that built one dynamic `UNION ALL`
+query across selected leaves. That was simple and safe, but route-first latency
+on small partitions exposed orchestration overhead. The current implementation
+is a C SRF bound to the same public SQL function.
 
 ## Current Evidence
 
-Local PostgreSQL 18 benchmark, `8 x 50K` rows, self-query top-10:
+Historical local PostgreSQL 18 baseline, `8 x 50K` rows, self-query top-10:
 
 | Method | Average latency | Recall@10 |
 |---|---:|---:|
@@ -39,14 +41,29 @@ Local PostgreSQL 18 benchmark, `8 x 50K` rows, self-query top-10:
 | `parent_filtered_exact` | `8.849 ms` | `100.0%` |
 | `helper_all_leaves` | `23-25 ms` | workload-dependent |
 
+Current C/Index-AM benchmark on the same default harness shape,
+`8 x 50K` rows, 4 queries, `dim=16`, `k=10`, `local_k=32`,
+`ef_search=64`:
+
+| Method | avg ms | p50 ms | p95 ms | Recall@10 |
+|---|---:|---:|---:|---:|
+| `direct_leaf_index` | `3.647` | `3.045` | `5.169` | `1.0000` |
+| `helper_selected` | `3.627` | `3.279` | `4.673` | `1.0000` |
+| `helper_selected_exact_fallback` | `3.443` | `3.344` | `4.065` | `1.0000` |
+| `parent_filtered_exact` | `9.094` | `9.100` | `9.365` | `1.0000` |
+| `helper_all_leaves` | `25.417` | `24.856` | `27.060` | `1.0000` |
+| `helper_all_leaves_exact_fallback` | `24.529` | `24.423` | `24.872` | `1.0000` |
+| `parent_all_merge_append` | `24.232` | `24.167` | `24.728` | `1.0000` |
+
 Interpretation:
 
-- the helper already beats parent filtered exact search for the selected-leaf
-  route-first workload;
-- the gap to direct leaf index scan is about `2.4 ms` on the measured small
-  partition shape;
-- this justifies a C helper only if small-leaf routed latency is a product
-  target, not as a correctness requirement.
+- the C helper preserves recall on the benchmarked self-query workload;
+- selected-leaf route-first helper latency is now effectively tied with a
+  direct leaf index scan on this benchmark shape;
+- the helper still beats parent filtered exact search for selected-leaf
+  route-first workloads;
+- all-leaf fanout remains comparable to PostgreSQL's parent `Merge Append`
+  over all leaf indexes, so the main win is route-first filtered dispatch.
 
 ## Non-Goals
 
@@ -54,8 +71,8 @@ Interpretation:
 - Do not relax fail-closed leaf/index validation.
 - Do not introduce transparent arbitrary `WHERE` filtered ANN planner support.
 - Do not concatenate local top-k lists without global exact rerank.
-- Do not replace the existing PL/pgSQL helper until the C helper matches its
-  behavior on error paths and result ordering.
+- Do not promote transparent arbitrary `WHERE` filtered ANN planner support
+  from this helper alone.
 
 ## Candidate C Contract
 
@@ -74,28 +91,30 @@ The C helper should preserve the SQL-level behavior:
 - deterministic global ordering by exact distance, with a stable tie-breaker if
   required by regression output.
 
-Implementation options:
+Implementation:
 
-1. Keep the public PL/pgSQL wrapper and call a private C SRF after catalog
-   validation.
-2. Move validation and execution fully to C, using SPI only for the local leaf
-   ordered scans.
-3. Later, bypass SPI for local leaf scans only if a safe internal Index AM scan
-   path is specified and benchmarked.
-
-Option 1 or 2 is the first viable implementation. Option 3 is a separate
-executor/internal-scan project.
+- the public SQL function is bound directly to the C symbol
+  `sorted_hnsw_partition_search`;
+- leaf discovery and validation happen in C against PostgreSQL catalogs;
+- each selected leaf is opened with `AccessShareLock`;
+- the local search uses PostgreSQL's Index AM APIs
+  (`index_beginscan`, `index_rescan`, `index_getnext_slot`) against the
+  leaf-local `sorted_hnsw` index;
+- global result ordering is by distance with stable leaf/TID tie-breakers;
+- `row_data` is built from the heap slot as `jsonb`, preserving SQL-visible
+  result shape;
+- `exact_fallback := true` still runs only when the ANN candidate pool
+  underfills `top_k`.
 
 ## Promotion Gate
 
-Promote the C helper only if the same benchmark harness shows one of:
+The C helper is promoted because the same benchmark harness shows:
 
-- selected-leaf average latency within `25%` of `direct_leaf_index` while
-  preserving `100%` self-query recall on the existing local benchmark;
-- at least `30%` lower average latency than the PL/pgSQL helper on small-leaf
-  route-first workloads;
-- materially lower p95 latency on a real routed workload where helper overhead
-  is visible in the profile.
+- selected-leaf average latency within `25%` of `direct_leaf_index`
+  (`3.627 ms` vs `3.647 ms`);
+- `100%` self-query Recall@10 on the benchmarked shape;
+- materially lower selected-leaf latency than the historical PL/pgSQL helper
+  baseline (`5.359 ms` -> `3.627 ms`, about `32%` faster).
 
 Required benchmark output:
 
@@ -152,12 +171,12 @@ Run:
 make bench-partitioned-sorted-hnsw
 ```
 
-Expected: the candidate C helper reaches one promotion condition above without
-recall regression.
+Expected: no recall regression and no loss of the selected-leaf latency tie
+with direct leaf index scan without a documented reason.
 
 ## Decision
 
-The C helper is a performance-gated follow-up, not a release blocker for the
-current route-first partitioned HNSW contract. The PL/pgSQL helper remains the
-safe default until a C implementation clears behavioral parity and benchmark
-promotion gates.
+`sorted_hnsw_partition_search(...)` now uses the C/Index-AM implementation.
+This closes the route-first helper overhead gap without changing the SQL
+contract. Transparent parent-dispatched ANN/GraphRAG planner paths remain a
+separate design problem.
