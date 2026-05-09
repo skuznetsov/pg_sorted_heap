@@ -457,9 +457,22 @@ psql -d fh_test -f scripts/bench_fh_int16_compare.sql
 4. **PG-native parallel model.** Replace experimental pthread.
 5. **Official TurboQuant comparison.** No public implementation was
    available at time of writing.
-4. **Diversity-based memory routing.** The naive similarity routing failed.
+6. **Pruned ranges scorer anomaly.** `fh_packed_score_ranges_topk` has a
+   parked correctness anomaly when `n_ranges == shortlist_m` and around
+   `FH_MAX_THREADS`: on the Gutenberg 103K store, `shortlist_m=12,nprobe=12`
+   dropped recall@10 to roughly 3% while adjacent `nprobe` values behaved
+   normally. This does not affect the current exhaustive operating point or the
+   parity gate where `nprobe >= n_segments` routes to the canonical exhaustive
+   scorer, but it must be fixed before any future pruned-search promotion.
+   Start at `src/flashhadamard.c` in `fh_packed_score_ranges_topk`; the same
+   parked branch also lost inline-fallback results when `n_ranges` exceeded
+   `FH_MAX_THREADS` because `*filled = 0` was reset before thread merge.
+   Repro: build the experimental store, compare 50-query ground truth from
+   `flashhadamard_store_scan(..., nprobe := 100)` against
+   `nprobe := 12, shortlist_m := 12`.
+7. **Diversity-based memory routing.** The naive similarity routing failed.
    Coverage/MMR-based selection might succeed but is untested. (Parked.)
-5. **Engine integration.** The current evaluator + C helper is a research
+8. **Engine integration.** The current evaluator + C helper is a research
    harness, not a production index path. Integration into pg_sorted_heap
    as a native quantization mode is the logical next step.
 
