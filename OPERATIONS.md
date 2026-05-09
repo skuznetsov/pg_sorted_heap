@@ -31,7 +31,9 @@ make policy-safety-selftest \
   UNNEST_GATE_SELFTEST_TMP_ROOT=/private/tmp
 ```
 
-Related CI lane: `.github/workflows/policy-safety-selftest.yml`.
+Related CI lane in repository checkouts:
+`.github/workflows/policy-safety-selftest.yml`. Source archives intentionally
+omit `.github`, but the local target above remains available.
 
 ## Command selection quick map
 

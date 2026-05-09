@@ -42,5 +42,13 @@ if ! rg -n 'policy-safety-selftest\.yml' "$OPERATIONS" >/dev/null; then
   echo "expected OPERATIONS to mention policy-safety-selftest workflow file" >&2
   exit 1
 fi
+if ! rg -n 'Source archives intentionally' "$OPERATIONS" >/dev/null; then
+  echo "expected OPERATIONS to mention source archives near workflow guidance" >&2
+  exit 1
+fi
+if ! rg -n 'omit `\.github`' "$OPERATIONS" >/dev/null; then
+  echo "expected OPERATIONS to clarify that source archives omit .github" >&2
+  exit 1
+fi
 
 echo "selftest_docs_policy_safety_quickstart_contract status=ok"
