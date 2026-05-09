@@ -35,6 +35,7 @@ on:
       - scripts/selftest_policy_safety_workflow_contract.sh
       - scripts/selftest_policy_safety_target_composition.sh
       - scripts/selftest_policy_safety_workflow_target_sync.sh
+      - scripts/selftest_release_archive_contract.sh
       - scripts/run_unnest_ab_perf_sentinel.sh
       - scripts/run_unnest_ab_startup_sensitivity_probe.sh
       - scripts/run_unnest_ab_startup_sensitivity_guard.sh
@@ -148,6 +149,7 @@ on:
       - scripts/selftest_policy_safety_workflow_contract.sh
       - scripts/selftest_policy_safety_target_composition.sh
       - scripts/selftest_policy_safety_workflow_target_sync.sh
+      - scripts/selftest_release_archive_contract.sh
       - scripts/run_unnest_ab_perf_sentinel.sh
       - scripts/run_unnest_ab_startup_sensitivity_probe.sh
       - scripts/run_unnest_ab_startup_sensitivity_guard.sh

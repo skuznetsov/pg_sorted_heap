@@ -53,5 +53,6 @@ require_fragment 'bash ./scripts/selftest_docs_make_sentinel_cold_observe_contra
 require_fragment 'bash ./scripts/selftest_docs_policy_safety_quickstart_contract.sh'
 require_fragment 'bash ./scripts/selftest_policy_safety_workflow_contract.sh'
 require_fragment 'bash ./scripts/selftest_policy_safety_target_composition.sh'
+require_fragment 'bash ./scripts/selftest_release_archive_contract.sh'
 
 echo "selftest_policy_safety_target_composition status=ok"

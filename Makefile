@@ -393,6 +393,7 @@ policy-safety-selftest:
 	bash ./scripts/selftest_policy_safety_workflow_contract.sh $(UNNEST_AB_SELFTEST_TMP_ROOT)
 	bash ./scripts/selftest_policy_safety_target_composition.sh $(UNNEST_AB_SELFTEST_TMP_ROOT)
 	bash ./scripts/selftest_policy_safety_workflow_target_sync.sh $(UNNEST_AB_SELFTEST_TMP_ROOT)
+	bash ./scripts/selftest_release_archive_contract.sh $(UNNEST_AB_SELFTEST_TMP_ROOT)
 
 unnest-ab-profile-boundary-history-policy-review-manifest:
 	bash ./scripts/build_unnest_ab_boundary_history_policy_review_manifest.sh "$(UNNEST_AB_NIGHTLY_POLICY_REVIEW_MANIFEST_INPUT)" "$(UNNEST_AB_NIGHTLY_POLICY_REVIEW_MANIFEST_OUT)"

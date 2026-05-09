@@ -18,7 +18,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPER="$SCRIPT_DIR/extract_pg_sorted_heap_define.sh"
-SOURCE_C="$SCRIPT_DIR/../pg_sorted_heap.c"
+SOURCE_C="$SCRIPT_DIR/../src/pg_sorted_heap.c"
 
 if [ ! -x "$HELPER" ]; then
   echo "required script is not executable: $HELPER" >&2

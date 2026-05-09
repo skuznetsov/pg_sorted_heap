@@ -12,6 +12,7 @@ on:
       - scripts/selftest_policy_safety_workflow_contract.sh
       - scripts/selftest_policy_safety_target_composition.sh
       - scripts/selftest_policy_safety_workflow_target_sync.sh
+      - scripts/selftest_release_archive_contract.sh
       - scripts/selftest_make_help_policy_review_trusted_workflow.sh
       - scripts/selftest_make_help_policy_safety_selftest.sh
       - scripts/selftest_make_unnest_ab_boundary_history_policy_review_window_trusted_workflow.sh
@@ -36,6 +37,7 @@ on:
       - scripts/selftest_policy_safety_workflow_contract.sh
       - scripts/selftest_policy_safety_target_composition.sh
       - scripts/selftest_policy_safety_workflow_target_sync.sh
+      - scripts/selftest_release_archive_contract.sh
       - scripts/selftest_make_help_policy_review_trusted_workflow.sh
       - scripts/selftest_make_help_policy_safety_selftest.sh
       - scripts/selftest_make_unnest_ab_boundary_history_policy_review_window_trusted_workflow.sh
