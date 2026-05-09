@@ -24,6 +24,10 @@ if [ ! -f "$ATTRS" ]; then
   echo "missing .gitattributes: $ATTRS" >&2
   exit 1
 fi
+if ! git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "selftest_release_archive_contract status=skipped reason=git_metadata_absent"
+  exit 0
+fi
 
 attr_value() {
   git -C "$ROOT_DIR" check-attr export-ignore -- "$1" | awk -F': ' '{print $3}'

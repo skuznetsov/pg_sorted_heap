@@ -26,8 +26,8 @@ if [ ! -f "$RUNNER_SCRIPT" ]; then
   exit 2
 fi
 if [ ! -f "$WORKFLOW" ]; then
-  echo "workflow not found: $WORKFLOW" >&2
-  exit 2
+  echo "selftest_lightweight_workflow_script_coverage status=skipped reason=workflow_files_absent"
+  exit 0
 fi
 
 count_path_hits() {

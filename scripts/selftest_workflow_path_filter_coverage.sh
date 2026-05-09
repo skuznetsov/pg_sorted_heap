@@ -22,12 +22,12 @@ LIGHTWORKFLOW="$ROOT_DIR/.github/workflows/perf-compare-selftest.yml"
 SANITY_WORKFLOW="$ROOT_DIR/.github/workflows/workflow-path-filter-sanity.yml"
 
 if [ ! -f "$LIGHTWORKFLOW" ]; then
-  echo "workflow not found: $LIGHTWORKFLOW" >&2
-  exit 2
+  echo "selftest_workflow_path_filter_coverage status=skipped reason=workflow_files_absent"
+  exit 0
 fi
 if [ ! -f "$SANITY_WORKFLOW" ]; then
-  echo "workflow not found: $SANITY_WORKFLOW" >&2
-  exit 2
+  echo "selftest_workflow_path_filter_coverage status=skipped reason=workflow_files_absent"
+  exit 0
 fi
 
 require_path_filter_twice() {

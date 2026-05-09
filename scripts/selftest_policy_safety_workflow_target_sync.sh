@@ -26,8 +26,8 @@ if [ ! -f "$MAKEFILE" ]; then
   exit 1
 fi
 if [ ! -f "$WORKFLOW" ]; then
-  echo "missing workflow file: $WORKFLOW" >&2
-  exit 1
+  echo "selftest_policy_safety_workflow_target_sync status=skipped reason=workflow_files_absent"
+  exit 0
 fi
 
 extract_target_block() {

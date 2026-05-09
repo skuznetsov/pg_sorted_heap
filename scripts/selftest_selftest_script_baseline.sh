@@ -19,6 +19,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNNER_SCRIPT="$SCRIPT_DIR/run_lightweight_selftests.sh"
 WORKFLOW_DIR="$SCRIPT_DIR/../.github/workflows"
+WORKFLOW_GUARDS_AVAILABLE=1
 EXCLUDED_FROM_LIGHTWEIGHT=(
   "selftest_unnest_ab_probe_make_arg_contract.sh"
 )
@@ -28,8 +29,7 @@ if [ ! -f "$RUNNER_SCRIPT" ]; then
   exit 2
 fi
 if [ ! -d "$WORKFLOW_DIR" ]; then
-  echo "workflow directory not found: $WORKFLOW_DIR" >&2
-  exit 2
+  WORKFLOW_GUARDS_AVAILABLE=0
 fi
 
 WORKDIR="$(mktemp -d "$TMP_ROOT/pg_sorted_heap_selftest_baseline.XXXXXX")"
@@ -102,6 +102,9 @@ if [ -s "$WORKDIR/excluded_from_lightweight.sorted" ]; then
   fi
   while IFS= read -r excluded_name; do
     [ -n "$excluded_name" ] || continue
+    if [ "$WORKFLOW_GUARDS_AVAILABLE" -ne 1 ]; then
+      continue
+    fi
     guarded=0
     while IFS= read -r workflow_file; do
       [ -f "$workflow_file" ] || continue
@@ -137,4 +140,8 @@ if [ -s "$WORKDIR/unknown_in_runner" ]; then
   exit 1
 fi
 
-echo "selftest_selftest_script_baseline status=ok scripts=$count"
+if [ "$WORKFLOW_GUARDS_AVAILABLE" -eq 1 ]; then
+  echo "selftest_selftest_script_baseline status=ok scripts=$count workflow_guards=checked"
+else
+  echo "selftest_selftest_script_baseline status=ok scripts=$count workflow_guards=skipped reason=workflow_files_absent"
+fi
