@@ -86,27 +86,63 @@ require_reference() {
   fi
 }
 
+ARCHIVE_DIR="$(mktemp -d "$TMP_ROOT/pg_sorted_heap_release_archive_contract.XXXXXX")"
+cleanup() {
+  rm -rf "$ARCHIVE_DIR"
+}
+trap cleanup EXIT
+
+git -C "$ROOT_DIR" archive --format=tar HEAD | tar -xf - -C "$ARCHIVE_DIR"
+
+require_archive_file() {
+  local path="$1"
+  if [ ! -f "$ARCHIVE_DIR/$path" ]; then
+    echo "expected source archive to contain file: $path" >&2
+    exit 1
+  fi
+}
+
+require_archive_absent() {
+  local path="$1"
+  if [ -e "$ARCHIVE_DIR/$path" ]; then
+    echo "expected source archive to omit path: $path" >&2
+    exit 1
+  fi
+}
+
 if rg -n 'CLAUDE_\*\.md[[:space:]]+export-ignore' "$ATTRS" >/dev/null; then
   echo "stale CLAUDE_*.md export-ignore rule should not be present" >&2
   exit 1
 fi
 
 require_in_archive "docs/turboquant-consumer-plan.md"
+require_archive_file "docs/turboquant-consumer-plan.md"
 require_reference 'docs/turboquant-consumer-plan\.md' "docs/flashhadamard-note.md"
 
 require_in_archive "scripts/build_hnsw_graph.py"
+require_archive_file "scripts/build_hnsw_graph.py"
 require_reference 'scripts/build_hnsw_graph\.py' "docs/vector-search.md"
 require_reference 'scripts/build_hnsw_graph\.py' "Makefile"
 
 require_export_ignored_path ".agents/example"
+require_archive_absent ".agents"
 require_export_ignored_path ".claude/settings.local.json"
+require_archive_absent ".claude"
 require_export_ignored_path ".crystal_ball/analysis_cache.db"
+require_archive_absent ".crystal_ball"
 require_export_ignored_path ".github/workflows/ci.yml"
+require_archive_absent ".github"
 require_export_ignored_path ".ruff_cache/CACHEDIR.TAG"
+require_archive_absent ".ruff_cache"
 require_export_ignored "TODO.md"
+require_archive_absent "TODO.md"
 require_export_ignored "docs/announcement-0.13.0.md"
+require_archive_absent "docs/announcement-0.13.0.md"
 require_export_ignored "scripts/bench_hnsw_pg.py"
+require_archive_absent "scripts/bench_hnsw_pg.py"
 require_export_ignored "scripts/ingest_gutenberg_gptoss_sh.py"
+require_archive_absent "scripts/ingest_gutenberg_gptoss_sh.py"
 require_export_ignored "scripts/sim_hierarchical_graph.py"
+require_archive_absent "scripts/sim_hierarchical_graph.py"
 
 echo "selftest_release_archive_contract status=ok"
