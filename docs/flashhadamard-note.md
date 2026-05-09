@@ -187,7 +187,7 @@ is fixed. Rerank overhead is negligible (<0.5ms for M=12).
 ### Robustness
 
 Stable across seeds 42/123/7/999 on vetted 50-query subset. 200-query
-runs confirm 50-query results within noise (see consumer-plan.md).
+runs confirm 50-query results within noise (see `turboquant-consumer-plan.md`).
 Earlier numbers in the evidence trail used different setups (non-TopK inner,
 different holdout splits); the canonical numbers above supersede them.
 

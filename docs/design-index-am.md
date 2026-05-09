@@ -538,10 +538,9 @@ as tombstones. REINDEX rebuilds the full graph.
 
 | File | Purpose |
 |------|---------|
-| `src/sorted_hnsw.c` | Index AM handler, build, scan, cost, vacuum |
+| `src/sorted_hnsw.c` | Index AM handler, search, build, scan, cost, vacuum |
 | `src/sorted_hnsw.h` | Page layout, node structs, constants |
 | `src/hnsw_build.c` | HNSW construction algorithm (C port) |
-| `src/hnsw_search.c` | HNSW search with SQ8 (moved from pq.c) |
 
 Estimated size: ~3000-4000 lines of new C code.
 

@@ -33,7 +33,7 @@ query → rotate → fold group scales into coeffs → packed ADC score (C helpe
 |---|---|---|
 | Core math | PolarQuant + 1-bit QJL residual | structured block-Hadamard + scalar quant + packed ADC |
 | Rotation | random orthogonal (dense, O(d^2) metadata) | seed-derived permutation + signs + FWHT (O(1) metadata) |
-| Residual correction | explicit 1-bit QJL stage | none (refuted on our workloads; see consumer-plan.md) |
+| Residual correction | explicit 1-bit QJL stage | none (refuted on our workloads; see `turboquant-consumer-plan.md`) |
 | Quantizer | Gaussian Lloyd-Max | Gaussian Lloyd-Max (shared) |
 | Scoring | not focused on packed kernel path | packed nibble ADC with transposed layout + fused C top-k |
 | Main target | KV-cache + vector search | retrieval / ANN-style packed search + KV memory (proposed) |
