@@ -66,8 +66,8 @@ if ! rg -n 'requirements-vector-tools\.txt' "$VECTOR_DOC" >/dev/null; then
   echo "expected docs/vector-search.md to mention requirements-vector-tools.txt" >&2
   exit 1
 fi
-if rg -n '/Users/sergey/Projects/C/clustered_pg/' "$VECTOR_DOC" >/dev/null; then
-  echo "unexpected machine-specific absolute workspace path in docs/vector-search.md" >&2
+if rg -n '/Users/sergey/Projects/C/clustered_pg/' "$ROOT_DIR/docs" >/dev/null; then
+  echo "unexpected machine-specific absolute workspace path in docs/" >&2
   exit 1
 fi
 if ! rg -n 'requirements-vector-tools\.txt' "$OPERATIONS" >/dev/null; then

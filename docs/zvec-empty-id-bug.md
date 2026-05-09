@@ -25,7 +25,7 @@ Environment used for the verified local repro:
 
 Repo-owned script:
 
-- [`scripts/repro_zvec_synthetic_threshold.py`](/Users/sergey/Projects/C/clustered_pg/scripts/repro_zvec_synthetic_threshold.py)
+- [`scripts/repro_zvec_synthetic_threshold.py`](../scripts/repro_zvec_synthetic_threshold.py)
 
 Command:
 
@@ -117,7 +117,7 @@ So this is not a simple "after N rows everything breaks" threshold.
 
 Repo-owned script:
 
-- [`scripts/repro_zvec_gutenberg_threshold.py`](/Users/sergey/Projects/C/clustered_pg/scripts/repro_zvec_gutenberg_threshold.py)
+- [`scripts/repro_zvec_gutenberg_threshold.py`](../scripts/repro_zvec_gutenberg_threshold.py)
 
 Current verified Gutenberg signature:
 

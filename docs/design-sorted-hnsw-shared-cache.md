@@ -14,7 +14,7 @@ therefore promotes the shared slot to a full decoded immutable scan snapshot.
 ## Problem
 
 `sorted_hnsw` already keeps a decoded scan cache per backend in
-[`src/sorted_hnsw.c`](/Users/sergey/Projects/C/clustered_pg/src/sorted_hnsw.c),
+[`src/sorted_hnsw.c`](../src/sorted_hnsw.c),
 keyed by `{relid, relfilenode, cache_gen}`.
 
 That solves repeated scans inside one backend, but every new backend still pays
@@ -106,7 +106,7 @@ to keep writable-path updates from reusing stale state.
 ## Shared memory layout
 
 Use the existing shared-memory hook pattern already present in
-[`src/sorted_heap_scan.c`](/Users/sergey/Projects/C/clustered_pg/src/sorted_heap_scan.c).
+[`src/sorted_heap_scan.c`](../src/sorted_heap_scan.c).
 
 Add:
 
@@ -201,7 +201,7 @@ That is enough to keep the branch and stop treating it as speculative.
 ## Validation plan
 
 Use the new benchmark split from
-[`scripts/bench_sorted_hnsw_fixed_graph.sh`](/Users/sergey/Projects/C/clustered_pg/scripts/bench_sorted_hnsw_fixed_graph.sh):
+[`scripts/bench_sorted_hnsw_fixed_graph.sh`](../scripts/bench_sorted_hnsw_fixed_graph.sh):
 
 - `fresh`: cross-backend cold-start cost
 - `reuse`: steady-state search cost

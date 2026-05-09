@@ -74,7 +74,7 @@ CREATE INDEX ... USING sorted_hnsw (embedding) WITH (m = 16, ef_construction = 6
 
 Benchmark harness:
 
-- [`scripts/bench_graph_rag.py`](/Users/sergey/Projects/C/clustered_pg/scripts/bench_graph_rag.py)
+- [`scripts/bench_graph_rag.py`](../scripts/bench_graph_rag.py)
 - local ephemeral PostgreSQL 18 temp cluster
 - deterministic synthetic fact graph
 - compares:
@@ -380,7 +380,7 @@ realistic payload model, not another synthetic-only extrapolation.
 
 A better falsifier now exists in:
 
-- [`scripts/bench_graph_rag_gutenberg.py`](/Users/sergey/Projects/C/clustered_pg/scripts/bench_graph_rag_gutenberg.py)
+- [`scripts/bench_graph_rag_gutenberg.py`](../scripts/bench_graph_rag_gutenberg.py)
 
 This harness uses real Gutenberg paragraphs instead of synthetic payload text.
 It builds a small text graph:
@@ -518,7 +518,7 @@ So the objective conclusion today is narrower than for `pgvector`:
 
 That instability is now isolated more sharply by the repo-owned reproducer:
 
-- [`scripts/repro_zvec_gutenberg_threshold.py`](/Users/sergey/Projects/C/clustered_pg/scripts/repro_zvec_gutenberg_threshold.py)
+- [`scripts/repro_zvec_gutenberg_threshold.py`](../scripts/repro_zvec_gutenberg_threshold.py)
 
 Current threshold signature on the lexical-hash Gutenberg corpus:
 
@@ -538,7 +538,7 @@ shape.
 That theory is now falsified by a second repo-owned reproducer on a plain
 synthetic FP32 corpus:
 
-- [`scripts/repro_zvec_synthetic_threshold.py`](/Users/sergey/Projects/C/clustered_pg/scripts/repro_zvec_synthetic_threshold.py)
+- [`scripts/repro_zvec_synthetic_threshold.py`](../scripts/repro_zvec_synthetic_threshold.py)
 
 Current synthetic signature:
 
@@ -573,7 +573,7 @@ So the stronger objective conclusion is:
 
 For an upstream-ready summary of the current evidence, see:
 
-- [`docs/zvec-empty-id-bug.md`](/Users/sergey/Projects/C/clustered_pg/docs/zvec-empty-id-bug.md)
+- [`docs/zvec-empty-id-bug.md`](./zvec-empty-id-bug.md)
 
 Two more diagnostic observations make that conclusion sharper:
 
@@ -891,8 +891,8 @@ benchmark that matches the current `cogniformerus` multihop question shape:
 
 That now exists in:
 
-- [`scripts/bench_graph_rag_multihop.py`](/Users/sergey/Projects/C/clustered_pg/scripts/bench_graph_rag_multihop.py)
-- [`scripts/sweep_graph_rag_multihop.py`](/Users/sergey/Projects/C/clustered_pg/scripts/sweep_graph_rag_multihop.py)
+- [`scripts/bench_graph_rag_multihop.py`](../scripts/bench_graph_rag_multihop.py)
+- [`scripts/sweep_graph_rag_multihop.py`](../scripts/sweep_graph_rag_multihop.py)
 
 The benchmark builds a deterministic fact graph and measures:
 
@@ -997,7 +997,7 @@ Interpretation:
 The next honest question was not API shape but ANN seed quality. That is now
 measured directly by:
 
-- [`scripts/sweep_graph_rag_multihop.py`](/Users/sergey/Projects/C/clustered_pg/scripts/sweep_graph_rag_multihop.py)
+- [`scripts/sweep_graph_rag_multihop.py`](../scripts/sweep_graph_rag_multihop.py)
 
 This harness keeps the corpus fixed per `ef_construction` and sweeps:
 
@@ -1227,7 +1227,7 @@ The next environment-variance adversary check was to rerun the same
 `5K`-chain / `10K`-row / `384D` fact benchmark on an AWS ARM64 host
 (`4 vCPU`, `8 GiB RAM`) using the repo-owned wrapper:
 
-- [`scripts/bench_graph_rag_multihop_aws.sh`](/Users/sergey/Projects/C/clustered_pg/scripts/bench_graph_rag_multihop_aws.sh)
+- [`scripts/bench_graph_rag_multihop_aws.sh`](../scripts/bench_graph_rag_multihop_aws.sh)
 
 At the previously recommended local balanced point:
 
@@ -1636,10 +1636,10 @@ recorded below.
 
 ## Repeated-build local variance
 
-- [`scripts/repeat_graph_rag_multihop_builds.py`](/Users/sergey/Projects/C/clustered_pg/scripts/repeat_graph_rag_multihop_builds.py)
-- [`scripts/repeat_graph_rag_multihop_builds_aws.sh`](/Users/sergey/Projects/C/clustered_pg/scripts/repeat_graph_rag_multihop_builds_aws.sh)
+- [`scripts/repeat_graph_rag_multihop_builds.py`](../scripts/repeat_graph_rag_multihop_builds.py)
+- [`scripts/repeat_graph_rag_multihop_builds_aws.sh`](../scripts/repeat_graph_rag_multihop_builds_aws.sh)
 
-It wraps [`scripts/bench_graph_rag_multihop.py`](/Users/sergey/Projects/C/clustered_pg/scripts/bench_graph_rag_multihop.py)
+It wraps [`scripts/bench_graph_rag_multihop.py`](../scripts/bench_graph_rag_multihop.py)
 so each repeat gets a fresh temp cluster and a fresh HNSW build, then reports
 median / min / max for selected rows.
 
@@ -1795,9 +1795,9 @@ run the path-aware GraphRAG helpers on the actual tiny multihop corpus that
 
 - source: `cogniformerus/bin/butler_small_model_eval.cr`
 - repo-owned fixture:
-  [`scripts/fixtures/graph_rag_butler_gate_seed.json`](/Users/sergey/Projects/C/clustered_pg/scripts/fixtures/graph_rag_butler_gate_seed.json)
+  [`scripts/fixtures/graph_rag_butler_gate_seed.json`](../scripts/fixtures/graph_rag_butler_gate_seed.json)
 - harness:
-  [`scripts/bench_graph_rag_butler_gate.py`](/Users/sergey/Projects/C/clustered_pg/scripts/bench_graph_rag_butler_gate.py)
+  [`scripts/bench_graph_rag_butler_gate.py`](../scripts/bench_graph_rag_butler_gate.py)
 
 This fixture is intentionally tiny:
 
@@ -1867,7 +1867,7 @@ cross-file question bank already used by Butler's own code benchmark.
 - question source:
   `cogniformerus/bin/butler_code_test.cr`
 - harness:
-  [`scripts/bench_graph_rag_code_corpus.py`](/Users/sergey/Projects/C/clustered_pg/scripts/bench_graph_rag_code_corpus.py)
+  [`scripts/bench_graph_rag_code_corpus.py`](../scripts/bench_graph_rag_code_corpus.py)
 
 This harness builds a narrow code-GraphRAG shape:
 
@@ -2749,7 +2749,7 @@ Important caveat:
 
 That code-corpus frontier is now also checked under a repeated-build protocol:
 
-- [`scripts/repeat_graph_rag_code_corpus_builds.py`](/Users/sergey/Projects/C/clustered_pg/scripts/repeat_graph_rag_code_corpus_builds.py)
+- [`scripts/repeat_graph_rag_code_corpus_builds.py`](../scripts/repeat_graph_rag_code_corpus_builds.py)
 - `3` independent fresh temp-cluster builds
 - local `facts_sh` only, same stable point:
   - `384D`
@@ -2788,7 +2788,7 @@ Interpretation:
 That same repeated-build protocol was then rerun on an AWS ARM64 host
 (`4 vCPU`, `8 GiB RAM`) using:
 
-- [`scripts/repeat_graph_rag_code_corpus_builds_aws.sh`](/Users/sergey/Projects/C/clustered_pg/scripts/repeat_graph_rag_code_corpus_builds_aws.sh)
+- [`scripts/repeat_graph_rag_code_corpus_builds_aws.sh`](../scripts/repeat_graph_rag_code_corpus_builds_aws.sh)
 - the same `3` fresh builds
 - the same minimal synced `cogniformerus` source tree and
   `butler_code_test.cr` prompt set
@@ -3032,7 +3032,7 @@ The next adversary check was a second real code corpus outside this repository:
 
 This surfaced one real harness bug first:
 
-- [`scripts/bench_graph_rag_code_corpus.py`](/Users/sergey/Projects/C/clustered_pg/scripts/bench_graph_rag_code_corpus.py)
+- [`scripts/bench_graph_rag_code_corpus.py`](../scripts/bench_graph_rag_code_corpus.py)
   originally globbed `*.cr` paths without filtering `is_file()`
 - on the `folding` tree that accidentally picked up `.crystal-cache` directories
   ending in `.cr`
