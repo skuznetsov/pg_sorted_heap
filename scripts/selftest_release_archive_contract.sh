@@ -65,6 +65,17 @@ require_export_ignored() {
   fi
 }
 
+require_export_ignored_path() {
+  local path="$1"
+  local value
+
+  value="$(attr_value "$path")"
+  if [ "$value" != "set" ]; then
+    echo "expected source archive to exclude $path, got export-ignore=$value" >&2
+    exit 1
+  fi
+}
+
 require_reference() {
   local pattern="$1"
   local path="$2"
@@ -87,6 +98,11 @@ require_in_archive "scripts/build_hnsw_graph.py"
 require_reference 'scripts/build_hnsw_graph\.py' "docs/vector-search.md"
 require_reference 'scripts/build_hnsw_graph\.py' "Makefile"
 
+require_export_ignored_path ".agents/example"
+require_export_ignored_path ".claude/settings.local.json"
+require_export_ignored_path ".crystal_ball/analysis_cache.db"
+require_export_ignored_path ".github/workflows/ci.yml"
+require_export_ignored_path ".ruff_cache/CACHEDIR.TAG"
 require_export_ignored "TODO.md"
 require_export_ignored "docs/announcement-0.13.0.md"
 require_export_ignored "scripts/bench_hnsw_pg.py"
