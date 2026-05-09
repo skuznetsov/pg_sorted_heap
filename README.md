@@ -730,47 +730,16 @@ on top of it.
 
 ## Architecture
 
-| File | Purpose |
-|------|---------|
-| `sorted_heap.h` | Meta page layout, zone map structs (v7), SortedHeapRelInfo |
-| `sorted_heap.c` | Table AM: sorted multi_insert, zone map persistence, compact, merge, vacuum |
-| `sorted_heap_scan.c` | Custom scan: planner hook, parallel scan, multi-col pruning, IN/ANY, runtime params |
-| `sorted_heap_online.c` | Online compact + merge: trigger-based copy, replay, swap |
-| `pg_sorted_heap.c` | Extension entry, legacy clustered index AM, GUC registration |
-| `svec.h` / `svec.c` | svec type (float32): I/O, typmod, NEON cosine distance `<=>` |
-| `hsvec.h` / `hsvec.c` | hsvec type (float16): I/O, cosine distance, NEON SIMD, casts |
-| `pq.h` / `pq.c` | PQ, IVF, ANN scan, sidecar HNSW search, graph scan, beam search |
-
-### Zone map details
-
-- **v7 format**: 32-byte entries with col1 + col2 min/max per page, persisted
-  sorted prefix count
-- Meta page (block 0): 250 entries in special space
-- Overflow pages: 254 entries/page, linked list (no capacity limit)
-- Updated atomically via GenericXLog during multi_insert
-- Autovacuum rebuilds zone map when validity flag is not set
-
-### Custom scan provider
-
-- Hooks into `set_rel_pathlist_hook`
-- Extracts PK bounds from WHERE clauses (constants, params, IN/ANY)
-- Binary search on monotonically sorted zone map, linear scan otherwise
-- `heap_setscanlimits(start, nblocks)` for physical block skip
-- Parallel-aware: `add_partial_path` + Gather for multi-worker scans
-- EXPLAIN: `Zone Map: N of M blocks (pruned P)`
+Use [Architecture](docs/architecture.md) for the storage, zone-map, custom scan,
+compaction, and runtime-parameter model.
 
 ## Limitations
 
-- Zone map tracks first two PK columns. Supported types: int2/4/8,
-  timestamp(tz), date, uuid, text/varchar (`COLLATE "C"`).
-- Online compact/merge not supported for UUID/text/varchar PKs.
-- UPDATE does not re-sort; use compact/merge periodically.
-- Automatic `sorted_hnsw` ordered scans currently target base-relation
-  `ORDER BY embedding <=> query LIMIT k` queries. Filtered retrieval flows
-  should use explicit materialization or the GraphRAG helper/wrapper surface.
-- `heap_setscanlimits()` only supports contiguous block ranges.
-- pg_dump/restore: compact needed after restore.
-- pg_upgrade 17 to 18: tested and verified.
+Use [Limitations](docs/limitations.md) for current behavioral boundaries and
+operational caveats.
+
+Use [Stability Matrix](docs/stability-matrix.md) before depending on beta,
+experimental, or legacy/manual APIs.
 
 ## Documentation
 
