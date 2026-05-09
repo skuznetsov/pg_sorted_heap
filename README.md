@@ -929,6 +929,7 @@ SET sorted_heap.ann_timing = on;                 -- timing breakdown in DEBUG1
 ## Documentation
 
 - [Quick Start](docs/quickstart.md)
+- [Stable API](docs/api-stable.md) -- compact application-facing API surface
 - [Stability Matrix](docs/stability-matrix.md) -- stable, beta, experimental,
   and legacy/manual surface boundaries
 - [Vector Search](docs/vector-search.md) -- `sorted_hnsw`, IVF-PQ, sidecar HNSW

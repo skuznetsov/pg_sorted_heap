@@ -4061,5 +4061,11 @@ svec_ann_scan(PG_FUNCTION_ARGS)
 }
 
 
-/* Legacy/manual graph and sidecar HNSW scan paths. */
-#include "pq_legacy_ann.inc"
+/*
+ * Legacy/manual graph and sidecar HNSW scan paths.
+ *
+ * This implementation unit is intentionally included into pq.c instead of
+ * compiled separately: it preserves the existing static helper linkage while
+ * keeping the primary PQ/IVF file readable.
+ */
+#include "pq_legacy_ann_impl.inc"

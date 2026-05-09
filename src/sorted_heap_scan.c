@@ -4740,5 +4740,10 @@ sorted_heap_graph_resolve_attrs(Relation rel, const char *caller,
 }
 
 
-/* GraphRAG expansion and rerank primitives. */
-#include "sorted_heap_scan_graphrag.inc"
+/*
+ * GraphRAG expansion and rerank primitives.
+ *
+ * This implementation unit stays in the same translation unit so the existing
+ * planner/executor/stat helper linkage and call ordering remain unchanged.
+ */
+#include "sorted_heap_scan_graphrag_impl.inc"

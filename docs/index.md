@@ -108,6 +108,9 @@ At 100M rows, a point query reads **1 buffer** (vs 8 for btree, 519,906 for seq 
 See the [Stability Matrix](stability-matrix) for the full stable, beta,
 experimental, and legacy/manual boundary.
 
+For a compact application-facing API list, see the [Stable API](api-stable).
+For the complete reference, see [SQL API](api).
+
 ## Contract specs
 
 - [Composite-PK Pruning](spec-composite-pk-pruning) -- first-pass two-column
