@@ -36,6 +36,7 @@ on:
       - scripts/selftest_policy_safety_target_composition.sh
       - scripts/selftest_policy_safety_workflow_target_sync.sh
       - scripts/selftest_release_archive_contract.sh
+      - scripts/selftest_extension_packaging_contract.sh
       - scripts/run_unnest_ab_perf_sentinel.sh
       - scripts/run_unnest_ab_startup_sensitivity_probe.sh
       - scripts/run_unnest_ab_startup_sensitivity_guard.sh
@@ -115,6 +116,9 @@ on:
       - .github/workflows/policy-safety-selftest.yml
       - .github/workflows/ci.yml
       - Makefile
+      - META.json
+      - pg_sorted_heap.control
+      - sql/**
   push:
     paths:
       - scripts/compare_perf_probe_logsets.sh
@@ -150,6 +154,7 @@ on:
       - scripts/selftest_policy_safety_target_composition.sh
       - scripts/selftest_policy_safety_workflow_target_sync.sh
       - scripts/selftest_release_archive_contract.sh
+      - scripts/selftest_extension_packaging_contract.sh
       - scripts/run_unnest_ab_perf_sentinel.sh
       - scripts/run_unnest_ab_startup_sensitivity_probe.sh
       - scripts/run_unnest_ab_startup_sensitivity_guard.sh
@@ -229,6 +234,9 @@ on:
       - .github/workflows/policy-safety-selftest.yml
       - .github/workflows/ci.yml
       - Makefile
+      - META.json
+      - pg_sorted_heap.control
+      - sql/**
 
 concurrency:
   group: perf-compare-selftest-${{ github.ref }}
