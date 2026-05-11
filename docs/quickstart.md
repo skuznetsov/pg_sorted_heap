@@ -8,7 +8,7 @@ nav_order: 2
 
 ## Requirements
 
-- PostgreSQL 17 or 18
+- PostgreSQL 16, 17, or 18
 - Standard PGXS build toolchain (`pg_config` in PATH)
 
 ## Build and install
@@ -22,8 +22,8 @@ make && make install
 To build for a specific PG version:
 
 ```bash
-make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
-make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+make PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config
+make install PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config
 ```
 
 ## Create a sorted_heap table
@@ -91,7 +91,7 @@ make test-alter-table          # ALTER TABLE DDL (36 checks)
 make test-partition-lock       # partition helper lock behavior
 make test-dump-restore         # pg_dump/restore lifecycle (13 checks)
 make test-graph-builder        # graph sidecar bootstrap + rebuild smoke
-make test-pg-upgrade           # pg_upgrade 17->18 (13 checks)
+make test-pg-upgrade           # pg_upgrade 17->18 by default (13 checks)
 ```
 
 ## Stable GraphRAG quick start

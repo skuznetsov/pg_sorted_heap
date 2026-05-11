@@ -61,8 +61,8 @@ AWS fact-shaped multihop GraphRAG, `5K` chains, `384D`:
 
 Release gates for `0.13.0`:
 
-- full `CI` green on PostgreSQL `17` and `18`
-- `pg_upgrade 17→18` green
+- full `CI` green on PostgreSQL `16`, `17`, and `18`
+- `pg_upgrade 16→18` and `17→18` green
 - local `make test-release` green on `2026-04-07`
 
 ## What to claim
@@ -120,7 +120,7 @@ Use this short blurb when a site needs one paragraph.
 > - crash recovery
 > - concurrent online operations
 > - shared-cache correctness
-> - CI green on PostgreSQL 17 and 18, including `pg_upgrade 17 -> 18`
+> - CI green on PostgreSQL 16, 17, and 18, including `pg_upgrade 16 -> 18` and `17 -> 18`
 >
 > FlashHadamard is included in `0.13.0`, but still explicitly experimental.
 > The stable headline of this release is GraphRAG + planner-integrated ANN
@@ -185,7 +185,7 @@ Use this short blurb when a site needs one paragraph.
 > - crash recovery
 > - concurrent online operations
 > - shared-cache correctness
-> - CI green on PostgreSQL 17 and 18, including `pg_upgrade 17→18`
+> - CI green on PostgreSQL 16, 17, and 18, including `pg_upgrade 16→18` and `17→18`
 >
 > FlashHadamard is in the repo and release, but still explicitly experimental.
 > The stable headline of `0.13.0` is GraphRAG + planner-integrated ANN inside
@@ -266,7 +266,7 @@ Body:
 >
 > This release also adds lifecycle hardening across extension upgrade,
 > dump/restore, crash recovery, concurrent online operations, and
-> `pg_upgrade 17→18`.
+> `pg_upgrade 16→18` and `17→18`.
 >
 > Release: https://github.com/skuznetsov/pg_sorted_heap/releases/tag/v0.13.0
 > Repo: https://github.com/skuznetsov/pg_sorted_heap

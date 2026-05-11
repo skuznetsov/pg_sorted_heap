@@ -56,8 +56,8 @@ btree-competitive query performance without a separate index structure.
   map maintenance, reaching heap-parity UPDATE throughput. Compact/merge
   restores zone map pruning. Recommended for write-heavy workloads.
 
-- **PG 17 and PG 18** -- Builds and runs on both versions with zero warnings.
-  pg_upgrade from 17 to 18 tested and verified.
+- **PG 16, PG 17, and PG 18** -- Builds and runs on all three supported
+  versions. pg_upgrade from 16 to 18 and from 17 to 18 is tested and verified.
 
 ## How it works
 

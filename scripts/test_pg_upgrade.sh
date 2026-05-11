@@ -2,17 +2,20 @@
 set -euo pipefail
 
 # ============================================================
-# pg_upgrade 17→18 lifecycle test for pg_sorted_heap
+# pg_upgrade lifecycle test for pg_sorted_heap
 # ============================================================
 #
-# Creates a PG 17 cluster with sorted_heap tables, upgrades to PG 18,
+# Creates an old-version cluster with sorted_heap tables, upgrades it,
 # verifies data integrity, zone map stats, and scan pruning.
 #
+# Versions default to 17→18. Override with PG_OLD_VERSION / PG_NEW_VERSION.
 # Usage: ./scripts/test_pg_upgrade.sh [tmp_root] [port_old] [port_new]
 
 TMP_ROOT="${1:-${TMPDIR:-/tmp}}"
 PORT_OLD="${2:-65496}"
 PORT_NEW="${3:-65497}"
+PG_OLD_VERSION="${PG_OLD_VERSION:-17}"
+PG_NEW_VERSION="${PG_NEW_VERSION:-18}"
 
 if [[ "$TMP_ROOT" != /* ]]; then
   echo "tmp_root must be absolute: $TMP_ROOT" >&2; exit 2
@@ -21,7 +24,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# --- Locate PG 17 and PG 18 binaries ---
+# --- Locate PostgreSQL binaries ---
 detect_pg_bindir() {
   local ver="$1"
   local envvar="PG${ver}_BINDIR"
@@ -44,20 +47,20 @@ detect_pg_bindir() {
   echo ""
 }
 
-PG17_BIN="$(detect_pg_bindir 17)"
-PG18_BIN="$(detect_pg_bindir 18)"
+PGOLD_BIN="$(detect_pg_bindir "$PG_OLD_VERSION")"
+PGNEW_BIN="$(detect_pg_bindir "$PG_NEW_VERSION")"
 
-if [ -z "$PG17_BIN" ]; then
-  echo "ERROR: PostgreSQL 17 not found. Set PG17_BINDIR or install via Homebrew/PGDG." >&2
+if [ -z "$PGOLD_BIN" ]; then
+  echo "ERROR: PostgreSQL $PG_OLD_VERSION not found. Set PG${PG_OLD_VERSION}_BINDIR or install via Homebrew/PGDG." >&2
   exit 2
 fi
-if [ -z "$PG18_BIN" ]; then
-  echo "ERROR: PostgreSQL 18 not found. Set PG18_BINDIR or install via Homebrew/PGDG." >&2
+if [ -z "$PGNEW_BIN" ]; then
+  echo "ERROR: PostgreSQL $PG_NEW_VERSION not found. Set PG${PG_NEW_VERSION}_BINDIR or install via Homebrew/PGDG." >&2
   exit 2
 fi
 
-echo "PG 17: $PG17_BIN"
-echo "PG 18: $PG18_BIN"
+echo "PG old ($PG_OLD_VERSION): $PGOLD_BIN"
+echo "PG new ($PG_NEW_VERSION): $PGNEW_BIN"
 
 TMP_DIR=""
 pass=0; fail=0; total=0
@@ -76,10 +79,10 @@ check() {
 
 cleanup() {
   if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR/old/data" ]; then
-    "$PG17_BIN/pg_ctl" -D "$TMP_DIR/old/data" -m immediate stop >/dev/null 2>&1 || true
+    "$PGOLD_BIN/pg_ctl" -D "$TMP_DIR/old/data" -m immediate stop >/dev/null 2>&1 || true
   fi
   if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR/new/data" ]; then
-    "$PG18_BIN/pg_ctl" -D "$TMP_DIR/new/data" -m immediate stop >/dev/null 2>&1 || true
+    "$PGNEW_BIN/pg_ctl" -D "$TMP_DIR/new/data" -m immediate stop >/dev/null 2>&1 || true
   fi
   if [ -n "$TMP_DIR" ]; then
     rm -rf "$TMP_DIR"
@@ -91,22 +94,22 @@ TMP_DIR="$(mktemp -d "$TMP_ROOT/pg_sorted_heap_upgrade.XXXXXX")"
 mkdir -p "$TMP_DIR/old" "$TMP_DIR/new"
 
 # ============================================================
-# Phase 1: Build + install for PG 17
+# Phase 1: Build + install for old PG
 # ============================================================
 echo ""
-echo "=== Phase 1: Build for PG 17 ==="
-make -C "$ROOT_DIR" clean install PG_CONFIG="$PG17_BIN/pg_config" >/dev/null 2>/dev/null || true
+echo "=== Phase 1: Build for PG $PG_OLD_VERSION ==="
+make -C "$ROOT_DIR" clean install PG_CONFIG="$PGOLD_BIN/pg_config" >/dev/null 2>/dev/null || true
 
 # ============================================================
-# Phase 2: Create PG 17 cluster with test data
+# Phase 2: Create old PG cluster with test data
 # ============================================================
-echo "=== Phase 2: Create PG 17 cluster ==="
-"$PG17_BIN/initdb" -D "$TMP_DIR/old/data" -A trust --no-locale --data-checksums >/dev/null 2>&1
-"$PG17_BIN/pg_ctl" -D "$TMP_DIR/old/data" -l "$TMP_DIR/old/postmaster.log" \
+echo "=== Phase 2: Create PG $PG_OLD_VERSION cluster ==="
+"$PGOLD_BIN/initdb" -D "$TMP_DIR/old/data" -A trust --no-locale --data-checksums >/dev/null 2>&1
+"$PGOLD_BIN/pg_ctl" -D "$TMP_DIR/old/data" -l "$TMP_DIR/old/postmaster.log" \
   -o "-k $TMP_DIR -p $PORT_OLD" start >/dev/null
 
 PSQL_OLD() {
-  "$PG17_BIN/psql" -h "$TMP_DIR" -p "$PORT_OLD" postgres -v ON_ERROR_STOP=1 -qtAX "$@"
+  "$PGOLD_BIN/psql" -h "$TMP_DIR" -p "$PORT_OLD" postgres -v ON_ERROR_STOP=1 -qtAX "$@"
 }
 
 PSQL_OLD -c "CREATE EXTENSION pg_sorted_heap"
@@ -145,29 +148,29 @@ SELECT CASE WHEN sorted_heap_zonemap_stats('upgrade_test'::regclass) LIKE '%flag
 ")
 check "pre_upgrade_zm_valid" "1" "$zm_valid"
 
-# Stop PG 17
-"$PG17_BIN/pg_ctl" -D "$TMP_DIR/old/data" -m fast stop >/dev/null
+# Stop old PG
+"$PGOLD_BIN/pg_ctl" -D "$TMP_DIR/old/data" -m fast stop >/dev/null
 
 # ============================================================
-# Phase 3: Build + install for PG 18
+# Phase 3: Build + install for new PG
 # ============================================================
 echo ""
-echo "=== Phase 3: Build for PG 18 ==="
-make -C "$ROOT_DIR" clean install PG_CONFIG="$PG18_BIN/pg_config" >/dev/null 2>/dev/null || true
+echo "=== Phase 3: Build for PG $PG_NEW_VERSION ==="
+make -C "$ROOT_DIR" clean install PG_CONFIG="$PGNEW_BIN/pg_config" >/dev/null 2>/dev/null || true
 
 # ============================================================
 # Phase 4: pg_upgrade
 # ============================================================
-echo "=== Phase 4: pg_upgrade 17→18 ==="
-"$PG18_BIN/initdb" -D "$TMP_DIR/new/data" -A trust --no-locale >/dev/null 2>&1
+echo "=== Phase 4: pg_upgrade ${PG_OLD_VERSION}→${PG_NEW_VERSION} ==="
+"$PGNEW_BIN/initdb" -D "$TMP_DIR/new/data" -A trust --no-locale >/dev/null 2>&1
 
 (
   cd "$TMP_DIR/new"
-  "$PG18_BIN/pg_upgrade" \
+  "$PGNEW_BIN/pg_upgrade" \
     --old-datadir "$TMP_DIR/old/data" \
     --new-datadir "$TMP_DIR/new/data" \
-    --old-bindir  "$PG17_BIN" \
-    --new-bindir  "$PG18_BIN" \
+    --old-bindir  "$PGOLD_BIN" \
+    --new-bindir  "$PGNEW_BIN" \
     --old-port    "$PORT_OLD" \
     --new-port    "$PORT_NEW" \
     --socketdir   "$TMP_DIR"
@@ -178,11 +181,11 @@ echo "=== Phase 4: pg_upgrade 17→18 ==="
 # ============================================================
 echo ""
 echo "=== Phase 5: Post-upgrade verification ==="
-"$PG18_BIN/pg_ctl" -D "$TMP_DIR/new/data" -l "$TMP_DIR/new/postmaster.log" \
+"$PGNEW_BIN/pg_ctl" -D "$TMP_DIR/new/data" -l "$TMP_DIR/new/postmaster.log" \
   -o "-k $TMP_DIR -p $PORT_NEW" start >/dev/null
 
 PSQL_NEW() {
-  "$PG18_BIN/psql" -h "$TMP_DIR" -p "$PORT_NEW" postgres -v ON_ERROR_STOP=1 -qtAX "$@"
+  "$PGNEW_BIN/psql" -h "$TMP_DIR" -p "$PORT_NEW" postgres -v ON_ERROR_STOP=1 -qtAX "$@"
 }
 
 count=$(PSQL_NEW -c "SELECT count(*) FROM upgrade_test")
@@ -227,7 +230,7 @@ SELECT CASE WHEN sorted_heap_zonemap_stats('upgrade_test'::regclass) LIKE '%flag
 check "post_compact_zm_valid" "1" "$zm_valid"
 
 # Verify zone map pruning via EXPLAIN (SETs + EXPLAIN in single session)
-has_pruning=$("$PG18_BIN/psql" -h "$TMP_DIR" -p "$PORT_NEW" postgres -qtAX \
+has_pruning=$("$PGNEW_BIN/psql" -h "$TMP_DIR" -p "$PORT_NEW" postgres -qtAX \
   -c "SET enable_indexscan = off; SET enable_bitmapscan = off; EXPLAIN SELECT count(*) FROM upgrade_test WHERE id = 500" \
   2>/dev/null | grep -c 'pruned' || true)
 check "post_upgrade_pruning_works" "t" "$([ "$has_pruning" -gt 0 ] && echo t || echo f)"

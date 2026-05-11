@@ -1485,10 +1485,14 @@ pg_sorted_heap_pkidx_handler(PG_FUNCTION_ARGS)
 		.amclusterable = true,
 		.ampredlocks = false,
 		.amcanparallel = false,
+#if PG_VERSION_NUM >= 170000
 		.amcanbuildparallel = false,
+#endif
 		.amcaninclude = false,
 		.amusemaintenanceworkmem = false,
+#if PG_VERSION_NUM >= 160000
 		.amsummarizing = false,
+#endif
 		.amparallelvacuumoptions = VACUUM_OPTION_NO_PARALLEL,
 		.amkeytype = InvalidOid,
 

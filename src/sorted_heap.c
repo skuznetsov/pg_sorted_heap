@@ -14,6 +14,7 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/generic_xlog.h"
 #include "access/heapam.h"
 #include "access/multixact.h"
@@ -44,6 +45,11 @@
 #include "executor/tuptable.h"
 
 #include "sorted_heap.h"
+
+#if PG_VERSION_NUM < 170000
+#include "storage/backendid.h"
+typedef BackendId ProcNumber;
+#endif
 
 /* ----------------------------------------------------------------
  *  v4 backward compatibility structures

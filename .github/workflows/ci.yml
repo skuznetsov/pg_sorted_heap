@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        pg_version: [17, 18]
+        pg_version: [16, 17, 18]
       fail-fast: false
 
     steps:
@@ -75,15 +75,23 @@ jobs:
           if-no-files-found: ignore
 
   pg-upgrade:
-    name: pg_upgrade 17→18
+    name: pg_upgrade ${{ matrix.old_pg }}→${{ matrix.new_pg }}
     runs-on: ubuntu-latest
     needs: build-and-test
     timeout-minutes: 30
+    strategy:
+      matrix:
+        include:
+          - old_pg: 16
+            new_pg: 18
+          - old_pg: 17
+            new_pg: 18
+      fail-fast: false
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install PostgreSQL 17 and 18
+      - name: Install PostgreSQL ${{ matrix.old_pg }} and ${{ matrix.new_pg }}
         env:
           DEBIAN_FRONTEND: noninteractive
           NEEDRESTART_MODE: a
@@ -97,24 +105,24 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/pgdg.list
           echo "Refreshing APT metadata"
           sudo apt-get -o Acquire::Retries=3 update
-          echo "Installing PostgreSQL 17"
+          echo "Installing PostgreSQL ${{ matrix.old_pg }}"
           sudo apt-get -o Acquire::Retries=3 -o Dpkg::Use-Pty=0 install -y \
-            postgresql-17 postgresql-server-dev-17
-          echo "Installing PostgreSQL 18"
+            postgresql-${{ matrix.old_pg }} postgresql-server-dev-${{ matrix.old_pg }}
+          echo "Installing PostgreSQL ${{ matrix.new_pg }}"
           sudo apt-get -o Acquire::Retries=3 -o Dpkg::Use-Pty=0 install -y \
-            postgresql-18 postgresql-server-dev-18
+            postgresql-${{ matrix.new_pg }} postgresql-server-dev-${{ matrix.new_pg }}
 
       - name: Build and install for both versions
         run: |
-          make clean PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
-          make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
-          sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
-          make clean PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
-          make PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
-          sudo make install PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+          make clean PG_CONFIG=/usr/lib/postgresql/${{ matrix.old_pg }}/bin/pg_config
+          make PG_CONFIG=/usr/lib/postgresql/${{ matrix.old_pg }}/bin/pg_config
+          sudo make install PG_CONFIG=/usr/lib/postgresql/${{ matrix.old_pg }}/bin/pg_config
+          make clean PG_CONFIG=/usr/lib/postgresql/${{ matrix.new_pg }}/bin/pg_config
+          make PG_CONFIG=/usr/lib/postgresql/${{ matrix.new_pg }}/bin/pg_config
+          sudo make install PG_CONFIG=/usr/lib/postgresql/${{ matrix.new_pg }}/bin/pg_config
 
       - name: Run pg_upgrade test
         env:
-          PG17_BINDIR: /usr/lib/postgresql/17/bin
-          PG18_BINDIR: /usr/lib/postgresql/18/bin
+          PG_OLD_VERSION: ${{ matrix.old_pg }}
+          PG_NEW_VERSION: ${{ matrix.new_pg }}
         run: ./scripts/test_pg_upgrade.sh /tmp 5450 5451

@@ -144,8 +144,8 @@ detailed rewrite/free-space contract.
 
 - **pg_dump / pg_restore:** the zone map needs a compact after restore to
   re-enable scan pruning.
-- **pg_upgrade 17 to 18:** tested and verified. Data files (including zone map)
-  are copied as-is.
+- **pg_upgrade 16 to 18 and 17 to 18:** tested and verified. Data files
+  (including zone map) are copied as-is.
 
 Post-restore checklist:
 

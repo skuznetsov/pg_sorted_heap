@@ -549,10 +549,14 @@ sorted_hnsw_handler(PG_FUNCTION_ARGS)
 	amroutine->amclusterable = false;
 	amroutine->ampredlocks = false;
 	amroutine->amcanparallel = false;
+#if PG_VERSION_NUM >= 170000
 	amroutine->amcanbuildparallel = false;
+#endif
 	amroutine->amcaninclude = false;
 	amroutine->amusemaintenanceworkmem = true;
+#if PG_VERSION_NUM >= 160000
 	amroutine->amsummarizing = false;
+#endif
 	amroutine->amparallelvacuumoptions = VACUUM_OPTION_NO_PARALLEL;
 	amroutine->amkeytype = InvalidOid;
 

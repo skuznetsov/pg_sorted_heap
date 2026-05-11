@@ -655,7 +655,7 @@ as an upper-bound speed/quality shape, not the only baseline.
 
 ### Requirements
 
-- PostgreSQL 17 or 18
+- PostgreSQL 16, 17, or 18
 - Standard PGXS build toolchain (`pg_config` in PATH)
 
 ### Build and install
@@ -706,7 +706,7 @@ make test-partition-lock       # partition helper lock behavior
 make test-dump-restore         # pg_dump/restore lifecycle
 make test-graphrag-lifecycle   # GraphRAG upgrade + dump/restore lifecycle
 make test-graph-builder        # graph sidecar bootstrap + rebuild smoke
-make test-pg-upgrade           # pg_upgrade 17->18
+make test-pg-upgrade           # pg_upgrade 17->18 by default
 make policy-safety-selftest    # policy + doc contract checks
 make pg-core-regression-smoke  # PG core regression smoke test
 make selftest-lightweight      # lightweight selftest suite

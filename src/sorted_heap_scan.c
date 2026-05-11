@@ -35,6 +35,7 @@
 #include "optimizer/paths.h"
 #include "optimizer/restrictinfo.h"
 #include "miscadmin.h"
+#include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "storage/shmem.h"
 #include "funcapi.h"
@@ -46,6 +47,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
 #include "access/parallel.h"

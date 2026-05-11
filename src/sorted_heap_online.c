@@ -13,6 +13,7 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/heapam.h"
 #include "access/multixact.h"
 #include "access/tableam.h"
@@ -27,6 +28,7 @@
 #include "executor/spi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"

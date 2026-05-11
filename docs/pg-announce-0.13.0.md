@@ -110,7 +110,7 @@ AWS fact-shaped multihop GraphRAG workload, `5K` chains, `384D`:
 
 Requirements:
 
-- PostgreSQL 17 or 18
+- PostgreSQL 16, 17, or 18
 - Standard PGXS build toolchain with `pg_config` in `PATH`
 
 Build from source:
@@ -182,7 +182,7 @@ The `0.13.0` release-candidate checks include:
 - GraphRAG lifecycle coverage for upgrade and dump/restore
 - crash recovery checks
 - concurrent online-operation checks
-- `pg_upgrade` coverage from PostgreSQL 17 to 18
+- `pg_upgrade` coverage from PostgreSQL 16 to 18 and from 17 to 18
 - `sorted_hnsw` chunked/shared-cache integration checks
 
 For local verification:

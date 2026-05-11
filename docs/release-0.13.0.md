@@ -292,7 +292,7 @@ These checks exercise the already-stable core extension surface around:
 - TOAST integrity across rewrite paths
 - ALTER TABLE compatibility
 - dump / restore lifecycle
-- `pg_upgrade` compatibility from PostgreSQL 17 to 18
+- `pg_upgrade` compatibility from PostgreSQL 16 to 18 and from 17 to 18
 
 ## Release positioning
 
