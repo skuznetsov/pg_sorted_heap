@@ -96,6 +96,7 @@ PG_FUNCTION_INFO_V1(sorted_heap_merge);
  * ---------------------------------------------------------------- */
 static void sorted_heap_init_meta_page_smgr(const RelFileLocator *rlocator,
 											ProcNumber backend, bool need_wal);
+static void sorted_heap_relinfo_reset_zonemap_cache(SortedHeapRelInfo *info);
 static void sorted_heap_relinfo_invalidate(Oid relid);
 /* sorted_heap_zonemap_load is declared in sorted_heap.h (non-static) */
 static void sorted_heap_zonemap_flush(Relation rel, SortedHeapRelInfo *info);
@@ -515,6 +516,27 @@ sorted_heap_get_relinfo(Relation rel)
 	return info;
 }
 
+static void
+sorted_heap_relinfo_reset_zonemap_cache(SortedHeapRelInfo *info)
+{
+	info->zm_loaded = false;
+	info->zm_lazy_invalidated = false;
+	info->zm_disk_sorted_cleared = false;
+	if (info->zm_overflow)
+	{
+		pfree(info->zm_overflow);
+		info->zm_overflow = NULL;
+	}
+	if (info->zm_overflow_blocks)
+	{
+		pfree(info->zm_overflow_blocks);
+		info->zm_overflow_blocks = NULL;
+	}
+	info->zm_overflow_nentries = 0;
+	info->zm_overflow_alloc = 0;
+	info->zm_total_entries = 0;
+}
+
 /*
  * Relcache invalidation callback.
  *
@@ -538,22 +560,7 @@ sorted_heap_relcache_callback(Datum arg, Oid relid)
 		if (info != NULL)
 		{
 			info->pk_probed = false;
-			info->zm_loaded = false;
-			info->zm_lazy_invalidated = false;
-			info->zm_disk_sorted_cleared = false;
-			if (info->zm_overflow)
-			{
-				pfree(info->zm_overflow);
-				info->zm_overflow = NULL;
-			}
-			if (info->zm_overflow_blocks)
-			{
-				pfree(info->zm_overflow_blocks);
-				info->zm_overflow_blocks = NULL;
-			}
-			info->zm_overflow_nentries = 0;
-			info->zm_overflow_alloc = 0;
-			info->zm_total_entries = 0;
+			sorted_heap_relinfo_reset_zonemap_cache(info);
 		}
 	}
 	else
@@ -566,22 +573,7 @@ sorted_heap_relcache_callback(Datum arg, Oid relid)
 		while ((info = hash_seq_search(&status)) != NULL)
 		{
 			info->pk_probed = false;
-			info->zm_loaded = false;
-			info->zm_lazy_invalidated = false;
-			info->zm_disk_sorted_cleared = false;
-			if (info->zm_overflow)
-			{
-				pfree(info->zm_overflow);
-				info->zm_overflow = NULL;
-			}
-			if (info->zm_overflow_blocks)
-			{
-				pfree(info->zm_overflow_blocks);
-				info->zm_overflow_blocks = NULL;
-			}
-			info->zm_overflow_nentries = 0;
-			info->zm_overflow_alloc = 0;
-			info->zm_total_entries = 0;
+			sorted_heap_relinfo_reset_zonemap_cache(info);
 		}
 	}
 }
@@ -599,18 +591,7 @@ sorted_heap_relinfo_invalidate(Oid relid)
 
 	info = hash_search(sorted_heap_relinfo_hash, &relid, HASH_FIND, NULL);
 	if (info != NULL)
-	{
-		if (info->zm_overflow)
-		{
-			pfree(info->zm_overflow);
-			info->zm_overflow = NULL;
-		}
-		if (info->zm_overflow_blocks)
-		{
-			pfree(info->zm_overflow_blocks);
-			info->zm_overflow_blocks = NULL;
-		}
-	}
+		sorted_heap_relinfo_reset_zonemap_cache(info);
 
 	hash_search(sorted_heap_relinfo_hash, &relid, HASH_REMOVE, NULL);
 }

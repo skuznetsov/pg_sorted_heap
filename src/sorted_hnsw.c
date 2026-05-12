@@ -598,11 +598,11 @@ sorted_hnsw_scan_stats(PG_FUNCTION_ARGS)
 		" last={ef=%d,nodes=%d,l0_candidates=%d,initial_results=%d,"
 		"topup_ef=%d,topup_candidates=%d,topup_results=%d,"
 		"fallback_results=%d,final_results=%d,exact_fallback=%s}",
-		shnsw_scan_stats.calls,
-		shnsw_scan_stats.l0_searches,
-		shnsw_scan_stats.topup_searches,
-		shnsw_scan_stats.exact_fallbacks,
-		shnsw_scan_stats.exact_fallback_wins,
+		(unsigned long long) shnsw_scan_stats.calls,
+		(unsigned long long) shnsw_scan_stats.l0_searches,
+		(unsigned long long) shnsw_scan_stats.topup_searches,
+		(unsigned long long) shnsw_scan_stats.exact_fallbacks,
+		(unsigned long long) shnsw_scan_stats.exact_fallback_wins,
 		shnsw_scan_stats.last_ef,
 		shnsw_scan_stats.last_nodes,
 		shnsw_scan_stats.last_l0_candidates,

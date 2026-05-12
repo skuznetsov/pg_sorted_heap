@@ -131,9 +131,12 @@ static void (*pg_sorted_heap_heap_multi_insert_orig)(Relation rel,
 
 static bool pg_sorted_heap_pkidx_int_key_to_int64(Datum value, Oid valueType,
 												int64 *minor_key);
+static HTAB *pg_sorted_heap_zone_map_create_rel_hash(void);
+static void pg_sorted_heap_zone_map_free_relinfo(ClusteredPgZoneMapRelInfo *info);
+static void pg_sorted_heap_zone_map_destroy_all(void);
 static ClusteredPgZoneMapRelInfo *pg_sorted_heap_zone_map_get_relinfo(Relation rel);
 static void pg_sorted_heap_zone_map_invalidate(Oid relid);
-static void pg_sorted_heap_relcache_callback(Datum arg, Oid relid);
+static void pg_sorted_heap_relcache_dispatch_callback(Datum arg, Oid relid);
 static void pg_sorted_heap_clustered_heap_tuple_insert(Relation rel,
 													TupleTableSlot *slot,
 													CommandId cid, int options,
@@ -399,6 +402,46 @@ pg_sorted_heap_clustered_heap_relation_copy_for_cluster(Relation OldTable,
  * ----------------------------------------------------------------
  */
 
+static HTAB *
+pg_sorted_heap_zone_map_create_rel_hash(void)
+{
+	HASHCTL		ctl;
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(ClusteredPgZoneMapRelInfo);
+	ctl.hcxt = TopMemoryContext;
+	return hash_create("pg_sorted_heap zone map rels",
+					   16, &ctl,
+					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+static void
+pg_sorted_heap_zone_map_free_relinfo(ClusteredPgZoneMapRelInfo *info)
+{
+	if (info->block_map != NULL)
+		hash_destroy(info->block_map);
+	info->block_map = NULL;
+	info->initialized = false;
+}
+
+static void
+pg_sorted_heap_zone_map_destroy_all(void)
+{
+	HASH_SEQ_STATUS status;
+	ClusteredPgZoneMapRelInfo *entry;
+
+	if (pg_sorted_heap_zone_map_rels == NULL)
+		return;
+
+	hash_seq_init(&status, pg_sorted_heap_zone_map_rels);
+	while ((entry = hash_seq_search(&status)) != NULL)
+		pg_sorted_heap_zone_map_free_relinfo(entry);
+
+	hash_destroy(pg_sorted_heap_zone_map_rels);
+	pg_sorted_heap_zone_map_rels = NULL;
+}
+
 /*
  * Invalidate zone map for a relation.  Called from lifecycle hooks
  * (truncate, new filelocator, copy_data, copy_for_cluster) to prevent
@@ -415,46 +458,41 @@ pg_sorted_heap_zone_map_invalidate(Oid relid)
 	info = hash_search(pg_sorted_heap_zone_map_rels, &relid, HASH_FIND, NULL);
 	if (info != NULL)
 	{
-		if (info->block_map != NULL)
-			hash_destroy(info->block_map);
-		info->block_map = NULL;
-		info->initialized = false;
+		pg_sorted_heap_zone_map_free_relinfo(info);
 		hash_search(pg_sorted_heap_zone_map_rels, &relid, HASH_REMOVE, NULL);
 	}
 }
 
 /*
- * Relcache invalidation callback: clears zone map negative cache so that
- * newly created clustered_pk_index indexes are discovered on next insert.
+ * Extension-wide relcache invalidation dispatcher.
+ *
+ * PostgreSQL lets an extension register multiple relcache callbacks, but a
+ * single dispatcher makes the cache ownership explicit at the registration
+ * site.  Keep the domain-specific invalidation code in its owning module:
+ * - pg_sorted_heap.c: insert-side directed-placement zone map
+ * - pq.c: HNSW L0/upper session caches
+ * - sorted_heap.c: Table AM relation metadata and disk zone map state
  */
 static void
-pg_sorted_heap_relcache_callback(Datum arg, Oid relid)
+pg_sorted_heap_relcache_dispatch_callback(Datum arg, Oid relid)
 {
-	/* Evict session-local HNSW L0 cache if its relation was invalidated */
+	/* Evict session-local HNSW L0 cache if its relation was invalidated. */
 	sorted_heap_hnsw_relcache_invalidate(relid);
 
-	if (pg_sorted_heap_zone_map_rels == NULL)
-		return;
-
-	if (OidIsValid(relid))
+	if (pg_sorted_heap_zone_map_rels != NULL)
 	{
-		pg_sorted_heap_zone_map_invalidate(relid);
-	}
-	else
-	{
-		/* InvalidOid = full invalidation: destroy all entries */
-		HASH_SEQ_STATUS status;
-		ClusteredPgZoneMapRelInfo *entry;
-
-		hash_seq_init(&status, pg_sorted_heap_zone_map_rels);
-		while ((entry = hash_seq_search(&status)) != NULL)
+		if (OidIsValid(relid))
 		{
-			if (entry->block_map != NULL)
-				hash_destroy(entry->block_map);
+			pg_sorted_heap_zone_map_invalidate(relid);
 		}
-		hash_destroy(pg_sorted_heap_zone_map_rels);
-		pg_sorted_heap_zone_map_rels = NULL;
+		else
+		{
+			/* InvalidOid = full invalidation: destroy all entries. */
+			pg_sorted_heap_zone_map_destroy_all();
+		}
 	}
+
+	sorted_heap_relcache_callback(arg, relid);
 }
 
 static Oid
@@ -474,17 +512,8 @@ pg_sorted_heap_zone_map_get_relinfo(Relation rel)
 
 	/* Create top-level hash on first call */
 	if (pg_sorted_heap_zone_map_rels == NULL)
-	{
-		HASHCTL		ctl;
-
-		memset(&ctl, 0, sizeof(ctl));
-		ctl.keysize = sizeof(Oid);
-		ctl.entrysize = sizeof(ClusteredPgZoneMapRelInfo);
-		ctl.hcxt = TopMemoryContext;
-		pg_sorted_heap_zone_map_rels = hash_create("pg_sorted_heap zone map rels",
-												 16, &ctl,
-												 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-	}
+		pg_sorted_heap_zone_map_rels =
+			pg_sorted_heap_zone_map_create_rel_hash();
 
 	/*
 	 * Overflow guard: if tracking too many relations (e.g. after many
@@ -494,27 +523,9 @@ pg_sorted_heap_zone_map_get_relinfo(Relation rel)
 	if (hash_get_num_entries(pg_sorted_heap_zone_map_rels) >=
 		CLUSTERED_PG_ZONE_MAP_MAX_RELS)
 	{
-		HASH_SEQ_STATUS status;
-		ClusteredPgZoneMapRelInfo *entry;
-
-		hash_seq_init(&status, pg_sorted_heap_zone_map_rels);
-		while ((entry = hash_seq_search(&status)) != NULL)
-		{
-			if (entry->block_map != NULL)
-				hash_destroy(entry->block_map);
-		}
-		hash_destroy(pg_sorted_heap_zone_map_rels);
-		{
-			HASHCTL		ctl;
-
-			memset(&ctl, 0, sizeof(ctl));
-			ctl.keysize = sizeof(Oid);
-			ctl.entrysize = sizeof(ClusteredPgZoneMapRelInfo);
-			ctl.hcxt = TopMemoryContext;
-			pg_sorted_heap_zone_map_rels = hash_create("pg_sorted_heap zone map rels",
-													 16, &ctl,
-													 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-		}
+		pg_sorted_heap_zone_map_destroy_all();
+		pg_sorted_heap_zone_map_rels =
+			pg_sorted_heap_zone_map_create_rel_hash();
 	}
 
 	info = hash_search(pg_sorted_heap_zone_map_rels, &relid, HASH_ENTER, &found);
@@ -1608,8 +1619,8 @@ _PG_init(void)
 
 	MarkGUCPrefixReserved("sorted_heap");
 
-	CacheRegisterRelcacheCallback(pg_sorted_heap_relcache_callback, (Datum) 0);
-	CacheRegisterRelcacheCallback(sorted_heap_relcache_callback, (Datum) 0);
+	CacheRegisterRelcacheCallback(pg_sorted_heap_relcache_dispatch_callback,
+								  (Datum) 0);
 	sorted_heap_scan_init();
 	sorted_hnsw_init();
 }
