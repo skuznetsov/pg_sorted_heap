@@ -6,7 +6,7 @@ nav_order: 19
 
 # Spec: Zone-Map-Only Fast Paths
 
-Status: proposed
+Status: first metadata-only helper implemented
 Risk tier: CAUTION
 Primary goal: define the honest boundary between current zone-map pruning and
 future heap-fetch-avoiding optimizations.
@@ -43,7 +43,7 @@ For ordinary `SELECT` queries:
 - `EXPLAIN` should keep showing `Custom Scan (SortedHeapScan)`, not an
   index-only path.
 
-This is the right correctness boundary for `0.13`.
+This is the right correctness boundary for `0.14`.
 
 ## Non-Goals
 
@@ -69,6 +69,16 @@ Candidate examples:
 
 This path does not return user rows. It can only answer metadata-level
 questions or prove no heap page can match.
+
+Implemented first helper:
+
+- `sorted_heap_zonemap_may_match_int8(regclass, bigint, bigint)` returns
+  `false` only when valid first-key zone-map metadata proves that an `int8`
+  range cannot match.
+- The helper fail-opens to `true` on stale zone maps, unsupported key shapes,
+  or possible overlap.
+- The helper is intentionally a building block for application/planner logic,
+  not a row-returning executor path.
 
 ### Path B: Covering sidecar / value-bearing index
 
@@ -96,10 +106,11 @@ entries.
 
 Expected:
 
-- result is empty;
-- no false negatives are possible because the zone map proves no page overlaps;
-- if implemented as a metadata fast path, MVCC semantics are explicitly
-  documented.
+- `sorted_heap_zonemap_may_match_int8(...)` returns `false` for a range outside
+  all valid first-key zone-map entries;
+- it returns `true` for overlapping ranges;
+- stale or unsupported metadata returns `true`, preserving normal heap
+  execution.
 
 ### Z2. Covered-row path proves coverage
 
@@ -140,7 +151,7 @@ attach/detach:
 
 ## Decision
 
-For `0.13`, treat "index-only scan equivalent" as resolved into this spec:
+For `0.14`, treat "index-only scan equivalent" as resolved into this spec:
 zone-map-only row return is not a valid feature on the current storage format.
 Future work should choose explicitly between metadata-only fast paths and a
 covering value-bearing sidecar.

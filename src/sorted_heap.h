@@ -158,6 +158,7 @@ sorted_heap_get_zm_entry(SortedHeapRelInfo *info, uint32 idx)
 
 extern Datum sorted_heap_tableam_handler(PG_FUNCTION_ARGS);
 extern Datum sorted_heap_zonemap_stats(PG_FUNCTION_ARGS);
+extern Datum sorted_heap_zonemap_may_match_int8(PG_FUNCTION_ARGS);
 extern Datum sorted_heap_compact(PG_FUNCTION_ARGS);
 extern Datum sorted_heap_rebuild_zonemap_sql(PG_FUNCTION_ARGS);
 extern void sorted_heap_relcache_callback(Datum arg, Oid relid);

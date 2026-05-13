@@ -125,6 +125,8 @@ For the complete reference, see [SQL API](api).
   replay-key contract for UUID/text online maintenance.
 - [Zone-Map-Only Fast Paths](spec-zone-map-only-fast-paths) -- boundary between
   page pruning, metadata-only answers, and future covering sidecars.
+- [Append-Zone Runs](spec-append-zone-runs) -- proof contract required before
+  append-only sorted runs can become cheap merge inputs.
 - [Large-Vector Sublinear Search](spec-large-vector-sublinear) -- benchmark gate
   for IVF-PQ / SQ-family revival at 500K+ scale.
 - [SIMD ADC And DiskANN Comparison](spec-simd-adc-diskann) -- benchmark

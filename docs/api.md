@@ -217,6 +217,20 @@ Example output:
 v6 nentries=1946 flags=valid,sorted overflow_pages=7
 ```
 
+### `sorted_heap_zonemap_may_match_int8(regclass, bigint, bigint)`
+
+Returns `false` only when valid zone-map metadata proves that the first-key
+`int8` range cannot match any tracked heap page. It returns `true` when the
+range may match, and also fail-opens to `true` when metadata is stale or the
+table/key shape is unsupported.
+
+This is a metadata-only empty-result probe. It does not return rows and does
+not bypass heap visibility or executor quals.
+
+```sql
+SELECT sorted_heap_zonemap_may_match_int8('events'::regclass, 100, 200);
+```
+
 ### `sorted_heap_rebuild_zonemap(regclass)`
 
 Forces a full zone map rebuild by scanning all tuples. Useful after

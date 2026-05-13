@@ -2,7 +2,7 @@
   "name": "pg_sorted_heap",
   "abstract": "Sorted heap table access method with zone-map pruning and built-in vector search",
   "description": "pg_sorted_heap physically sorts PostgreSQL table storage by primary key, prunes irrelevant heap blocks with per-page zone maps, and includes built-in vector types plus planner-integrated HNSW search.",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "maintainer": [
     "Sergey Kuznetsov <pgsql@rigelstar.com>"
   ],
@@ -18,9 +18,9 @@
   },
   "provides": {
     "pg_sorted_heap": {
-      "file": "sql/pg_sorted_heap--0.13.0.sql",
+      "file": "sql/pg_sorted_heap--0.14.0.sql",
       "docfile": "README.md",
-      "version": "0.13.0",
+      "version": "0.14.0",
       "abstract": "Sorted heap table access method with zone-map pruning and built-in vector search"
     }
   },

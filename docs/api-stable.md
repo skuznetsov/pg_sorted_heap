@@ -42,6 +42,7 @@ CREATE TABLE events (
 | API | Use |
 |---|---|
 | `sorted_heap_zonemap_stats(regclass)` | Inspect zone-map validity and coverage |
+| `sorted_heap_zonemap_may_match_int8(regclass, bigint, bigint)` | Fail-open metadata probe for first-key int8 range overlap |
 | `sorted_heap_restore_plan(parent default NULL)` | Post-restore maintenance checklist |
 | `sorted_heap_scan_stats()` | Shared/global scan pruning counters |
 | `sorted_heap_scan_stats_by_relation()` | Per-relation scan pruning counters |

@@ -23,6 +23,7 @@ backward compatibility.
 | `sorted_heap_compact(...)`, `sorted_heap_merge(...)` | Offline maintenance with full rewrite semantics | Regression and crash-recovery coverage |
 | `sorted_heap_compact_online(...)`, `sorted_heap_merge_online(...)` | Non-blocking maintenance with trigger-based change replay | Concurrent DML tests, crash-recovery tests |
 | Zone-map inspection and rebuild helpers | Operational visibility and recovery | Regression and lifecycle tests |
+| Zone-map metadata overlap probe | Fail-open empty-result proof for first-key `int8` ranges | Regression and documented no-row-return contract |
 | `sorted_heap_scan_stats(...)` and reset helpers | Runtime scan observability | Regression and dedicated selftests |
 | `svec` and `hsvec` vector types | Native vector storage for the extension | Regression and vector benchmark coverage |
 | `sorted_hnsw` Index AM | Planner-integrated KNN over `svec`/`hsvec` with exact rerank | `sorted_hnsw` regression, chunked-cache test, benchmark harness |

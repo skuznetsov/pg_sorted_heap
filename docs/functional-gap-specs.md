@@ -6,7 +6,7 @@ nav_order: 13
 
 # Functional Gap Specs
 
-This document tracks the next functional gaps after the `0.13.0` release
+This document tracks the next functional gaps after the `0.14.0` release
 surface. It is intentionally contract-first: each gap should get a small spec,
 acceptance tests, and only then implementation.
 
@@ -357,7 +357,8 @@ Target direction:
 | P0 | G2 huge-table compaction model | Needed to explain free-space requirements honestly |
 | P1 | G4 parent-level observability | Storage, index-health, local/shared scan rollups, and GraphRAG source-rel route stats landed; broader persistent telemetry remains out of scope |
 | P1 | G3 filtered ANN | Expected by vector-search users, but broader than storage |
-| P2 | G7 zone-map-only / index-only-like fast paths | Spec boundary landed; real row-returning path requires a covering sidecar |
+| P2 | G7 zone-map-only / index-only-like fast paths | Metadata-only empty-result probe landed; real row-returning path requires a covering sidecar |
+| P2 | G10 append-zone run metadata | Design guardrail landed; safe implementation requires row-order certification |
 | P2 | G8 large-vector sublinear search revival | Benchmark-gated; do not reopen refuted 103K pruning as a default |
 | P2 | G9 SIMD ADC and pgvectorscale DiskANN comparison | Benchmark-gated; external baseline needs versioned settings and strict-order note |
 | P2 | G5 online lossy-PK support | Useful, but current fail-closed behavior is acceptable |

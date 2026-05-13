@@ -87,6 +87,7 @@ typedef struct SortedHeapOverflowPageDataV4
 
 PG_FUNCTION_INFO_V1(sorted_heap_tableam_handler);
 PG_FUNCTION_INFO_V1(sorted_heap_zonemap_stats);
+PG_FUNCTION_INFO_V1(sorted_heap_zonemap_may_match_int8);
 PG_FUNCTION_INFO_V1(sorted_heap_compact);
 PG_FUNCTION_INFO_V1(sorted_heap_rebuild_zonemap_sql);
 PG_FUNCTION_INFO_V1(sorted_heap_merge);
@@ -2242,6 +2243,74 @@ sorted_heap_zonemap_stats(PG_FUNCTION_ARGS)
 	table_close(rel, AccessShareLock);
 
 	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+
+/*
+ * Metadata-only first-column zone-map overlap probe.
+ *
+ * This helper is intentionally fail-open: it returns false only when valid
+ * sorted_heap zone-map metadata proves that no tracked page overlaps the
+ * requested int8 range.  It does not return rows and it is not an index-only
+ * scan replacement.
+ */
+Datum
+sorted_heap_zonemap_may_match_int8(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int64		lower = PG_GETARG_INT64(1);
+	int64		upper = PG_GETARG_INT64(2);
+	Relation	rel;
+	SortedHeapRelInfo *info;
+	BlockNumber	nblocks;
+	uint32		i;
+	bool		may_match = false;
+
+	if (lower > upper)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("lower bound must be less than or equal to upper bound")));
+
+	rel = table_open(relid, AccessShareLock);
+	if (rel->rd_tableam != &sorted_heap_am_routine)
+	{
+		table_close(rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a sorted_heap table",
+						RelationGetRelationName(rel))));
+	}
+
+	info = sorted_heap_get_relinfo(rel);
+	sorted_heap_zonemap_load(rel, info);
+
+	if (!info->zm_usable || !info->zm_scan_valid)
+	{
+		table_close(rel, AccessShareLock);
+		PG_RETURN_BOOL(true);
+	}
+
+	nblocks = RelationGetNumberOfBlocks(rel);
+	if (info->zm_total_entries == 0)
+	{
+		table_close(rel, AccessShareLock);
+		PG_RETURN_BOOL(nblocks > SORTED_HEAP_META_BLOCK + 1);
+	}
+
+	for (i = 0; i < info->zm_total_entries; i++)
+	{
+		SortedHeapZoneMapEntry *entry = sorted_heap_get_zm_entry(info, i);
+
+		if (entry->zme_min == PG_INT64_MAX)
+			continue;
+		if (entry->zme_max >= lower && entry->zme_min <= upper)
+		{
+			may_match = true;
+			break;
+		}
+	}
+
+	table_close(rel, AccessShareLock);
+	PG_RETURN_BOOL(may_match);
 }
 
 /* ----------------------------------------------------------------

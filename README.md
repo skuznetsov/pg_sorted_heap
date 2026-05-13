@@ -63,7 +63,7 @@ plus planner-integrated HNSW search.
     not the default execution path
   - `pthread` inside the backend remains experimental architecture debt;
     this path is documented, benchmarked, and tested, but not promoted to
-    the stable `0.13` release surface
+    the stable `0.14` release surface
 
 ### Legacy/manual
 
@@ -366,7 +366,9 @@ path-aware helper transferred cleanly to AWS at both `5K` and `10K` chains.
 The full tuning history, reasoning, external-engine caveats, and larger-scale
 results live in
 [docs/design-graphrag.md](docs/design-graphrag.md).
-The current `0.13` release target and hardening gates live in
+The current release hardening gates live in
+[docs/stability-matrix.md](docs/stability-matrix.md), with the GraphRAG
+promotion history captured in
 [docs/graphrag-0.13-plan.md](docs/graphrag-0.13-plan.md).
 
 There is now also a **real code-corpus** GraphRAG benchmark using the actual
@@ -759,7 +761,8 @@ experimental, or legacy/manual APIs.
 - [SQL API](docs/api.md) -- full function reference
 - [Benchmarks](docs/benchmarks.md) -- latency, throughput, vector search
 - [GraphRAG 0.13 Plan](docs/graphrag-0.13-plan.md) -- stable target and hardening gates
-- [Release 0.13.0](docs/release-0.13.0.md) -- repo-owned GitHub release note
+- [Release 0.14.0](docs/release-0.14.0.md) -- repo-owned GitHub release note
+- [Release 0.13.0](docs/release-0.13.0.md) -- prior GraphRAG release note
 - [FlashHadamard Note](docs/flashhadamard-note.md) -- experimental retrieval lane and canonical operating points
 - [FlashHadamard Retrospective](docs/flashhadamard-retrospective.md) -- what was proved, refuted, and still unproven
 - [Limitations](docs/limitations.md)

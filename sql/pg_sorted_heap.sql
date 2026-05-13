@@ -1,9 +1,9 @@
 CREATE EXTENSION pg_sorted_heap;
-SELECT public.version() = 'pg_sorted_heap 0.13.0' AS version_probe \gset
+SELECT public.version() = 'pg_sorted_heap 0.14.0' AS version_probe \gset
 \echo version_probe :version_probe
-SELECT (public.pg_sorted_heap_observability() ~ 'pg_sorted_heap=0.13.0') AS observability_bootstrap \gset
+SELECT (public.pg_sorted_heap_observability() ~ 'pg_sorted_heap=0.14.0') AS observability_bootstrap \gset
 \echo observability_bootstrap :observability_bootstrap
-SELECT (public.pg_sorted_heap_observability() ~ 'pg_sorted_heap=0.13.0') AS observability_probe \gset
+SELECT (public.pg_sorted_heap_observability() ~ 'pg_sorted_heap=0.14.0') AS observability_probe \gset
 \echo observability_probe :observability_probe
 
 -- ====================================================================
@@ -190,6 +190,31 @@ FROM (
 ) sub;
 
 DROP TABLE pg_sorted_heap_copy_dp;
+
+-- Composite clustered_pk_index keys should be accepted and grouped by the
+-- full lexicographic key, not only by the first column.
+CREATE TABLE pg_sorted_heap_copy_dp2(tenant_id int, id int, payload text)
+USING clustered_heap;
+CREATE INDEX pg_sorted_heap_copy_dp2_idx
+    ON pg_sorted_heap_copy_dp2 USING clustered_pk_index (tenant_id, id);
+
+INSERT INTO pg_sorted_heap_copy_dp2(tenant_id, id, payload)
+SELECT ((g - 1) % 4) + 1, (((g - 1) / 4) % 12) + 1, repeat('z', 500)
+FROM generate_series(1, 1440) g;
+
+SELECT
+    CASE WHEN avg(blk_count) <= 4.0
+         THEN 'copy_composite_directed_ok'
+         ELSE 'copy_composite_directed_FAIL'
+    END AS copy_composite_directed_result
+FROM (
+    SELECT tenant_id, id, count(DISTINCT (ctid::text::point)[0]::int) AS blk_count
+    FROM pg_sorted_heap_copy_dp2
+    GROUP BY tenant_id, id
+) sub \gset
+\echo copy_composite_directed_result :copy_composite_directed_result
+
+DROP TABLE pg_sorted_heap_copy_dp2;
 
 -- ================================================================
 -- UPDATE + DELETE on directed-placement table
@@ -694,6 +719,16 @@ SELECT
          THEN 'zonemap_created_ok'
          ELSE 'zonemap_created_FAIL'
     END AS sh3_zonemap_created;
+DO $$ BEGIN
+    PERFORM sorted_heap_rebuild_zonemap('sh3_zonemap'::regclass);
+END $$;
+SELECT
+    CASE WHEN sorted_heap_zonemap_may_match_int8('sh3_zonemap'::regclass, 100, 120)
+              AND NOT sorted_heap_zonemap_may_match_int8('sh3_zonemap'::regclass, 1000, 1200)
+         THEN 'zonemap_may_match_ok'
+         ELSE 'zonemap_may_match_FAIL'
+    END AS sh3_zonemap_may_match_result \gset
+\echo sh3_zonemap_may_match_result :sh3_zonemap_may_match_result
 SELECT count(*) AS sh3_zonemap_count FROM sh3_zonemap;
 DROP TABLE sh3_zonemap;
 DROP TABLE sh3_src1;

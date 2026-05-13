@@ -6,7 +6,7 @@ set -euo pipefail
 # ============================================================
 #
 # Verifies the GraphRAG fact-graph surface across:
-# - extension upgrade 0.12.0 -> 0.13.0
+# - extension upgrade 0.12.0 -> 0.14.0
 # - alias-schema registration
 # - pg_dump / pg_restore of the registry-backed alias mapping
 # - pg_dump / pg_restore of segmented/routed GraphRAG registries
@@ -289,11 +289,11 @@ check "pre_upgrade_wrapper_rows" "1" "$pre_upgrade_count"
 pre_upgrade_path_sig=$(PSQL "$DB" -c "$(path_signature_sql facts_v12 '[0,0,1,0]' 2 2 1 2)")
 check "pre_upgrade_path_signature_nonempty" "t" "$([ -n "$pre_upgrade_path_sig" ] && echo t || echo f)"
 
-# --- Phase 2: upgrade to 0.13 and verify unified surface ---
-PSQL "$DB" -c "ALTER EXTENSION pg_sorted_heap UPDATE TO '0.13.0'"
+# --- Phase 2: upgrade to 0.14 and verify unified surface ---
+PSQL "$DB" -c "ALTER EXTENSION pg_sorted_heap UPDATE TO '0.14.0'"
 
 extver=$(PSQL "$DB" -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_sorted_heap'")
-check "version_after_upgrade" "0.13.0" "$extver"
+check "version_after_upgrade" "0.14.0" "$extver"
 
 canonical_cfg=$(PSQL "$DB" -c "$(config_sql facts_v12)")
 check "canonical_config_defaults" "entity_id|relation_id|target_id|embedding|payload|f" "$canonical_cfg"
@@ -472,7 +472,7 @@ check "route_plan_exact_default" "t" "$(echo "$exact_plan" | grep -c 'default' |
 "$PG_BINDIR/pg_restore" -h "$TMP_DIR" -p "$PORT" -d "$DB" "$TMP_DIR/graph_rag.fc" 2>/dev/null
 
 restored_extver=$(PSQL "$DB" -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_sorted_heap'")
-check "version_after_restore" "0.13.0" "$restored_extver"
+check "version_after_restore" "0.14.0" "$restored_extver"
 
 restored_registry_rows=$(PSQL "$DB" -c "SELECT count(*) FROM sorted_heap_graph_registry")
 check "registry_rows_after_restore" "1" "$restored_registry_rows"

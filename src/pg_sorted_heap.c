@@ -47,7 +47,7 @@ PG_FUNCTION_INFO_V1(pg_sorted_heap_locator_cmp);
 PG_FUNCTION_INFO_V1(pg_sorted_heap_locator_advance_major);
 PG_FUNCTION_INFO_V1(pg_sorted_heap_locator_next_minor);
 
-#define CLUSTERED_PG_EXTENSION_VERSION "0.13.0"
+#define CLUSTERED_PG_EXTENSION_VERSION "0.14.0"
 #define CLUSTERED_PG_OBS_API_VERSION 1
 
 typedef struct ClusteredPgStats
@@ -79,13 +79,14 @@ typedef struct ClusteredPgPkidxBuildState
 
 
 /*
- * Zone map for directed placement: maps minor_key -> BlockNumber so that
+ * Zone map for directed placement: maps clustered key -> BlockNumber so that
  * tuple_insert can direct rows with the same clustering key to the same
  * heap block, achieving physical clustering at insertion time.
  */
 typedef struct ClusteredPgZoneMapBlockKey
 {
-	int64		minor_key;
+	int64		key1;
+	int64		key2;
 } ClusteredPgZoneMapBlockKey;
 
 typedef struct ClusteredPgZoneMapBlockEntry
@@ -97,9 +98,12 @@ typedef struct ClusteredPgZoneMapBlockEntry
 typedef struct ClusteredPgZoneMapRelInfo
 {
 	Oid			relid;			/* hash key */
+	int			nkeys;			/* supported key attrs: 1 or 2 */
 	AttrNumber	key_attnum;		/* heap attribute number of clustering key */
 	Oid			key_typid;		/* INT2OID, INT4OID, or INT8OID */
-	HTAB	   *block_map;		/* minor_key -> BlockNumber */
+	AttrNumber	key_attnum2;	/* optional second clustering key */
+	Oid			key_typid2;		/* optional second INT2OID, INT4OID, or INT8OID */
+	HTAB	   *block_map;		/* clustered key -> BlockNumber */
 	bool		initialized;	/* true once clustering index found */
 	bool		probed;			/* true after first index-list scan attempt */
 } ClusteredPgZoneMapRelInfo;
@@ -110,7 +114,7 @@ static Oid		pg_sorted_heap_pkidx_am_oid_cache = InvalidOid;
 /* Sort helper for multi_insert key grouping */
 typedef struct ClusteredPgMultiInsertKeySlot
 {
-	int64		key;
+	ClusteredPgZoneMapBlockKey key;
 	int			idx;
 	bool		valid;
 } ClusteredPgMultiInsertKeySlot;
@@ -131,6 +135,15 @@ static void (*pg_sorted_heap_heap_multi_insert_orig)(Relation rel,
 
 static bool pg_sorted_heap_pkidx_int_key_to_int64(Datum value, Oid valueType,
 												int64 *minor_key);
+static int pg_sorted_heap_block_key_cmp_values(const ClusteredPgZoneMapBlockKey *a,
+											   const ClusteredPgZoneMapBlockKey *b);
+static bool pg_sorted_heap_slot_get_block_key(ClusteredPgZoneMapRelInfo *relinfo,
+											  TupleTableSlot *slot,
+											  ClusteredPgZoneMapBlockKey *mapkey);
+static bool pg_sorted_heap_pkidx_extract_block_key(Relation indexRelation,
+												   Datum *values, bool *isnull,
+												   ClusteredPgZoneMapBlockKey *mapkey,
+												   int *nkeys);
 static HTAB *pg_sorted_heap_zone_map_create_rel_hash(void);
 static void pg_sorted_heap_zone_map_free_relinfo(ClusteredPgZoneMapRelInfo *info);
 static void pg_sorted_heap_zone_map_destroy_all(void);
@@ -397,7 +410,7 @@ pg_sorted_heap_clustered_heap_relation_copy_for_cluster(Relation OldTable,
  *
  * On first tuple_insert for a relation, discover the clustered_pk_index
  * (if any), extract the key column number, and build an in-memory
- * minor_key -> BlockNumber map.  For each subsequent insert, look up
+ * clustered key -> BlockNumber map.  For each subsequent insert, look up
  * the key in the zone map and hint the heap via RelationSetTargetBlock.
  * ----------------------------------------------------------------
  */
@@ -532,8 +545,11 @@ pg_sorted_heap_zone_map_get_relinfo(Relation rel)
 	if (!found)
 	{
 		info->relid = relid;
+		info->nkeys = 0;
 		info->key_attnum = InvalidAttrNumber;
 		info->key_typid = InvalidOid;
+		info->key_attnum2 = InvalidAttrNumber;
+		info->key_typid2 = InvalidOid;
 		info->block_map = NULL;
 		info->initialized = false;
 		info->probed = false;
@@ -560,14 +576,31 @@ pg_sorted_heap_zone_map_get_relinfo(Relation rel)
 				indexrel->rd_index->indnatts >= 1)
 			{
 				AttrNumber	heap_attnum = indexrel->rd_index->indkey.values[0];
+				AttrNumber	heap_attnum2 = InvalidAttrNumber;
 				TupleDesc	idxdesc = RelationGetDescr(indexrel);
+				int			nkeys;
 
-				if (heap_attnum > 0 && idxdesc->natts > 0)
+				nkeys = indexrel->rd_index->indnkeyatts;
+				if (nkeys < 1)
+					nkeys = indexrel->rd_index->indnatts;
+				if (nkeys > 2)
+					nkeys = 2;
+				if (nkeys == 2)
+					heap_attnum2 = indexrel->rd_index->indkey.values[1];
+
+				if (heap_attnum > 0 && idxdesc->natts >= nkeys &&
+					(nkeys == 1 || heap_attnum2 > 0))
 				{
 					HASHCTL		ctl;
 
+					info->nkeys = nkeys;
 					info->key_attnum = heap_attnum;
 					info->key_typid = TupleDescAttr(idxdesc, 0)->atttypid;
+					if (nkeys == 2)
+					{
+						info->key_attnum2 = heap_attnum2;
+						info->key_typid2 = TupleDescAttr(idxdesc, 1)->atttypid;
+					}
 
 					memset(&ctl, 0, sizeof(ctl));
 					ctl.keysize = sizeof(ClusteredPgZoneMapBlockKey);
@@ -620,25 +653,17 @@ pg_sorted_heap_clustered_heap_tuple_insert(Relation rel, TupleTableSlot *slot,
 										 struct BulkInsertStateData *bistate)
 {
 	ClusteredPgZoneMapRelInfo *relinfo;
-	int64		minor_key = 0;
+	ClusteredPgZoneMapBlockKey mapkey;
 	bool		key_valid = false;
 
 	relinfo = pg_sorted_heap_zone_map_get_relinfo(rel);
 
 	if (relinfo != NULL && relinfo->initialized)
 	{
-		Datum	val;
-		bool	isnull;
-
-		val = slot_getattr(slot, relinfo->key_attnum, &isnull);
-		if (!isnull &&
-			pg_sorted_heap_pkidx_int_key_to_int64(val, relinfo->key_typid,
-												&minor_key))
+		if (pg_sorted_heap_slot_get_block_key(relinfo, slot, &mapkey))
 		{
-			ClusteredPgZoneMapBlockKey mapkey;
 			ClusteredPgZoneMapBlockEntry *entry;
 
-			mapkey.minor_key = minor_key;
 			entry = hash_search(relinfo->block_map, &mapkey, HASH_FIND, NULL);
 			if (entry != NULL)
 			{
@@ -665,13 +690,11 @@ pg_sorted_heap_clustered_heap_tuple_insert(Relation rel, TupleTableSlot *slot,
 	if (key_valid && relinfo != NULL && relinfo->block_map != NULL)
 	{
 		BlockNumber		actual_block = ItemPointerGetBlockNumber(&slot->tts_tid);
-		ClusteredPgZoneMapBlockKey mapkey;
 		ClusteredPgZoneMapBlockEntry *entry;
 		bool			found;
 
 		pg_sorted_heap_zone_map_check_overflow(relinfo);
 
-		mapkey.minor_key = minor_key;
 		entry = hash_search(relinfo->block_map, &mapkey, HASH_ENTER, &found);
 		entry->block = actual_block;
 	}
@@ -688,9 +711,7 @@ pg_sorted_heap_multi_insert_key_cmp(const void *a, const void *b)
 	if (!ka->valid) return 1;
 	if (!kb->valid) return -1;
 
-	if (ka->key < kb->key) return -1;
-	if (ka->key > kb->key) return 1;
-	return 0;
+	return pg_sorted_heap_block_key_cmp_values(&ka->key, &kb->key);
 }
 
 /*
@@ -711,7 +732,7 @@ pg_sorted_heap_clustered_heap_multi_insert(Relation rel, TupleTableSlot **slots,
 	int			pos;
 	int			i;
 	int			distinct_keys;
-	int64		prev_key;
+	ClusteredPgZoneMapBlockKey prev_key;
 	bool		prev_valid;
 
 	relinfo = pg_sorted_heap_zone_map_get_relinfo(rel);
@@ -727,28 +748,24 @@ pg_sorted_heap_clustered_heap_multi_insert(Relation rel, TupleTableSlot **slots,
 	/* Extract clustering key from every slot and count distinct keys */
 	ks = palloc(nslots * sizeof(ClusteredPgMultiInsertKeySlot));
 	distinct_keys = 0;
-	prev_key = 0;
+	memset(&prev_key, 0, sizeof(prev_key));
 	prev_valid = false;
 
 	for (i = 0; i < nslots; i++)
 	{
-		Datum	val;
-		bool	isnull;
-
 		ks[i].idx = i;
-		val = slot_getattr(slots[i], relinfo->key_attnum, &isnull);
-		if (!isnull &&
-			pg_sorted_heap_pkidx_int_key_to_int64(val, relinfo->key_typid,
-												&ks[i].key))
+		if (pg_sorted_heap_slot_get_block_key(relinfo, slots[i], &ks[i].key))
 			ks[i].valid = true;
 		else
 		{
-			ks[i].key = 0;
+			memset(&ks[i].key, 0, sizeof(ks[i].key));
 			ks[i].valid = false;
 		}
 
 		/* Approximate distinct key count (exact would need a hash) */
-		if (ks[i].valid && (!prev_valid || ks[i].key != prev_key))
+		if (ks[i].valid &&
+			(!prev_valid ||
+			 pg_sorted_heap_block_key_cmp_values(&ks[i].key, &prev_key) != 0))
 		{
 			distinct_keys++;
 			prev_key = ks[i].key;
@@ -768,18 +785,16 @@ pg_sorted_heap_clustered_heap_multi_insert(Relation rel, TupleTableSlot **slots,
 		{
 			if (ks[i].valid)
 			{
-				ClusteredPgZoneMapBlockKey mapkey;
 				ClusteredPgZoneMapBlockEntry *entry;
 
-				mapkey.minor_key = ks[i].key;
-				entry = hash_search(relinfo->block_map, &mapkey,
+				entry = hash_search(relinfo->block_map, &ks[i].key,
 									HASH_FIND, NULL);
 				if (entry != NULL)
 				{
 					if (entry->block < RelationGetNumberOfBlocks(rel))
 						RelationSetTargetBlock(rel, entry->block);
 					else
-						hash_search(relinfo->block_map, &mapkey,
+						hash_search(relinfo->block_map, &ks[i].key,
 									HASH_REMOVE, NULL);
 				}
 				break;
@@ -804,13 +819,14 @@ pg_sorted_heap_clustered_heap_multi_insert(Relation rel, TupleTableSlot **slots,
 
 			for (i = 0; i < nslots; )
 			{
-				int64	key = ks[i].key;
+				ClusteredPgZoneMapBlockKey key = ks[i].key;
 				bool	valid = ks[i].valid;
 				int		last_idx = ks[i].idx;
 
 				while (i < nslots &&
 					   ks[i].valid == valid &&
-					   (!valid || ks[i].key == key))
+					   (!valid ||
+						pg_sorted_heap_block_key_cmp_values(&ks[i].key, &key) == 0))
 				{
 					last_idx = ks[i].idx;
 					i++;
@@ -819,13 +835,11 @@ pg_sorted_heap_clustered_heap_multi_insert(Relation rel, TupleTableSlot **slots,
 				if (valid)
 				{
 					BlockNumber blk;
-					ClusteredPgZoneMapBlockKey mk;
 					ClusteredPgZoneMapBlockEntry *e;
 					bool	found;
 
 					blk = ItemPointerGetBlockNumber(&slots[last_idx]->tts_tid);
-					mk.minor_key = key;
-					e = hash_search(relinfo->block_map, &mk,
+					e = hash_search(relinfo->block_map, &key,
 									HASH_ENTER, &found);
 					e->block = blk;
 				}
@@ -850,24 +864,23 @@ pg_sorted_heap_clustered_heap_multi_insert(Relation rel, TupleTableSlot **slots,
 	while (pos < nslots)
 	{
 		int		group_start = pos;
-		int64	group_key = ks[pos].key;
+		ClusteredPgZoneMapBlockKey group_key = ks[pos].key;
 		bool	group_valid = ks[pos].valid;
 		int		group_size;
 
 		while (pos < nslots &&
 			   ks[pos].valid == group_valid &&
-			   (!group_valid || ks[pos].key == group_key))
+			   (!group_valid ||
+				pg_sorted_heap_block_key_cmp_values(&ks[pos].key, &group_key) == 0))
 			pos++;
 
 		group_size = pos - group_start;
 
 		if (group_valid)
 		{
-			ClusteredPgZoneMapBlockKey mapkey;
 			ClusteredPgZoneMapBlockEntry *entry;
 
-			mapkey.minor_key = group_key;
-			entry = hash_search(relinfo->block_map, &mapkey,
+			entry = hash_search(relinfo->block_map, &group_key,
 								HASH_FIND, NULL);
 
 			/* Release bistate buffer pin so target block takes effect */
@@ -879,7 +892,7 @@ pg_sorted_heap_clustered_heap_multi_insert(Relation rel, TupleTableSlot **slots,
 				if (entry->block < RelationGetNumberOfBlocks(rel))
 					RelationSetTargetBlock(rel, entry->block);
 				else
-					hash_search(relinfo->block_map, &mapkey,
+					hash_search(relinfo->block_map, &group_key,
 								HASH_REMOVE, NULL);
 			}
 		}
@@ -899,12 +912,10 @@ pg_sorted_heap_clustered_heap_multi_insert(Relation rel, TupleTableSlot **slots,
 
 			if (BlockNumberIsValid(last_block))
 			{
-				ClusteredPgZoneMapBlockKey mk;
 				ClusteredPgZoneMapBlockEntry *e;
 				bool	found;
 
-				mk.minor_key = group_key;
-				e = hash_search(relinfo->block_map, &mk,
+				e = hash_search(relinfo->block_map, &group_key,
 								HASH_ENTER, &found);
 				e->block = last_block;
 			}
@@ -975,13 +986,60 @@ pg_sorted_heap_pkidx_int_key_to_int64(Datum value, Oid valueType, int64 *minor_k
 	}
 }
 
+static int
+pg_sorted_heap_block_key_cmp_values(const ClusteredPgZoneMapBlockKey *a,
+									const ClusteredPgZoneMapBlockKey *b)
+{
+	if (a->key1 < b->key1) return -1;
+	if (a->key1 > b->key1) return 1;
+	if (a->key2 < b->key2) return -1;
+	if (a->key2 > b->key2) return 1;
+	return 0;
+}
+
 static bool
-pg_sorted_heap_pkidx_extract_minor_key(Relation indexRelation, Datum *values,
-									bool *isnull, int64 *minor_key)
+pg_sorted_heap_slot_get_block_key(ClusteredPgZoneMapRelInfo *relinfo,
+								  TupleTableSlot *slot,
+								  ClusteredPgZoneMapBlockKey *mapkey)
+{
+	Datum		val;
+	bool		isnull;
+
+	if (relinfo == NULL || slot == NULL || mapkey == NULL)
+		return false;
+	if (relinfo->nkeys < 1 || relinfo->nkeys > 2)
+		return false;
+
+	memset(mapkey, 0, sizeof(*mapkey));
+
+	val = slot_getattr(slot, relinfo->key_attnum, &isnull);
+	if (isnull ||
+		!pg_sorted_heap_pkidx_int_key_to_int64(val, relinfo->key_typid,
+											&mapkey->key1))
+		return false;
+
+	if (relinfo->nkeys == 2)
+	{
+		val = slot_getattr(slot, relinfo->key_attnum2, &isnull);
+		if (isnull ||
+			!pg_sorted_heap_pkidx_int_key_to_int64(val, relinfo->key_typid2,
+												&mapkey->key2))
+			return false;
+	}
+
+	return true;
+}
+
+static bool
+pg_sorted_heap_pkidx_extract_block_key(Relation indexRelation, Datum *values,
+									bool *isnull,
+									ClusteredPgZoneMapBlockKey *mapkey,
+									int *nkeys)
 {
 	TupleDesc	tupdesc;
+	int			key_count;
 
-	if (values == NULL || isnull == NULL || minor_key == NULL)
+	if (values == NULL || isnull == NULL || mapkey == NULL)
 		return false;
 	if (indexRelation == NULL)
 		return false;
@@ -989,13 +1047,35 @@ pg_sorted_heap_pkidx_extract_minor_key(Relation indexRelation, Datum *values,
 	tupdesc = RelationGetDescr(indexRelation);
 	if (tupdesc == NULL || tupdesc->natts == 0)
 		return false;
+	key_count = indexRelation->rd_index != NULL ?
+		indexRelation->rd_index->indnkeyatts : tupdesc->natts;
+	if (key_count < 1)
+		key_count = tupdesc->natts;
+	if (key_count < 1 || key_count > 2 || tupdesc->natts < key_count)
+		return false;
 
 	if (isnull[0])
 		return false;
 
-	return pg_sorted_heap_pkidx_int_key_to_int64(values[0],
+	memset(mapkey, 0, sizeof(*mapkey));
+	if (!pg_sorted_heap_pkidx_int_key_to_int64(values[0],
 											  TupleDescAttr(tupdesc, 0)->atttypid,
-											  minor_key);
+											  &mapkey->key1))
+		return false;
+
+	if (key_count == 2)
+	{
+		if (isnull[1])
+			return false;
+		if (!pg_sorted_heap_pkidx_int_key_to_int64(values[1],
+												  TupleDescAttr(tupdesc, 1)->atttypid,
+												  &mapkey->key2))
+			return false;
+	}
+
+	if (nkeys != NULL)
+		*nkeys = key_count;
+	return true;
 }
 
 static IndexBulkDeleteResult *
@@ -1023,17 +1103,18 @@ pg_sorted_heap_pkidx_build_callback(Relation indexRelation, ItemPointer heap_tid
                                  void *state)
 {
 	ClusteredPgPkidxBuildState *buildstate = (ClusteredPgPkidxBuildState *) state;
-	int64		minor_key = 0;
+	ClusteredPgZoneMapBlockKey mapkey;
 
 	if (buildstate == NULL || indexRelation == NULL || buildstate->indexInfo == NULL)
 		return;
 	if (!tupleIsAlive)
 		return;
-	if (!pg_sorted_heap_pkidx_extract_minor_key(indexRelation, values, isnull, &minor_key))
+	if (!pg_sorted_heap_pkidx_extract_block_key(indexRelation, values, isnull,
+											   &mapkey, NULL))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("pg_sorted_heap build path does not support this index key"),
-				 errhint("clustered_pk_index supports exactly one key attribute of types int2, int4 or int8.")));
+				 errhint("clustered_pk_index supports one or two key attributes of types int2, int4 or int8.")));
 	buildstate->index_tuples++;
 }
 
@@ -1321,11 +1402,11 @@ pg_sorted_heap_pkidx_build(Relation heapRelation, Relation indexRelation,
 				 errmsg("clustered_pk_index ambuild requires index metadata"),
 				 errhint("Call CREATE INDEX with a valid catalog state.")));
 
-	if (indexInfo->ii_NumIndexAttrs != 1)
+	if (indexInfo->ii_NumIndexKeyAttrs < 1 || indexInfo->ii_NumIndexKeyAttrs > 2)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("clustered_pk_index ambuild supports exactly one key attribute"),
-				 errhint("Create a single-column index for the first iteration.")));
+				 errmsg("clustered_pk_index ambuild supports one or two key attributes"),
+				 errhint("Create an index with one or two integer key columns.")));
 
 	result = palloc0_object(IndexBuildResult);
 
@@ -1355,19 +1436,22 @@ pg_sorted_heap_pkidx_insert(Relation indexRelation, Datum *values, bool *isnull,
 					IndexUniqueCheck checkUnique, bool indexUnchanged,
 					IndexInfo *indexInfo)
 {
-	int64		minor_key;
+	ClusteredPgZoneMapBlockKey mapkey;
 
 	(void)checkUnique;
 	(void)indexUnchanged;
 	pg_sorted_heap_stats.insert_calls++;
 
-	if (indexInfo == NULL || indexInfo->ii_NumIndexAttrs != 1)
+	if (indexInfo == NULL ||
+		indexInfo->ii_NumIndexKeyAttrs < 1 ||
+		indexInfo->ii_NumIndexKeyAttrs > 2)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("clustered_pk_index supports exactly one key attribute"),
-				 errhint("Create a single-column index for the first iteration.")));
+				 errmsg("clustered_pk_index supports one or two key attributes"),
+				 errhint("Create an index with one or two integer key columns.")));
 
-	if (!pg_sorted_heap_pkidx_extract_minor_key(indexRelation, values, isnull, &minor_key))
+	if (!pg_sorted_heap_pkidx_extract_block_key(indexRelation, values, isnull,
+											   &mapkey, NULL))
 			ereport(ERROR, (errcode(ERRCODE_DATATYPE_MISMATCH),
 						 errmsg("clustered_pk_index currently supports only int2/int4/int8 index key types"),
 						 errdetail("Index key is NULL, missing, or has unsupported type.")));
@@ -1488,7 +1572,7 @@ pg_sorted_heap_pkidx_handler(PG_FUNCTION_ARGS)
 #endif
 		.amcanbackward = false,
 		.amcanunique = false,
-		.amcanmulticol = false,
+		.amcanmulticol = true,
 		.amoptionalkey = false,
 		.amsearcharray = false,
 		.amsearchnulls = false,
