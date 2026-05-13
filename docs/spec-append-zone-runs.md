@@ -6,7 +6,7 @@ nav_order: 20
 
 # Spec: Append-Zone Run Metadata
 
-Status: design guardrail
+Status: design guardrail; observational registry prototype exists
 Risk tier: CAUTION
 Primary goal: capture the safe contract for future append-run metadata without
 using page-level zone maps as a stronger proof than they provide.
@@ -27,7 +27,8 @@ incorrect physical order during merge.
 
 ## Required Contract
 
-A future append-run registry must be proof-bearing:
+The current `sorted_heap_append_run_registry` is observational only. Before it
+can become merge input, it must be proof-bearing:
 
 - record relation filenode or a rewrite-safe storage identity;
 - record inclusive block range for the run;

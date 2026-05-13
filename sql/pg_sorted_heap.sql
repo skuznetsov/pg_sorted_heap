@@ -216,6 +216,206 @@ FROM (
 
 DROP TABLE pg_sorted_heap_copy_dp2;
 
+-- Explicit ordered bulk helper: full-key ordering should produce dense
+-- tenant-local runs without relying on implicit COPY batch boundaries.
+CREATE TEMP TABLE pg_sorted_heap_bulk_src(tenant_id int, id int, payload text);
+INSERT INTO pg_sorted_heap_bulk_src(tenant_id, id, payload)
+SELECT ((g * 37) % 8) + 1,
+       g,
+       repeat('b', 500)
+FROM generate_series(1, 1600) g;
+
+CREATE TABLE pg_sorted_heap_bulk_ordered(tenant_id int, id int, payload text)
+USING clustered_heap;
+CREATE INDEX pg_sorted_heap_bulk_ordered_idx
+    ON pg_sorted_heap_bulk_ordered USING clustered_pk_index (tenant_id, id);
+
+SELECT sorted_heap_bulk_load_ordered(
+    'pg_sorted_heap_bulk_ordered'::regclass,
+    'SELECT tenant_id, id, payload FROM pg_sorted_heap_bulk_src',
+    'tenant_id, id',
+    true,
+    ARRAY['tenant_id', 'id']::name[]
+) AS bulk_ordered_inserted \gset
+\echo bulk_ordered_inserted :bulk_ordered_inserted
+
+SELECT
+    CASE WHEN avg(blk_count) <= 20.0
+         THEN 'bulk_ordered_locality_ok'
+         ELSE 'bulk_ordered_locality_FAIL'
+    END AS bulk_ordered_locality_result
+FROM (
+    SELECT tenant_id, count(DISTINCT (ctid::text::point)[0]::int) AS blk_count
+    FROM pg_sorted_heap_bulk_ordered
+    GROUP BY tenant_id
+) sub \gset
+\echo bulk_ordered_locality_result :bulk_ordered_locality_result
+
+SELECT
+    CASE WHEN count(*) = 1
+              AND bool_and(is_current)
+              AND min(row_count) = 1600
+              AND min(ordering_mode) = 'full-order'
+              AND min(rows_per_block) > 0
+              AND min(first_row_json->>'tenant_id') = '1'
+              AND min(first_row_json->>'id') = '8'
+              AND min(last_row_json->>'tenant_id') = '8'
+              AND min(last_row_json->>'id') = '1595'
+              AND min(first_key) = ARRAY[1, 8]::bigint[]
+              AND min(last_key) = ARRAY[8, 1595]::bigint[]
+         THEN 'bulk_ordered_run_current_ok'
+         ELSE 'bulk_ordered_run_current_FAIL'
+    END AS bulk_ordered_run_current_result
+FROM sorted_heap_append_run_status('pg_sorted_heap_bulk_ordered'::regclass) \gset
+\echo bulk_ordered_run_current_result :bulk_ordered_run_current_result
+
+SELECT
+    CASE WHEN run_count = 1
+              AND current_run_count = 1
+              AND stale_run_count = 0
+              AND current_rows = 1600
+              AND can_merge IS FALSE
+              AND reason = 'observational_only_not_merge_input'
+         THEN 'bulk_ordered_plan_current_ok'
+         ELSE 'bulk_ordered_plan_current_FAIL'
+    END AS bulk_ordered_plan_current_result
+FROM sorted_heap_append_run_plan('pg_sorted_heap_bulk_ordered'::regclass) \gset
+\echo bulk_ordered_plan_current_result :bulk_ordered_plan_current_result
+
+CREATE TABLE pg_sorted_heap_bulk_invalidated(tenant_id int, id int, payload text)
+USING clustered_heap;
+CREATE INDEX pg_sorted_heap_bulk_invalidated_idx
+    ON pg_sorted_heap_bulk_invalidated USING clustered_pk_index (tenant_id, id);
+
+SELECT sorted_heap_bulk_load_ordered(
+    'pg_sorted_heap_bulk_invalidated'::regclass,
+    'SELECT tenant_id, id, payload FROM pg_sorted_heap_bulk_src WHERE id <= 16',
+    'tenant_id, id',
+    false,
+    ARRAY['tenant_id', 'id']::name[]
+) AS bulk_ordered_invalidated_inserted \gset
+\echo bulk_ordered_invalidated_inserted :bulk_ordered_invalidated_inserted
+
+SELECT sorted_heap_append_run_invalidate('pg_sorted_heap_bulk_invalidated'::regclass)
+    AS bulk_ordered_invalidate_count \gset
+\echo bulk_ordered_invalidate_count :bulk_ordered_invalidate_count
+
+SELECT
+    CASE WHEN run_count = 1
+              AND current_run_count = 0
+              AND stale_run_count = 1
+              AND can_merge IS FALSE
+              AND reason = 'stale_or_invalid_witnesses_present'
+         THEN 'bulk_ordered_plan_invalidated_ok'
+         ELSE 'bulk_ordered_plan_invalidated_FAIL'
+    END AS bulk_ordered_plan_invalidated_result
+FROM sorted_heap_append_run_plan('pg_sorted_heap_bulk_invalidated'::regclass) \gset
+\echo bulk_ordered_plan_invalidated_result :bulk_ordered_plan_invalidated_result
+
+SELECT sorted_heap_append_run_cleanup('pg_sorted_heap_bulk_invalidated'::regclass)
+    AS bulk_ordered_invalidated_cleanup_count \gset
+\echo bulk_ordered_invalidated_cleanup_count :bulk_ordered_invalidated_cleanup_count
+
+CREATE TABLE pg_sorted_heap_bulk_plain(tenant_id int, id int);
+DO $$
+BEGIN
+    PERFORM sorted_heap_bulk_load_ordered(
+        'pg_sorted_heap_bulk_plain'::regclass,
+        'SELECT 1, 1',
+        '1'
+    );
+    RAISE EXCEPTION 'bulk_ordered_plain_table_FAIL';
+EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE 'target relation % must use sorted_heap or clustered_heap%' THEN
+        RAISE NOTICE 'bulk_ordered_plain_table_blocked_ok';
+    ELSE
+        RAISE;
+    END IF;
+END
+$$;
+
+DO $$
+BEGIN
+    PERFORM sorted_heap_bulk_load_ordered(
+        'pg_sorted_heap_bulk_ordered'::regclass,
+        'SELECT 1, 1; SELECT 2, 2',
+        '1'
+    );
+    RAISE EXCEPTION 'bulk_ordered_semicolon_guard_FAIL';
+EXCEPTION WHEN others THEN
+    IF SQLERRM LIKE 'source_sql and order_by must be single SQL fragments%' THEN
+        RAISE NOTICE 'bulk_ordered_semicolon_guard_ok';
+    ELSE
+        RAISE;
+    END IF;
+END
+$$;
+
+TRUNCATE pg_sorted_heap_bulk_ordered;
+SELECT
+    CASE WHEN count(*) = 1 AND bool_and(NOT is_current)
+         THEN 'bulk_ordered_run_stale_ok'
+         ELSE 'bulk_ordered_run_stale_FAIL'
+    END AS bulk_ordered_run_stale_result
+FROM sorted_heap_append_run_status('pg_sorted_heap_bulk_ordered'::regclass) \gset
+\echo bulk_ordered_run_stale_result :bulk_ordered_run_stale_result
+
+SELECT
+    CASE WHEN run_count = 1
+              AND current_run_count = 0
+              AND stale_run_count = 1
+              AND can_merge IS FALSE
+              AND reason = 'stale_or_invalid_witnesses_present'
+         THEN 'bulk_ordered_plan_stale_ok'
+         ELSE 'bulk_ordered_plan_stale_FAIL'
+    END AS bulk_ordered_plan_stale_result
+FROM sorted_heap_append_run_plan('pg_sorted_heap_bulk_ordered'::regclass) \gset
+\echo bulk_ordered_plan_stale_result :bulk_ordered_plan_stale_result
+
+SELECT sorted_heap_append_run_cleanup('pg_sorted_heap_bulk_ordered'::regclass)
+    AS bulk_ordered_cleanup_count \gset
+\echo bulk_ordered_cleanup_count :bulk_ordered_cleanup_count
+
+SELECT
+    CASE WHEN run_count = 0
+              AND can_merge IS FALSE
+              AND reason = 'no_append_run_witnesses'
+         THEN 'bulk_ordered_plan_empty_ok'
+         ELSE 'bulk_ordered_plan_empty_FAIL'
+    END AS bulk_ordered_plan_empty_result
+FROM sorted_heap_append_run_plan('pg_sorted_heap_bulk_ordered'::regclass) \gset
+\echo bulk_ordered_plan_empty_result :bulk_ordered_plan_empty_result
+
+CREATE TABLE pg_sorted_heap_bulk_orphan(tenant_id int, id int, payload text)
+USING clustered_heap;
+CREATE INDEX pg_sorted_heap_bulk_orphan_idx
+    ON pg_sorted_heap_bulk_orphan USING clustered_pk_index (tenant_id, id);
+
+SELECT sorted_heap_bulk_load_ordered(
+    'pg_sorted_heap_bulk_orphan'::regclass,
+    'SELECT tenant_id, id, payload FROM pg_sorted_heap_bulk_src WHERE id <= 16',
+    'tenant_id, id',
+    false,
+    ARRAY['tenant_id', 'id']::name[]
+) AS bulk_ordered_orphan_inserted \gset
+\echo bulk_ordered_orphan_inserted :bulk_ordered_orphan_inserted
+SELECT 'pg_sorted_heap_bulk_orphan'::regclass::oid AS bulk_ordered_orphan_relid \gset
+DROP TABLE pg_sorted_heap_bulk_orphan;
+
+SELECT sorted_heap_append_run_cleanup(NULL)
+    AS bulk_ordered_orphan_cleanup_count \gset
+\echo bulk_ordered_orphan_cleanup_count :bulk_ordered_orphan_cleanup_count
+
+SELECT count(*) AS bulk_ordered_orphan_registry_count
+FROM sorted_heap_append_run_registry
+WHERE relid::oid = :bulk_ordered_orphan_relid \gset
+\echo bulk_ordered_orphan_registry_count :bulk_ordered_orphan_registry_count
+
+DROP TABLE pg_sorted_heap_bulk_plain;
+DROP TABLE pg_sorted_heap_bulk_invalidated;
+DROP TABLE pg_sorted_heap_bulk_ordered;
+DROP TABLE pg_sorted_heap_bulk_src;
+
 -- ================================================================
 -- UPDATE + DELETE on directed-placement table
 -- ================================================================

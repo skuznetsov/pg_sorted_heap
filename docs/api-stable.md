@@ -24,6 +24,7 @@ CREATE TABLE events (
 | `sorted_heap_compact_online(regclass)` | Online compaction with trigger-based change replay |
 | `sorted_heap_merge(regclass)` | Offline sorted-prefix plus unsorted-tail merge |
 | `sorted_heap_merge_online(regclass)` | Online merge |
+| `sorted_heap_bulk_load_ordered(regclass, source_sql, order_by, analyze_after := false, key_columns := NULL)` | Trusted ordered bulk ingestion with observational run witness |
 | `sorted_heap_rebuild_zonemap(regclass)` | Manual zone-map rebuild |
 
 ## Partition maintenance
@@ -43,6 +44,10 @@ CREATE TABLE events (
 |---|---|
 | `sorted_heap_zonemap_stats(regclass)` | Inspect zone-map validity and coverage |
 | `sorted_heap_zonemap_may_match_int8(regclass, bigint, bigint)` | Fail-open metadata probe for first-key int8 range overlap |
+| `sorted_heap_append_run_status(regclass default NULL)` | Inspect ordered bulk-load append-run witnesses and stale/current status |
+| `sorted_heap_append_run_plan(regclass)` | Dry-run append-run summary; never authorizes merge in this release |
+| `sorted_heap_append_run_invalidate(regclass default NULL)` | Mark append-run witnesses invalid |
+| `sorted_heap_append_run_cleanup(regclass default NULL)` | Delete invalid, relfilenode-stale, or orphaned append-run witnesses |
 | `sorted_heap_restore_plan(parent default NULL)` | Post-restore maintenance checklist |
 | `sorted_heap_scan_stats()` | Shared/global scan pruning counters |
 | `sorted_heap_scan_stats_by_relation()` | Per-relation scan pruning counters |

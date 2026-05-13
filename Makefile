@@ -83,6 +83,11 @@ BENCH_ANN_MATRIX_ROWS ?= 320
 BENCH_ANN_MATRIX_QUERIES ?= 3
 BENCH_ANN_MATRIX_DIM ?= 8
 BENCH_ANN_MATRIX_K ?= 3
+BENCH_WBA_BULK_PORT ?= 65511
+BENCH_WBA_BULK_ROWS ?= 65536
+BENCH_WBA_BULK_TENANTS ?= 4096
+BENCH_WBA_BULK_WINDOWS ?= 1024,8192,65536
+BENCH_WBA_BULK_PAYLOAD_BYTES ?= 200
 BENCH_PORT ?= 65494
 BENCH_SCALES ?= 1000000,10000000
 VECTOR_BENCH_DSN ?= host=/tmp port=65432 dbname=bench_nomic
@@ -527,6 +532,9 @@ bench-large-vector-synthetic:
 bench-ann-matrix-offline-smoke:
 	bash ./scripts/bench_ann_matrix_offline_smoke.sh $(TMP_SELFTEST_ROOT) $(BENCH_ANN_MATRIX_ROWS) $(BENCH_ANN_MATRIX_QUERIES) $(BENCH_ANN_MATRIX_DIM) $(BENCH_ANN_MATRIX_K)
 
+bench-witness-bulk-load:
+	bash ./scripts/bench_witness_bulk_load.sh $(TMP_SELFTEST_ROOT) $(BENCH_WBA_BULK_PORT) $(BENCH_WBA_BULK_ROWS) $(BENCH_WBA_BULK_TENANTS) $(BENCH_WBA_BULK_WINDOWS) $(BENCH_WBA_BULK_PAYLOAD_BYTES)
+
 test-graphrag-lifecycle:
 	./scripts/test_graph_rag_lifecycle.sh $(TMP_SELFTEST_ROOT) $(TEST_GRAPHRAG_PORT)
 
@@ -686,6 +694,7 @@ help:
 	@echo "  make test-release TMP_SELFTEST_ROOT=<abs_tmp_dir>"
 	@echo "  make bench-large-vector-synthetic BENCH_LARGE_VECTOR_ROWS=<n> BENCH_LARGE_VECTOR_QUERIES=<n> BENCH_LARGE_VECTOR_DIM=<n>"
 	@echo "  make bench-ann-matrix-offline-smoke BENCH_ANN_MATRIX_ROWS=<n> BENCH_ANN_MATRIX_QUERIES=<n> BENCH_ANN_MATRIX_DIM=<n>"
+	@echo "  make bench-witness-bulk-load BENCH_WBA_BULK_ROWS=<n> BENCH_WBA_BULK_TENANTS=<n> BENCH_WBA_BULK_WINDOWS=<csv>"
 	@echo "  make test-graph-builder TEST_GRAPH_PORT=<port>"
 	@echo "  make build-graph-bench-nomic VECTOR_BENCH_DSN='<dsn>' VECTOR_GRAPH_TABLE=<graph_table> VECTOR_ENTRY_TABLE=<entry_table>"
 	@echo "  make build-hnsw-bench-nomic VECTOR_BENCH_DSN='<dsn>' HNSW_SOURCE_TABLE=<graph_table> HNSW_PREFIX=<prefix>"

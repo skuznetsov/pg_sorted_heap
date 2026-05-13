@@ -127,6 +127,8 @@ For the complete reference, see [SQL API](api).
   page pruning, metadata-only answers, and future covering sidecars.
 - [Append-Zone Runs](spec-append-zone-runs) -- proof contract required before
   append-only sorted runs can become cheap merge inputs.
+- [Witness-Bearing Bulk Load](spec-witness-bearing-bulk-load) -- LTP/WBA-shaped
+  bulk reorder harness and run-certificate design direction.
 - [Large-Vector Sublinear Search](spec-large-vector-sublinear) -- benchmark gate
   for IVF-PQ / SQ-family revival at 500K+ scale.
 - [SIMD ADC And DiskANN Comparison](spec-simd-adc-diskann) -- benchmark

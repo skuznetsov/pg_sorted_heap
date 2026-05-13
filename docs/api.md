@@ -45,6 +45,47 @@ Non-blocking variant of merge with the same three-phase approach as
 CALL sorted_heap_merge_online('events'::regclass);
 ```
 
+### `sorted_heap_bulk_load_ordered(regclass, text, text, boolean default false, name[] default NULL)`
+
+Explicit trusted-operator bulk ingestion helper. It inserts rows from
+`source_sql` into a concrete `sorted_heap` or `clustered_heap` table after
+ordering the source by `order_by`.
+
+```sql
+SELECT sorted_heap_bulk_load_ordered(
+    'events'::regclass,
+    'SELECT id, payload FROM staging_events',
+    'id',
+    analyze_after := true,
+    key_columns := ARRAY['id']::name[]);
+```
+
+This is an ingestion-locality helper, not a merge/compaction input. `source_sql`
+and `order_by` are dynamic SQL fragments and should be supplied only by trusted
+operators or migration code. The source query must return the target table
+columns in target order.
+
+The helper records an observational append-run witness. Inspect it with:
+
+```sql
+SELECT *
+FROM sorted_heap_append_run_status('events'::regclass);
+
+SELECT *
+FROM sorted_heap_append_run_plan('events'::regclass);
+```
+
+`is_current = false` means the relation filenode changed or the witness was
+otherwise marked invalid. Current releases do not consume these witnesses for
+merge/compaction. The witness includes the inserted heap block range, row count,
+rows per touched heap block, and first/last source rows under the requested
+ordering. If `key_columns` is supplied, the witness also includes normalized
+`bigint[]` first/last keys for one or two integer key columns.
+
+Use `sorted_heap_append_run_invalidate(...)` to mark witnesses invalid and
+`sorted_heap_append_run_cleanup(...)` to delete invalid, relfilenode-stale, or
+relation-orphaned rows.
+
 ### Partition-scoped maintenance
 
 For declarative partitioned tables, use the explicit parent helpers instead of
