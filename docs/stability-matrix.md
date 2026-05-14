@@ -22,6 +22,7 @@ backward compatibility.
 | `sorted_heap` table access method | Physically sorted heap storage with zone-map pruning | Core regression, dump/restore, crash recovery, TOAST, ALTER TABLE, online operation tests |
 | `sorted_heap_compact(...)`, `sorted_heap_merge(...)` | Offline maintenance with full rewrite semantics | Regression and crash-recovery coverage |
 | `sorted_heap_compact_online(...)`, `sorted_heap_merge_online(...)` | Non-blocking maintenance with trigger-based change replay | Concurrent DML tests, crash-recovery tests |
+| `sorted_heap_bulk_load_ordered(...)` and append-run witness helpers | Trusted ordered bulk ingestion plus fail-closed observational run metadata | API-stable docs and witness bulk-load benchmark smoke |
 | Zone-map inspection and rebuild helpers | Operational visibility and recovery | Regression and lifecycle tests |
 | Zone-map metadata overlap probe | Fail-open empty-result proof for first-key `int8` ranges | Regression and documented no-row-return contract |
 | `sorted_heap_scan_stats(...)` and reset helpers | Runtime scan observability | Regression and dedicated selftests |
