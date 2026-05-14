@@ -12,6 +12,9 @@ research paths out of the stable contract.
 
 ## Highlights
 
+- PostgreSQL 16 is now part of the verified support matrix, alongside
+  PostgreSQL 17 and 18. The release gates include PG16 `installcheck` and
+  `pg_upgrade` 16->18.
 - `clustered_pk_index` accepts one or two integer key columns for
   directed-placement workloads. `(tenant_id, id)` style layouts no longer
   collapse placement to the first column.
